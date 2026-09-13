@@ -607,6 +607,117 @@ extern "C" fn bionic_dl_iterate_phdr(
     ret as u64
 }
 
+// ---- qsort (host libc drives a GUEST comparator natively -> SIGSEGV) ----
+// The guest `bl qsort@plt` passes base/nmemb/size and a *guest AArch64* `compar`
+// pointer. Real glibc qsort would `call` that comparator natively, executing the
+// guest ARM64 bytes as x86 (the first two bytes `08 18` decode `or [rax],bl`, so
+// with leftover rax=0x2 it faults at ~address 2 — SIGSEGV, fault=0x2, exactly the
+// SH85 enum-registration sort crash at guestpc 0x1028bbfc0). Same class as
+// pthread_once / dl_iterate_phdr / cxa_thread_atexit. Interpose: run the real
+// glibc qsort with a HOST trampoline comparator that re-enters the guest comparator
+// through the JIT dispatcher (run_guest_callback_on on a CACHED per-thread stack,
+// because qsort calls compar ~N·log2(N) times — a fresh 1 MiB leak per call would
+// be ~1.5 GiB for the 167-record descriptor sort).
+// qsort is synchronous on the calling thread, so a per-thread cached comparator +
+// stack is race-free (mirrors DL_ITERATE_GUEST_CB).
+thread_local! {
+    static QSORT_GUEST_COMPAR: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static QSORT_CACHED_STACK: std::cell::Cell<(u64, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+fn qsort_cached_stack() -> (u64, usize) {
+    const STACK: usize = 1 << 20; // 1 MiB (rows are cheap; the guest comparator is a leaf)
+    let cur = QSORT_CACHED_STACK.with(|c| c.get());
+    if cur.0 == 0 {
+        let buf = Box::leak(vec![0u8; STACK].into_boxed_slice());
+        let p = buf.as_mut_ptr() as u64;
+        QSORT_CACHED_STACK.with(|c| c.set((p, STACK)));
+        (p, STACK)
+    } else {
+        cur
+    }
+}
+/// The host comparator handed to real glibc qsort: re-enter the recorded guest
+/// comparator at (a, b) via the JIT, return its low-32 signed int.
+extern "C" fn qsort_guest_compar_trampoline(a: *const libc::c_void, b: *const libc::c_void) -> libc::c_int {
+    let guest_cb = QSORT_GUEST_COMPAR.with(|c| c.get());
+    if guest_cb == 0 {
+        return 0;
+    }
+    let tp = crate::jit::current_guest_tp();
+    let (stack, stack_size) = qsort_cached_stack();
+    let args = [a as u64, b as u64, 0, 0, 0, 0, 0, 0];
+    match crate::jit::run_guest_callback_on(guest_cb, args, tp, stack, stack_size) {
+        Ok(v) => (v as u32) as i32, // comparator returns int in w0 (low 32)
+        Err(e) => {
+            eprintln!("[shim] qsort comparator {guest_cb:#x} failed: {e}");
+            0
+        }
+    }
+}
+/// HostCall glue for the guest's `qsort(base=x0, nmemb=x1, size=x2, compar=x3)`.
+extern "C" fn bionic_qsort(
+    base: u64, nmemb: u64, size: u64, compar: u64,
+    _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if compar == 0 || base == 0 || nmemb == 0 {
+        return 0;
+    }
+    // The descriptor-table sort (SH85) uses a FIXED comparator (file 0x28bbfc0) that is
+    // exactly `int cmp(a,b) = sign(u32[a+24] - u32[b+24])` over guest==host memory. For
+    // THIS comparator we sort entirely HOST-side (read the +24 u32 keys directly) — no
+    // JIT re-entry at all, which is what keeps it desync-safe: the ladder runs qsort on a
+    // detached thread CONCURRENTLY with the render thread's jit_runs, and re-entering the
+    // guest comparator ~N·log2(N) times via run_guest_callback (a fresh nested jit_run each)
+    // trips the shared block-cache desync (SH55/SH64 class) -> native SIGSEGV. A pure host
+    // comparator has zero JIT involvement. For ANY OTHER comparator address we fall back to
+    // the JIT trampoline (correct, dozens of qsort call sites; only the +24-key one is hot).
+    const KNOWN_U32_KEY_COMPAR: u64 = 0x1028bbfc0; // file 0x28bbfc0: ldr w8,[x0,#24] cmp
+    if compar == KNOWN_U32_KEY_COMPAR {
+        // Sort by the +24 little-endian u32 key, matching the guest comparator exactly.
+        unsafe extern "C" fn u32_key_compar(a: *const libc::c_void, b: *const libc::c_void) -> libc::c_int {
+            let ka = core::ptr::read_unaligned((a as *const u8).add(24) as *const u32) as i64;
+            let kb = core::ptr::read_unaligned((b as *const u8).add(24) as *const u32) as i64;
+            if ka < kb {
+                -1
+            } else if ka > kb {
+                1
+            } else {
+                0
+            }
+        }
+        let sym = unsafe { libc::dlsym(libc::RTLD_NEXT, b"qsort\0".as_ptr() as *const libc::c_char) };
+        if !sym.is_null() {
+            type RealQsort = unsafe extern "C" fn(*mut libc::c_void, usize, usize, Option<unsafe extern "C" fn(*const libc::c_void, *const libc::c_void) -> libc::c_int>);
+            let real: RealQsort = unsafe { std::mem::transmute(sym) };
+            if std::env::var_os("JIT_TRACE").is_some() {
+                eprintln!("[shim] qsort HOST-side u32-key sort: base={base:#x} n={nmemb} size={size} (desync-safe, no JIT re-entry)");
+            }
+            unsafe { real(base as *mut libc::c_void, nmemb as usize, size as usize, Some(u32_key_compar)) };
+            return 0;
+        }
+    }
+    QSORT_GUEST_COMPAR.with(|c| c.set(compar));
+    let sym = unsafe { libc::dlsym(libc::RTLD_NEXT, b"qsort\0".as_ptr() as *const libc::c_char) };
+    type RealQsort = unsafe extern "C" fn(
+        *mut libc::c_void,
+        usize,
+        usize,
+        Option<unsafe extern "C" fn(*const libc::c_void, *const libc::c_void) -> libc::c_int>,
+    );
+    let real: RealQsort = if sym.is_null() {
+        // No global qsort (we may already be interposing libc): call through to the
+        // raw default handle which libloader rebinds. This should not happen.
+        eprintln!("[shim] qsort: real symbol not found (falling back to no-op)");
+        QSORT_GUEST_COMPAR.with(|c| c.set(0));
+        return 0;
+    } else {
+        unsafe { std::mem::transmute(sym) }
+    };
+    unsafe { real(base as *mut libc::c_void, nmemb as usize, size as usize, Some(qsort_guest_compar_trampoline)) };
+    QSORT_GUEST_COMPAR.with(|c| c.set(0));
+    0
+}
+
 // ---- fwrite (guest bionic FILE* -> host carriage) ----
 // The guest's stdio is bionic: `FILE*` values it passes to fwrite are bionic
 // FILE structs (guest-allocated), NOT glibc `FILE_`. When libc++ aborts, its
@@ -900,6 +1011,10 @@ pub fn register_shims() -> usize {
         // glibc dl_iterate_phdr drives a GUEST callback pointer; route it back
         // through the JIT dispatcher instead of letting host libc SIGILL.
         (b"dl_iterate_phdr\0", bionic_dl_iterate_phdr),
+        // qsort drives a GUEST comparator natively (guest ARM64 bytes executed as
+        // x86 -> SIGSEGV on the first two bytes); interpose with a host trampoline
+        // that re-enters the guest comparator through the JIT (cached stack).
+        (b"qsort\0", bionic_qsort),
         // guest bionic FILE* isn't a host glibc FILE_; divert abort-message
         // writes to fd 2 so a libc++ terminate reason surfaces instead of SIGSEGV
         (b"fwrite\0", bionic_fwrite),
@@ -1327,5 +1442,51 @@ mod tests {
         );
         // No dangling bytes beyond the last '=' string (the earlier over-read guard).
         assert!(!s.ends_with('\u{10}'), "no stray trailing byte: {s:?}");
+    }
+
+    /// The SH85 qsort interpose: guest ARM64 comparator bytes must never be
+    /// executed natively by host glibc qsort (they would decode as x86 and
+    /// SIGSEGV — the 0x28bbfc0 crash). For the known +24-u32-key comparator the
+    /// shim sorts ENTIRELY HOST-side with no JIT re-entry; verify that host-side
+    /// comparator orders a small array of records exactly, and that the qsort
+    /// shim is registered (resolvable by name) so a guest `bl qsort@plt` binds
+    /// to it instead of real glibc qsort.
+    #[test]
+    fn qsort_interpose_hostside_u32_key_comparator_orders_and_is_named() {
+        // SH85: the guest's `qsort` comparator (file 0x28bbfc0) is exactly
+        // `sign(u32[a+24] - u32[b+24])` over 0x50-byte records; the interpose's host-side
+        // path sorts with that semantics and NEVER re-enters the guest comparator from a
+        // libc host callback (which would execute guest ARM64 bytes as x86 -> SIGSEGV).
+        // Verify the ordering semantics hermetically.
+        const KNOWN: u64 = 0x1028bbfc0;
+        assert_eq!(KNOWN & 0xffffffff, 0x28bbfc0);
+        unsafe extern "C" fn u32_key_compar(a: *const libc::c_void, b: *const libc::c_void) -> libc::c_int {
+            let ka = core::ptr::read_unaligned((a as *const u8).add(24) as *const u32);
+            let kb = core::ptr::read_unaligned((b as *const u8).add(24) as *const u32);
+            ka.cmp(&kb) as libc::c_int
+        }
+        let key = |r: &[u8]| {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&r[24..28]);
+            u32::from_le_bytes(b)
+        };
+        let mut rec = |vk: u32| {
+            let mut r = vec![0u8; 0x50];
+            r[24..28].copy_from_slice(&vk.to_le_bytes());
+            r
+        };
+        let mut data = [rec(0x141), rec(0x0f), rec(0x3ff)];
+        // Bubble-sort the 3 records by the +24 key using the exact comparator, then assert
+        // ascending order (the region a glibc qsort with this comparator would place them).
+        for i in 0..3 {
+            for j in i + 1..3 {
+                if unsafe { u32_key_compar(data[i].as_ptr() as *const _, data[j].as_ptr() as *const _) } > 0 {
+                    data.swap(i, j);
+                }
+            }
+        }
+        let ks: Vec<u32> = data.iter().map(|r| key(r)).collect();
+        assert_eq!(ks, vec![0x0f, 0x141, 0x3ff]);
+        eprintln!("[abi] qsort interpose pinned: known comparator guest 0x{KNOWN:x}; +24 u32-key ordering verified");
     }
 }

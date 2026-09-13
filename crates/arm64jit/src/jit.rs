@@ -2339,51 +2339,43 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
                 }
             }
         }
-        // SH83/SH84 (--v2boot ladder): nativeGameGlobalInit's registration path builds a
-        // string-keyed hash-map. Its insert fn (guest entry 0x1029f3e70, x0 = the map, moved
-        // to x19 at 0x29f3e98) ends in a dispatch `ldp x1,x8,[x19,#16]` at 0x29f3f6c then a
-        // bucket probe. Two uninitialised-heap gates:
-        //  SH83: optional hash-fn-2 at [map+0x18] held leftover host garbage
-        //    (0x4741495241003635 = ASCII "56\0ARAIG") instead of the engine's default 0, so
-        //    `cbz x8 -> blr x1` was NOT taken and `blr x8` jumped into unmapped memory
-        //    (SIGSEGV 0x1029f3f7c). The engine map is single-hash (+0x10 = real string hash
-        //    0x102a25dec) so +0x18 must be 0.
-        //  SH84: the bucket-probe reads the map's numeric header (count +0x38, mask +0x40,
-        //    divisors +0x3c/+0x44, load +0x48, size +0x58) which are also leftover host-heap
-        //    garbage, so `idx = hash mod garbage` gives a wild index and `ldr x23,[x22]` reads
-        //    a wild/garbage bucket (SIGSEGV 0x1029f3f84). The engine's coherent EMPTY-map state
-        //    (recon deleg_52c74ca3, disasm-verified) is: +0x00 bucket array (base, 0 if the
-        //    insert's own grow path allocates it), +0x38=+0x3c=+0x44=0x400 (1024 buckets),
-        //    +0x40=0 (mask -> always take the primary-divisor branch), +0x48=0x100,
-        //    +0x58=0 (size 0 keeps the growth/shrink fast path idle), +0x60=0 (err, re-cleared).
-        //    Both repairs happen at the insert ENTRY (a real JIT block boundary; the dispatch
-        //    is mid-block), guarded on +0x10 == the REAL string-hash so a foreign/two-hash map
-        //    is never touched.
+        // SH83/SH84 (--v2boot ladder): nativeGameGlobalInit's registration path builds
+        // Roblox string-keyed hash-maps (a family of map types sharing the header layout).
+        // Their ops dispatch at `ldp x1,x8,[x19,#16]; cbz x8 -> blr x1; else blr x8` — the
+        // optional hash-fn-2 slot at +0x18 is read and `blr x8`'d when non-zero. Under the
+        // JIT that slot holds leftover host-heap garbage (0x4741495241003635 = ASCII
+        // "56\0ARAIG", 0x1800064, ... run-variable) instead of the engine's default 0, so
+        // the blr jumps into unmapped memory (SIGSEGV at 0x1029f3f7c insert / 0x1029f4284
+        // rehash). A REAL second-level hash is always an in-image code address, so any
+        // non-zero +0x18 that falls OUTSIDE the image [base, base+len) is garbage -> zero it
+        // (safe for every map of the family, including the span-hash map whose +0x10 differs).
+        // Also (SH84) seed the map's coherent EMPTY numeric header + zeroed bucket array the
+        // first time we see each distinct map, so its probe (idx = hash mod divisor) lands in
+        // [0,0x3ff] and reads sentinel 0 instead of a wild slot.
+        let routeb_map_op_entry: Option<u64> = match pc {
+            0x1029f3e70 | 0x1029f4258 | 0x1029f4088 | 0x1029f4348 => Some(unsafe { (*state).x[0] }),
+            _ => None,
+        };
         if routeb_hashfix_enabled() {
-            if pc == 0x1029f3e70 {
-                const STRING_HASH: u64 = 0x102a25dec;
-                let map = unsafe { (*state).x[0] }; // x0 = map at insert entry (mov x19,x0 at 0x29f3e98)
+            if let Some(map) = routeb_map_op_entry {
                 if map != 0 {
-                    let h1 = unsafe { *((map + 0x10) as *const u64) };
-                    if h1 == STRING_HASH {
-                        // SH83: force the single-hash path (+0x18 hash-fn-2 -> 0).
-                        let h2 = unsafe { *((map + 0x18) as *const u64) };
-                        if h2 != 0 {
-                            unsafe { *((map + 0x18) as *mut u64) = 0 };
-                            eprintln!(
-                                "[routeb-hashfix] string hash-map @ 0x{map:x} +0x18 0x{h2:x} -> 0 (insert falls back to single-hash blr x1)"
-                            );
-                        }
-                        // SH84: seed a coherent EMPTY-map numeric header so the bucket probe's
-                        // idx = hash mod divisor lands in [0,1023] and reads bucket sentinel 0.
-                        // +0x00 bucket array: force-replace ONCE per map with a fresh zeroed
-                        // 1024x8 array so the probe reads sentinel 0 immediately. The engine's
-                        // own +0x00 array (when non-zero) is UNINITIALIZED host-heap garbage in
-                        // every slot (no insert has ever completed under the JIT, so there is
-                        // nothing to orphan) — leaving it is exactly why the probe read garbage
-                        // at [bucket=860] and SIGSEGV'd. Guarded host-side so we only replace
-                        // the first time we see this map address (repeat inserts must keep the
-                        // entries the insert-new path writes).
+                    // Universal (all map-op entries): a real hash fn lives in .text; garbage
+                    // (host heap / small ints) does not. Zero +0x18 when non-image -> the op's
+                    // `cbz x8 -> blr x1` takes the single-hash path instead of `blr x8` into
+                    // unmapped memory. Safe for every map of the family (string and span hashes).
+                    let h2 = unsafe { *((map + 0x18) as *const u64) };
+                    let in_image = |a: u64| a >= base && a - base < image.len() as u64;
+                    if h2 != 0 && !in_image(h2) {
+                        unsafe { *((map + 0x18) as *mut u64) = 0 };
+                        eprintln!("[routeb-hashfix] string-hash-map @ 0x{map:x} +0x18 0x{h2:x} (non-image garbage) -> 0");
+                    }
+                    // SH84 empty-map header + zeroed bucket array: ONLY at the INSERT entry
+                    // (0x1029f3e70), once per distinct map — that is where a freshly built map
+                    // first comes up from uninitialized host heap, so there is nothing to orphan
+                    // and the probe needs a coherent empty bucket. The rehash/grow ops reuse an
+                    // already-populated array and must NOT be force-emptied (they preserve the
+                    // entries SH83/84 let insert write).
+                    if pc == 0x1029f3e70 {
                         unsafe {
                             use std::collections::HashSet;
                             use std::sync::{Mutex, OnceLock};
@@ -2396,31 +2388,19 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
                             if freshly_seeded {
                                 let arr = Box::leak(vec![0u8; 0x2000].into_boxed_slice());
                                 *(map as *mut u64) = arr.as_mut_ptr() as u64;
-                                let mut wrote = false;
-                                let mk = |off: usize, val: u32| -> bool {
+                                let mk = |off: usize, val: u32| {
                                     let p = (map + off as u64) as *mut u32;
-                                    if unsafe { *p } != val {
-                                        unsafe { *p = val };
-                                        true
-                                    } else {
-                                        false
-                                    }
+                                    unsafe { *p = val };
                                 };
-                                wrote |= mk(0x38, 0x400); // count/capacity
-                                wrote |= mk(0x3c, 0x400); // primary divisor
-                                wrote |= mk(0x40, 0); // mask -> always primary-divisor branch
-                                wrote |= mk(0x44, 0x400); // secondary divisor
-                                wrote |= mk(0x48, 0x100); // load threshold (x256)
-                                wrote |= mk(0x60, 0); // err
-                                // +0x58 is u64 size; cap it at 0 so the growth/shrink path stays idle.
-                                let sz = (map + 0x58) as *const u64;
-                                if unsafe { *sz } != 0 {
-                                    unsafe { *((map + 0x58) as *mut u64) = 0 };
-                                    wrote = true;
-                                }
-                                let _ = wrote;
+                                mk(0x38, 0x400);
+                                mk(0x3c, 0x400);
+                                mk(0x40, 0);
+                                mk(0x44, 0x400);
+                                mk(0x48, 0x100);
+                                mk(0x60, 0);
+                                unsafe { *((map + 0x58) as *mut u64) = 0 };
                                 eprintln!(
-                                    "[routeb-hashfix] string hash-map @ 0x{map:x} +0x00 forced to zeroed 1024x8 bucket array 0x{:x} + empty header (cap 0x400, mask 0, div 0x400, load 0x100, size 0) for a coherent bucket probe",
+                                    "[routeb-hashfix] map @ 0x{map:x} empty header + zeroed bucket array (0x{:x}) seeded for a coherent insert probe",
                                     arr.as_ptr() as u64
                                 );
                             }
@@ -2466,6 +2446,29 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
 /// (EXEC_CTX), on a fresh 1 MiB guest stack, seeded with the given tpidr.
 /// Returns the guest x0 after the callback's `ret`.
 pub fn run_guest_callback(fn_addr: u64, args: [u64; 8], tpidr: u64) -> Result<u64, String> {
+    // A fresh 1 MiB guest stack for the callback frame (leaked for lifetime — the
+    // guest keeps using it across nested hostcalls during the callback).
+    const STACK: usize = 1 << 20;
+    let stack = Box::leak(vec![0u8; STACK].into_boxed_slice());
+    run_guest_callback_on(fn_addr, args, tpidr, stack.as_mut_ptr() as u64, STACK)
+}
+
+/// Run a guest function on a caller-provided stack buffer (so a hot, called-many
+/// times guest callback — e.g. a `qsort` comparator, ~N·log2(N) invocations — can
+/// reuse one cached stack rather than leaking a MiB per call). `stack` must be a
+/// non-null host buffer of at least `stack_size` bytes that is valid for the guest
+/// to use as its stack for the duration; the caller owns its lifetime.
+///
+/// # Safety
+/// `stack` must point to `stack_size` bytes of writeable memory that stays valid
+/// for the whole callback (the JIT does not run concurrently on it).
+pub fn run_guest_callback_on(
+    fn_addr: u64,
+    args: [u64; 8],
+    tpidr: u64,
+    stack: u64,
+    stack_size: usize,
+) -> Result<u64, String> {
     let (image_addr, image_len, base) = {
         let guard = EXEC_CTX.lock().unwrap();
         let ctx = guard.as_ref().ok_or("run_guest_callback: no active guest image")?;
@@ -2478,14 +2481,10 @@ pub fn run_guest_callback(fn_addr: u64, args: [u64; 8], tpidr: u64) -> Result<u6
         ));
     }
     let image = unsafe { std::slice::from_raw_parts(image_addr as *const u8, image_len) };
-    // A fresh 1 MiB guest stack for the callback frame (leaked for lifetime —
-    // the guest keeps using it across nested hostcalls during the callback).
-    const STACK: usize = 1 << 20;
-    let stack = Box::leak(vec![0u8; STACK].into_boxed_slice());
     let mut st = CpuState::new();
     st.tpidr = tpidr;
     st.x[..8].copy_from_slice(&args);
-    st.x[31] = (stack.as_ptr() as u64) + (STACK as u64) - 16; // aligned top
+    st.x[31] = (stack) + (stack_size as u64) - 16; // aligned top
     jit_run(image, base, fn_addr, &mut st as *mut CpuState)?;
     Ok(st.x[0])
 }
