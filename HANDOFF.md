@@ -1,4 +1,6 @@
 # Open Sober — Agent Handoff
+## SH67c (Sep 13, 2026, hermes-worker): multi-tile grid experiment through the engine emitter — net-reverted, finding documented (docs/frontier-sh67b-emitter-draws.md addendum). Repeated engine-emitter jit_run rasterizes fine reused on one already-uploaded VBO, but ANY glBufferData in the emitter drive (per-tile re-upload or fresh buffer object) silently drops subsequent draws (variant abort with first=0); mechanism = llvmpipe/engine-context VA-state/orphan interaction, needs a JIT GLES-draw trace. Workspace green 509/0; the committed SH67b single-quad deliverable is intact and re-verified (gradient pixel-verified, exit 124). Frontier lever unchanged.
+
 
 ## Session (Sep 13, 2026, hermes-worker, cycle SH67b) — RESOLVED SH66/67: the engine's REAL geometry emitter (0x105b35288) now VISIBLY draws its authored quad — pixel-verified in the presented frame through the engine's own GLES path, presented via the real engine swap. Workspace **509/0** (unchanged). Commit c645a9e (SH67) + pending (SH67b). Doc docs/frontier-sh67b-emitter-draws.md, artifact runs/sh67b-emitter-quad.png + runs/sh66-renderemitter.txt + runs/sh67b-swap.txt.
 

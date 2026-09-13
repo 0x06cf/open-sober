@@ -88,3 +88,32 @@ env RENDEREMITTER_GLTRAP=1 ...               # post-emit state dump (diagnostic)
 ```
 
 Workspace 509/0 (example-only changes).
+
+## SH67c addendum (Sep 13, 2026) — multi-tile grid experiment: net-reverted, finding documented
+
+Attempted to extend `--renderemitter` to draw a GRID of colored tiles through the
+engine's own emitter (each tile a separate desync-safe top-level jit_run) so the
+engine's real GLES path produces a populated multi-element 2D frame. All variants
+failed to rasterize per-tile and were REVERTED (no code change; workspace 509/0
+green, single-quad SH67b deliverable intact):
+
+- **glBufferData re-upload per tile** (re-upload the shared VBO): every tile clean
+  (err=0, cur_prog=walker program, array_buffer=VBO) yet NO pixels — back buffer
+  kept the walker bands.
+- **Separate per-tile VBOs** (pre-uploaded once, bind per tile): identical silent
+  no-raster.
+- **Bisection — reuse ONE already-uploaded VBO, no glBufferData, emit N times**:
+  WORKS (gradient rendered, repeated emitter jit_run is fine).
+- **Shared VBO with all tiles + per-tile `first=t*4` (handed off via the
+  disasm-proven first=x2/count=x4 ABI)**: silent no-raster; with `first=0` the run
+  ABORTED (exit 134).
+
+**Conclusion / lesson:** in this engine state (shared walker-emitter context),
+repeated engine-emitter `jit_run` rasterizes fine when reusing one already-uploaded
+buffer, but ANY `glBufferData` call inside the emitter's drive (re-upload or a fresh
+buffer object) silently drops subsequent draws (and can abort variantly). The
+mechanism is an llvmpipe/engine-context interaction (orphaned-buffer / VA-state
+invalidation) not yet pinned — needs a JIT GLES-draw trace in a future cycle. The
+single authored quad (SH67b) remains the proven, pixel-verified engine-emitter
+deliverable; a multi-primitive populated frame via the engine emitter is a blocked
+enhancement, not a frontier lever.
