@@ -2163,20 +2163,23 @@ struct RealSprite {
 }
 
 /// SH73 — the real Roblox AUTH/log-in surface assets (the APK's own login
-/// screen artwork, under ExtraContent/textures/ui/LuaApp/graphic/Auth):
-/// reversevignette.png (the dark blurred login backdrop) + logo_white_1x.png
-/// (the Roblox wordmark). Enable with RENDEREMITTER_LOGIN=1. Entries are
-/// absolute (the auth assets live outside the content/textures/ui root).
+/// screen artwork, under ExtraContent/textures/ui/LuaApp/graphic/Auth/ plus
+/// the sibling noconnection chip): reversevignette.png (the dark blurred login
+/// backdrop) + logo_white_1x.png (the Roblox wordmark) + noconnection.png (the
+/// connection-loss chip, SH74). Enable with RENDEREMITTER_LOGIN=1. Entries
+/// are absolute (the auth assets live outside the content/textures/ui root).
 fn login_ui_textures() -> Vec<RealSprite> {
     static LT: std::sync::OnceLock<Vec<RealSprite>> = std::sync::OnceLock::new();
     LT.get_or_init(|| {
         let auth = "/home/hermes-worker/.cache/open-sober/android-env/assets/ExtraContent/textures/ui/LuaApp/graphic/Auth";
+        let graphic = "/home/hermes-worker/.cache/open-sober/android-env/assets/ExtraContent/textures/ui/LuaApp/graphic";
         let mut out = Vec::new();
-        for (name, rel) in [
-            ("reversevignette.png", "reversevignette.png"),
-            ("logo_white_1x.png", "logo_white_1x.png"),
+        for (name, dir, rel) in [
+            ("reversevignette.png", auth, "reversevignette.png"),
+            ("logo_white_1x.png", auth, "logo_white_1x.png"),
+            ("noconnection.png", graphic, "noconnection.png"),
         ] {
-            let path = format!("{auth}/{rel}");
+            let path = format!("{dir}/{rel}");
             match std::fs::read(&path).ok().and_then(|d| decode_png_rgba(&d)) {
                 Some((w, h, rgba)) => {
                     eprintln!(
@@ -2290,6 +2293,7 @@ pub fn render_engine_emitter_multi(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) 
         &[
             ("reversevignette.png", 0.0, 0.0, 1.78, 512, 512, 6),
             ("logo_white_1x.png", 0.0, 0.35, 0.22, 193, 44, 2),
+            ("noconnection.png", 0.0, -0.15, 0.10, 70, 50, 2),
         ]
     } else {
         &[
