@@ -2423,6 +2423,39 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
                         }
                     }
                 }
+                // SH92: at the INSERT entry (0x1029f3e70), a NON-FAMILY map/this must also be
+                // substituted. The OTel registrar loop (file 0x29b3814) reads its INSERT map from
+                // [0x106838380]; that slot can end up holding the `.data` descriptor-table base
+                // 0x1067da308 (in-image, so SH88's `v<0x100000000` predicate passes it through) —
+                // a NON-coherent object, not the seeded empty map. Its +0x10 (=[0x67da318]=
+                // 0x00a80000003f0060) is not an in-image family hash, so the +0x18 repair also
+                // `continue`s, and INSERT runs with garbage -> its +0x30 stack-spill slot is
+                // executed as code (fault==rip==stack, observed 0x1029b3828). Overwrite the
+                // candidate with the seeded substitute map iff it is NOT a real family map:
+                //   m==0 or m<0x100000000  -> invalid/sub-image -> substitute
+                //   else [m+0x10] not in {SPAN_HASH,STRING_HASH} -> non-family object -> substitute
+                // (A real family map's +0x10 IS one of those hashes and is never overwritten;
+                // the seeded substitute itself has +0x10==SPAN_HASH so it is never re-substituted.)
+                const FAMILY_HASHES: [u64; 2] = [0x1029b4a84, 0x102a25dec]; // span + string
+                if pc == 0x1029f3e70 {
+                    if let Some(s) = sub {
+                        for reg in [0usize, 19] {
+                            let m = unsafe { (*state).x[reg] };
+                            let non_family = if m == 0 || m < 0x100000000 {
+                                m != 0 // substitute a non-zero non-family candidate (incl .data)
+                            } else {
+                                let h1 = unsafe { *((m + 0x10) as *const u64) };
+                                !FAMILY_HASHES.contains(&h1)
+                            };
+                            if non_family {
+                                unsafe { (*state).x[reg] = s };
+                                eprintln!(
+                                    "[routeb-hashfix] SH92 substituted seeded pb_defaults registry map for non-family map/this 0x{m:x} at pc=0x{pc:x} reg=x{reg}"
+                                );
+                            }
+                        }
+                    }
+                }
                 let x0map = unsafe { (*state).x[0] };
                 let x19map = unsafe { (*state).x[19] };
                 // The map arg may arrive in x0 (the ABI register, later `mov x19,x0`) OR be
@@ -9192,6 +9225,57 @@ mod fp16_and_fabd_fccmp_exec {
         eprintln!(
             "[abi] routeb-hashfix pinned: insert dispatch file 0x{INSERT_DISPATCH:x} crash 0x{:x} string-hash 0x{:x}; +0x18 garbage 0x{GARBAGE:x} -> 0 (blr falls back to single-hash x1), +0x10 untouched",
             CRASH - 0x100000000, STRING_HASH - 0x100000000
+        );
+    }
+
+    #[test]
+    fn routeb_hashfix_substitutes_nonfamily_map_at_insert_entry() {
+        // SH92 (--v2boot ladder): the OTel registrar loop (file 0x29b3814) reads its
+        // INSERT map from [0x106838380]; that slot can end up holding the `.data`
+        // descriptor-table base 0x1067da308 (in-image, so SH88's v<0x100000000
+        // predicate passes it through) — a NON-coherent object, not a real family map.
+        // Its +0x10 (=0x00a80000003f0060) is not a family hash, so INSERT runs with a
+        // garbage map and faults (observed guestpc 0x1029b3828, fault==rip==host stack).
+        // The INSERT entry (0x1029f3e70) must substitute any candidate whose +0x10 is
+        // NOT {SPAN_HASH 0x1029b4a84, STRING_HASH 0x102a25dec}.
+        const INSERT_ENTRY: u64 = 0x1029f3e70;
+        const _DATA_TABLE: u64 = 0x1067da308; // .data descriptor-table base handed as map
+        const SPAN_HASH: u64 = 0x1029b4a84;
+        const STRING_HASH: u64 = 0x102a25dec;
+        const FAMILY_HASHES: [u64; 2] = [SPAN_HASH, STRING_HASH];
+        assert_eq!(INSERT_ENTRY & 0xffffffff, 0x29f3e70);
+        let _sub = 0x7f0000abcd0000u64; // synthetic seeded substitute map guest addr
+
+        // Non-family .data object: not sub-image, but +0x10 is not a family hash now.
+        let non_family = |m: u64| {
+            if m == 0 || m < 0x100000000 {
+                m != 0
+            } else {
+                !FAMILY_HASHES.contains(&(unsafe { *((m as usize + 0x10) as *const u64) }))
+            }
+        };
+        // The real .data table's +0x10 is the descriptor record 0x00a80000003f0060, which
+        // we cannot write; instead model it: a heap object whose +0x10 is NOT a family hash.
+        let foreign = Box::leak(Box::new([0u64; 4])).as_mut_ptr() as u64;
+        unsafe { *((foreign + 0x10) as *mut u64) = 0xdeadbeef }; // non-family hash
+        assert!(foreign >= 0x100000000);
+        assert!(non_family(foreign), "non-family +(0x10) object must be substituted");
+
+        // A real string family map must NOT be substituted.
+        let fam = Box::leak(Box::new([0u64; 4])).as_mut_ptr() as u64;
+        unsafe { *((fam + 0x10) as *mut u64) = STRING_HASH };
+        assert!(!non_family(fam), "family map must never be substituted");
+        unsafe { *((fam + 0x10) as *mut u64) = SPAN_HASH };
+        assert!(!non_family(fam), "span family map must never be substituted");
+
+        // Sub-image non-zero tag also substitutes (SH88 path).
+        assert!(non_family(0x1800064));
+        // Zero does not (nothing to substitute).
+        assert!(!non_family(0));
+        eprintln!(
+            "[abi] routeb-sh92 pinned: INSERT entry file 0x{} substitutes non-family map/this ({:x?}) via +0x10 family-hash check; family maps untouched; sub-image 0x1800064 substituted",
+            INSERT_ENTRY - 0x100000000,
+            FAMILY_HASHES
         );
     }
 
