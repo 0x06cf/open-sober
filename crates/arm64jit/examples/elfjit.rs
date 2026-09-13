@@ -1047,8 +1047,13 @@ pub fn routeb_seed_game_global_vector() -> u64 {
                 *((vtab + i as u64 * 8) as *mut u64) = leaf;
             }
             *(0x106dcae20u64 as *mut u64) = obj; // +0xe20 object (dispatch target)
-            *((obj + 0x00) as *mut u64) = vtab; // +0 vtable ptr
-            *((obj + 0x08) as *mut u64) = leaf; // +8 also a leaf (alternate dispatch)
+            // Fill the ENTIRE obj (0x40) with the vtab so EVERY field offset the walk
+            // may deref (obj+0, +8, +0x10, +0x18, +0x48...) reads a non-null vtable whose
+            // slots are all benign leaves (the crash moved to `[obj+0x18]` deref = 0).
+            // Any `ldr xN,[obj+off]` then `ldr [xN+0x10]`/`[xN+0x18]`/`blr` lands on leaf.
+            for i in 0..(0x40 / 8) {
+                *((obj + i as u64 * 8) as *mut u64) = vtab;
+            }
             // The SAME probe block is dispatched with x19 = a second in-image .bss
             // singleton (0x106846970) whose +8 begin slot is also NULL under the JIT
             // (observed: ldrb [x8] / ldp [x8+16] deref it -> fault 0x0/0x10). Point its
@@ -1057,6 +1062,12 @@ pub fn routeb_seed_game_global_vector() -> u64 {
             *(0x106846978u64 as *mut u64) = node; // +0x08 begin
             *(0x106846970u64 as *mut u64) = node; // +0x00 end
             *(0x106846980u64 as *mut u64) = node; // +0x10 cap
+            // SH99b: the do-init walk then iterates a SECOND 8-byte-pointer vector at
+            // [0x106dcaEA8] (end) / [0x106dcaEB0] (begin): `ldp x21,x22,[..]` @0x1022085c8
+            // skips the per-entry `ldrb [x23+8]` probe when begin==end. Point both at the
+            // same non-null zeroed node so the walk is an empty span (no per-entry deref).
+            *(0x106dcaea8u64 as *mut u64) = node; // second vector end
+            *(0x106dcaeB0u64 as *mut u64) = node; // second vector begin
         }
         eprintln!(
             "[elfjit:routeB] SH99 seeded empty 0x10-stride global vector [0x106dcae08..0x18]=0x{node:x} + dispatch obj [0x106dcae20]=0x{obj:x}(+8 leaf) so the globalinit probe+deref validate without NULL or blr-into-0"
