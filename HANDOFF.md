@@ -1,6 +1,44 @@
 # Open Sober — Agent Handoff
 
-## Session (Sep 13, 2026, hermes-worker, cycle SH64) — drove the engine's REAL per-node PRESENT walker so populated scene nodes actually DRAW through their render-obj vt[+24] — closing the SH64 nested-jit_run desync SIGSEGV. Workspace **509/0** (was 508/0, +1). Doc docs/frontier-sh64-present-walker.md, artifact runs/sh64-renderwalker.txt, repro runs/capture_renderwalker.sh.
+## Session (Sep 13, 2026, hermes-worker, cycle SH65) — the engine's REAL per-node PRESENT walker now draws REAL GEOMETRY per populated scene node: a distinct colored mesh band per node, pixel-verified in the live engine context. Workspace **509/0** (unchanged). Commit 27141d1. Doc docs/frontier-sh65-renderwalker-geometry.md, artifact runs/sh65-renderwalker-geometry.png + runs/sh65-final-readbacks.txt, repro runs/capture_renderwalker_geometry.sh.
+
+SH64 delivered the per-node draw as a flat colored clear; SH65 advances it to
+REAL GEOMETRY through a **cached real-Mesa (libGLESv2.so.2) shader program**
+(`walker_mesh_program()`: vs/fs compile + program link status logged), 
+rasterized per node as `glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)` on a per-node
+colored band. Still PURE HOST (no nested jit_run, no guest dispatch table), so
+the SH64 desync-proof property holds. Backdrop clear gated to the first node
+(`i % nodes == 0`) so all bands accumulate into ONE presented frame; fixed-
+function state normalized (full viewport + depth/cull/blend/scissor off) and
+glFlush/glFinish before readback so stale engine state can't silently clip.
+
+**Empirical (real libroblox.so, exit 124, zero SIGSEGV):** per-node
+`glReadPixels` readback proves EXACT rasterization — item#0 (640,93) =
+rgba(102,51,242) = [0.4,0.2,0.95] (violet), item#1 (640,223) = rgba(26,178,13) =
+[0.1,0.7,0.05] (green), item#2 (640,352) = rgba(230,38,26) = [0.9,0.15,0.1]
+(red), all 9 across 3 nodes × 3 frames; captured frame
+(sh65-renderwalker-geometry.png) shows three distinct real mesh bands
+(violet y≈584-680, green y≈440-536, red y≈320-416) on a dark backdrop;
+`present walker Ok(ret=0x1)` ×3; persist 45B byte-exact.
+
+**Key SDLC finding:** `glDrawElements` with an UNSIGNED_BYTE EBO **silently
+rasterized nothing** in the engine's ES3.2 llvmpipe context (program valid 1,
+link 1, validate 1, GL error 0x0 — yet the readback stayed the backdrop color).
+Switching to `glDrawArrays` on identical vertices made the quads rasterize
+immediately (readbacks flipped to exact band colors). EBO path kept behind
+RENDERWALKER_DRAWELEMENTS=1; glDrawArrays is the default. Lesson: in this
+context prefer non-indexed host-side mesh draws; element-index draws can no-op
+without any GL error.
+
+**Honest scope:** build (SH63) + present (SH64) + **render (SH65)** of the
+node/item ABI a Lua-created screen would consume is now end-to-end headlessly —
+the walker draws real distinct geometry, pixel-verified. The node render-obj is
+still the recovered ctx / fabricated coherent object (NOT a real UI/GuiObject),
+so drawn content is distinct mesh bands, not a populated login/home screen.
+Standing structural wall unchanged (Lua app-shell / nativeGameGlobalInit parks /
+type-4 producer vector glue-installed only). **Advance:** any future per-node
+draw can now be arbitrary host-side real geometry (meshes, textures, UI prims)
+without recompiling the walker.
 
 The SH63 doc left the present side open: the engine's real per-node PRESENT
 walker (`0x5b2ed48`, mid-loop entry `0x105b2eec0`) was proven to run (SH64 note)
