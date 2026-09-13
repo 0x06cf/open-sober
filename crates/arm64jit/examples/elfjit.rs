@@ -1328,14 +1328,13 @@ fn routeb_seed_task_singletons() {
         eprintln!("[elfjit:routeB] benign singleton virtual registered at {a:#x}");
         a
     });
-    // Leaked vtable; every 8-byte slot = the benign leaf. SH110: enlarge from
-    // 0x60 to 0x580 so high-slot virtual dispatches resolve too — the bridge
-    // natives dispatch through these singletons at vtable+0xf8 / +0x108 / +0x548
-    // (ldr x8,[obj]; ldr x8,[x8,#0xf8]; blr x8). A 0x60 vtable let the [..+0xf8/..]
-    // reads pull raw host x86 bytes past the allocation -> 'pc outside image'
-    // soft-return (SH103 class). 0x580 covers slot 0x548 + the slop above it.
-    let vtable: &'static mut [u8] = Box::leak(vec![0u8; 0x580].into_boxed_slice());
-    for i in 0..(0x580 / 8) {
+    // Leaked 0x60-byte vtable; every 8-byte slot = the benign leaf. SH110 reverted:
+    // widening to 0x580 made nativeInitializeNativeFlags hard-crash (high-slot leaf
+    // returns a0 while the caller derefs it -> NULL+0x28 fault) BEFORE StartLuaAppDM.
+    // 0x60 keeps the clean milestone (soft-return at high vtable slots is benign);
+    // track the widening as frontier-sh110's next gate instead.
+    let vtable: &'static mut [u8] = Box::leak(vec![0u8; 0x60].into_boxed_slice());
+    for i in 0..(0x60 / 8) {
         unsafe { *(vtable.as_mut_ptr().wrapping_add(i * 8) as *mut u64) = leaf; }
     }
     let vtable_addr = vtable.as_ptr() as u64;
