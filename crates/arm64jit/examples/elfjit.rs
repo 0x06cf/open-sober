@@ -1304,6 +1304,7 @@ fn routeb_patch_map_dispatch() {
 }
 
 static ROUTEB_LEAF_ADDR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static ROUTEB_ADAPTER_REC_ADDR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 /// Route-B SH81: seed the two engine dispatch-singleton `.data` records so the
 /// accessor `2b9dee0`'s lazy-create returns a coherent object instead of an
 /// all-zero stub (whose `+0` vtable is NULL). The gate-force (`routeb_patch_
@@ -4653,6 +4654,20 @@ fn main() {
                 // SH99: seed the global 0x10-stride vector the deep globalinit do-init
                 // probes (guest 0x106dcae08, begin deref'd unconditionally -> NULL SEGV).
                 let _ = routeb_seed_game_global_vector();
+                // SH107: nativeUpdateAdapterInit (rung 2) reads a global adapter-config
+                // RECORD through [guest 0x106ed7a18] (adrp x9,6ed7000; ldr x9,[x9,#2584]
+                // = 0xa18; then `ldrb w10,[x9]; tbnz w10,#0`). BSS leaves it 0 -> NULL
+                // deref `ldrb [x9]` SIGSEGV at 0x10221d7a8. Seed it to a zeroed
+                // 0x20 record: bit0==0 takes the clean path (ldr q0,[x9]; str q0,[x8];
+                // ldr x10,[x9,#16]; str x10,[x8,#16]; ret) -> copies zeros, no change.
+                let adapter_rec =
+                    *ROUTEB_ADAPTER_REC_ADDR.get_or_init(|| {
+                        let r = Box::leak(vec![0u8; 0x20usize].into_boxed_slice()).as_mut_ptr() as u64;
+                        unsafe { *(0x106ed7a18u64 as *mut u64) = r; }
+                        eprintln!("[elfjit:v2boot] SH107 seeded adapter-record [0x106ed7a18]=0x{r:x} (zeroed 0x20 byte record, bit0=0 clean path)");
+                        r
+                    });
+                let _ = adapter_rec;
                 let _ = (iimg, ib);
                 // rung index 1 == nativeGameGlobalInit in the rungs array below.
                 for (name, guest, args) in rungs.iter() {
