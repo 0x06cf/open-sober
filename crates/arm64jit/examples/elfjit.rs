@@ -1441,6 +1441,454 @@ fn imgpix_rect(
     ((x_ndc + 1.0) / 2.0 * vw, (1.0 - y_ndc) / 2.0 * vh)
 }
 
+// ============================================================================
+// SH77 — minimal pure-std TrueType outline rasterizer (text labels on the
+// login form). Parses sfnt tables (cmap Format-4 + glyf simple contours), flattens
+// quadratic outlines and fills with non-zero winding (4x4 supersampled) into an
+// RGBA8 strip (transparent bg, opaque glyph interiors) so the same textured
+// emitter path renders legible login text. Zero new deps / no network
+// (fonts/ SourceSansPro-Bold.ttf; handles short AND long loca).
+// ============================================================================
+fn be16(d: &[u8], o: usize) -> u16 {
+    u16::from_be_bytes([d[o], d[o + 1]])
+}
+fn bes16(d: &[u8], o: usize) -> i16 {
+    i16::from_be_bytes([d[o], d[o + 1]])
+}
+fn be32(d: &[u8], o: usize) -> u32 {
+    u32::from_be_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
+}
+
+/// Find a sfnt table's (offset, length) by 4-char tag. Returns None if the font
+/// is a CFF/OTTO head (`'OTTO'` signature; no glyf outlines) or the tag is absent.
+fn sfnt_find_table(font: &[u8], tag: &[u8; 4]) -> Option<(usize, usize)> {
+    if font.len() < 12 || be32(font, 0) == 0x4F54544F {
+        return None; // 'OTTO' CFF
+    }
+    let n = be16(font, 4) as usize;
+    for i in 0..n {
+        let rec = 12 + 16 * i;
+        if rec + 16 <= font.len() && &font[rec..rec + 4] == tag {
+            let off = be32(font, rec + 8) as usize;
+            let len = be32(font, rec + 12) as usize;
+            if off + len <= font.len() {
+                return Some((off, len));
+            }
+        }
+    }
+    None
+}
+
+/// A parsed cmap Format-4 subtable (Windows BMP preferred, then any Unicode).
+struct Cmap4 {
+    seg_count: usize,
+    end: Vec<u16>,
+    start: Vec<u16>,
+    delta: Vec<i16>,
+    ro: Vec<u16>,
+    garr: usize,     // glyphIdArray offset (within font bytes)
+    ro_base: usize,  // offset of the idRangeOffset table (within font bytes)
+}
+fn font_cmap4(font: &[u8]) -> Option<Cmap4> {
+    let (c, _) = sfnt_find_table(font, b"cmap")?;
+    if c + 4 > font.len() {
+        return None;
+    }
+    let n = be16(font, c + 2) as usize;
+    let mut best: Option<(usize, u8)> = None; // (subtable offset, priority)
+    for i in 0..n {
+        let rec = c + 4 + 8 * i;
+        if rec + 8 > font.len() {
+            continue;
+        }
+        let plat = be16(font, rec);
+        let enc = be16(font, rec + 2);
+        let off = be32(font, rec + 4) as usize + c;
+        if off + 8 > font.len() {
+            continue;
+        }
+        let fmt = be16(font, off);
+        let prio = match (plat, enc) {
+            (3, 1) => 2, // Windows BMP
+            (0, _) => 1, // Unicode
+            _ => 0,
+        };
+        if fmt == 4 && prio > best.map(|(_, p)| p).unwrap_or(0) {
+            best = Some((off, prio));
+        }
+    }
+    let s = best?.0;
+    let seg_x2 = be16(font, s + 6) as usize;
+    let seg = seg_x2 / 2;
+    if seg == 0 {
+        return None;
+    }
+    let end_s = s + 14;
+    let start_s = end_s + seg_x2 + 2;
+    let delta_s = start_s + seg_x2;
+    let ro_s = delta_s + seg_x2;
+    let garr = ro_s + seg_x2;
+    let mut end = Vec::with_capacity(seg);
+    let mut start = Vec::with_capacity(seg);
+    let mut delta = Vec::with_capacity(seg);
+    let mut ro = Vec::with_capacity(seg);
+    for i in 0..seg {
+        end.push(be16(font, end_s + 2 * i));
+        start.push(be16(font, start_s + 2 * i));
+        delta.push(bes16(font, delta_s + 2 * i));
+        ro.push(be16(font, ro_s + 2 * i));
+    }
+    Some(Cmap4 { seg_count: seg, end, start, delta, ro, garr, ro_base: ro_s })
+}
+impl Cmap4 {
+    /// Map a Unicode code point to a glyph id, honoring both the idDelta and
+    /// idRangeOffset segment encodings (idRangeOffset addresses are relative to
+    /// the idRangeOffset entry's own position in the subtable).
+    fn gid(&self, font: &[u8], cp: u32) -> u16 {
+        let cp = (cp & 0xFFFF) as u16;
+        for i in 0..self.seg_count {
+            if cp > self.end[i] || cp < self.start[i] {
+                continue;
+            }
+            if self.ro[i] == 0 {
+                return ((cp as i32 + self.delta[i] as i32) & 0xFFFF) as u16;
+            }
+            // element address = address(idRangeOffset[i]) + ro[i] + 2*(cp - startCode[i])
+            let elem = self.ro_base + 2 * i + self.ro[i] as usize + 2 * (cp as usize - self.start[i] as usize);
+            if elem + 2 > font.len() {
+                return 0;
+            }
+            let gi = be16(font, elem);
+            if gi == 0 {
+                return 0;
+            }
+            return ((gi as i32 + self.delta[i] as i32) & 0xFFFF) as u16;
+        }
+        0
+    }
+}
+
+/// Advance width for a glyph id (hmtx: u16 advance width per glyph, 4 bytes each).
+fn font_advance_width(font: &[u8], gid: u16) -> u16 {
+    sfnt_find_table(font, b"hmtx")
+        .and_then(|(m, _)| m.checked_add(gid as usize * 4).filter(|o| *o + 2 <= font.len()))
+        .map(|o| be16(font, o))
+        .unwrap_or(0)
+}
+
+/// Contour point rings of a SIMPLE glyph: each ring is (x, y, on_curve).
+/// Returns None for composite glyphs / CFF / malformed (caller skips + logs).
+fn font_glyph_contours(font: &[u8], gid: u16) -> Option<Vec<Vec<(i16, i16, bool)>>> {
+    let ((h, _), (l, _), (g, _)) = (
+        sfnt_find_table(font, b"head")?,
+        sfnt_find_table(font, b"loca")?,
+        sfnt_find_table(font, b"glyf")?,
+    );
+    let fmt = bes16(font, h + 50);
+    let a = match fmt {
+        0 => be16(font, l + 2 * gid as usize) as usize * 2,
+        _ => be32(font, l + 4 * gid as usize) as usize,
+    };
+    let b = match fmt {
+        0 => be16(font, l + 2 * (gid as usize + 1)) as usize * 2,
+        _ => be32(font, l + 4 * (gid as usize + 1)) as usize,
+    };
+    if a >= b || b > font.len() || a >= font.len() {
+        return None;
+    }
+    let nc = bes16(font, g + a);
+    if nc < 0 {
+        return None; // composite: bail
+    }
+    let nc = nc as usize;
+    if nc == 0 {
+        return Some(Vec::new()); // empty glyph (e.g. space)
+    }
+    let endp = g + a + 10;
+    let mut ends = Vec::with_capacity(nc);
+    for i in 0..nc {
+        ends.push(be16(font, endp + 2 * i) as usize);
+    }
+    let ilen = be16(font, endp + 2 * nc) as usize;
+    let mut p = endp + 2 * nc + 2 + ilen;
+    let mut flags = Vec::new();
+    let total = ends[nc - 1] + 1;
+    while flags.len() < total {
+        let f = *font.get(p)?;
+        flags.push(f);
+        p += 1;
+        if f & 0x08 != 0 {
+            let n = *font.get(p)?;
+            p += 1;
+            for _ in 0..n {
+                flags.push(f);
+            }
+        }
+    }
+    // x coordinates (with per-point x-metrics).
+    let mut xs = Vec::with_capacity(total);
+    let mut x = 0i32;
+    for i in 0..total {
+        let f = flags[i];
+        if f & 0x02 != 0 {
+            // short vector signed
+            let d = *font.get(p)?;
+            p += 1;
+            x += if f & 0x10 != 0 { d as i32 } else { -(d as i8 as i32) };
+        } else if f & 0x10 == 0 {
+            let d = *font.get(p)? as i8 as i32;
+            p += 1;
+            x += d;
+        }
+        xs.push(x);
+    }
+    // y coordinates.
+    let mut ys = Vec::with_capacity(total);
+    let mut y = 0i32;
+    for i in 0..total {
+        let f = flags[i];
+        if f & 0x04 != 0 {
+            let d = *font.get(p)?;
+            p += 1;
+            y += if f & 0x20 != 0 { d as i32 } else { -(d as i8 as i32) };
+        } else if f & 0x20 == 0 {
+            let d = *font.get(p)? as i8 as i32;
+            p += 1;
+            y += d;
+        }
+        ys.push(y);
+    }
+    let mut rings = Vec::with_capacity(nc);
+    let mut start = 0usize;
+    for e in &ends {
+        let ring: Vec<(i16, i16, bool)> = (start..=*e)
+            .map(|i| (xs[i] as i16, ys[i] as i16, flags[i] & 0x01 != 0))
+            .collect();
+        rings.push(ring);
+        start = e + 1;
+    }
+    Some(rings)
+}
+
+/// Flatten one TrueType contour ring into a closed polygon of f32 font-unit
+/// points, sampling each quadratic on/off segment (spec quadratic rules:
+/// on-on -> line; on-off-on -> quadratic; two consecutive offs -> implied
+/// on-curve at their midpoint). Ring wrap is folded by iterating all points.
+fn flatten_ring(pts: &[(i16, i16, bool)]) -> Vec<(f32, f32)> {
+    let n = pts.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let st = pts.iter().position(|p| p.2).unwrap_or(0);
+    let at = |idx: usize| -> (f32, f32, bool) {
+        let p = pts[idx % n];
+        (p.0 as f32, p.1 as f32, p.2)
+    };
+    let mut out: Vec<(f32, f32)> = Vec::new();
+    // Emit a run of off-curves `offs` bridged from on-point `a` to on-point `b`:
+    // 0 offs -> nothing; 1 off -> quadratic a-o-b; >=2 offs -> implied on-curve
+    // midpoints turn the run into k quadratics.
+    let emit = |a: (f32, f32), offs: &[(f32, f32)], b: (f32, f32), out: &mut Vec<(f32, f32)>| {
+        if offs.is_empty() {
+            return;
+        }
+        let mut prev = a;
+        let mut idx = 0usize;
+        while idx < offs.len() {
+            let o = offs[idx];
+            let end: (f32, f32) = if idx + 1 < offs.len() {
+                ((o.0 + offs[idx + 1].0) / 2.0, (o.1 + offs[idx + 1].1) / 2.0)
+            } else {
+                b
+            };
+            for t in [0.25f32, 0.5, 0.75] {
+                let u = 1.0 - t;
+                out.push((
+                    u * u * prev.0 + 2.0 * u * t * o.0 + t * t * end.0,
+                    u * u * prev.1 + 2.0 * u * t * o.1 + t * t * end.1,
+                ));
+            }
+            out.push(end);
+            prev = end;
+            idx += 1;
+        }
+    };
+    // Walk the ring, collecting off-curve runs between on-curves.
+    let mut start_on: Option<(f32, f32)> = None;
+    let mut offs: Vec<(f32, f32)> = Vec::new();
+    let mut seen = 0usize;
+    let mut i = 0usize;
+    while seen < n {
+        let (x, y, on) = at(st + i);
+        seen += 1;
+        if on {
+            if let Some(a) = start_on {
+                if !offs.is_empty() {
+                    emit(a, &offs, (x, y), &mut out); // pushes endpoint (x,y)
+                    let _ = a;
+                }
+                // else: line a->(x,y), endpoint pushed below
+            }
+            start_on = Some((x, y));
+            offs.clear();
+            // endpoints already emitted by `emit` are (x,y) == last vertex; only
+            // push when it is NOT already the last output vertex (avoid dup).
+            if !(out.last().map_or(false, |&(lx, ly)| (lx - x).abs() < 1e-4 && (ly - y).abs() < 1e-4)) {
+                out.push((x, y));
+            }
+        } else {
+            offs.push((x, y));
+        }
+        i += 1;
+    }
+    // Close the ring back to the start on-curve.
+    if let Some(a) = start_on {
+        let (sx, sy, _) = at(st);
+        if !offs.is_empty() {
+            emit(a, &offs, (sx, sy), &mut out);
+        }
+        // ensure the polygon is closed (first vertex appended last if distinct)
+        if let Some(&first) = out.first() {
+            if let Some(&last) = out.last() {
+                if (first.0 - last.0).abs() > 1e-4 || (first.1 - last.1).abs() > 1e-4 {
+                    out.push(first);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Non-zero-winding coverage of `rings` (already transformed to image space).
+fn covered(rings: &[Vec<(f32, f32)>], x: f32, y: f32) -> bool {
+    let mut w = 0i32;
+    for r in rings {
+        for i in 0..r.len() {
+            let a = r[i];
+            let b = r[(i + 1) % r.len()];
+            if (a.1 > y) != (b.1 > y) {
+                let xi = a.0 + (y - a.1) / (b.1 - a.1) * (b.0 - a.0);
+                if xi > x {
+                    w += if b.1 > a.1 { 1 } else { -1 };
+                }
+            }
+        }
+    }
+    w != 0
+}
+
+/// Rasterize a text row into a w x h RGBA8 buffer (transparent background).
+/// Layout: characters left-to-right; `pu` = px per font unit; `color` baked;
+/// `pen_start_x` (px) = x of the first glyph's origin; `baseline_row` (px,
+/// image y-down) = where glyph y=0 sits. Coverage supersampled ss=4 per pixel.
+fn rasterize_text_row(
+    font: &[u8],
+    text: &str,
+    pu: f32,
+    color: [u8; 4],
+    w: u32,
+    h: u32,
+    pen_start_x: f32,
+    baseline_row: f32,
+) -> Vec<u8> {
+    let ss = 4;
+    let cmap = font_cmap4(font);
+    let mut rings: Vec<Vec<(f32, f32)>> = Vec::new();
+    let mut pen = pen_start_x;
+    if let Some(cm) = &cmap {
+        for ch in text.chars() {
+            let gid = cm.gid(font, ch as u32);
+            if gid == 0 {
+                continue;
+            }
+            if let Some(contours) = font_glyph_contours(font, gid) {
+                for pts in &contours {
+                    if pts.len() < 3 {
+                        continue;
+                    }
+                    let flat = flatten_ring(pts);
+                    let ring_t: Vec<(f32, f32)> = flat
+                        .iter()
+                        .map(|(fx, fy)| (pen + fx * pu, baseline_row - fy * pu))
+                        .collect();
+                    if ring_t.len() >= 3 {
+                        rings.push(ring_t);
+                    }
+                }
+            }
+            pen += font_advance_width(font, gid) as f32 * pu;
+        }
+    }
+    let mut out = vec![0u8; (w as usize) * (h as usize) * 4];
+    for py in 0..h as usize {
+        for px in 0..w as usize {
+            let mut cov = 0i32;
+            for sy in 0..ss {
+                for sx in 0..ss {
+                    let fx = px as f32 + (sx as f32 + 0.5) / ss as f32;
+                    let fy = py as f32 + (sy as f32 + 0.5) / ss as f32;
+                    if covered(&rings, fx, fy) {
+                        cov += 1;
+                    }
+                }
+            }
+            let a = (cov as u32 * 255) / (ss * ss) as u32;
+            if a > 0 {
+                let o = (py * w as usize + px) * 4;
+                out[o] = color[0];
+                out[o + 1] = color[1];
+                out[o + 2] = color[2];
+                out[o + 3] = a as u8;
+            }
+        }
+    }
+    out
+}
+
+/// SH77 — cached font bytes for the login-form text labels. Reads the real
+/// SourceSansPro-Bold.ttf from the extracted assets once.
+fn login_font_bytes() -> &'static [u8] {
+    static FB: std::sync::OnceLock<Option<&'static [u8]>> = std::sync::OnceLock::new();
+    FB.get_or_init(|| {
+        let path = "/home/hermes-worker/.cache/open-sober/android-env/assets/fonts/SourceSansPro-Bold.ttf";
+        match std::fs::read(path) {
+            Ok(d) => Some(Box::leak(d.into_boxed_slice())),
+            Err(e) => {
+                eprintln!("[elfjit:renderemitter-login] WARN: cannot read login font {path}: {e}");
+                None
+            }
+        }
+    })
+    .as_deref()
+    .unwrap_or(&[])
+}
+
+/// Rasterize a login-form text label into a 256-wide RGBA8 strip, centered
+/// (transparent bg, glyph color). Returns None if the font is unavailable.
+fn rasterize_login_label(text: &str, color: [u8; 4], h: u32, pu: f32) -> Option<RealSprite> {
+    let font = login_font_bytes();
+    if font.is_empty() {
+        return None;
+    }
+    let cmap = font_cmap4(font)?;
+    // Measure used width to center the string in the 256-wide row.
+    let mut used = 0.0f32;
+    for ch in text.chars() {
+        let gid = cmap.gid(font, ch as u32);
+        if gid != 0 {
+            used += font_advance_width(font, gid) as f32 * pu;
+        }
+    }
+    let pen_start = (256.0 - used) / 2.0;
+    // baseline_row: pad(4) + ascender*pu. Ascender = 722 for SSPro Bold (from
+    // the statically-derived yMax of 'i'/'l'); use a fixed generous ascender so
+    // caps + ascenders sit with pad.
+    let ascender = 722.0f32;
+    let baseline_row = 4.0 + ascender * pu;
+    let rgba = rasterize_text_row(font, text, pu, color, 256, h, pen_start, baseline_row);
+    Some(RealSprite { name: format!("{text}"), w: 256, h, rgba })
+}
+
 fn emitter_tex_program() -> (u32, i32) {
     static TP: std::sync::OnceLock<(u32, i32)> = std::sync::OnceLock::new();
     *TP.get_or_init(|| {
@@ -2208,6 +2656,32 @@ fn login_ui_textures() -> Vec<RealSprite> {
         // bar. 256x16 rows keep the boxes wide (aspect 16).
         solid("field.png", (224, 224, 230, 255), 256, 16);
         solid("loginbtn.png", (0, 158, 68, 255), 256, 16);
+        // SH77 — a 2nd field (the password row) + real TEXT labels rasterized
+        // from the APK's own SourceSansPro-Bold.ttf (glyph outlines flattened
+        // with quadratic sampling, non-zero-winding 4x4-supersampled into
+        // transparent 256-wide RGBA8 rows). White "Log In" composites over the
+        // green button; dark-slate field placeholders over the two fields. The
+        // FS outputs texture2D, so color is baked into the glyph texels and the
+        // text rows sit AFTER their backing prim in atlas/painter order.
+        solid("field2.png", (224, 224, 230, 255), 256, 16);
+        for (name, color, h, pu) in [
+            ("Log In", [255u8, 255, 255, 255], 40u32, 0.034f32),
+            ("Email address", [96u8, 96, 110, 255], 32u32, 0.030f32),
+            ("Password", [96u8, 96, 110, 255], 32u32, 0.030f32),
+        ] {
+            match rasterize_login_label(name, color, h, pu) {
+                Some(s) => {
+                    eprintln!(
+                        "[elfjit:renderemitter-login] rasterized text label '{name}' ({}x{})",
+                        s.w, s.h
+                    );
+                    out.push(s);
+                }
+                None => eprintln!(
+                    "[elfjit:renderemitter-login] WARN: text label '{name}' unavailable (font missing?) — skipped"
+                ),
+            }
+        }
         out
     })
     .clone()
@@ -2310,8 +2784,15 @@ pub fn render_engine_emitter_multi(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) 
             ("reversevignette.png", 0.0, 0.0, 1.78, 512, 512, 6),
             ("logo_white_1x.png", 0.0, 0.35, 0.22, 193, 44, 2),
             ("noconnection.png", 0.0, -0.15, 0.10, 70, 50, 2),
-            ("field.png", 0.0, -0.45, 0.045, 128, 8, 2),
-            ("loginbtn.png", 0.0, -0.62, 0.05, 128, 8, 2),
+            ("field.png", 0.0, -0.45, 0.045, 24, 8, 2),
+            ("loginbtn.png", 0.0, -0.62, 0.05, 24, 8, 2),
+            ("field2.png", 0.0, -0.54, 0.045, 128, 8, 2),
+            // SH77 text labels (real SourceSansPro-Bold glyphs) — centered on
+            // their backing prim; probe = an opaque glyph-interior texel (the
+            // glyph color is baked into the texel, so byte-exact over any dst).
+            ("Log In", 0.0, -0.62, 0.05, 130, 18, 2),
+            ("Email address", 0.0, -0.45, 0.045, 76, 21, 2),
+            ("Password", 0.0, -0.54, 0.045, 156, 12, 2),
         ]
     } else {
         &[
@@ -7236,5 +7717,149 @@ mod sh69_tests {
         assert!((bx - 640.0).abs() < bw * 16.0 * 0.5625 * 640.0 + 4.0, "button x {bx}");
         assert!(by > 0.0 && by < 720.0, "button y {by}");
         let _ = bh;
+    }
+}
+
+// SH77 hermetic regression: the pure-std TrueType rasterizer + login text
+// integration. The coverage/font-table pieces are fully hermetic (feed an
+// in-memory font slice); the login-label screen probes additionally verify the
+// exact glyph pixels the emitter probes (host font file, same hard-coded asset
+// path the renderer uses).
+#[cfg(test)]
+mod sh77_tests {
+    use super::*;
+
+    #[test]
+    fn sh77_flatten_ring_emits_closed_quad_polygon() {
+        // Square ring: on-curves at the 4 corners (unit 0..100), CCW.
+        let pts: Vec<(i16, i16, bool)> =
+            vec![(10, 10, true), (90, 10, true), (90, 90, true), (10, 90, true)];
+        let poly = flatten_ring(&pts);
+        // closed polygon with >= 4 points
+        assert!(poly.len() >= 4, "poly len {}", poly.len());
+        // region-winding: a point strictly inside the square is covered
+        assert!(covered(&vec![poly.clone()], 50.0, 50.0), "center must be covered");
+        // a point outside the square is not covered
+        assert!(!covered(&vec![poly.clone()], 150.0, 150.0), "outside must be uncovered");
+        assert!(!covered(&vec![poly.clone()], 5.0, 50.0), "left-of must be uncovered");
+    }
+
+    #[test]
+    fn sh77_quadratic_offs_flatten_cover_interior() {
+        // on -> off -> off -> on : the two off-curves imply an on-curve at their
+        // midpoint, forming two quadratics that still enclose the center area.
+        let pts: Vec<(i16, i16, bool)> = vec![
+            (0, 0, true),
+            (0, 100, false),
+            (100, 100, false), // midpoint implied at (50,100)
+            (100, 0, true),
+        ];
+        let poly = flatten_ring(&pts);
+        assert!(poly.len() >= 8, "quad flattens to sample points, got {}", poly.len());
+        // center of the shape is covered
+        assert!(covered(&vec![poly.clone()], 50.0, 50.0), "center must be covered");
+        // well outside is not
+        assert!(!covered(&vec![poly], 200.0, 200.0), "outside must be uncovered");
+    }
+
+    #[test]
+    fn sh77_covered_uses_nonzero_winding_for_counter() {
+        // Outer square + inner square (one nested, opposite winding) -> the
+        // donut interior is uncovered (winding cancels), the outer ring is.
+        let outer: Vec<(i16, i16, bool)> =
+            vec![(0, 0, true), (100, 0, true), (100, 100, true), (0, 100, true)];
+        let inner: Vec<(i16, i16, bool)> =
+            vec![(30, 30, true), (30, 70, true), (70, 70, true), (70, 30, true)];
+        let po = flatten_ring(&outer);
+        let pi = flatten_ring(&inner);
+        let rings = vec![po, pi];
+        // center (50,50) inside the inner (opposite winding) -> uncovered (hole)
+        assert!(!covered(&rings, 50.0, 50.0), "hole center must be uncovered");
+        // (15,15) inside the outer but outside the hole -> covered ring
+        assert!(covered(&rings, 15.0, 15.0), "ring must be covered");
+    }
+
+    // The real font path is the same hard-coded absolute path the login
+    // renderer uses; rely on the asset being present (already unzipped on this
+    // box). If absent, skip gracefully rather than fail the workspace.
+    fn real_font() -> Option<Vec<u8>> {
+        std::fs::read("/home/hermes-worker/.cache/open-sober/android-env/assets/fonts/SourceSansPro-Bold.ttf").ok()
+    }
+
+    #[test]
+    fn sh77_cmap4_maps_ascii_log_in_to_nonzero_gid() {
+        let Some(font) = real_font() else { return };
+        let cmap = font_cmap4(&font).expect("cmap4");
+        for cp in "Log In Email address Password".chars().map(|c| c as u32) {
+            let gid = cmap.gid(&font, cp);
+            assert!(gid != 0, "char {cp:#x} ({}'') maps to gid 0", char::from_u32(cp).unwrap());
+        }
+    }
+
+    #[test]
+    fn sh77_text_grid_runs_for_each_label() {
+        let Some(font) = real_font() else { return };
+        for (text, color, h, pu) in [
+            ("Log In", [255u8, 255, 255, 255], 40u32, 0.034f32),
+            ("Email address", [96u8, 96, 110, 255], 32u32, 0.030f32),
+            ("Password", [96u8, 96, 110, 255], 32u32, 0.030f32),
+        ] {
+            let cmap = font_cmap4(&font).unwrap();
+            let mut used = 0.0f32;
+            for ch in text.chars() {
+                let gid = cmap.gid(&font, ch as u32);
+                if gid != 0 {
+                    used += font_advance_width(&font, gid) as f32 * pu;
+                }
+            }
+            let pen_start = (256.0 - used) / 2.0;
+            let asc = 722.0f32;
+            let baseline = 4.0 + asc * pu;
+            let rgba = rasterize_text_row(&font, text, pu, color, 256, h, pen_start, baseline);
+            // nonzero glyph pixels present
+            let opaque = rgba
+                .chunks_exact(4)
+                .filter(|px| px[3] >= 250)
+                .count();
+            assert!(opaque > 50, "'{text}' only {opaque} opaque px (label invisible)");
+            // glyph color baked
+            let sample_alpha = rgba
+                .chunks_exact(4)
+                .find(|px| px[3] >= 250)
+                .expect("opaque sample");
+            assert_eq!(&sample_alpha[..3], &color[..3], "'{text}' glyph rgb not baked color");
+            // background transparent
+            assert_eq!(rgba[0] as u8, 0, "'{text}' corner not transparent");
+        }
+    }
+
+    #[test]
+    fn sh77_login_label_probes_are_opaque_glyph_interior() {
+        let Some(font) = real_font() else { return };
+        // The exact (pix,piy) probe texels used in the emitter placements must be
+        // opaque glyph interiors so the blend yields the baked glyph color.
+        let cases: &[(&str, (u32, u32))] = &[
+            ("Log In", (130, 18)),
+            ("Email address", (76, 21)),
+            ("Password", (156, 12)),
+        ];
+        for (text, (pix, piy)) in cases {
+            let color = if *text == "Log In" { [255u8, 255, 255, 255] } else { [96u8, 96, 110, 255] };
+            let h: u32 = if *text == "Log In" { 40 } else { 32 };
+            let pu: f32 = if *text == "Log In" { 0.034 } else { 0.030 };
+            let cmap = font_cmap4(&font).unwrap();
+            let mut used = 0.0f32;
+            for ch in text.chars() {
+                let gid = cmap.gid(&font, ch as u32);
+                if gid != 0 {
+                    used += font_advance_width(&font, gid) as f32 * pu;
+                }
+            }
+            let pen_start = (256.0 - used) / 2.0;
+            let baseline = 4.0 + 722.0 * pu;
+            let rgba = rasterize_text_row(&font, text, pu, color, 256, h, pen_start, baseline);
+            let a = rgba[((*piy as usize) * 256 + *pix as usize) * 4 + 3];
+            assert!(a >= 250, "'{text}' probe ({pix},{piy}) alpha={a} not opaque glyph");
+        }
     }
 }
