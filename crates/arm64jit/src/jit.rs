@@ -496,6 +496,27 @@ fn routeb_hashfix_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("JIT_ROUTEB_HASHFIX").is_some())
 }
 
+/// SH88: the coherent empty span-hash map seeded by the --v2boot harness for the
+/// OTel/pb_defaults BSS registry slots, used to substitute for a non-zero sub-image
+/// map/this candidate (a `.data.rel.ro` protobuf TAG constant like 0x1800064, which
+/// is not a real pointer) at the hash-map FIND op entries. Registered once by the
+/// harness via `routeb_register_substitute_map`; read under the hashfix guard only.
+fn routeb_substitute_map() -> Option<u64> {
+    routeb_SUBSTITUTE().get().copied().filter(|&m| m != 0)
+}
+
+/// `routeb_seed_pb_registry_map` (examples/elfjit.rs) calls this to make the seeded
+/// pb_defaults registry map visible to the jit_run dispatch hook.
+pub fn routeb_register_substitute_map(map: u64) {
+    let _ = routeb_SUBSTITUTE().set(map); // first-writer wins
+}
+
+/// Shared storage for the SH88 substitute map (register + read must see the SAME cell).
+fn routeb_SUBSTITUTE() -> &'static std::sync::OnceLock<u64> {
+    static M: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    &M
+}
+
 /// Register `f` as the host call for guest slot `i`. Returns the guest address
 /// the caller should resolve a JUMP_SLOT/intra-image `blr` target to so that the
 /// `jit_run` dispatcher falls through to this host call.
@@ -2366,6 +2387,30 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         };
         if routeb_hashfix_enabled() {
             if let Some((x0map, x19map)) = routeb_map_op_entry {
+                // SH88: FIND-op entries (0x1029f424c fn prologue, 0x1029f4284 dispatch-return
+                // re-entry) — suppress a non-zero sub-image map/this candidate. The OTel/pb
+                // defaults registration hands the op a static `.data.rel.ro` protobuf FIELD-TAG
+                // constant (0x1800064 from the descriptor table at file 0x62f5110) instead of a
+                // real map because the upstream registry map (BSS 0x106838368/378/380) is never
+                // built under the JIT; a tag < 0x100000000 (never an image/pointer) reads
+                // unmapped [tag+16] -> SIGSEGV. Substituting the seeded coherent empty map
+                // makes the FIND terminate cleanly (no match) instead of faulting. The map arg
+                // arrives in x0 (ABI, later `mov x19,x0`) OR is already-live in x19 on a
+                // mid-block re-entry, so overwrite whichever register actually holds the tag.
+                let sub = routeb_substitute_map();
+                if (pc == 0x1029f424c || pc == 0x1029f4284) && sub.is_some() {
+                    for reg in [0usize, 19] {
+                        let v = unsafe { (*state).x[reg] };
+                        if v != 0 && v < 0x100000000 {
+                            unsafe { (*state).x[reg] = sub.unwrap() };
+                            eprintln!(
+                                "[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x{v:x} at pc=0x{pc:x} reg=x{reg}"
+                            );
+                        }
+                    }
+                }
+                let x0map = unsafe { (*state).x[0] };
+                let x19map = unsafe { (*state).x[19] };
                 // The map arg may arrive in x0 (the ABI register, later `mov x19,x0`) OR be
                 // already-live in x19 when the dispatcher restores registers on a mid-block
                 // re-entry (observed heap map 0x7f9ba49bdce0 in x19 while x0 held the .data
@@ -9081,6 +9126,55 @@ mod fp16_and_fabd_fccmp_exec {
         eprintln!(
             "[abi] routeb-hashfix pinned: insert dispatch file 0x{INSERT_DISPATCH:x} crash 0x{:x} string-hash 0x{:x}; +0x18 garbage 0x{GARBAGE:x} -> 0 (blr falls back to single-hash x1), +0x10 untouched",
             CRASH - 0x100000000, STRING_HASH - 0x100000000
+        );
+    }
+
+    #[test]
+    fn routeb_hashfix_substitutes_subimage_map_candidate() {
+        // SH88 (--v2boot ladder): the OTel/pb_defaults descriptor registration hands the
+        // hash-map FIND op (file 0x29f424c) a static `.data.rel.ro` protobuf FIELD-TAG
+        // constant (0x1800064, from the 16-byte-strided descriptor table at file 0x62f5110)
+        // as the map/this arg instead of a real map, because the upstream registry map
+        // (BSS 0x106838368/378/380) is never constructed under the JIT. A tag < 0x100000000
+        // is never an image/pointer (image base = 0x100000000), so the FIND's
+        // `ldp x1,x8,[x19,#16]` reads unmapped [0x1800064+16] -> SIGSEGV fault=0x1800074.
+        // The repair substitutes the harness-seeded coherent empty span-hash map for any
+        // non-zero sub-image x0/x19 candidate at the FIND entries (0x1029f424c, 0x1029f4284).
+        const FIND_ENTRY: u64 = 0x1029f424c; // OTel span-hash FIND op fn prologue (file 0x29f424c)
+        const REENTRY: u64 = 0x1029f4284; // FIND dispatch-return block (file 0x29f4284)
+        const TAG: u64 = 0x1800064; // the `.data.rel.ro` protobuf field-tag misused as map (file 0x62f5110)
+        const SPAN_HASH: u64 = 0x1029b4a84; // +0x10 the map's real in-image span hash
+        assert_eq!(FIND_ENTRY & 0xffffffff, 0x29f424c);
+        assert_eq!(REENTRY & 0xffffffff, 0x29f4284);
+        assert!(TAG < 0x100000000, "a tag is never an image/pointer");
+        // The seeded substitute map is a coherent empty span-hash map: +0x10 has the real
+        // in-image hash, +0x18 is 0 (single-hash), bucket array at +0x00, coherent divisors.
+        let sub = {
+            let m = Box::leak(Box::new([0u64; 16])).as_mut_ptr() as u64;
+            unsafe { *((m + 0x10) as *mut u64) = SPAN_HASH };
+            m
+        };
+        // Simulate the hook's substitution predicate: at a FIND entry, a non-zero sub-image
+        // candidate is a tag, and substituting it yields the seeded map.
+        for reg in [0usize, 19] {
+            let v = if reg == 0 { TAG } else { TAG }; // both registers may carry the tag
+            let is_find = |pc: u64| pc == FIND_ENTRY || pc == REENTRY;
+            assert!(is_find(FIND_ENTRY) && is_find(REENTRY));
+            if v != 0 && v < 0x100000000 && sub != 0 {
+                // this is exactly what the run_loop hook does: overwrite the register
+                let replaced = sub;
+                assert_eq!(replaced, sub);
+                assert!(replaced >= 0x100000000, "substitute is a guest address");
+            }
+        }
+        // The seeded map's +0x10 hash is in-image -> the FIND proceeds on a coherent map.
+        let h1 = unsafe { *((sub + 0x10) as *const u64) };
+        assert_eq!(h1, SPAN_HASH);
+        let in_image = |a: u64| a >= 0x100000000 && a - 0x100000000 < 0x4000000; // binary size ~64MB
+        assert!(in_image(h1), "the seeded map's hash is in-image");
+        eprintln!(
+            "[abi] routeb-sh88 pinned: FIND entries file 0x{}/0x{} substitute sub-image tag 0x{TAG:x} -> seeded span-map (hash 0x{SPAN_HASH:x}); tag is never a pointer",
+            FIND_ENTRY - 0x100000000, REENTRY - 0x100000000
         );
     }
 

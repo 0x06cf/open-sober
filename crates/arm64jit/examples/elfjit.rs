@@ -940,11 +940,50 @@ fn routeb_patch_dispatch_gate() {
     ROUTEB_GATE_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// Benign virtual leaf for the Route-B seeded singletons: returns its first
-/// arg (x0). Many dispatch stubs call `vt[+N](this, ...)` and store the result
-/// into a sink or use it as `this`; identity is the safe default for an
-/// unresolved virtual, and it never dereferences anything, so a null-vtable
-/// stub can't crash on the read (`ldr x8,[x8,#48]; blr x8`) that SH81 hit.
+/// SH88: the OTel/pb_defaults registration passes a static `.data.rel.ro` protobuf
+/// field-TAG constant (e.g. 0x1800064, from the 16-byte-strided descriptor table at
+/// file 0x62f5110) as the map/this argument to the hash-map FIND op (file 0x29f424c,
+/// guest 0x1029f424c) instead of a real map — because the upstream registry map it
+/// should have been constructed from (BSS slots 0x106838368/0x106838378/0x106838380)
+/// is never built under the JIT. A tag constant is < 0x100000000 (never an image/pointer),
+/// so the FIND's `ldp x1,x8,[x19,#16]` reads unmapped [0x1800064+16] -> SIGSEGV.
+/// Fix: seed a coherent empty span-hash map once and install it into the pb_defaults
+/// registry slots so the caller's map hand-off yields a real object. The jit.rs
+/// routeb_map_op_entry hook substitutes this seeded map for any non-zero sub-image
+/// `x0` map candidate at the FIND op entries.
+pub fn routeb_seed_pb_registry_map(image: &[u8], base: u64) -> u64 {
+    use std::sync::OnceLock;
+    static SEEDED: OnceLock<u64> = OnceLock::new();
+    *SEEDED.get_or_init(|| {
+        // Coherent empty span/string hash-map (same bytes SH84 builds for the insert map):
+        // +0x00 zeroed 1024x8 bucket array, +0x08 key-eq leaf (skip; empty buckets never
+        // collide), +0x10 real in-image span hash, +0x18=0 (single-hash), +0x38/+0x3c/+0x44
+        // =0x400 divisors, +0x40=0 mask, +0x48=0x100 load, +0x58=0 size, +0x60=0 err.
+        let map = Box::leak(vec![0u8; 0x80usize].into_boxed_slice()).as_mut_ptr() as u64;
+        unsafe {
+            let arr = Box::leak(vec![0u8; 0x2000usize].into_boxed_slice());
+            *(map as *mut u64) = arr.as_mut_ptr() as u64; // +0x00 bucket array
+            *((map + 0x10) as *mut u64) = 0x1029b4a84; // +0x10 real span hash (in-image)
+            *((map + 0x18) as *mut u64) = 0; // +0x18 single-hash
+            *((map + 0x38) as *mut u32) = 0x400;
+            *((map + 0x3c) as *mut u32) = 0x400;
+            *((map + 0x40) as *mut u32) = 0;
+            *((map + 0x44) as *mut u32) = 0x400;
+            *((map + 0x48) as *mut u32) = 0x100;
+            *((map + 0x58) as *mut u64) = 0;
+            *((map + 0x60) as *mut u32) = 0;
+        }
+        // Install into the pb_defaults BSS registry slots (idempotent data seed).
+        for slot in [0x106838368u64, 0x106838378, 0x106838380] {
+            unsafe { *(slot as *mut u64) = map };
+        }
+        eprintln!(
+            "[elfjit:routeB] SH88 seeded coherent empty pb_defaults registry map 0x{map:x} (hash 0x1029b4a84) into slots 0x106838368/378/380 + substituted for miss-register tag maps"
+        );
+        let _ = (image, base);
+        map
+    })
+}
 extern "C" fn routeb_singleton_leaf(a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64) -> u64 {
     a0
 }
@@ -4310,6 +4349,16 @@ fn main() {
                 eprintln!(
                     "[elfjit:v2boot] SH86 seeded CRT allocator-hook globals [0x1067daaf0]=[0x1067d0840]=0 so operator-new takes the fast path (no blr through host garbage)"
                 );
+                // SH88: the OTel/pb_defaults descriptor registration passes a static
+                // `.data.rel.ro` protobuf FIELD-TAG constant (0x1800064 from the 16-byte
+                // strided table at file 0x62f5110) as the map/this arg to the hash-map FIND
+                // op (file 0x29f424c), because the upstream registry map it should have been
+                // constructed from (BSS 0x106838368/378/380) is never built under the JIT.
+                // Seed a coherent empty span-hash map into those slots and register it with
+                // the dispatch hook as the substitute for sub-image map/this candidates.
+                let pb_map = routeb_seed_pb_registry_map(iimg, ib);
+                arm64jit::jit::routeb_register_substitute_map(pb_map);
+                let _ = (iimg, ib);
                 // rung index 1 == nativeGameGlobalInit in the rungs array below.
                 for (name, guest, args) in rungs.iter() {
                     eprintln!("[elfjit:v2boot] driving {name} @ guest {guest:#x} (env={env_ptr:#x} thiz={thiz:#x})");
