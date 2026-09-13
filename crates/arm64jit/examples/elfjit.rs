@@ -1127,17 +1127,19 @@ pub fn render_engine_emitter_quad(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) -
             gi(0x8CA9 /*GL_DRAW_FRAMEBUFFER_BINDING*/, &mut dfbo);
             gi(0x0C01 /*GL_DRAW_BUFFER*/, &mut rb);
             eprintln!("[elfjit:renderemitter] draw_fbo={dfbo} draw_buffer={rb:#x} (before emit)");
-            if rb == 0 {
-                // GL_DRAW_BUFFER==GL_NONE: the default FBO has no draw buffer
-                // wired to the visible surface, so the emitter's glDrawArrays
-                // silently drops pixels. Wire GL_BACK (0x0405) so the emit lands
-                // on the presented surface (SH66b root cause).
-                if let Some(db) = mesa_fn::<extern "C" fn(u32)>(h, b"glDrawBuffer\0") {
-                    db(0x0405 /*GL_BACK*/);
-                    gi(0x0C01, &mut rb);
-                    eprintln!("[elfjit:renderemitter] draw_buffer -> {rb:#x} (wired GL_BACK)");
-                }
-            }
+        }
+        // SH66b root cause + FIX: GL_DRAW_BUFFER==GL_NONE. The prior attempt used
+        // glDrawBuffer (singular) — a DESKTOP-only symbol Mesa's libGLESv2.so.2
+        // does NOT export (nm: only the plural glDrawBuffers, ES3.0+), so it
+        // silently no-op'd via mesa_fn->None. Use the real ES3 plural
+        // glDrawBuffers(1,{GL_BACK}) + glReadBuffer(GL_BACK) so a default-FBO emit
+        // lands on the presented back buffer.
+        if let Some(dbs) = mesa_fn::<extern "C" fn(i32, *const u32)>(h, b"glDrawBuffers\0") {
+            let back = 0x0405u32; // GL_BACK
+            dbs(1, &back);
+        }
+        if let Some(rbuf) = mesa_fn::<extern "C" fn(u32)>(h, b"glReadBuffer\0") {
+            rbuf(0x0405 /*GL_BACK*/);
         }
         let mut st = arm64jit::jit::CpuState::new();
         st.tpidr = arm64jit::jit::current_guest_tp();
@@ -1155,6 +1157,42 @@ pub fn render_engine_emitter_quad(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) -
                 0
             }
             Ok(r) => {
+                // SH67 diagnostic: what state did the emit leave / rely on? Check
+                // gl error, the CURRENT program (+ whether it still has our
+                // aPos/aColor locations and links), and the draw/read buffer — to
+                // pin why the fabricated quad's pixels don't land despite the
+                // GL_BACK wire. The emitter may rebind its OWN program (which
+                // could fail to link in llvmpipe) or redirect to its own FBO.
+                if std::env::var_os("RENDEREMITTER_GLTRAP").is_some() {
+                    let ge: Option<extern "C" fn() -> u32> = mesa_fn(h, b"glGetError\0");
+                    let gpi: Option<extern "C" fn(u32, *mut i32)> = mesa_fn(h, b"glGetIntegerv\0");
+                    let gal: Option<extern "C" fn(u32, *const i8) -> i32> = mesa_fn(h, b"glGetAttribLocation\0");
+                    let gpp: Option<extern "C" fn(u32, u32, *mut i32)> = mesa_fn(h, b"glGetProgramiv\0");
+                    let mut cur_prog = 0i32;
+                    let mut dfbo = 0i32;
+                    let mut dbuf = 0i32;
+                    let mut gerr = 0u32;
+                    if let Some(f) = ge { gerr = f(); }
+                    if let Some(f) = gpi {
+                        f(0x8B8D /*GL_CURRENT_PROGRAM*/, &mut cur_prog);
+                        f(0x8CA9 /*GL_DRAW_FRAMEBUFFER_BINDING*/, &mut dfbo);
+                        f(0x0C01 /*GL_DRAW_BUFFER*/, &mut dbuf);
+                    }
+                    let (ap, ac, lstat) = if cur_prog > 0 && cur_prog as u64 >= 0x100000000 {
+                        (-99, -99, -99)
+                    } else if let (Some(f), Some(p)) = (gal, gpp) {
+                        let ap = f(cur_prog as u32, b"aPos\0".as_ptr() as *const i8);
+                        let ac = f(cur_prog as u32, b"aColor\0".as_ptr() as *const i8);
+                        let mut ls = 0i32;
+                        p(cur_prog as u32, 0x8B82 /*GL_LINK_STATUS*/, &mut ls);
+                        (ap, ac, ls)
+                    } else {
+                        (-98, -98, -98)
+                    };
+                    eprintln!(
+                        "[elfjit:renderemitter] GLTRAP err={gerr:#x} cur_prog={cur_prog:#x} draw_fbo={dfbo} draw_buffer={dbuf:#x} aPos_loc={ap} aColor_loc={ac} link_status={lstat}"
+                    );
+                }
                 // glFinish so the draw is submitted. RENDEREMITTER_READBACK_BEFORE_SWAP=1
                 // reads the CURRENT (back) buffer right after the emitter's draw,
                 // BEFORE presenting — isolating the emitter's own rasterization from
