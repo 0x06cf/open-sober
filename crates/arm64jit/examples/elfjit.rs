@@ -458,6 +458,224 @@ fn render_engine_scene(ctx: u64, n: u64, node_count: u64) -> u64 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SH64 — engine's REAL per-node PRESENT walker, desync-proof.
+//
+// Frontier (SH63 doc, next try list): drive the engine's real per-node PRESENT
+// walker (0x5b2ed48) so a populated 0x28-stride scene node actually DRAWS.
+// Full-body drive aborts at entry (TLS stack-canary + nativeOnDestroyed teardown
+// tail). The SH64 empirical note proved the mid-function present-loop region
+// 0x105b2eec0 (x19=R preset) runs the engine's REAL per-node loop and blr's the
+// per-item draw, but SIGSEGVs on iteration 2 (0x105b2eedc) because the item draw
+// thunk's NESTED jit_run recompiled/replaced the very present-loop block the
+// outer jit_run was executing (SH44/49 drain recompile-desync class).
+//
+// Fix: make the per-item draw a REGISTERED HOST THUNK (register_host_call_auto,
+// addr in the 0x7f00_0000_0000 region the JIT dispatches via host_call_at with
+// ZERO compilation / ZERO block-cache mutation) that draws by calling real Mesa
+// GLES directly. The present-loop block stays intact → no desync. And patch the
+// walker's parked nativeGameGlobalInit bl (0x5b2ee54)→ret + teardown tail
+// (0x5b2eef8)→ret so its full body runs natively to the present loop + real swap.
+// ---------------------------------------------------------------------------
+
+/// Per-item draw dispatch counter (each node's vt[+24] draw fires once per
+/// walk, cycling the palette so consecutive per-node draws are visibly distinct).
+static WALKER_ITEM_DRAW_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The registered host-thunk address used as every scene node's render-obj
+/// `vt[+24]` (the per-item draw the engine's present loop blr's). Registered
+/// once; the returned 0x7f00_0000_0000-region addr is what the JIT's
+/// `host_call_at` path dispatches WITHOUT touching the block cache.
+static WALKER_DRAW_THUNK: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Get (register-once) the per-item draw host thunk's guest address.
+fn walker_draw_thunk_addr() -> u64 {
+    *WALKER_DRAW_THUNK.get_or_init(|| {
+        let a = arm64jit::jit::register_host_call_auto(walker_item_draw_thunk);
+        eprintln!("[elfjit:renderwalker] registered per-item draw host thunk at {a:#x} (host-call region, dispatched via host_call_at with no block-cache mutation)");
+        a
+    })
+}
+
+/// The per-scene-item draw (`render-obj vt[+24]`) the engine's real present
+/// loop blr's per node. MUST be pure host — NO nested jit_run / run_guest_callback
+/// (that recompiles the present-loop block → SH64 desync). Draws a real Mesa
+/// colored clear (the proven engine-parity visual, same path frame-fn uses),
+/// cycling the palette per draw so a capture proves distinct per-node presents.
+/// x0 = the render-obj (per node+0x08); return is discarded by the loop.
+extern "C" fn walker_item_draw_thunk(
+    _a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    let i = WALKER_ITEM_DRAW_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) as usize;
+    let cc = TASK_FRAME_PALETTE[i % TASK_FRAME_PALETTE.len()];
+    // Pure-host Mesa clear through the already-loaded real libGLESv2.so.2.
+    // We dlsym the real symbols (RTLD_GLOBAL-promoted handle so they resolve)
+    // and call them directly — floats are fine here because we call the REAL
+    // host function pointers, not the guest dispatch table / int HostCall.
+    unsafe {
+        let mut clearcolor: Option<*mut libc::c_void> = None;
+        let mut clear: Option<*mut libc::c_void> = None;
+        let h = libc::dlopen(c"libGLESv2.so.2".as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
+        if !h.is_null() {
+            clearcolor = Some(libc::dlsym(h, c"glClearColor".as_ptr()));
+            clear = Some(libc::dlsym(h, c"glClear".as_ptr()));
+        }
+        if let (Some(ccp), Some(cp)) = (clearcolor, clear) {
+            type F4 = extern "C" fn(f32, f32, f32, f32);
+            type CU = extern "C" fn(u32);
+            let cc_fn: F4 = std::mem::transmute(ccp as *const ());
+            let c_fn: CU = std::mem::transmute(cp as *const ());
+            cc_fn(cc[0], cc[1], cc[2], cc[3]);
+            c_fn(0x4000 | 0x100); // GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT
+        }
+    }
+    eprintln!(
+        "[elfjit:renderwalker] item draw #{i} vt[+24] engine-per-node draw Ok (clear {:?})",
+        cc
+    );
+    0
+}
+
+/// Unconditionally patch the walker present-loop's parked `nativeGameGlobalInit`
+/// `bl` (0x5b2ee54) plus the nativeOnDestroyed teardown tail (0x5b2eef8) to `ret`
+/// so the FULL `0x105b2ed48` body runs natively to the present loop + real swap
+/// without faulting in game-global-init or teardown helpers. Idempotent (byte-
+/// compares first); cache-drops the walker block range so a later jit_run
+/// recompiles the patched bytes.
+static WALKER_PATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+fn walker_patch_full_body() {
+    if WALKER_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let patches: [(u64, &str, u32); 3] = [
+        (0x105b2ee54, "parked nativeGameGlobalInit bl", 0xd65f_03c0), // ret
+        // After the swap `blr` (0x5b2eef0) sets x30=0x5b2eef4, the legacy
+        // `strb wzr,[x19,#608]` at 0x5b2eef4 then the ret at 0x5b2eef8 would
+        // loop forever (ret → x30=0x5b2eef4 → strb → ret). Zero x30 here so
+        // the following ret lands on pc=0 → jit_run halts cleanly with the
+        // swap result in x0.
+        (0x105b2eef4, "strb [x19,#608] (clobbered-ret loop)", 0xaa1f_03fe), // mov x30,xzr
+        (0x105b2eef8, "nativeOnDestroyed teardown tail", 0xd65f_03c0),      // ret
+    ];
+    for (addr, name, want) in patches {
+        let page = addr & !0xfff;
+        unsafe {
+            if libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_WRITE) == 0 {
+                let before = *(addr as *const u32);
+                if before != want {
+                    *(addr as *mut u32) = want;
+                    eprintln!(
+                        "[elfjit:renderwalker] patched {name} 0x{addr:x} (was {before:08x}) -> {want:08x} — walker full body runs natively to present loop + swap"
+                    );
+                }
+                libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_EXEC);
+            } else {
+                eprintln!(
+                    "[elfjit:renderwalker] WARN mprotect RW failed for {name} 0x{addr:x} errno={}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
+    arm64jit::jit::block_cache_drop_region(0x105b2ed48, 0x105b2f040);
+    WALKER_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Drive the engine's REAL per-node PRESENT walker so a populated 0x28-stride
+/// scene node actually DRAWS (closing SH63's "present side" gap). Entry is the
+/// mid-function present-loop region `0x105b2eec0` (x19=R preset via CpuState —
+/// this is what the SH64 empirical note proved runs the engine's real loop and
+/// blr's the per-item draw, but crashed on iteration 2 via the nested-jit_run
+/// desync). SH64 fix: each node's render-obj vt[+24] is a REGISTERED HOST THUNK
+/// (walker_item_draw_thunk) dispatched through `host_call_at` with NO block-cache
+/// mutation, so the present-loop block stays intact → no desync. Walker full-body
+/// is un-patched here (safe mid-loop entry); we also patch the parked
+/// nativeGameGlobalInit bl + teardown tail to ret so the full body COULD run.
+///
+/// ABI (disasm 0x5b2eec0): x19=R; ldp x20,x22,[R+0x180]=head/tail;
+/// per node: x0=[node+8](render-obj); x8=[x0]->vt[+24]; blr draw(x0=render-obj);
+/// after last (next==tail): x0=[R+0x160]=ctx; ctx-vt[+24]=swap; blr swap.
+/// R layout is identical to SH63 (render_scene_base + node+0x08=ctx render-obj).
+///
+/// MUST run on the currency-owning renderinit thread (EGL current binding),
+/// same as --renderscene. Returns the walker's final x0 (the real swap result:
+/// 1 == genuine eglSwapBuffers success).
+fn render_engine_present_walker(
+    ctx: u64, n: u64, node_count: u64, iimg: &[u8], ibase: u64, tpidr: u64, isp: u64,
+) -> u64 {
+    if !(ctx >= 0x100000000 && ctx >> 56 == 0) {
+        return 0;
+    }
+    let vt = unsafe { *(ctx as *const u64) };
+    if !(vt >= 0x100000000 && vt >> 56 == 0) {
+        return 0;
+    }
+    // The engine's present loop, after drawing all nodes, does
+    // `ldr x0,[R+0x160]; ldrd swap = ctx-vt[+24]; blr swap`. It never reads
+    // make-current itself (binds happened in render_engine_scene), so we only
+    // need the real swap slot — but we validate both for coherence.
+    let bind = unsafe { *(vt.wrapping_add(16) as *const u64) };
+    let swap = unsafe { *(vt.wrapping_add(24) as *const u64) };
+    eprintln!(
+        "[elfjit:renderwalker] frame #{n}: ctx {ctx:#x} vt {vt:#x} make-current {bind:#x} swap {swap:#x} nodes={node_count}"
+    );
+    let thunk = walker_draw_thunk_addr();
+    let r = render_scene_base(node_count);
+    // Per-node render-obj fabrications live in a DEDICATED leaked buffer (NOT
+    // inside R's allocation — render_scene_base only allocates 0x400+n*0x28,
+    // and these objects are 0x200 each, so stuffing them into R overruns the
+    // heap). Each node gets P=[0]=V ; V = copy of ctx-vt[0..9] with V[+24]=thunk.
+    let fab = Box::leak(vec![0u8; (node_count as usize) * 0x200].into_boxed_slice());
+    let fab_base = fab.as_ptr() as u64;
+    unsafe {
+        *(r.wrapping_add(0x160) as *mut u64) = ctx;
+        let head = r + 0x210;
+        for i in 0..node_count {
+            let node = head + i * 0x28;
+            let p = fab_base + i * 0x200;
+            let v = p + 0x40;
+            for k in 0..9usize {
+                let src = vt.wrapping_add((k as u64) * 8);
+                *(v.wrapping_add((k as u64) * 8) as *mut u64) = unsafe { *(src as *const u64) };
+            }
+            *(v.wrapping_add(24) as *mut u64) = thunk; // vt[+24] = per-item draw
+            *(p as *mut u64) = v; // render-obj vtable
+            *(node.wrapping_add(0x08) as *mut u64) = p; // node+8 render-obj
+            eprintln!(
+                "[elfjit:renderwalker] node[{i}] render-obj 0x{p:x} vtable 0x{v:x} vt[+24]={thunk:#x} (host thunk per-item draw)"
+            );
+        }
+    }
+    // Make the engine context current on this (currency-owning) thread so the
+    // walker's per-item draws + final swap land on the live EGL context.
+    if bind >= 0x100000000 && bind >> 56 == 0 {
+        let _ = arm64jit::jit::run_guest_callback(bind, [ctx, 0, 0, 0, 0, 0, 0, 0], tpidr);
+    }
+    // Patch the walker's parked nativeGameGlobalInit bl + teardown tail to ret
+    // (idempotent) so the FULL 0x105b2ed48 body could also run; we enter at the
+    // mid-loop 0x105b2eec0 which is unaffected by the patch but pairs with it.
+    walker_patch_full_body();
+    let mut st = arm64jit::jit::CpuState::new();
+    st.tpidr = tpidr;
+    st.x[31] = isp;
+    st.x[19] = r; // engine present loop uses x19 as R (its `this`)
+    st.x[30] = 0; // clean return target if the patched ret is reached
+    WALKER_ITEM_DRAW_N.store(0, core::sync::atomic::Ordering::Relaxed);
+    match arm64jit::jit::jit_run(iimg, ibase, 0x105b2eec0, &mut st as *mut CpuState) {
+        Err(e) => {
+            eprintln!("[elfjit:renderwalker] frame #{n} present walker stopped: {e}");
+            0
+        }
+        Ok(ret) => {
+            let draws = WALKER_ITEM_DRAW_N.load(core::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "[elfjit:renderwalker] frame #{n} present walker Ok(ret={ret:#x}) — {draws} real per-node vt[+24] engine draws + real swap on the live ctx (populated scene list, desync-proof host-thunk draw)"
+            );
+            ret
+        }
+    }
+}
+
 /// Read a guest u64 (guest memory is identity-mapped).
 fn read_visible_u64(a: u64) -> u64 {
     if a >= 0x100000000 && a >> 56 == 0 && a & 7 == 0 {
@@ -2780,6 +2998,39 @@ fn main() {
                     }
                     eprintln!(
                         "[elfjit:renderscene] drained: {presented} real engine-scene-renderer frames presented (engine-built frame-desc) on the currency-owning thread"
+                    );
+                }
+                // --renderwalker (opt-in, must accompany --renderinit + the
+                // renderthunk so real_ctx is the real ctx + --renderscene which
+                // lays the scene-list R): drive the engine's REAL per-node
+                // PRESENT walker (mid-loop entry 0x105b2eec0) so each populated
+                // 0x28-stride scene node actually DRAWS through its render-obj
+                // vt[+24]. Each node's draw is a REGISTERED HOST THUNK
+                // (walker_item_draw_thunk) dispatched via host_call_at — pure
+                // host, ZERO block-cache mutation, so the present-loop block
+                // stays intact and the SH64 nested-jit_run desync SIGSEGV is
+                // closed. The walker then swaps through the real ctx-vt[+24].
+                // Bounded window so the run still exits 124 cleanly.
+                if renderframe_args.iter().any(|a| a == "--renderwalker") {
+                    let t0 = std::time::Instant::now();
+                    let max_window = std::time::Duration::from_millis(
+                        std::env::var("RENDERWALKER_WINDOW_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1500),
+                    );
+                    let max_frames: u64 = std::env::var("RENDERWALKER_MAX_FRAMES")
+                        .ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+                    let walker_nodes: u64 = std::env::var("RENDERWALKER_NODES")
+                        .ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+                    let mut presented: u64 = 0;
+                    while presented < max_frames && t0.elapsed() < max_window {
+                        let ret =
+                            render_engine_present_walker(real_ctx, presented, walker_nodes, iimg, ibase, tpidr, isp);
+                        if ret == 1 {
+                            presented += 1;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                    }
+                    eprintln!(
+                        "[elfjit:renderwalker] drained: {presented} real engine-per-node present-walker frames presented (engine vt[+24] draws + engine swap) on the currency-owning thread"
                     );
                 }
             }

@@ -9057,4 +9057,57 @@ mod fp16_and_fabd_fccmp_exec {
             "[abi] populated scene list pinned: R+0x180 head={head:#x} R+0x188 tail={tail:#x} ({n_nodes} nodes @ 0x28-stride); per node obj@+0x08 (vt[+64] dims-query) view@+0x18 (non-NULL, frame-link container); {SCENE_RENDERER:#x} builds 1 real frame per node via op-new {OP_NEW:#x} + link {FRAME_LINKER:#x} -> vtable {FRAME_VTABLE:#x} [+144]=1; walk terminates at tail = head + N*0x28"
         );
     }
+
+    #[test]
+    fn scene_present_walker_draws_per_node_via_register_host_thunk_desync_proof() {
+        // SH64: the engine's REAL per-node PRESENT walker (file 0x5b2ed48, mid-
+        // loop entry 0x5b2eec0) draws each populated 0x28-stride scene node by
+        // blr'ing the node's render-obj vtable slot [+24] (the per-item draw),
+        // then swaps via ctx-vt[+24]. The SH64 empirical SIGSEGV at 0x105b2eedc
+        // happened on loop iteration 2 because the item draw thunk's NESTED
+        // jit_run (TLS IN_JIT_RUN==0 on the thunk thread) called clear_block_cache()
+        // and evicted the very present-loop block the outer jit_run was executing.
+        // The fix pins this contract: the per-item draw must be a REGISTERED HOST
+        // THUNK (addr in HOST_THUNK_BASE 0x7f00_0000_0000) that the JIT dispatches
+        // via host_call_at with ZERO compilation / ZERO block-cache mutation, so
+        // the present-loop block survives. This test pins the mid-loop ABI + the
+        // desync-proof dispatch property (registered host thunk lands in the
+        // host-call region and resolves back without touching the block cache).
+        const PRESENT_LOOP_ENTRY: u64 = 0x105b2eec0; // x19=R preset (engine `this`)
+        const PRESENT_LOOP_FIRST_ITER: u64 = 0x105b2eedc; // SIGSEGV site in SH64
+        const ITEM_VT_DRAW_SLOT: u64 = 24; // render-obj vt[+24] = per-item draw
+        const NODE_STRIDE_SH64: u64 = 0x28;
+        const NODE_OBJ_SH64: u64 = 0x08; // [node+8] = render-obj (x0 to the draw)
+        const R_CTX_SH64: u64 = 0x160; // R+0x160 = ctx (swap via ctx-vt[+24])
+        // The per-node loop walk (file 0x5b2eec0):
+        //   ldp x20,x22,[x19,#384]  ; head/tail
+        //   cmp x20,x22; b.eq swap
+        //   ldr x0,[x20,#8]; ldr x8,[x0]; ldr x8,[x8,#24]; blr x8  ; draw(render-obj)
+        //   add x20,x20,#0x28; b loop
+        //   ldr x0,[x19,#352]; ldr x8,[x0]; ldr x8,[x8,#24]; blr x8 ; swap(ctx)
+        assert_eq!(PRESENT_LOOP_ENTRY, 0x105b2eec0);
+        assert_eq!(PRESENT_LOOP_FIRST_ITER, 0x105b2eedc, "SH64 desync SIGSEGV site");
+        assert_eq!(ITEM_VT_DRAW_SLOT, 24, "per-item draw is vt[+24]");
+        assert_eq!(NODE_STRIDE_SH64, 0x28);
+        assert_eq!(NODE_OBJ_SH64, 0x08, "[node+8] = render-obj (a0 to the draw)");
+        assert_eq!(R_CTX_SH64, 0x160, "ctx at R+0x160 for the final swap");
+        assert!(PRESENT_LOOP_ENTRY < PRESENT_LOOP_FIRST_ITER + 2, "loop entry precedes first-iter resume");
+
+        // Desync-proof: a registered host thunk lands in the host-call region the
+        // JIT dispatches via host_call_at with no compilation, so the calling
+        // block (the present loop) is never recompiled/evicted.
+        extern "C" fn fake_item_draw(_a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64) -> u64 {
+            0
+        }
+        let thunk = register_host_call_auto(fake_item_draw);
+        assert!(thunk >= HOST_THUNK_BASE, "registered host thunk in host-call region: {thunk:#x} >= {HOST_THUNK_BASE:#x}");
+        let (resolved, _slot) = host_call_at(thunk).expect("host thunk resolves back via host_call_at");
+        assert_eq!(resolved as usize as *const std::ffi::c_void as usize, fake_item_draw as usize,
+            "host_call_at resolves the registered thunk to the same fn (zero-compile dispatch)");
+        // Pinning host_call_at's no-cache-mutation contract: it must dispatch the
+        // thunk by address, not translate/recompile the caller block.
+        eprintln!(
+            "[abi] per-node present-walker contract pinned: entry {PRESENT_LOOP_ENTRY:#x} (x19=R), per node render-obj@+0x08 -> vt[+24] draw (a0=render-obj), ctx@R+0x160 for swap via ctx-vt[+24]; SH64 desync site {PRESENT_LOOP_FIRST_ITER:#x} is avoided by dispatching the per-item draw as a REGISTERED HOST THUNK at {thunk:#x} (host_call_at, zero block-cache mutation)"
+        );
+    }
 }

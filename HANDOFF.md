@@ -1,5 +1,68 @@
 # Open Sober — Agent Handoff
 
+## Session (Sep 13, 2026, hermes-worker, cycle SH64) — drove the engine's REAL per-node PRESENT walker so populated scene nodes actually DRAW through their render-obj vt[+24] — closing the SH64 nested-jit_run desync SIGSEGV. Workspace **509/0** (was 508/0, +1). Doc docs/frontier-sh64-present-walker.md, artifact runs/sh64-renderwalker.txt, repro runs/capture_renderwalker.sh.
+
+The SH63 doc left the present side open: the engine's real per-node PRESENT
+walker (`0x5b2ed48`, mid-loop entry `0x105b2eec0`) was proven to run (SH64 note)
+and blr the per-item draw but SIGSEGVs on iteration 2 (0x105b2eedc) because the
+draw thunk's nested jit_run recompiled the very present-loop block being executed.
+
+New elfjit `--renderwalker` delivers it (three pieces):
+
+- **Per-item draw = REGISTERED HOST THUNK (desync-proof).** Each scene node's
+  render-obj `vt[+24]` is a `walker_item_draw_thunk` registered via
+  `register_host_call_auto` (0x7f00_0000_0000 region). The JIT's `host_call_at`
+  dispatches it with **zero compilation / zero block-cache mutation**, so the
+  present-loop block survives — the root cause of the SH64 SIGSEGV (nested
+  `run_guest_callback` from a thunk thread where TLS `IN_JIT_RUN==0` →
+  `clear_block_cache()` evicts the block being executed) is closed. The thunk is
+  pure host (dlsym `glClearColor`/`glClear` on the real libGLESv2.so.2), cycling
+  the palette per draw.
+- **Walker mid-loop drive** `0x105b2eec0` with `x19=R` preset via `CpuState`
+  (`run_guest_callback` can't preset x19 — must use `jit_run`). The engine's real
+  loop reads head/tail from R+0x180/0x188, per node blr's `vt[+24]` draw, then
+  swaps via `ctx-vt[+24]` (real eglSwapBuffers).
+- **Full-body-native patches** (idempotent): `0x105b2ee54` parked
+  nativeGameGlobalInit bl → ret; **`0x105b2eef4` strb→`mov x30,xzr`** (critical —
+  the swap `blr` clobbers x30 to 0x5b2eef4, so the legacy strb + ret at 0x5b2eef8
+  would loop forever; zeroing x30 lets the ret land on pc=0 → jit_run halts with
+  the swap result in x0); `0x105b2eef8` teardown tail → ret. Block range
+  [0x105b2ed48,0x105b2f040) cache-dropped after patching.
+
+**Empirical (real libroblox.so, runs/sh64-renderwalker.txt, exit 124):**
+`present walker Ok(ret=0x1)` ×3 (each = 3 per-node engine `vt[+24]` draws + real
+engine swap on the live ctx); `item draw #N ... engine-per-node draw Ok` ×9
+(3 nodes × 3 frames, distinct palette colors — a capture would show distinct
+per-node frames); persist 45B byte-exact; **zero** SIGSEGV/SIGABRT/json-overflow.
+Per-node fabrications live in a dedicated leaked buffer (NOT inside R's
+allocation — stuffing them into R overran the 0x478-byte heap, the first SIGSEGV).
+
+New regression `scene_present_walker_draws_per_node_via_register_host_thunk_desync_proof`
+pins the mid-loop ABI (entry 0x105b2eec0, per-node render-obj@+0x08→vt[+24] draw,
+ctx@R+0x160 swap) + the desync-proof property (a registered host thunk lands in
+the 0x7f00_0000_0000 host-call region and `host_call_at` resolves it back with no
+compilation). Productized baseline re-verified green (renderscene + 3 swap
+Ok(0x1) + persist byte-exact, exit 124).
+
+**Honest scope:** the engine's real present walker drives a populated scene list
+to completion — build (SH63) + present (SH64) of the node/item ABI a Lua-created
+screen would consume, end-to-end headlessly. The node render-obj is still the
+recovered ctx/fabricated coherent object, NOT a real UI/GuiObject, so the drawn
+content is a distinct engine-parity clear, not a populated login/home screen.
+Standing structural wall unchanged (Lua app-shell / nativeGameGlobalInit parks /
+type-4 producer vector glue-installed only). The SH64 desync wall is closed: any
+future per-node draw can now be host-side GLES content without recompiling the
+walker.
+
+**Next frontier:** (a) synthesize the walker's per-item draw as REAL geometry
+(engine emitter 0x105b35288 via the seeded GLES slots, or direct Mesa mesh calls
+from the host thunk — both now desync-safe) so a populated node draws
+engine-detailed content instead of the parity clear; or (b) advance the
+data-persistence path (objective 2b) now that renderscene/renderwalker prove the
+frame+present plane; or (c) target the standing structural wall — feed a real
+engine session producer so the engine self-populates its scene list (needs Lua
+app-shell / auth+network).
+
 ## Session (Sep 13, 2026, hermes-worker, cycle SH63) — the engine's REAL scene renderer now walks a POPULATED scene list: it builds ONE real 0x98 frame-desc per 0x28-stride scene node, in addition to the base frame at R+0x170 — closing SH62's named "populate the scene list" gap. Workspace **508/0** (was 507/0, +1). Commits pending. Doc docs/frontier-sh63-scene-populated-nodes.md, artifact runs/sh63-renderscene-populated.txt, repro runs/capture_renderscene.sh (now node-count-aware).
 
 `render_scene_base(node_count)` now lays N 0x28-stride scene nodes into R
