@@ -1,0 +1,61 @@
+[fsmap] armed persistence root SOBER_ANDROID_ROOT=/home/hermes-worker/.local/share/open-sober/android-root
+[persist] live datastore roundtrip: write=45B fsync=0 read_back_byte_exact=true on_disk=Some(true) host=/home/hermes-worker/.local/share/open-sober/android-root/data/user/0/com.roblox.client/databases/session.db
+[plt] patched __stack_chk_guard GOT 0x631aa30 (0x0) -> 0x55b9933c5958
+[plt] bound 534 JUMP_SLOT + 77 GLOB_DAT/ABS64 (0 unresolved), 1 unresolved
+PLT imports bound: 534 to host thunks (0 unbound)
+[mempool] big-alloc 0x1d9801c routed to host calloc (thunk @ 0x1062d9000)
+[mempool] thunk bytes: e0 03 01 aa 11 0a 40 f9 20 02 1f d6 00 00 00 00 08 00 00 00 (JIT-readable via guest image)
+loaded '/home/hermes-worker/.cache/open-sober/robbox/libroblox.so': is_pie=true base_load_vaddr=0x0 e_entry=0x100000000
+  segment guest=[0x100000000,0x1062d8190) host=same prot=r-x
+  segment guest=[0x1062dc1c0,0x1067d3000) host=same prot=rw-
+  segment guest=[0x1067d67c0,0x107333c3c) host=same prot=rw-
+[tail] reserved 402653184B guest RW tail @0x107334000
+[lsm-map] allocator 0x1d97744 routed to host calloc(x0) (thunk @ 0x1062d9800)
+[lsm-map] NOP'd LSM init store at 0x101d975f8 (guest 0x1d975f8) to keep seeded empty map
+[lsm-map] seeded static empty LocalStorageManager map: global 0x10726f8c0 -> bucket array 0x7f4e0f2cc010 (4194304 buckets, shared zero sub @0x7f4e112cc010)
+[JNICall-singleton] SH82b seeded intern-table @ obj+0x30 bucket array 0x55b9c73f1060 (+0x38 capacity 0x400) so the GlobalInit do-init hash lookup never derefs NULL
+[JNICall-singleton] seeded ptr 0x107333948 -> object 0x107333950 (zeroed bss ~ PTHREAD_MUTEX_INITIALIZER at +8)
+[lsm-map] readback global 0x10726f8c0 = 0x7f4e0f2cc010 (must be non-zero)
+running entry guest=0x102173ff4 host=0x102173ff4 (segment base guest=0x100000000 size=0x7333c3c)
+guest sp=0x55b9c77f2f70 tls(tpidr)=0x55b9c77f3080
+JNI boot: x0 = JavaVM* 0x55b9c73d7980
+[roblox:JNIMain] TelemetryProtocol::setProcessTimeOverride: %ld
+[roblox:JNIMain] DeviceStaticParams is null.
+[elfjit] jit_run returned Ok(0x10006) — entering post-run phase
+JIT(no-QEMU) entry() -> 65542 (0x10006)
+[elfjit] driving StartApp @ guest 0x10258b144 after JNI_OnLoad (env=0x55b9c73d7950 jobject=0x55b9c7934cf0 params=0x55b9c7aaacb0)
+[elfjit:routeB] patched dispatch-gate `and w0,w0,#1` 0x102173124 (12000000) -> `mov w0,#1` (52800020) — gated dispatch sites take the clean direct path, bypassing the singleton null-vtable crash
+[elfjit:routeB] benign singleton virtual registered at 0x7f00000001c0
+[elfjit:routeB] seeded dispatch singletons .data 0x106829a48/0x106829a68 (size=0x28 alloc=8 src=template 0x55b9c7933df0/0x55b9c7948100, vtable@0x55b9c7aaae70=leaf 0x7f00000001c0) — 2b9dee0 lazy-create returns coherent objects, no null-vtable crash
+[elfjit:appcmd] posting APP_CMD_0 (1)
+[elfjit:kicker] host thread drives 0x106863af8 (pulse 1->2)
+[elfjit:kicker] t=0 guest_global 0x106863af8=%0x1
+[elfjit:anativewindow] wired real X11 window XID=0x200000 on :269 as the guest ANativeWindow
+[elfjit:appcmd] posting APP_CMD_1 (2)
+[elfjit:appcmd] posting APP_CMD_2 (11)
+[elfjit:kicker] t=100 guest_global 0x106863af8=%0x2
+[elfjit:kicker] t=200 guest_global 0x106863af8=%0x2
+[elfjit:kicker] t=300 guest_global 0x106863af8=%0x2
+[elfjit:v2boot] after boot start: [0x106829ea8] = 0x0
+[elfjit:v2boot] SH86 seeded CRT allocator-hook globals [0x1067daaf0]=[0x1067d0840]=0 so operator-new takes the fast path (no blr through host garbage)
+[elfjit:v2boot] driving nativeInitializeNativeFlags @ guest 0x10232048c (env=0x55b9c73d7950 thiz=0x7f4dfc000c70)
+[elfjit:v2boot] nativeInitializeNativeFlags stopped: run_loop: pc 0x202ba48000001 outside image [0x100000000, 0x107333c3c)
+[elfjit:v2boot] after nativeInitializeNativeFlags: [0x106829ea8] = 0x0
+[elfjit:v2boot] driving nativeGameGlobalInit @ guest 0x102206404 (env=0x55b9c73d7950 thiz=0x7f4dfc000c70)
+[elfjit:v2boot] seeded main-thread-id [0x106863a68]=0x7f4e07fff6c0 for GlobalInit thread-dispatch (this thread == stored == self -> takes the vt[+48] match path, no park)
+[routeb-hashfix] map @ 0x7f4dfc023960 empty header + zeroed bucket array (0x7f4dfc55fd20) seeded for a coherent insert probe
+[routeb-hashfix] map @ 0x7f4dfc023d30 empty header + zeroed bucket array (0x7f4dfc561d30) seeded for a coherent insert probe
+double free or corruption (out)
+
+[SIGABRT] tid=4096281 fault=0x3e9003e80f9 rip=0x7f4e1145f69c guestpc=0x0 rbx_matches_gueststate=false (reg_state=0x7f4e07ff8cb8, tid=139972918495672)
+  x0=0x0 x1=0x0 x2=0x0 x3=0x0 x4=0x0
+  x5=0x0 x6=0x0 x7=0x0 x8=0x0 x9=0x0 sp=0x0
+  x10=0x0 x19=0x0 x20=0x0 x21=0x0 x22=0x0
+  x23=0x0 x28=0x0 x29=0x0 lr(x30)=0x0 lsm_map_global=0x7f4e0f2cc010
+  HOST rax=0x0 rbx=0x3e8119 rcx=0x7f4e1145f69c rdx=0x6 rsi=0x3e8119 rdi=0x3e80f9
+  HOST rbp=0x1000 rsp=0x7f4e07ff8420 r8=0xffffffff r9=0x0 r10=0x22 r11=0x246
+  HOST r12=0x7f4e07ff8580 r13=0x6 r14=0x7f4e07ff8580 r15=0x7f4e07ff8580 eflags=0x246
+  GUEST_THREADS (4096252:1,0x7f4e0eba3578) (4096253:2,0x7f4e0d68c578) (4096281:0,0x7f4e07ff8cb8) in_jit_run=true
+  raw[]= 00 0f 05 89 c3 e8 92 f4 04 00 44 89 ea 89 de 89 c7 b8 ea 00 00 00 0f 05 89 c3 f7 db 3d 00 f0 ff ff b8 00 00 00 00 0f 47 c3 e9 76 ff ff ff 66 0f
+
+  BT:
