@@ -999,31 +999,46 @@ extern "C" fn routeb_singleton_leaf(a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: 
 /// forcing `blr x1` (always the primary hash) is behavior-preserving and immune to JIT
 /// block-entry coverage gaps. Patch `blr x8` (d63f0100) -> `blr x1` (d63f0020).
 fn routeb_patch_map_dispatch() {
-    const ADDR: u64 = 0x1029f4280; // file 0x29f4280: `blr x8`
+    // Two dispatch `blr x8` sites in the Roblox string/span hash-map family, each the
+    // optional-hash2 branch of `ldp x1,x8,[x19,#16]; cbz x8;<tail>blr x1`:
+    //   FIND/grow op  file 0x29f4280 (guest 0x1029f4280) — SH87
+    //   INSERT op     file 0x29f3f78 (guest 0x1029f3f78) — SH89 (identical pattern:
+    //                 29f3f6c ldp x1,x8,[x19,#16]; 29f3f74 cbz x8,29f3f80;
+    //                 29f3f78 blr x8; 29f3f80 blr x1)
+    // Forcing `blr x1` (primary hash) at both is behavior-preserving: hash2 is
+    // redundant in this family (observed real value is just `br x1` aliasing the
+    // primary) and the hash only selects a bucket probe (correctness via the key-eq
+    // comparator at map+0x08), so garbage +0x18 can never be branched into.
+    const FIND_BLR: (u64, u64) = (0x1029f4280, 0x29f4280);
+    const INSERT_BLR: (u64, u64) = (0x1029f3f78, 0x29f3f78);
     let want = 0xd63f_0020u32; // blr x1
-    let page = ADDR & !0xfff;
-    unsafe {
-        if libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_WRITE) == 0 {
-            let before = *(ADDR as *const u32);
-            if before == 0xd63f_0100u32 {
-                *(ADDR as *mut u32) = want;
-                eprintln!(
-                    "[elfjit:routeB] SH87 patched map-family dispatch `blr x8` 0x{ADDR:x} ({before:08x}) -> `blr x1` ({want:08x}) — always primary hash, +0x18 hash2 can't blr into 0x1800064"
-                );
-            } else if before == want {
-                eprintln!("[elfjit:routeB] SH87 map-dispatch 0x{ADDR:x} already {want:08x}");
+    for (addr, _file) in [FIND_BLR, INSERT_BLR] {
+        let page = addr & !0xfff;
+        unsafe {
+            if libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_WRITE) == 0 {
+                let before = *(addr as *const u32);
+                if before == 0xd63f_0100u32 {
+                    *(addr as *mut u32) = want;
+                    eprintln!(
+                        "[elfjit:routeB] SH87/89 patched map-family dispatch `blr x8` 0x{addr:x} ({before:08x}) -> `blr x1` ({want:08x}) — always primary hash, +0x18 hash2 can't blr into garbage"
+                    );
+                } else if before == want {
+                    eprintln!("[elfjit:routeB] SH87/89 map-dispatch 0x{addr:x} already {want:08x}");
+                } else {
+                    eprintln!("[elfjit:routeB] WARN SH87/89 map-dispatch 0x{addr:x} unexpected {before:08x}, not patched");
+                }
+                libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_EXEC);
             } else {
-                eprintln!("[elfjit:routeB] WARN SH87 map-dispatch 0x{ADDR:x} unexpected {before:08x}, not patched");
+                eprintln!(
+                    "[elfjit:routeB] WARN SH87/89 mprotect RW failed for map-dispatch 0x{addr:x} errno={}",
+                    std::io::Error::last_os_error()
+                );
             }
-            libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_EXEC);
-        } else {
-            eprintln!(
-                "[elfjit:routeB] WARN SH87 mprotect RW failed for map-dispatch 0x{ADDR:x} errno={}",
-                std::io::Error::last_os_error()
-            );
         }
     }
+    // Drop the JIT block cache over both the FIND/grow family and the INSERT op.
     arm64jit::jit::block_cache_drop_region(0x1029f4240, 0x1029f4360);
+    arm64jit::jit::block_cache_drop_region(0x1029f3e70, 0x1029f3f90);
 }
 
 static ROUTEB_LEAF_ADDR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
