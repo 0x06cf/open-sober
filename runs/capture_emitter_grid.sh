@@ -9,10 +9,22 @@ cd "$(dirname "$0")/.."
 LOG=/home/hermes-worker/runs/sh67d-emitter-grid.txt
 PNG=/home/hermes-worker/runs/sh67d-emitter-grid.png
 NQ=${RENDEREMITTER_QUADS:-6}
+TEX=${RENDEREMITTER_TEX:-0}
+rm -f "$LOG" "$PNG"
+if [ "$TEX" = "1" ]; then
+  ENVVAR="RENDEREMITTER_QUADS=$NQ RENDEREMITTER_TEX=1"
+  LOG=/home/hermes-worker/runs/sh67e-emitter-grid-tex.txt
+  PNG=/home/hermes-worker/runs/sh67e-emitter-grid-tex.png
+else
+  ENVVAR="RENDEREMITTER_QUADS=$NQ"
+  LOG=/home/hermes-worker/runs/sh67d-emitter-grid.txt
+  PNG=/home/hermes-worker/runs/sh67d-emitter-grid.png
+fi
+echo "log=$LOG png=$PNG"
 rm -f "$LOG" "$PNG"
 timeout 150 env JIT_DRIVE_LIFECYCLE=1 RENDERINIT_WARMUP_MS=1000 RENDERWALKER_NODES=3 \
   RENDERWALKER_MAX_FRAMES=2 RENDERWALKER_WINDOW_MS=2600 RENDERWALKER_GLDEBUG=1 \
-  RENDEREMITTER_QUADS="$NQ" \
+  $ENVVAR \
   ./target/debug/examples/elfjit ~/.cache/open-sober/robbox/libroblox.so 0x2173ff4 \
   --jni --startapp 0x258b144 \
   --renderinit 0x105b3a280 --renderthunk --renderframe --renderwalker --renderemitter \

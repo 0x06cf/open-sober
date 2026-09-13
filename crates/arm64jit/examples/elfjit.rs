@@ -1260,6 +1260,59 @@ pub fn render_engine_emitter_quad(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) -
 }
 
 
+/// SH67e — cached real-Mesa TEXTURED program used ONLY by the emitter's textured
+/// branch (RENDEREMITTER_TEX=1). SEPARATE from walker_mesh_program (which the
+/// walker per-node thunk also binds) so the two don't fight over the shared
+/// GLES2-program state. Attributes layout(location=0) aPos vec2,
+/// (location=1) aColor vec4, (location=2) aTex vec2; uniform sampler2D uTex;
+/// FS outputs texture2D(uTex, vUV) (texture source of color — a tile whose
+/// texture isn't sampled reads black/backdrop, proving the sampler is live).
+/// Returns (program, uTex uniform loc).
+fn emitter_tex_program() -> (u32, i32) {
+    static TP: std::sync::OnceLock<(u32, i32)> = std::sync::OnceLock::new();
+    *TP.get_or_init(|| {
+        let h = unsafe { libc::dlopen(c"libGLESv2.so.2".as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+        if h.is_null() {
+            return (0, -1);
+        }
+        let (Some(cs), Some(ss), Some(cp), Some(cprog), Some(att), Some(bal), Some(ln)) = (
+            mesa_fn::<extern "C" fn(u32) -> u32>(h, b"glCreateShader\0"),
+            mesa_fn::<extern "C" fn(u32, i32, *const *const i8, *const i32)>(h, b"glShaderSource\0"),
+            mesa_fn::<extern "C" fn(u32)>(h, b"glCompileShader\0"),
+            mesa_fn::<extern "C" fn() -> u32>(h, b"glCreateProgram\0"),
+            mesa_fn::<extern "C" fn(u32, u32)>(h, b"glAttachShader\0"),
+            mesa_fn::<extern "C" fn(u32, u32, *const i8)>(h, b"glBindAttribLocation\0"),
+            mesa_fn::<extern "C" fn(u32)>(h, b"glLinkProgram\0"),
+        ) else {
+            return (0, -1);
+        };
+        let vs_src = c"attribute vec2 aPos; attribute vec4 aColor; attribute vec2 aTex; varying vec2 vUV; void main(){ vUV = aTex; gl_Position = vec4(aPos,0.0,1.0); }\n".to_bytes_with_nul();
+        let fs_src = c"precision mediump float; uniform sampler2D uTex; varying vec2 vUV; void main(){ gl_FragColor = texture2D(uTex, vUV); }\n".to_bytes_with_nul();
+        let vs_ptr = vs_src.as_ptr() as *const i8;
+        let fs_ptr = fs_src.as_ptr() as *const i8;
+        let vs = cs(0x8B31);
+        ss(vs, 1, &vs_ptr, std::ptr::null());
+        cp(vs);
+        let fs = cs(0x8B30);
+        ss(fs, 1, &fs_ptr, std::ptr::null());
+        cp(fs);
+        let prog = cprog();
+        att(prog, vs);
+        att(prog, fs);
+        bal(prog, 0, b"aPos\0".as_ptr() as *const i8);
+        bal(prog, 1, b"aColor\0".as_ptr() as *const i8);
+        bal(prog, 2, b"aTex\0".as_ptr() as *const i8);
+        ln(prog);
+        let gul: Option<extern "C" fn(u32, *const i8) -> i32> = mesa_fn(h, b"glGetUniformLocation\0");
+        let uloc = match gul {
+            Some(f) => f(prog, b"uTex\0".as_ptr() as *const i8),
+            None => -1,
+        };
+        eprintln!("[elfjit:renderemitter-grid] textured program built prog={prog:#x} uTex loc={uloc}");
+        (prog, uloc)
+    })
+}
+
 /// SH67d — a POPULATED N-quad 2D frame drawn by the ENGINE's OWN geometry
 /// emitter 0x105b35288 in a SINGLE top-level jit_run. One pre-uploaded VBO holds
 /// all N*6 verts as GL_TRIANGLES (6 verts/quad), so `glDrawArrays(mode=0x4
@@ -1273,7 +1326,7 @@ pub fn render_engine_emitter_quad(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) -
 /// Same desync-safe shape as render_engine_emitter_quad: the emitter is its OWN
 /// top-level jit_run, never nested inside the present-walker block; runs on the
 /// currency-owning renderinit thread. Returns the emitter's ret (0 = clean draw).
-pub fn render_engine_emitter_grid(ctx: u64, iimg: &[u8], ibase: u64, isp: u64, nq: usize) -> u64 {
+pub fn render_engine_emitter_grid(ctx: u64, iimg: &[u8], ibase: u64, isp: u64, nq: usize, tex: bool) -> u64 {
     if !(ctx >= 0x100000000 && ctx >> 56 == 0) {
         return 0;
     }
@@ -1301,13 +1354,63 @@ pub fn render_engine_emitter_grid(ctx: u64, iimg: &[u8], ibase: u64, isp: u64, n
             eprintln!("[elfjit:renderemitter-grid] WARN: required Mesa symbols missing");
             return 0;
         };
-        up(mp.program);
+        // Emitter never calls glUseProgram/glUniform* — bind the program + set
+        // the sampler here so it persists through the single emit. Textured branch
+        // (RENDEREMITTER_TEX=1, tex=true): use the SEPARATE textured program and a
+        // pre-uploaded host texture (a per-tile palette strip) sampled by per-vertex
+        // aTex UVs the emitter interpolates. Texture upload is SAFE re: SH67c (it
+        // never touches GL_ARRAY_BUFFER / attrib pointers — no orphan class).
+        let stride: u64 = if tex { 32 } else { 24 };
+        let mut prog = mp.program;
+        if tex {
+            let (tprog, uloc) = emitter_tex_program();
+            if tprog != 0 {
+                prog = tprog;
+                // GenTextures + upload a palette strip: texture W x 1 texels, one
+                // run of `nq` palette colors (each 8px wide so NEAREST sampling at
+                // vUV picks the tile's solid color). RGBA8 uncompressed.
+                if let (Some(gt), Some(at), Some(bt), Some(tp_), Some(te)) = (
+                    mesa_fn::<extern "C" fn(i32, *mut u32)>(h, b"glGenTextures\0"),
+                    mesa_fn::<extern "C" fn(u32)>(h, b"glActiveTexture\0"),
+                    mesa_fn::<extern "C" fn(u32, u32)>(h, b"glBindTexture\0"),
+                    mesa_fn::<extern "C" fn(u32, u32, i32, i32)>(h, b"glTexParameteri\0"),
+                    mesa_fn::<extern "C" fn(u32, i32, i32, i32, i32, i32, u32, u32, *const i8)>(h, b"glTexImage2D\0"),
+                ) {
+                    let mut texid = 0u32;
+                    gt(1, &mut texid);
+                    at(0x84C0 /*GL_TEXTURE0*/);
+                    bt(0x0DE1 /*GL_TEXTURE_2D*/, texid);
+                    tp_(0x0DE1, 0x2800 /*GL_TEXTURE_MAG_FILTER*/, 0x2600 /*GL_NEAREST*/, 0);
+                    tp_(0x0DE1, 0x2801 /*GL_TEXTURE_MIN_FILTER*/, 0x2600, 0);
+                    let w = (nq * 8).max(8);
+                    let mut px: Vec<u8> = Vec::with_capacity(w * 4);
+                    for t6 in 0..nq {
+                        let cc = TASK_FRAME_PALETTE[t6 % TASK_FRAME_PALETTE.len()];
+                        let rg = [(cc[0] * 255.0) as u8, (cc[1] * 255.0) as u8, (cc[2] * 255.0) as u8, (cc[3] * 255.0) as u8];
+                        for _ in 0..8 {
+                            px.extend_from_slice(&rg);
+                        }
+                    }
+                    while px.len() < w * 4 {
+                        px.extend_from_slice(&[0, 0, 0, 255]);
+                    }
+                    te(0x0DE1, 0, 0x1908 /*GL_RGBA*/, w as i32, 1, 0, 0x1908, 0x1401, px.as_ptr() as *const i8);
+                    if uloc >= 0 {
+                        if let Some(ui) = mesa_fn::<extern "C" fn(i32, i32)>(h, b"glUniform1i\0") {
+                            ui(uloc, 0);
+                        }
+                    }
+                    eprintln!("[elfjit:renderemitter-grid] tex {w}x1 RGBA uploaded (glTexImage2D 0x1908) uTex loc={uloc} prog={tprog:#x}");
+                }
+            }
+        }
+        up(prog);
         // Grid placement: nq tiles over `cols` columns (~1.9 wide NDC viewport).
         let cols = 3usize.max(1);
         let rows = (nq + cols - 1) / cols;
         let cell_w = 1.9 / cols as f32;
         let cell_h = 1.8 / rows as f32;
-        let mut verts: Vec<f32> = Vec::with_capacity(nq * 24);
+        let mut verts: Vec<f32> = Vec::with_capacity(nq * (if tex { 32 } else { 24 }));
         for t in 0..nq {
             let cc = TASK_FRAME_PALETTE[t % TASK_FRAME_PALETTE.len()];
             let col = (t % cols) as f32;
@@ -1317,18 +1420,28 @@ pub fn render_engine_emitter_grid(ctx: u64, iimg: &[u8], ibase: u64, isp: u64, n
             let y1 = 1.0 - (row + 0.02) * cell_h; // top
             let y0 = 1.0 - (row + 1.0 - 0.02) * cell_h; // bottom
             // GL_TRIANGLES: two tris per quad (v0,v1,v2,v0,v2,v3), 6 verts.
-            // Each vert = x,y, r,g,b,a (6 floats, stride 24).
-            let mut push = |x: f32, y: f32, v: &mut Vec<f32>| {
-                v.extend_from_slice(&[x, y, cc[0], cc[1], cc[2], cc[3]]);
+            // Textured branch: each vert = x,y, r,g,b,a, u,v (8 floats, stride 32),
+            // uv samples the tile's palette region of the strip texture
+            // ([t/nq, (t+1)/nq) horizontally, vert-center vertically). Solid branch:
+            // each vert = x,y, r,g,b,a (6 floats, stride 24).
+            let mut push = move |x: f32, y: f32, u: f32, v: &mut Vec<f32>| {
+                if tex {
+                    v.extend_from_slice(&[x, y, cc[0], cc[1], cc[2], cc[3],
+                        (t as f32 + 0.5) / nq as f32, 0.5]);
+                } else {
+                    v.extend_from_slice(&[x, y, cc[0], cc[1], cc[2], cc[3]]);
+                }
             };
-            push(x0, y0, &mut verts);
-            push(x1, y0, &mut verts);
-            push(x1, y1, &mut verts);
-            push(x0, y0, &mut verts);
-            push(x1, y1, &mut verts);
-            push(x0, y1, &mut verts);
+            let u0 = (t as f32) / nq as f32;
+            let u1 = (t as f32 + 1.0) / nq as f32;
+            push(x0, y0, u0, &mut verts);
+            push(x1, y0, u1, &mut verts);
+            push(x1, y1, u1, &mut verts);
+            push(x0, y0, u0, &mut verts);
+            push(x1, y1, u1, &mut verts);
+            push(x0, y1, u0, &mut verts);
         }
-        let total_verts = verts.len() / 6;
+        let total_verts = verts.len() / if tex { 8 } else { 6 };
         let nbytes = verts.len() * 4;
         let mut vbo = 0u32;
         gb(1, &mut vbo);
@@ -1354,18 +1467,38 @@ pub fn render_engine_emitter_grid(ctx: u64, iimg: &[u8], ibase: u64, isp: u64, n
         *(spec.wrapping_add(32) as *mut u32) = 3; // vform[3]={4,FLOAT}
         *(spec.wrapping_add(36) as *mut u32) = 1; // loc 1
         *(spec.wrapping_add(40) as *mut u32) = 0;
+        // Spec count / stride depend on the textured branch: textured adds spec[2]
+        // (aTex, attr 2, offset 24, format idx 1 vec2 FLOAT, loc enum 2 -> loc 2,
+        // size_addend 0) so stride becomes 32 (pos2@0 + color4@8 + uv2@24).
+        let n_spec_entries: usize = if tex { 3 } else { 2 };
+        if tex {
+            *(spec.wrapping_add(48) as *mut u32) = 2; // attr 2 texcoord
+            *(spec.wrapping_add(52) as *mut u32) = 24;
+            *(spec.wrapping_add(56) as *mut u32) = 1; // vform[1]={2,FLOAT}
+            *(spec.wrapping_add(60) as *mut u32) = 2; // attrib-loc-enum 2 -> loc 2
+            *(spec.wrapping_add(64) as *mut u32) = 0;
+        }
         *(bd0.wrapping_add(0x48) as *mut u32) = vbo;
         *(g.wrapping_add(0x48) as *mut u64) = bd0;
         *(g.wrapping_add(0x58) as *mut u64) = bd0;
+        if tex {
+            // BD slot for attr 2 is G+0x68 = G+0x48 + 2*0x10 (primitive_setup walks
+            // slots at attr*0x10); primitive_setup loop ends at spec[2], both wired
+            // to the same shared VBO.
+            *(g.wrapping_add(0x68) as *mut u64) = bd0;
+        }
         *(g.wrapping_add(0x38) as *mut u64) = m;
         *(m.wrapping_add(0x48) as *mut u64) = spec;
-        *(m.wrapping_add(0x50) as *mut u64) = spec + 48;
+        *(m.wrapping_add(0x50) as *mut u64) = spec + ((n_spec_entries * 24) as u64);
         *(m.wrapping_add(0x60) as *mut u64) = stride_tab;
-        *(stride_tab.wrapping_add(0) as *mut u64) = 24;
-        *(stride_tab.wrapping_add(8) as *mut u64) = 24;
+        *(stride_tab.wrapping_add(0) as *mut u64) = stride;
+        *(stride_tab.wrapping_add(8) as *mut u64) = stride;
+        if tex {
+            *(stride_tab.wrapping_add(16) as *mut u64) = stride;
+        }
         *(g.wrapping_add(0x78) as *mut u64) = 0; // non-indexed
         *(g.wrapping_add(0x8e) as *mut u16) = 0;
-        eprintln!("[elfjit:renderemitter-grid] built engine geometry ctx G={g:#x} M={m:#x} VBO={vbo} quads={nq} total_verts={total_verts} GL_TRIANGLES stride=24");
+        eprintln!("[elfjit:renderemitter-grid] built engine geometry ctx G={g:#x} M={m:#x} VBO={vbo} quads={nq} total_verts={total_verts} GL_TRIANGLES stride={stride} spec[{}] aPos=0 aColor=1{}", n_spec_entries, if tex { " aTex=2" } else { "" });
         // (3) Normalize fixed-function state + wire GL_DRAW_BUFFER to GL_BACK
         // (SH66b/SH67 pre-draw fixes): default FBO, full viewport, depth/cull/
         // blend/scissor off, glDrawBuffers(1,{GL_BACK}) so the single emit lands
@@ -1407,6 +1540,14 @@ pub fn render_engine_emitter_grid(ctx: u64, iimg: &[u8], ibase: u64, isp: u64, n
             }
             Ok(r) => r,
         };
+        if tex {
+            // Post-emit cleanup: the walker immediately reuses the same VAO-less
+            // global GLES2 context; leaving aTex (attr 2) enabled with a stale
+            // pointer would corrupt the walker's next frame.
+            if let Some(da) = mesa_fn::<extern "C" fn(u32)>(h, b"glDisableVertexAttribArray\0") {
+                da(2);
+            }
+        }
         let readback: Option<extern "C" fn(i32, i32, i32, i32, u32, u32, *mut i8)> =
             mesa_fn(h, b"glReadPixels\0");
         // glFinish so the draw is submitted, then present (engine bind + swap via
@@ -3816,8 +3957,14 @@ fn main() {
                             // Default (unset) keeps the SH67b single quad.
                             let nq: usize = std::env::var("RENDEREMITTER_QUADS")
                                 .ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+                            // RENDEREMITTER_TEX=1 (SH67e): add a 3rd per-vertex
+                            // texcoord attribute (aTex loc2) sampled from a
+                            // pre-uploaded host texture so the engine emitter draws
+                            // TEXTURED quads (stride 32), the populated UI-layer-
+                            // style commitment. Default: solid-color grid (SH67d).
+                            let tex = std::env::var_os("RENDEREMITTER_TEX").is_some();
                             if nq > 0 {
-                                let _ = render_engine_emitter_grid(real_ctx, iimg, ibase, isp, nq);
+                                let _ = render_engine_emitter_grid(real_ctx, iimg, ibase, isp, nq, tex);
                             } else {
                                 let _ = render_engine_emitter_quad(real_ctx, iimg, ibase, isp);
                             }
