@@ -9,7 +9,7 @@
 
 use std::ptr;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -1997,6 +1997,35 @@ fn clear_block_cache() {
     }
 }
 
+/// SH100: process-global count of top-level (`nesting==0`) guest jit_runs in
+/// flight across ALL threads. The do-init spawns guest WORKER THREADS
+/// (`spawn_pthread`) that each call `jit_run` top-level and thus hit the
+/// `nesting==0` -> `clear_block_cache()` branch — evicting every cached block
+/// WHILE the render/ladder thread is mid-execution of a translated block
+/// (SH55/64: "concurrent top-level jit_runs SIGABRT the shared block cache").
+/// The eviction itself doesn't free leaked blocks, but the torn guest-global
+/// state two threads mutate concurrently (the do-init walker's seeded
+/// vector/vtable 0x106846970) surfaces as a run-variable SIGSEGV across
+/// different guest pcs. Guard the eviction: only clear when this is the ONLY
+/// active top-level run, so a concurrent thread never evicts while another
+/// executes. This is deadlock-free (no cross-thread wait) and does NOT starve
+/// the render thread (which keeps running its own top-level jit_run; it simply
+/// no longer wipes the cache while the ladder translates).
+static ACTIVE_TOP_LEVEL_RUNS: AtomicU32 = AtomicU32::new(0);
+
+fn begin_top_level() {
+    let prev = ACTIVE_TOP_LEVEL_RUNS.fetch_add(1, Ordering::SeqCst);
+    if prev == 0 {
+        // We are the only active top-level run -> safe to evict stale blocks
+        // (no other thread is executing translated code we might unmap).
+        clear_block_cache();
+    }
+}
+
+fn end_top_level() {
+    ACTIVE_TOP_LEVEL_RUNS.fetch_sub(1, Ordering::SeqCst);
+}
+
 /// Public: drop cached blocks whose entry pc is in `[lo, hi)`. Used by elfjit
 /// host-side patchers (e.g. --drain-poll/--deque-node-live arming the pop-loop)
 /// that rewrite guest code after a hot region has already been compiled: the
@@ -2048,15 +2077,20 @@ pub fn jit_run(image: &[u8], base: u64, entry: u64, state: *mut CpuState) -> Res
     unsafe { (*state).pc = entry }
     let nesting = IN_JIT_RUN.with(|c| c.get());
     if nesting == 0 {
-        // Top-level entry: a new guest-image session begins. Evacuate the block
-        // cache so no stale block from a different image at the same address is
-        // ever executed (see `clear_block_cache`). Nested jit_runs (host-call
-        // -> run_guest_callback) keep the cache warm.
-        clear_block_cache();
+        // SH100: top-level entry across ANY thread. begin_top_level() bumps the
+        // process-global active-run counter and only evicts when we are the ONLY
+        // active top-level run, so a concurrent worker/render jit_run never
+        // clear_block_cache()s blocks while the ladder thread is executing them
+        // (SH55/64 class). Nested jit_runs (host-call -> run_guest_callback) keep
+        // the cache warm and leave the counter untouched.
+        begin_top_level();
     }
     IN_JIT_RUN.with(|c| c.set(c.get() + 1));
     let run_result = jit_run_inner(image, base, state);
     IN_JIT_RUN.with(|c| c.set(c.get() - 1));
+    if nesting == 0 {
+        end_top_level();
+    }
     run_result
 }
 
