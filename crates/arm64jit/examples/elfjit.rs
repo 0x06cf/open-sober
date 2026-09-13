@@ -1576,8 +1576,10 @@ fn font_advance_width(font: &[u8], gid: u16) -> u16 {
         .unwrap_or(0)
 }
 
-/// Contour point rings of a SIMPLE glyph: each ring is (x, y, on_curve).
-/// Returns None for composite glyphs / CFF / malformed (caller skips + logs).
+/// Contour point rings of a glyph (simple OR composite): each ring is
+/// (x, y, on_curve). Composite glyphs are decoded into their component glyphs'
+/// contours, each transformed by the component's offset/scale/2x2 (SH79).
+/// Returns None for CFF / malformed (caller skips + logs).
 fn font_glyph_contours(font: &[u8], gid: u16) -> Option<Vec<Vec<(i16, i16, bool)>>> {
     let ((h, _), (l, _), (g, _)) = (
         sfnt_find_table(font, b"head")?,
@@ -1585,6 +1587,23 @@ fn font_glyph_contours(font: &[u8], gid: u16) -> Option<Vec<Vec<(i16, i16, bool)
         sfnt_find_table(font, b"glyf")?,
     );
     let fmt = bes16(font, h + 50);
+    font_glyph_contours_rec(font, fmt, l, g, gid, 0)
+}
+
+/// Composite flags (OpenType glyf).
+const CF_ARG_1_AND_2_ARE_WORDS: u16 = 0x0001;
+const CF_ARGS_ARE_XY_VALUES: u16 = 0x0002;
+const CF_WE_HAVE_A_SCALE: u16 = 0x0008;
+const CF_MORE_COMPONENTS: u16 = 0x0020;
+const CF_WE_HAVE_AN_X_AND_Y_SCALE: u16 = 0x0040;
+const CF_WE_HAVE_A_TWO_BY_TWO: u16 = 0x0080;
+
+fn font_glyph_contours_rec(
+    font: &[u8], fmt: i16, l: usize, g: usize, gid: u16, depth: u32,
+) -> Option<Vec<Vec<(i16, i16, bool)>>> {
+    if depth > 16 {
+        return None; // guard runaway composite nesting
+    }
     let a = match fmt {
         0 => be16(font, l + 2 * gid as usize) as usize * 2,
         _ => be32(font, l + 4 * gid as usize) as usize,
@@ -1598,8 +1617,80 @@ fn font_glyph_contours(font: &[u8], gid: u16) -> Option<Vec<Vec<(i16, i16, bool)
     }
     let nc = bes16(font, g + a);
     if nc < 0 {
-        return None; // composite: bail
+        // ---------- COMPOSITE: decode each component, apply its transform ----------
+        let mut out: Vec<Vec<(i16, i16, bool)>> = Vec::new();
+        let mut p = g + a + 10; // skip numberOfContours + bbox (6 fields worth: xMin yMax xMax yMin -> 8 bytes; +2 = 10)
+        loop {
+            if p + 4 > font.len() {
+                return Some(out);
+            }
+            let fl = be16(font, p);
+            let cgid = be16(font, p + 2);
+            p += 4;
+            // args (arg1, arg2)
+            let (arg1, arg2): (i32, i32) = if fl & CF_ARG_1_AND_2_ARE_WORDS != 0 {
+                let a1 = bes16(font, p);
+                let a2 = bes16(font, p + 2);
+                p += 4;
+                (a1 as i32, a2 as i32)
+            } else {
+                let a1 = *font.get(p)? as i8 as i32;
+                let a2 = *font.get(p + 1)? as i8 as i32;
+                p += 2;
+                (a1, a2)
+            };
+            // transform params
+            let mut t11 = 1.0f32;
+            let mut t12 = 0.0f32;
+            let mut t21 = 0.0f32;
+            let mut t22 = 1.0f32;
+            if fl & CF_WE_HAVE_A_SCALE != 0 {
+                let s = bes16(font, p) as f32 / 16384.0;
+                p += 2;
+                t11 = s;
+                t22 = s;
+            } else if fl & CF_WE_HAVE_AN_X_AND_Y_SCALE != 0 {
+                let sx = bes16(font, p) as f32 / 16384.0;
+                let sy = bes16(font, p + 2) as f32 / 16384.0;
+                p += 4;
+                t11 = sx;
+                t22 = sy;
+            } else if fl & CF_WE_HAVE_A_TWO_BY_TWO != 0 {
+                t11 = bes16(font, p) as f32 / 16384.0;
+                t12 = bes16(font, p + 2) as f32 / 16384.0;
+                t21 = bes16(font, p + 4) as f32 / 16384.0;
+                t22 = bes16(font, p + 6) as f32 / 16384.0;
+                p += 8;
+            }
+            let sub = font_glyph_contours_rec(font, fmt, l, g, cgid, depth + 1)?;
+            // The args are XY offsets (ARG_1_AND_2_ARE_WORDS/ARGS_ARE_XY_VALUES);
+            // if not XY values they're point-match numbers (we cannot match points;
+            // fall back to treating as 0 offset, still render the glyph un-offset).
+            let (ox, oy) = if fl & CF_ARGS_ARE_XY_VALUES != 0 {
+                (arg1, arg2)
+            } else {
+                (0, 0) // point-matching args unsupported: render at origin
+            };
+            for ring in sub {
+                let offset_ring: Vec<(i16, i16, bool)> = ring
+                    .iter()
+                    .map(|&(x, y, on)| {
+                        let xf = t11 * x as f32 + t12 * y as f32 + ox as f32;
+                        let yf = t21 * x as f32 + t22 * y as f32 + oy as f32;
+                        (xf.round() as i16, yf.round() as i16, on)
+                    })
+                    .collect();
+                if !offset_ring.is_empty() {
+                    out.push(offset_ring);
+                }
+            }
+            if fl & CF_MORE_COMPONENTS == 0 {
+                break;
+            }
+        }
+        return Some(out);
     }
+    // ---------- SIMPLE ----------
     let nc = nc as usize;
     if nc == 0 {
         return Some(Vec::new()); // empty glyph (e.g. space)
@@ -7982,4 +8073,29 @@ mod sh77_tests {
     }
 }
 
+#[cfg(test)]
+mod sh79_tests {
+    use super::*;
+    fn real_font() -> Option<Vec<u8>> {
+        std::fs::read("/home/hermes-worker/.cache/open-sober/android-env/assets/fonts/SourceSansPro-Bold.ttf").ok()
+    }
+    #[test]
+    fn sh79_composite_glyph_decodes_and_rasterizes() {
+        let Some(font) = real_font() else { return };
+        for (ch, w, h, pu) in [('%', 512u32, 64u32, 0.08f32), (':', 512u32, 64u32, 0.08f32), ('0', 512u32, 64u32, 0.08f32)] {
+            let cmap = font_cmap4(&font).unwrap();
+            let gid = cmap.gid(&font, ch as u32);
+            assert!(gid != 0, "'{ch}' gid 0");
+            let contours = font_glyph_contours(&font, gid).expect("contours");
+            assert!(!contours.is_empty(), "'{ch}' no contours");
+            let used = font_advance_width(&font, gid) as f32 * pu;
+            let pen_start = (w as f32 - used) / 2.0;
+            let baseline = (h as f32 / 10.0) + 722.0 * pu;
+            let rgba = rasterize_text_row(&font, &ch.to_string(), pu, [96u8,96,110,255], w, h, pen_start, baseline);
+            let opaque = rgba.chunks_exact(4).filter(|px| px[3] >= 200).count();
+            assert!(opaque > 20, "composite '{ch}' only {opaque} opaque px");
+            eprintln!("[sh79] '{ch}' ({}) composite -> {opaque} opaque px", gid);
+        }
+    }
+}
 
