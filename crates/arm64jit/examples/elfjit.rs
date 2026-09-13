@@ -998,6 +998,45 @@ extern "C" fn routeb_singleton_leaf(a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: 
 /// SELECTS a bucket probe (correctness comes from the key-eq comparator at +0x08), so
 /// forcing `blr x1` (always the primary hash) is behavior-preserving and immune to JIT
 /// block-entry coverage gaps. Patch `blr x8` (d63f0100) -> `blr x1` (d63f0020).
+/// SH93: gameGlobalInit do-init PARKS forever because the do-init's CEvent completion
+/// (a stack sync-task, `bl 2207578` = SyncTask/CEvent::wait -> futex FUTEX_WAIT_BITSET
+/// on [cevent+4], polling byte [cevent+1] bit0) is set by a TaskScheduler worker-thread
+/// callback that never runs headlessly (SH55/SH64 forbid the required concurrent
+/// jit_run). NOP the barrier in the globalinit do-init ONLY: file 0x2206e70 (guest
+/// 0x102206e70) `bl 2207578` (0x940001c2). This block is reached ONLY via `b.ne
+/// 0x2206e28` at file 0x2206df0 (non-main-thread dispatch, verified single predecessor),
+/// i.e. only the --v2boot ladder takes it; the real main thread path (b.ne not-taken ->
+/// 0x2206df4) returns to 0x2206e74 AFTER the barrier, never reaching 0x2206e70, so the
+/// product path is untouched. Append-only bl->nop (d503201f). The TaskScheduler is fully
+/// constructed at 0x2206e68; the barrier is a pure handshake. Gate like SH87.
+fn routeb_patch_globalinit_cevent_barrier() {
+    const ADDR: u64 = 0x102206e70; // file 0x2206e70: `bl 2207578` = CEvent::wait (futex park)
+    let want = 0xd503_201fu32; // nop
+    let page = ADDR & !0xfff;
+    unsafe {
+        if libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_WRITE) == 0 {
+            let before = *(ADDR as *const u32);
+            if before == 0x9400_01c2u32 {
+                *(ADDR as *mut u32) = want;
+                eprintln!(
+                    "[elfjit:routeB] SH93 NOPed globalinit CEvent barrier `bl 2207578` 0x{ADDR:x} ({before:08x}) -> nop — do-init no longer parks on the never-firing worker thread"
+                );
+            } else if before == want {
+                eprintln!("[elfjit:routeB] SH93 CEvent barrier 0x{ADDR:x} already nop");
+            } else {
+                eprintln!("[elfjit:routeB] WARN SH93 CEvent barrier 0x{ADDR:x} unexpected {before:08x}, not patched");
+            }
+            libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_EXEC);
+        } else {
+            eprintln!(
+                "[elfjit:routeB] WARN SH93 mprotect RW failed for CEvent barrier 0x{ADDR:x} errno={}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    arm64jit::jit::block_cache_drop_region(0x102206e20, 0x102206f00);
+}
+
 fn routeb_patch_map_dispatch() {
     // Two dispatch `blr x8` sites in the Roblox string/span hash-map family, each the
     // optional-hash2 branch of `ldp x1,x8,[x19,#16]; cbz x8;<tail>blr x1`:
@@ -4268,6 +4307,10 @@ fn main() {
             // SH87: the map-family generic dispatch can blr through the garbage +0x18
             // hash2 of a rehash-copied map (0x1800064) — force blr x1 (primary hash).
             routeb_patch_map_dispatch();
+            // SH93: gameGlobalInit's do-init parks forever on a CEvent completion set by a
+            // TaskScheduler worker thread that never runs headlessly -> NOP the barrier so
+            // gameGlobalInit RETURNS (unlocks rung 2 nativeUpdateAdapterInit -> type-4 vector).
+            routeb_patch_globalinit_cevent_barrier();
             let boot_sp = st.x[31];
             let tpidr = arm64jit::jit::current_guest_tp();
             let ib = base;
