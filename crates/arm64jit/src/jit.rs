@@ -2373,7 +2373,44 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // a miscompiled straight-line guest function can be pinned to the exact
         // register carrying a stale value (e.g. a W-width write that failed to
         // zero the upper 32 bits, leaking the translation base into an index).
-        if let Ok(dump_pc) = std::env::var("JIT_DUMP_PC") {
+        // JIT_DUMP_REGION=<lo>-<hi>: instead dump the canary slot [x29-16] (and
+        // neighbors + guard GOT) at EVERY block entry whose pc lies in [lo,hi].
+        // Debug-only diagnostics for pinning a stack-smash writer.
+        let dump_pc = std::env::var("JIT_DUMP_PC").ok();
+        let dump_region = std::env::var("JIT_DUMP_REGION").ok();
+        if let Some(dr) = dump_region {
+            if let Some((lo_s, hi_s)) = dr.split_once('-') {
+                if let (Ok(lo), Ok(hi)) = (u64::from_str_radix(lo_s.trim_start_matches("0x"), 16),
+                                           u64::from_str_radix(hi_s.trim_start_matches("0x"), 16)) {
+                    if pc >= lo && pc < hi {
+                        let s = unsafe { &*state };
+                        let x29 = s.x[29];
+                        let mut line = format!("REGIONDUMP pc={pc:#x} x29={x29:#x}");
+                        line.push_str(&format!(" x8={:#x} x9={:#x} x19={:#x} x20={:#x} x22={:#x} x23={:#x} x31={:#x}",
+                            s.x[8], s.x[9], s.x[19], s.x[20], s.x[22], s.x[23], s.x[31]));
+                        // Guard GOT slot contents at this block entry.
+                        unsafe {
+                            let got: u64 = std::ptr::read_unaligned(0x1067d16f0u64 as *const u64);
+                            line.push_str(&format!(" guardGOT={got:#x}"));
+                            if got != 0 && got != !0u64 {
+                                line.push_str(&format!(" guardval={:#x}",
+                                    std::ptr::read_unaligned(got as *const u64)));
+                            }
+                        }
+                        if x29 != 0 {
+                            let base = x29.wrapping_sub(0x40);
+                            for off in (0u64..0x40).step_by(8) {
+                                let a = base.wrapping_add(off);
+                                let v = unsafe { std::ptr::read_unaligned(a as *const u64) };
+                                line.push_str(&format!("[{:#x}]={:#x}", a, v));
+                            }
+                        }
+                        println!("{line}");
+                    }
+                }
+            }
+        }
+        if let Some(dump_pc) = dump_pc {
             if let Ok(target) = u64::from_str_radix(dump_pc.trim_start_matches("0x"), 16) {
                 if pc == target {
                     let s = unsafe { &*state };
