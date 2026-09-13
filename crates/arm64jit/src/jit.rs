@@ -483,6 +483,19 @@ fn json_zero_fix_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("JIT_JSON_ZERO_FIX").is_some())
 }
 
+/// Whether the SH83 registration hash-map repair hook is armed (JIT_ROUTEB_HASHFIX).
+/// The --v2boot ladder's nativeGameGlobalInit do-init builds a string-keyed hash-map
+/// (file 0x29f3e70) whose optional hash-fn-2 slot at +0x18 holds a GARBAGE host value
+/// (0x4741495241003635, ASCII "56\0ARAIG") instead of the engine's default 0; the
+/// insert dispatch reads it at 0x29f3f6c `ldp x1,x8,[x19,#16]` and `blr x8` jumps into
+/// unmapped memory (SIGSEGV). The engine map uses single-hash (+0x10 = the real string
+/// hash 0x102a25dec) and leaves +0x18=0 so ops fall back to +0x10. Repair +0x18 -> 0.
+fn routeb_hashfix_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("JIT_ROUTEB_HASHFIX").is_some())
+}
+
 /// Register `f` as the host call for guest slot `i`. Returns the guest address
 /// the caller should resolve a JUMP_SLOT/intra-image `blr` target to so that the
 /// `jit_run` dispatcher falls through to this host call.
@@ -2323,6 +2336,34 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
                         "[json-fix] append check 0x102355d40 would overflow (len={len:#x} cap={cap}) -> forcing len=0 (SSO empty append)"
                     );
                     unsafe { (*state).x[2] = 0 };
+                }
+            }
+        }
+        // SH83 (--v2boot ladder): nativeGameGlobalInit's registration path builds a
+        // string-keyed hash-map. Its insert fn (guest entry 0x1029f3e70, x0 = the map, moved
+        // to x19 at 0x29f3e98) ends in a dispatch `ldp x1,x8,[x19,#16]; cbz x8 -> blr x1; else
+        // blr x8` at 0x29f3f6c/0x29f3f78: when the optional hash-fn-2 slot at [map+0x18] is
+        // non-zero it `blr x8` through it. Under the JIT that slot holds leftover host garbage
+        // (0x4741495241003635 = ASCII "56\0ARAIG") instead of the engine's default 0, so the
+        // blr jumps into unmapped memory (SIGSEGV guestpc 0x1029f3f7c). The map is single-hash:
+        // +0x10 holds the REAL string hash (0x102a25dec), +0x18 should be 0 so `cbz x8` falls
+        // back to `blr x1`. Repair +0x18 -> 0 on entry (idempotent; correct value is 0, so a
+        // real two-hash map is never touched — detected via the +0x10 slot).
+        if routeb_hashfix_enabled() {
+            if pc == 0x1029f3e70 {
+                const STRING_HASH: u64 = 0x102a25dec;
+                let map = unsafe { (*state).x[0] }; // x0 = map at insert entry (mov x19,x0 at 0x29f3e98)
+                if map != 0 {
+                    let h1 = unsafe { *((map + 0x10) as *const u64) };
+                    if h1 == STRING_HASH {
+                        let h2 = unsafe { *((map + 0x18) as *const u64) };
+                        if h2 != 0 {
+                            unsafe { *((map + 0x18) as *mut u64) = 0 };
+                            eprintln!(
+                                "[routeb-hashfix] string hash-map @ 0x{map:x} +0x18 0x{h2:x} -> 0 (insert falls back to single-hash blr x1)"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -8906,6 +8947,50 @@ mod fp16_and_fabd_fccmp_exec {
         eprintln!(
             "[abi] json fix pinned: append check file 0x{APPEND_CHECK:x} cap cell file 0x{:x} throw helper file 0x{:x}; would_throw(cap<m huge/appular) clamps len->0, len=0 never throws",
             CAP_CELL as u64, THROW_HELPER - 0x100000000
+        );
+    }
+
+    #[test]
+    fn routeb_hashfix_repairs_garbage_hash_fn2_slot() {
+        // SH83 (--v2boot ladder): nativeGameGlobalInit's registration path builds a
+        // string-keyed hash-map whose insert dispatch (file 0x29f3f6c `ldp x1,x8,[x19,#16]`)
+        // reads the optional hash-fn-2 slot at +0x18 and -- when non-zero -- `blr x8` through
+        // it. Under the JIT that slot holds leftover host garbage (0x4741495241003635 = ASCII
+        // "56\0ARAIG") rather than the engine's default 0, so the blr jumps into unmapped memory
+        // (SIGSEGV guestpc 0x1029f3f7c, observed in runs/sh82-v2boot-advance.txt). The map is
+        // single-hash: +0x10 holds the REAL string hash (0x102a25dec, file 0x2a25dec) and +0x18
+        // should be 0 so the `cbz x8` falls back to `blr x1`. The repair: at the dispatch pc,
+        // when the map is the string-hash map and +0x18 carries a garbage non-zero value, zero it.
+        const INSERT_DISPATCH: u64 = 0x1029f3f6c; // file 0x29f3f6c ldp x1,x8,[x19,#16]
+        const CRASH: u64 = 0x1029f3f7c; // file 0x29f3f7c blr x8 (blr into garbage) -- the observed SIGSEGV pc
+        const STRING_HASH: u64 = 0x102a25dec; // file 0x2a25dec the engine's real single string hash
+        const GARBAGE: u64 = 0x4741_4952_4100_3635; // the observed leftover host slot value (ASCII "56\0ARAIG")
+        assert_eq!(INSERT_DISPATCH & 0xffffffff, 0x29f3f6c);
+        assert_eq!(CRASH & 0xffffffff, 0x29f3f7c);
+        assert_eq!(STRING_HASH & 0xffffffff, 0x2a25dec);
+        // +0x18 is the hash-fn-2 slot the dispatch reads; +0x10 is the primary single hash that
+        // must stay untouched (a real two-hash engine map would use both -- but this map's +0x10
+        // IS the string hash, so it's the single-hash map the ladder builds).
+        let map = Box::leak(Box::new([0u64; 8])).as_mut_ptr() as u64;
+        unsafe {
+            *((map + 0x10) as *mut u64) = STRING_HASH; // +0x10 = real string hash (identical to the crash map)
+            *((map + 0x18) as *mut u64) = GARBAGE; // +0x18 = leaked garbage (would blr -> unmapped)
+        }
+        // The repair is triggered by pc == INSERT_DISPATCH and the +0x10 hash match.
+        let is_dispatch = true;
+        let h1 = unsafe { *((map + 0x10) as *const u64) };
+        assert!(is_dispatch && h1 == STRING_HASH);
+        // Apply the same repair the run_loop hook performs: zero +0x18.
+        let h2 = unsafe { *((map + 0x18) as *const u64) };
+        assert_eq!(h2, GARBAGE);
+        unsafe { *((map + 0x18) as *mut u64) = 0 };
+        // After repair, +0x18 == 0 -> the dispatch's `cbz x8` takes the `blr x1` (single-hash)
+        // path and never jumps through the garbage slot. +0x10 is untouched.
+        assert_eq!(unsafe { *((map + 0x18) as *const u64) }, 0);
+        assert_eq!(unsafe { *((map + 0x10) as *const u64) }, STRING_HASH);
+        eprintln!(
+            "[abi] routeb-hashfix pinned: insert dispatch file 0x{INSERT_DISPATCH:x} crash 0x{:x} string-hash 0x{:x}; +0x18 garbage 0x{GARBAGE:x} -> 0 (blr falls back to single-hash x1), +0x10 untouched",
+            CRASH - 0x100000000, STRING_HASH - 0x100000000
         );
     }
 
