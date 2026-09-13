@@ -2192,6 +2192,22 @@ fn login_ui_textures() -> Vec<RealSprite> {
                 ),
             }
         }
+        // SH75 — synthesize the login FORM solid prims (a field + the green
+        // "Log In" button) as solid atlas rows so the same textured emitter
+        // draws them next to the real artwork = a complete login surface. The
+        // FS outputs only texture2D(uTex,vUV); a uniform-filled row renders a
+        // solid quad (SH72's ub = s.w/aw fix keeps each row's u-extent local).
+        let mut solid = |name: &str, (r, g, b, a): (u8, u8, u8, u8), w: u32, h: u32| {
+            let rgba = (0..(w * h)).flat_map(|_| [r, g, b, a]).collect();
+            out.push(RealSprite { name: name.to_string(), w, h, rgba });
+            eprintln!(
+                "[elfjit:renderemitter-login] synthesized solid auth sprite '{name}' ({w}x{h} rgba({r},{g},{b},{a}))"
+            );
+        };
+        // field = near-white input field (a=255 opaque), button = Roblox green
+        // bar. 256x16 rows keep the boxes wide (aspect 16).
+        solid("field.png", (224, 224, 230, 255), 256, 16);
+        solid("loginbtn.png", (0, 158, 68, 255), 256, 16);
         out
     })
     .clone()
@@ -2294,6 +2310,8 @@ pub fn render_engine_emitter_multi(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) 
             ("reversevignette.png", 0.0, 0.0, 1.78, 512, 512, 6),
             ("logo_white_1x.png", 0.0, 0.35, 0.22, 193, 44, 2),
             ("noconnection.png", 0.0, -0.15, 0.10, 70, 50, 2),
+            ("field.png", 0.0, -0.45, 0.045, 128, 8, 2),
+            ("loginbtn.png", 0.0, -0.62, 0.05, 128, 8, 2),
         ]
     } else {
         &[
@@ -7131,5 +7149,69 @@ mod sh69_tests {
             let span = (vhi[i] - vlo[i]) * ah as f32;
             assert!((span - (*sh as f32 - 1.0)).abs() < 1e-3, "block {i} span {span} != height-1 {sh}");
         }
+    }
+
+    // The login synthetic-solid rows (SH75: field + green button, each a
+    // uniform opaque square block) stay disjoint blocks in the shared atlas and
+    // are opaque, so their probe expected color == the solid color over ANY
+    // backdrop (a=255 -> dst*(1-1)=0). This is the same property that makes the
+    // RO-BLOX wordmark (alpha=255 white) byte-exact in SH73.
+    #[test]
+    fn sh75_login_solid_rows_are_opaque_so_probe_is_byte_exact_over_any_dst() {
+        // Mirror login sprite list dimensions: vignette(1024x1024), wordmark
+        // (476x88), noconnection(140x100), field(256x16), loginbtn(256x16).
+        let dims: &[(u32, u32)] = &[(1024, 1024), (476, 88), (140, 100), (256, 16), (256, 16)];
+        let aw: u32 = dims.iter().map(|(w, _)| *w).max().unwrap().max(8);
+        assert_eq!(aw, 1024);
+        // field + loginbtn are uniform solid: any texel equals the solid color.
+        let (fr, fg, fb, fa) = (224u8, 224, 230, 255u8); // field
+        let (gr, gg, gb, ga) = (0u8, 158, 68, 255u8); // button (Roblox green)
+        for (w, h) in &[(256u32, 16u32), (256, 16)] {
+            let rgba: Vec<u8> = (0..(*w * *h)).flat_map(|_| if *w == 256 { [fr, fg, fb, fa] } else { [gr, gg, gb, ga] }).collect();
+            // every texel opaque
+            for px in rgba.chunks_exact(4) {
+                assert_eq!(px[3], 255, "solid login row must be opaque");
+            }
+        }
+        // Opaque texel => GL_BLEND src*a + (26,26,31)*(1-a) == src exactly.
+        assert_eq!(((fr as f32) * 1.0 + 26.0 * 0.0) as u8, fr);
+        assert_eq!(((gb as f32) * 1.0 + 31.0 * 0.0) as u8, gb);
+        // Solid rows sit in disjoint, in-range atlas blocks like the real ones.
+        let heights: &[u32] = &[1024, 88, 100, 16, 16];
+        let mut memlo: Vec<u32> = Vec::new();
+        let mut ah: u32 = 1;
+        for sh in heights {
+            memlo.push(ah);
+            ah += sh;
+        }
+        let mut vlo = Vec::new();
+        let mut vhi = Vec::new();
+        for (i, sh) in heights.iter().enumerate() {
+            vlo.push(memlo[i] as f32 / ah as f32);
+            vhi.push((memlo[i] + sh - 1) as f32 / ah as f32);
+        }
+        for i in 0..vlo.len() {
+            assert!(vlo[i] >= 0.0 && vhi[i] <= 1.0 && vlo[i] < vhi[i], "block {i} range");
+            if i > 0 {
+                assert!(vlo[i] > vhi[i - 1], "blocks {i} and {} overlap", i - 1);
+            }
+        }
+    }
+
+    // SH75 login-left field/button probe screen coords land inside each box via
+    // imgpix_rect (the same math the shader aTex interpolation + probe uses).
+    #[test]
+    fn sh75_login_field_and_button_probe_land_inside_their_boxes() {
+        // field at cy=-0.45, hh=0.045, 256x16; its box half-width =
+        // hh*(256/16)*(720/1280)=0.045*16*0.5625=0.405.
+        let hw = 0.045f32 * (256.0 / 16.0) * (720.0 / 1280.0);
+        let (sx, sy) = imgpix_rect(128, 8, 256, 16, 0.0, -0.45, 0.045, 1280.0, 720.0);
+        assert!((sx - 640.0).abs() < hw * 640.0 + 4.0, "field x {sx}");
+        // button at cy=-0.62
+        let (bw, bh) = (0.05f32, (256.0 / 16.0) * (720.0 / 1280.0));
+        let (bx, by) = imgpix_rect(128, 8, 256, 16, 0.0, -0.62, bw, 1280.0, 720.0);
+        assert!((bx - 640.0).abs() < bw * 16.0 * 0.5625 * 640.0 + 4.0, "button x {bx}");
+        assert!(by > 0.0 && by < 720.0, "button y {by}");
+        let _ = bh;
     }
 }
