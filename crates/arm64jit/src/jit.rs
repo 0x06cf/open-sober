@@ -2446,9 +2446,19 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
                     // "double free or corruption (out)" abort). The rehash/grow gates are
                     // cleared purely by the non-image +0x18 repair above (no force-empty).
                     if pc == 0x1029f3e70 {
+                        // SH90: seed ALSO the SPAN-hash map (the OTel pb_defaults registration
+                        // uses it heavily). SH84 only covered the STRING map (+0x10==0x102a25dec);
+                        // the span map (+0x10==0x1029b4a84) has the SAME numeric-header layout but
+                        // was left unseeded -> after ~12 inserts it GROWS in place with garbage
+                        // load/mask/divisor -> the post-growth probe derefs image-code bytes as a
+                        // bucket node -> SIGSEGV. Widening the gate to both real family hashes is
+                        // still safe: the seed only ever fires at the INSERT-entry block boundary
+                        // (0x1029f3e70, the sole JIT block entry here per SH86b) once per map, on
+                        // an empty map (no entries lost), and never touches a foreign object.
                         const STRING_HASH: u64 = 0x102a25dec; // the string map's primary hash
+                        const SPAN_HASH: u64 = 0x1029b4a84; // the span map's primary hash (SH90)
                         let h1 = unsafe { *((map + 0x10) as *const u64) };
-                        if h1 == STRING_HASH {
+                        if h1 == STRING_HASH || h1 == SPAN_HASH {
                             unsafe {
                                 use std::collections::HashSet;
                                 use std::sync::{Mutex, OnceLock};
