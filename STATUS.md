@@ -1,4 +1,8 @@
 # Open-Sober Status — Ongoing Autonomous Development
+## SH76 (Sep 13, 2026, hermes-worker): the Roblox login surface is now a LIVE animated film — RENDEREMITTER_LIVE=1 bobs the RO-BLOX wordmark per frame so consecutive present-walker frames differ. Real libroblox.so exit 124: wordmark probe y moved (560,496)->(560,474) across the two emitter drives, both byte-exact white, 10/10 probes present=true, 0 crash. Authored motion, not engine-self-driven. Doc frontier-sh76-emitter-live.md. Workspace 509/0.
+
+
+
 ## SH75 (Sep 13, 2026, hermes-worker): the engine's REAL geometry emitter now draws a COMPLETE Roblox LOGIN form headlessly — real reversevignette backdrop + real RO-BLOX wordmark + real noconnection Wi-Fi chip + synthesized solid prims (near-white field + Roblox-green "Log In" bar), all in ONE top-level jit_run from a shared vertical atlas, GL_BLEND over dark. RENDEREMITTER_LOGIN=1. Real libroblox.so exit 124: 2x `engine emitter Ok(count=36 sprites=5 swap=Ok(1))` + 2x walker Ok(0x1), **10/10 probes present=true** — wordmark/chip/field/button all BYTE-EXACT (diff=[0,0,0,0], alpha=255 opaque over any dst); vignette diff=[1,1,1]. Captured runs/sh73-emitter-login.png = genuine Roblox login/connection screen (wordmark -> Wi-Fi icon -> input field -> green button over vignette). 0 crash. login_ui_textures adds noconnection + synthesizes solid field/button rows (ub=s.w/aw keeps row-extents local); +2 hermetic regressions. Workspace **509/0**; example tests **11 pass** (was 9). Docs frontier-sh75-emitter-login-form.md, repro runs/capture_emitter_login.sh. Honest scope: harness-authored geometry (+ synthesized solid prims) + real artwork through the engine's own emitter; NOT the engine self-constructing a login UI/session; standing wall unchanged.
 
 

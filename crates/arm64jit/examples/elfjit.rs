@@ -2325,6 +2325,29 @@ pub fn render_engine_emitter_multi(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) 
     // Build the shared vertical atlas. aw = max sprite width (>=8); ah = 1
     // (backdrop strip row 0) + sum(sprite heights).
     let aw: u32 = sprites.iter().map(|s| s.w).max().unwrap_or(8).max(8);
+    // SH76 — a LIVE login film (RENDEREMITTER_LIVE=1): gently bob the wordmark
+    // (login placements index 1) about its authored center each emitter drive,
+    // so consecutive present-walker frames differ = the surface is not a single
+    // static frame. The probe tracks the same bob so it stays valid.
+    let live = std::env::var_os("RENDEREMITTER_LIVE").is_some() && login;
+    static LIVE_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let live_frame = if live {
+        LIVE_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1
+    } else {
+        0
+    };
+    let bob = if live {
+        // alternate a small vertical offset per frame: +0.03, -0.03, ...
+        if live_frame % 2 == 1 { 0.03f32 } else { -0.03f32 }
+    } else {
+        0.0
+    };
+    // Resolve a placement, applying the live bob to the wordmark.
+    let pl = |i: usize| -> (f32, f32, f32, u32, u32, u32) {
+        let (_, cx, cy, hh, pix, piy, tol) = placements[i];
+        let cy = if live && i == 1 { cy + bob } else { cy };
+        (cx, cy, hh, pix, piy, tol)
+    };
     let mut acc: u32 = 1;
     let mut vlo: Vec<f32> = Vec::new(); // per sprite va (v at its top memory row)
     let mut vhi: Vec<f32> = Vec::new(); // per sprite vb (v at its bottom mem row)
@@ -2418,7 +2441,7 @@ pub fn render_engine_emitter_multi(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) 
                     continue;
                 }
             }
-            let (_, cx, cy, hh, _, _, _) = placements[i];
+            let (cx, cy, hh, _, _, _) = pl(i);
             let corr = VH / VW;
             let half_w = hh * (s.w as f32 / s.h as f32) * corr;
             // The emitter projects NDC Y unmoved into glReadPixels y (0=bottom):
@@ -2607,7 +2630,7 @@ pub fn render_engine_emitter_multi(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) 
             // Per-sprite probe: expected = decoded rgba at (ix,iy), screen coord
             // via imgpix_rect (the exact vUV-linear math the shader uses).
             for (i, s) in sprites.iter().enumerate() {
-                let (_, cx, cy, hh, pix, piy, tol) = placements[i];
+                let (cx, cy, hh, pix, piy, tol) = pl(i);
                 let o4 = (piy as usize * s.w as usize + pix as usize) * 4;
                 // Expected == the GL_BLEND (SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
                 // composite of the sprite texel over the opaque dark backdrop:

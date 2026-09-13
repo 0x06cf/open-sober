@@ -1,43 +1,33 @@
 # SH73 — next artifact options (real Roblox auth surface now renders headlessly)
 
-SH73 landed the first real **login/auth** Roblox surface through the engine's own
-emitter path: the real `reversevignette` backdrop + the RO-BLOX wordmark, both
-pixel-verified (wordmark byte-exact), captured frame
-runs/sh73-emitter-login.png. Next unblocked steps:
+SH73/74/75 landed the real **login/auth** surface through the engine's own
+emitter path — real `reversevignette` + real RO-BLOX wordmark + real
+`noconnection` chip + solid field + green button, all 10/10 probes present=true
+(wordmark/chip/field/button byte-exact), captured runs/sh73-emitter-login.png.
+Options (A) more-login-assets and (C) solid UI prims are DONE (SH74/75). Next
+unblocked steps:
 
-## (A) More login-complete Auth set (<1 hr)
-The same `ExtraContent/textures/ui/LuaApp/graphic/Auth/` folder also has
-`classind_16.png` and `noconnection.png` (+ `FPSBackground.png`). Placing
-`noconnection` (a connection-loss chip) under the wordmark mimics the real
-offline-login state. `real_ui_textures` already skips failed sprites with a
-warn and supports absolute paths — pure data/placement change on the SH73
-function.
+## (B) Animate the login composite (<1 hr)
+SH71's `RENDEREMITTER_SPIN` rotates/per-frames a sprite. Apply a per-frame
+change to the login surface so it reads as a LIVE login screen across
+present-walker frames — e.g. a progress bar that grows per frame (the loading
+state) or a gently drifting wordmark. Same radial-sweep/probe verification.
 
-## (B) Animate the auth surface (<1 hr)
-SH71's `RENDEREMITTER_SPIN` rotates a sprite per frame. Apply the same per-frame
-rotation/scroll to the login composite (spin the wordmark or drift the vignette
-scroll) for a "live" auth screen across present-walker frames — same
-radial-sweep verification.
-
-## (C) "Purple Login-button" treatment (<1 hr)
-The extracted set has no real green "Log In" PNG (Roblox draws those as solid
-rounded rects). SH68 already proved the engine emitter composites a
-semi-transparent panel + a green button bar (solid-prim layering over the same
-draw path). Combine SH68's solid button bar WITH the SH73 real auth artwork in
-one frame → a fuller login screen: real wordmark + real vignette + a UI-solid
-green "Log In" bar. This is the next visual step up; both halves are proven, so
-it is a composition problem, not a render reach problem.
+## (D) Login-placeholder text labels (<1 hr)
+The solid field + green button read as a form but carry no text. If a font
+asset exists in the extracted `content/fonts` / bmfont set, rasterize "Log In"
+/Sign-up text into an atlas row and place it on the button — a more legible
+login button. Requires glyph rasterization; font HXD/OTF may already be in the
+APK (SH57 found "BuilderIcons fonts").
 
 ## Standing wall (unchanged, out of reach statically)
 The engine never self-populates a session: type-4 producer vector [0x106829ea8]
 external glue; nativeGameGlobalInit parks; no in-image path constructs a
 GuiObject and appends to the scene list. A true self-driven login screen still
-needs the Lua app-shell / game-activity session path. Every SH72/73 increment is
+needs the Lua app-shell / game-activity session path. Every SH72-75 increment is
 harness-authored geometry + real artwork through the engine's own emitter.
 
-## Recommendation (A → B)
-(A) is the cheapest and moves closest to a complete login read; then (B) for a
-live surface; (C) is the visual ceiling and worth doing once A+B land — it is
-the point where the frame stops being "a wordmark" and becomes "a login screen".
-Do NOT attempt per-node emitter vt[+24] (SH64 desync class, per SH69 next-artifact
-note).
+## Recommendation (B)
+Animate first (cheap, makes the surface unmistakably "live"); (D) text is the
+next legibility step. Do NOT attempt per-node emitter vt[+24] (SH64 desync
+class).
