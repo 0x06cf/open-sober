@@ -16,6 +16,12 @@
 5. Make sure the full workspace compiles: `cargo check --workspace`
 6. Run all tests: `cargo test --workspace`
 7. After verified, commit to `dev` and push.
+8. NEVER commit any file over 1MB (a pre-commit hook enforces this). This is not a
+   suggestion: GitHub's file limit is 100MB and run-capture / JIT-trace dumps
+   (e.g. `runs/sh9X-v2boot-*.txt` with JIT_REGION_WATCH/JIT_TRACE on) routinely hit
+   150MB+ and block every push. Keep repro/probe logs you commit small (<1MB); for
+   large captures, save them to disk but `git rm --cached` / `.gitignore` them so
+   they never enter a commit.
 
 ## Merge process
 
