@@ -1001,6 +1001,70 @@ extern "C" fn routeb_singleton_leaf(a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: 
     a0
 }
 
+/// SH99: the deep nativeGameGlobalInit do-init probes a GLOBAL 0x10-element-stride
+/// vector whose object lives at guest 0x106dcae08 (probe block: `adrp x19,0x106dca000;
+/// add x19,x19,#0xe08` @ 0x102208484/488; `ldp x10,x8,[x19]` @ 0x102208490 -> +0x08 is the
+/// begin pointer). Under the JIT the RW segment leaves the begin slot [0x106dcae10] = 0,
+/// and the header probe `ldrb w9,[x8]` (x8 = [x19+8] = begin @ 0x10220845c) derefs it
+/// UNCONDITIONALLY, before any empty/count check -> SIGSEGV fault=0x0 (the assert pc
+/// 0x10220847c is the resume of a preceding benign `bl`). Unlike SH84's empty-map seed,
+/// a begin=end=0 seed would re-crash (the ldrb/ldp deref begin directly). Fix: point the
+/// vector's {begin, end, cap} triplet at ONE non-null zeroed leaked node so the header
+/// read is valid (`ldrb[node]=0`, `ldp [node+16]=0`) AND the `(end-begin)>>4` element
+/// count @ 0x10220849c = 0 makes both the boundary probe and the walk resolve to an
+/// empty span harmlessly. Idempotent (OnceLock per process).
+pub fn routeb_seed_game_global_vector() -> u64 {
+    use std::sync::OnceLock;
+    static SEEDED: OnceLock<u64> = OnceLock::new();
+    *SEEDED.get_or_init(|| {
+        // A 0x40 zeroed node: begin=node means `ldrb [node]` reads 0 (valid), the
+        // csel @0x10220846c/470 keeps a sane embedded/short value, and the element
+        // count (end-begin)>>4 = 0 since begin==end==node.
+        let node = Box::leak(vec![0u8; 0x40usize].into_boxed_slice()).as_mut_ptr() as u64;
+        // The do-init block also reads a 4th pointer at [0x106dcae20] (the object
+        // itself at +0xe20 in the 0x106dca000 region) and virtual-dispatches
+        // `ldr x10,[x0]; ldr x8,[x10,#8]; blr x8` (0x1022084f0/4fc/500). Make it a
+        // coherent object whose +8 virtual is a benign host leaf.
+        let leaf =
+            *ROUTEB_LEAF_ADDR.get_or_init(|| {
+                let a = arm64jit::jit::register_host_call_auto(routeb_singleton_leaf);
+                eprintln!("[elfjit:routeB] SH99 benign dispatch leaf registered at {a:#x}");
+                a
+            });
+        let obj = Box::leak(vec![0u8; 0x30usize].into_boxed_slice()).as_mut_ptr() as u64;
+        unsafe {
+            *(0x106dcae08u64 as *mut u64) = node; // +0x00 end
+            *(0x106dcae10u64 as *mut u64) = node; // +0x08 begin
+            *(0x106dcae18u64 as *mut u64) = node; // +0x10 cap
+            // Dispatch target [0x106dcae20] must be a COHERENT OBJECT: the block does
+            // `ldr x10,[x0]` (x10=*obj = vtable) then `ldr x8,[x10,#0x10]` then `blr x8`
+            // — so obj+0 is a vtable pointer whose +0x10 slot is a benign leaf, and
+            // the leaf receives the args the caller left. (SH99 begin-seed advanced
+            // the fault from 0x0 to 0x10; this shapes obj so the +0x10 virtual deref
+            // lands on the leaf, not address 0.)
+            let vtab = Box::leak(vec![0u8; 0x30usize].into_boxed_slice()).as_mut_ptr() as u64;
+            for i in 0..(0x30 / 8) {
+                *((vtab + i as u64 * 8) as *mut u64) = leaf;
+            }
+            *(0x106dcae20u64 as *mut u64) = obj; // +0xe20 object (dispatch target)
+            *((obj + 0x00) as *mut u64) = vtab; // +0 vtable ptr
+            *((obj + 0x08) as *mut u64) = leaf; // +8 also a leaf (alternate dispatch)
+            // The SAME probe block is dispatched with x19 = a second in-image .bss
+            // singleton (0x106846970) whose +8 begin slot is also NULL under the JIT
+            // (observed: ldrb [x8] / ldp [x8+16] deref it -> fault 0x0/0x10). Point its
+            // begin/end/cap triple at the same non-null zeroed node so the header probe
+            // + count arithmetic validate as an empty span there too.
+            *(0x106846978u64 as *mut u64) = node; // +0x08 begin
+            *(0x106846970u64 as *mut u64) = node; // +0x00 end
+            *(0x106846980u64 as *mut u64) = node; // +0x10 cap
+        }
+        eprintln!(
+            "[elfjit:routeB] SH99 seeded empty 0x10-stride global vector [0x106dcae08..0x18]=0x{node:x} + dispatch obj [0x106dcae20]=0x{obj:x}(+8 leaf) so the globalinit probe+deref validate without NULL or blr-into-0"
+        );
+        node
+    })
+}
+
 /// SH87: the Roblox string/span hash-map family's generic dispatch (file 0x29f427c)
 /// `ldp x1,x8,[x19,#16]; cbz x8,<l1>; blr x8; <l1>: blr x1` branches through the
 /// optional hash-2 slot (+0x18) when non-zero. The OTel rehash-copy creates a NEW map
@@ -4429,6 +4493,9 @@ fn main() {
                 // the dispatch hook as the substitute for sub-image map/this candidates.
                 let pb_map = routeb_seed_pb_registry_map(iimg, ib);
                 arm64jit::jit::routeb_register_substitute_map(pb_map);
+                // SH99: seed the global 0x10-stride vector the deep globalinit do-init
+                // probes (guest 0x106dcae08, begin deref'd unconditionally -> NULL SEGV).
+                let _ = routeb_seed_game_global_vector();
                 let _ = (iimg, ib);
                 // rung index 1 == nativeGameGlobalInit in the rungs array below.
                 for (name, guest, args) in rungs.iter() {
