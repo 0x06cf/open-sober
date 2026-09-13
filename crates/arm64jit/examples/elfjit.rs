@@ -1598,6 +1598,238 @@ pub fn render_engine_emitter_grid(ctx: u64, iimg: &[u8], ibase: u64, isp: u64, n
         r
     }
 }
+
+/// SH68 — the engine's real emitter draws a LAYERED "login/home"-style frame
+/// (5 textured quads: backdrop, centered panel, button bar, title strip, field
+/// strip) in ONE top-level jit_run with GL_BLEND alpha compositing, sized/placed
+/// from the REAL scene list (R+0x180/0x188 -> SCENE_NODES). Same SH67d/e single-
+/// call discipline (one pre-uploaded VBO, GL_TRIANGLES, first=0, count=5*6=30)
+/// so the SH67c orphan class stays closed. Per-layer straight-alpha lives in a
+/// 5-texel RGBA strip; the FS outputs only texture2D(uTex,vUV) so the overlap
+/// readbacks verify the blend equation (panel∘backdrop must equal
+/// src*src.a + dst*(1-src.a)). Blend + program are host-set preconditions (the
+/// emitter has no such concepts). Returns the emitter's ret.
+pub fn render_engine_emitter_home(ctx: u64, iimg: &[u8], ibase: u64, isp: u64, layer_override: usize) -> u64 {
+    if !(ctx >= 0x100000000 && ctx >> 56 == 0) {
+        return 0;
+    }
+    let h = unsafe { libc::dlopen(c"libGLESv2.so.2".as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+    if h.is_null() {
+        eprintln!("[elfjit:renderemitter-home] WARN: dlopen libGLESv2.so.2 failed");
+        return 0;
+    }
+    // Read the REAL scene-list node count to size the layout (SH68-A): the harness
+    // laid R+0x180 head / R+0x188 tail (0x28-stride, one-past-end) via
+    // render_scene_base/render_engine_present_walker. Verify head/tail-derived
+    // count == SCENE_NODES so the layout is scene-driven, not hardcoded.
+    let r = RENDERSCENE_BASE.load(core::sync::atomic::Ordering::Relaxed);
+    let n_scene = SCENE_NODES.load(core::sync::atomic::Ordering::Relaxed);
+    let derived = if r != 0 {
+        unsafe {
+            let head = *(r as *const u64).add(0x180 / 8);
+            let tail = *(r as *const u64).add(0x188 / 8);
+            if tail >= head { tail.wrapping_sub(head) / 0x28 } else { 0 }
+        }
+    } else { 0 };
+    let n_layers = layer_override.max((n_scene as usize).max(5));
+    eprintln!("[elfjit:renderemitter-home] scene list R={r:#x} n_scene={n_scene} head/tail-derived={derived} match={}", r==0 || derived==n_scene);
+    let (tprog, uloc) = emitter_tex_program();
+    if tprog == 0 {
+        eprintln!("[elfjit:renderemitter-home] WARN: textured program unavailable");
+        return 0;
+    }
+    unsafe {
+        let (Some(gb), Some(bb), Some(bd), Some(up)) = (
+            mesa_fn::<extern "C" fn(i32, *mut u32)>(h, b"glGenBuffers\0"),
+            mesa_fn::<extern "C" fn(u32, u32)>(h, b"glBindBuffer\0"),
+            mesa_fn::<extern "C" fn(u32, isize, *const i8, u32)>(h, b"glBufferData\0"),
+            mesa_fn::<extern "C" fn(u32)>(h, b"glUseProgram\0"),
+        ) else {
+            eprintln!("[elfjit:renderemitter-home] WARN: required Mesa symbols missing");
+            return 0;
+        };
+        up(tprog);
+        // 5 defined layers (straight alpha, painter's order): backdrop, panel
+        // (alpha 0.55 -> every overlap is a verifiable blend), button, title,
+        // field. Surplus scene nodes (>5) add generic text-strips.
+        let layers: [(f32, f32, f32, f32, f32, f32, [f32; 4]); 5] = [
+            (-1.0, 1.0, -1.0, 1.0, 0.1, 0.0, [0.10, 0.10, 0.12, 1.00]),  // backdrop
+            (-0.55, 0.55, -0.36, 0.42, 0.3, 0.0, [0.24, 0.26, 0.32, 0.55]), // panel
+            (-0.40, 0.40, -0.30, -0.14, 0.5, 0.0, [0.16, 0.62, 0.44, 0.95]), // button
+            (-0.40, 0.40, 0.28, 0.34, 0.7, 0.0, [0.90, 0.88, 0.80, 0.80]), // title
+            (-0.40, 0.10, 0.10, 0.17, 0.9, 0.0, [0.35, 0.38, 0.45, 0.85]), // field
+        ];
+        let nq = n_layers;
+        let mut verts: Vec<f32> = Vec::with_capacity(nq * 48); // 8 floats * 6 verts
+        for t2 in 0..nq {
+            let (x0, x1, y0, y1, u) = if t2 < 5 {
+                let l = layers[t2];
+                (l.0, l.1, l.2, l.3, l.4)
+            } else {
+                // surplus node text-strip: full-width low band, split by index
+                let k = (t2 - 5) as f32;
+                let ys = 0.10 - (k + 1.0) * 0.09;
+                (-0.40, 0.40, ys - 0.04, ys + 0.04, 0.1)
+            };
+            let mut push = |x: f32, y: f32, uu: f32, v: &mut Vec<f32>| {
+                v.extend_from_slice(&[x, y, 1.0, 1.0, 1.0, 1.0, uu, 0.5]);
+            };
+            // NOTE: u is the texture column center (texel index/layer count), each
+            // quad maps a thin slice [u-1/(2nq), u+1/(2nq)]; NEAREST picks the solid
+            // texel. Use the SLICE edges so a layer never bleeds into the neighbor.
+            let half = 0.5 / nq as f32;
+            let (ua, ub) = (u - half, u + half);
+            push(x0, y0, ua, &mut verts);
+            push(x1, y0, ub, &mut verts);
+            push(x1, y1, ub, &mut verts);
+            push(x0, y0, ua, &mut verts);
+            push(x1, y1, ub, &mut verts);
+            push(x0, y1, ua, &mut verts);
+        }
+        let total_verts = verts.len() / 8;
+        let nbytes = verts.len() * 4;
+        let mut vbo = 0u32;
+        gb(1, &mut vbo);
+        bb(0x8892, vbo);
+        bd(0x8892, nbytes as isize, verts.as_ptr() as *const i8, 0x88E4);
+        // Texture: nq-texel RGBA strip (one solid straight-alpha per layer).
+        let (Some(gt), Some(at), Some(bt), Some(tp_), Some(te)) = (
+            mesa_fn::<extern "C" fn(i32, *mut u32)>(h, b"glGenTextures\0"),
+            mesa_fn::<extern "C" fn(u32)>(h, b"glActiveTexture\0"),
+            mesa_fn::<extern "C" fn(u32, u32)>(h, b"glBindTexture\0"),
+            mesa_fn::<extern "C" fn(u32, u32, i32, i32)>(h, b"glTexParameteri\0"),
+            mesa_fn::<extern "C" fn(u32, i32, i32, i32, i32, i32, u32, u32, *const i8)>(h, b"glTexImage2D\0"),
+        ) else {
+            return 0;
+        };
+        let mut texid = 0u32;
+        gt(1, &mut texid);
+        at(0x84C0);
+        bt(0x0DE1, texid);
+        tp_(0x0DE1, 0x2800, 0x2600, 0);
+        tp_(0x0DE1, 0x2801, 0x2600, 0);
+        let w = (nq * 8).max(8);
+        let mut px: Vec<u8> = Vec::with_capacity(w * 4);
+        for t2 in 0..nq {
+            let cc = if t2 < 5 { layers[t2].6 } else { [0.45, 0.48, 0.55, 0.85] };
+            let rg = [(cc[0]*255.0) as u8, (cc[1]*255.0) as u8, (cc[2]*255.0) as u8, (cc[3]*255.0) as u8];
+            for _ in 0..8 { px.extend_from_slice(&rg); }
+        }
+        while px.len() < w * 4 { px.extend_from_slice(&[0,0,0,255]); }
+        te(0x0DE1, 0, 0x1908, w as i32, 1, 0, 0x1908, 0x1401, px.as_ptr() as *const i8);
+        if uloc >= 0 {
+            if let Some(ui) = mesa_fn::<extern "C" fn(i32, i32)>(h, b"glUniform1i\0") { ui(uloc, 0); }
+        }
+        eprintln!("[elfjit:renderemitter-home] LAYOUT=home layers={nq} blend=enabled(SRC_ALPHA,ONE_MINUS_SRC_ALPHA) tex {w}x1 RGBA uploaded (glTexImage2D 0x1908) uTex loc={uloc} prog={tprog:#x}");
+        // Geometry context G (stride 32, spec[3]: pos/color/aTex) — same layout as
+        // render_engine_emitter_grid textured branch.
+        let gbuf = Box::leak(vec![0u64; 0x400].into_boxed_slice());
+        let raw = gbuf.as_ptr() as u64;
+        let g = (raw + 7) & !7;
+        let bd0 = (g + 0x100) & !7;
+        let m = (g + 0x180) & !7;
+        let spec = (g + 0x280) & !7;
+        let stride_tab = (g + 0x300) & !7;
+        let stride: u64 = 32;
+        *(spec.wrapping_add(0) as *mut u32) = 0;
+        *(spec.wrapping_add(4) as *mut u32) = 0;
+        *(spec.wrapping_add(8) as *mut u32) = 1;
+        *(spec.wrapping_add(12) as *mut u32) = 0;
+        *(spec.wrapping_add(16) as *mut u32) = 0;
+        *(spec.wrapping_add(24) as *mut u32) = 1;
+        *(spec.wrapping_add(28) as *mut u32) = 8;
+        *(spec.wrapping_add(32) as *mut u32) = 3;
+        *(spec.wrapping_add(36) as *mut u32) = 1;
+        *(spec.wrapping_add(40) as *mut u32) = 0;
+        *(spec.wrapping_add(48) as *mut u32) = 2; // aTex attr 2
+        *(spec.wrapping_add(52) as *mut u32) = 24;
+        *(spec.wrapping_add(56) as *mut u32) = 1;
+        *(spec.wrapping_add(60) as *mut u32) = 2;
+        *(spec.wrapping_add(64) as *mut u32) = 0;
+        *(bd0.wrapping_add(0x48) as *mut u32) = vbo;
+        *(g.wrapping_add(0x48) as *mut u64) = bd0;
+        *(g.wrapping_add(0x58) as *mut u64) = bd0;
+        *(g.wrapping_add(0x68) as *mut u64) = bd0;
+        *(g.wrapping_add(0x38) as *mut u64) = m;
+        *(m.wrapping_add(0x48) as *mut u64) = spec;
+        *(m.wrapping_add(0x50) as *mut u64) = spec + 72;
+        *(m.wrapping_add(0x60) as *mut u64) = stride_tab;
+        *(stride_tab.wrapping_add(0) as *mut u64) = stride;
+        *(stride_tab.wrapping_add(8) as *mut u64) = stride;
+        *(stride_tab.wrapping_add(16) as *mut u64) = stride;
+        *(g.wrapping_add(0x78) as *mut u64) = 0;
+        *(g.wrapping_add(0x8e) as *mut u16) = 0;
+        eprintln!("[elfjit:renderemitter-home] built engine geometry ctx G={g:#x} M={m:#x} VBO={vbo} quads={nq} total_verts={total_verts} GL_TRIANGLES stride=32 spec[3] aPos=0 aColor=1 aTex=2");
+        // Normalize fixed-function state + wire GL_DRAW_BUFFER to GL_BACK; for the
+        // home layout ENABLE GL_BLEND instead of disabling, and set the alpha
+        // blend func so the emitter's painter-order draws COMPOSITE like real UI.
+        if let (Some(vp), Some(ds), Some(en), Some(bfs)) = (
+            mesa_fn::<extern "C" fn(i32,i32,i32,i32)>(h, b"glViewport\0"),
+            mesa_fn::<extern "C" fn(u32)>(h, b"glDisable\0"),
+            mesa_fn::<extern "C" fn(u32)>(h, b"glEnable\0"),
+            mesa_fn::<extern "C" fn(u32,u32,u32,u32)>(h, b"glBlendFuncSeparate\0"),
+        ) {
+            vp(0, 0, 1280, 720);
+            ds(0x0B71); ds(0x0B44); ds(0x0C11);
+            en(0x0BE2); // GL_BLEND
+            bfs(0x0302, 0x0303, 0x0302, 0x0303); // S_ALPHA, ONE_MINUS_SRC_ALPHA
+        }
+        if let Some(bf) = mesa_fn::<extern "C" fn(u32, u32)>(h, b"glBindFramebuffer\0") { bf(0x8D40, 0); }
+        if let Some(dbs) = mesa_fn::<extern "C" fn(i32, *const u32)>(h, b"glDrawBuffers\0") { let back = 0x0405u32; dbs(1, &back); }
+        if let Some(rbuf) = mesa_fn::<extern "C" fn(u32)>(h, b"glReadBuffer\0") { rbuf(0x0405); }
+        // Drive the engine's real emitter ONCE: GL_TRIANGLES, count=6*nq.
+        let stkbuf = Box::leak(vec![0u8; 0x8000].into_boxed_slice());
+        let stk_top = (stkbuf.as_ptr() as u64).wrapping_add(0x8000) & !15;
+        let mut st = arm64jit::jit::CpuState::new();
+        st.tpidr = arm64jit::jit::current_guest_tp();
+        st.x[31] = stk_top;
+        st.x[0] = g;
+        st.x[1] = 0; st.x[2] = 0; st.x[3] = 0;
+        st.x[4] = (6 * nq) as u64;
+        st.x[5] = 0;
+        let ret = arm64jit::jit::jit_run(iimg, ibase, 0x105b35288, &mut st as *mut CpuState);
+        let r = match ret {
+            Err(e) => { eprintln!("[elfjit:renderemitter-home] engine emitter stopped: {e}"); return 0; }
+            Ok(r) => r,
+        };
+        if let Some(da) = mesa_fn::<extern "C" fn(u32)>(h, b"glDisableVertexAttribArray\0") { da(2); }
+        if let Some(fin) = mesa_fn::<extern "C" fn()>(h, b"glFinish\0") { fin(); }
+        let vt = unsafe { *(ctx as *const u64) };
+        let bind = unsafe { *(vt.wrapping_add(16) as *const u64) };
+        let swap = unsafe { *(vt.wrapping_add(24) as *const u64) };
+        let tp = arm64jit::jit::current_guest_tp();
+        let _ = arm64jit::jit::run_guest_callback(bind, [ctx, 0, 0, 0, 0, 0, 0, 0], tp);
+        let sw = arm64jit::jit::run_guest_callback(swap, [ctx, 0, 0, 0, 0, 0, 0, 0], tp);
+        let readback: Option<extern "C" fn(i32,i32,i32,i32,u32,u32,*mut i8)> = mesa_fn(h, b"glReadPixels\0");
+        eprintln!("[elfjit:renderemitter-home] engine emitter Ok(ret={r:#x}) draw_mode=0x4(first=0,count={}) layers={nq} swap={sw:?}", 6 * nq);
+        if let Some(rp) = readback {
+            // Verifiable readbacks: backdrop-only corner, the BLEND panel center
+            // (must equal src*a+dst*(1-a), proving alpha compositing), button,
+            // title. Panel rgba = (45,48,59) for (26,26,31) backdrop (dst) and
+            // (61,66,82) panel (src) at a=0.55: r=61*.55+26*.45=45.2, g=66*.55+26*.45=48, b=82*.55+31*.45=59.1.
+            let probes: [(i32, i32, [u8;4], &str); 4] = [
+                (51, 691, [26,26,31,255], "backdrop"),
+                (640, 360, [45,48,59,255], "panel-blend"),
+                (640, 281, [41,152,109,255], "button"),
+                (640, 472, [193,189,175,255], "title-bar"),
+            ];
+            for (fx, fy, exp8, name) in probes {
+                let mut px: [u8;4] = [0;4];
+                rp(fx, fy, 1, 1, 0x1908, 0x1401, px.as_mut_ptr() as *mut i8);
+                let diff = [
+                    (px[0] as i32 - exp8[0] as i32).abs(),
+                    (px[1] as i32 - exp8[1] as i32).abs(),
+                    (px[2] as i32 - exp8[2] as i32).abs(),
+                    (px[3] as i32 - exp8[3] as i32).abs(),
+                ];
+                let present = diff.iter().all(|d| *d <= 1);
+                eprintln!("[elfjit:renderemitter-home] {name} ({fx},{fy}) rgba({},{},{},{}) expect {:?} diff={diff:?} present={present}", px[0], px[1], px[2], px[3], exp8);
+            }
+        }
+        r
+    }
+}
+
 /// Present ONE real task-driven frame on the CURRENT thread (must be the
 /// renderinit thread where EGL current-binding is established — SH61b). Binds
 /// via the engine make-current 0x105b3b358, drives frame-fn 0x105b32c00, swaps
@@ -3963,7 +4195,15 @@ fn main() {
                             // TEXTURED quads (stride 32), the populated UI-layer-
                             // style commitment. Default: solid-color grid (SH67d).
                             let tex = std::env::var_os("RENDEREMITTER_TEX").is_some();
-                            if nq > 0 {
+                            // RENDEREMITTER_LAYOUT=home (SH68): the engine's real
+                            // emitter draws a LAYERED login/home-style frame (5
+                            // textured quads: backdrop/panel/button/title/field)
+                            // with GL_BLEND alpha compositing, sized from the real
+                            // scene list (R+0x180/0x188). Overrides the grid.
+                            let layout = std::env::var("RENDEREMITTER_LAYOUT").unwrap_or_default();
+                            if layout == "home" {
+                                let _ = render_engine_emitter_home(real_ctx, iimg, ibase, isp, 5);
+                            } else if nq > 0 {
                                 let _ = render_engine_emitter_grid(real_ctx, iimg, ibase, isp, nq, tex);
                             } else {
                                 let _ = render_engine_emitter_quad(real_ctx, iimg, ibase, isp);
