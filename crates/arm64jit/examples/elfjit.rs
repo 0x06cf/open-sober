@@ -1259,6 +1259,204 @@ pub fn render_engine_emitter_quad(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) -
     }
 }
 
+
+/// SH67d — a POPULATED N-quad 2D frame drawn by the ENGINE's OWN geometry
+/// emitter 0x105b35288 in a SINGLE top-level jit_run. One pre-uploaded VBO holds
+/// all N*6 verts as GL_TRIANGLES (6 verts/quad), so `glDrawArrays(mode=0x4
+/// GL_TRIANGLES, first=0, count=6N)` draws every tile in ONE call — the SH67c
+/// multi-tile blocker (ANY per-drive glBufferData/glBindBuffer on a buffer the
+/// engine's VAO-less GLES2 attrib-pointers already wired orphans the storage ->
+/// silent drop / SIGABRT, exit 134) is closed BY CONSTRUCTION: no per-tile
+/// re-drive, no inter-drive buffer change, GL_TRIANGLES keeps quads isolated (no
+/// TRIANGLE_STRIP cross-tile fusion). `nq` = quad count; each tile uses a
+/// distinct palette color + grid placement so readback can assert per-tile.
+/// Same desync-safe shape as render_engine_emitter_quad: the emitter is its OWN
+/// top-level jit_run, never nested inside the present-walker block; runs on the
+/// currency-owning renderinit thread. Returns the emitter's ret (0 = clean draw).
+pub fn render_engine_emitter_grid(ctx: u64, iimg: &[u8], ibase: u64, isp: u64, nq: usize) -> u64 {
+    if !(ctx >= 0x100000000 && ctx >> 56 == 0) {
+        return 0;
+    }
+    if nq == 0 {
+        return 0;
+    }
+    let h = unsafe { libc::dlopen(c"libGLESv2.so.2".as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+    if h.is_null() {
+        eprintln!("[elfjit:renderemitter-grid] WARN: dlopen libGLESv2.so.2 failed");
+        return 0;
+    }
+    let mp = walker_mesh_program();
+    if mp.program == 0 {
+        eprintln!("[elfjit:renderemitter-grid] WARN: mesh program unavailable");
+        return 0;
+    }
+    unsafe {
+        // (1) ONE real VBO uploaded ONCE with all N*6 verts (pos vec2 + color
+        // vec4, stride 24). Never re-touched after this -> no orphan class.
+        let genbuf: Option<extern "C" fn(i32, *mut u32)> = mesa_fn(h, b"glGenBuffers\0");
+        let bindbuf: Option<extern "C" fn(u32, u32)> = mesa_fn(h, b"glBindBuffer\0");
+        let bufdata: Option<extern "C" fn(u32, isize, *const i8, u32)> = mesa_fn(h, b"glBufferData\0");
+        let useprogram: Option<extern "C" fn(u32)> = mesa_fn(h, b"glUseProgram\0");
+        let (Some(gb), Some(bb), Some(bd), Some(up)) = (genbuf, bindbuf, bufdata, useprogram) else {
+            eprintln!("[elfjit:renderemitter-grid] WARN: required Mesa symbols missing");
+            return 0;
+        };
+        up(mp.program);
+        // Grid placement: nq tiles over `cols` columns (~1.9 wide NDC viewport).
+        let cols = 3usize.max(1);
+        let rows = (nq + cols - 1) / cols;
+        let cell_w = 1.9 / cols as f32;
+        let cell_h = 1.8 / rows as f32;
+        let mut verts: Vec<f32> = Vec::with_capacity(nq * 24);
+        for t in 0..nq {
+            let cc = TASK_FRAME_PALETTE[t % TASK_FRAME_PALETTE.len()];
+            let col = (t % cols) as f32;
+            let row = (t / cols) as f32;
+            let x0 = -0.95 + col * cell_w + 0.02 * cell_w;
+            let x1 = -0.95 + (col + 1.0) * cell_w - 0.02 * cell_w;
+            let y1 = 1.0 - (row + 0.02) * cell_h; // top
+            let y0 = 1.0 - (row + 1.0 - 0.02) * cell_h; // bottom
+            // GL_TRIANGLES: two tris per quad (v0,v1,v2,v0,v2,v3), 6 verts.
+            // Each vert = x,y, r,g,b,a (6 floats, stride 24).
+            let mut push = |x: f32, y: f32, v: &mut Vec<f32>| {
+                v.extend_from_slice(&[x, y, cc[0], cc[1], cc[2], cc[3]]);
+            };
+            push(x0, y0, &mut verts);
+            push(x1, y0, &mut verts);
+            push(x1, y1, &mut verts);
+            push(x0, y0, &mut verts);
+            push(x1, y1, &mut verts);
+            push(x0, y1, &mut verts);
+        }
+        let total_verts = verts.len() / 6;
+        let nbytes = verts.len() * 4;
+        let mut vbo = 0u32;
+        gb(1, &mut vbo);
+        bb(0x8892, vbo);
+        bd(0x8892, nbytes as isize, verts.as_ptr() as *const i8, 0x88E4);
+        // (2) Build the engine geometry context G (same layout as
+        // render_engine_emitter_quad — one shared VBO for both attrs).
+        let gbuf = Box::leak(vec![0u64; 0x400].into_boxed_slice());
+        let raw = gbuf.as_ptr() as u64;
+        let g = (raw + 7) & !7;
+        let bd0 = (g + 0x100) & !7;
+        let m = (g + 0x180) & !7;
+        let spec = (g + 0x280) & !7;
+        let stride_tab = (g + 0x300) & !7;
+        eprintln!("[elfjit:renderemitter-grid] g={g:#x} bd0={bd0:#x} m={m:#x} spec={spec:#x} stride_tab={stride_tab:#x}");
+        *(spec.wrapping_add(0) as *mut u32) = 0; // attr 0 pos
+        *(spec.wrapping_add(4) as *mut u32) = 0;
+        *(spec.wrapping_add(8) as *mut u32) = 1; // vform[1]={2,FLOAT}
+        *(spec.wrapping_add(12) as *mut u32) = 0; // loc 0
+        *(spec.wrapping_add(16) as *mut u32) = 0;
+        *(spec.wrapping_add(24) as *mut u32) = 1; // attr 1 color
+        *(spec.wrapping_add(28) as *mut u32) = 8;
+        *(spec.wrapping_add(32) as *mut u32) = 3; // vform[3]={4,FLOAT}
+        *(spec.wrapping_add(36) as *mut u32) = 1; // loc 1
+        *(spec.wrapping_add(40) as *mut u32) = 0;
+        *(bd0.wrapping_add(0x48) as *mut u32) = vbo;
+        *(g.wrapping_add(0x48) as *mut u64) = bd0;
+        *(g.wrapping_add(0x58) as *mut u64) = bd0;
+        *(g.wrapping_add(0x38) as *mut u64) = m;
+        *(m.wrapping_add(0x48) as *mut u64) = spec;
+        *(m.wrapping_add(0x50) as *mut u64) = spec + 48;
+        *(m.wrapping_add(0x60) as *mut u64) = stride_tab;
+        *(stride_tab.wrapping_add(0) as *mut u64) = 24;
+        *(stride_tab.wrapping_add(8) as *mut u64) = 24;
+        *(g.wrapping_add(0x78) as *mut u64) = 0; // non-indexed
+        *(g.wrapping_add(0x8e) as *mut u16) = 0;
+        eprintln!("[elfjit:renderemitter-grid] built engine geometry ctx G={g:#x} M={m:#x} VBO={vbo} quads={nq} total_verts={total_verts} GL_TRIANGLES stride=24");
+        // (3) Normalize fixed-function state + wire GL_DRAW_BUFFER to GL_BACK
+        // (SH66b/SH67 pre-draw fixes): default FBO, full viewport, depth/cull/
+        // blend/scissor off, glDrawBuffers(1,{GL_BACK}) so the single emit lands
+        // on the presented back buffer.
+        if let (Some(vp), Some(ds)) = (mesa_fn::<extern "C" fn(i32,i32,i32,i32)>(h, b"glViewport\0"), mesa_fn::<extern "C" fn(u32)>(h, b"glDisable\0")) {
+            vp(0, 0, 1280, 720);
+            ds(0x0B71); ds(0x0B44); ds(0x0BE2); ds(0x0C11);
+        }
+        if let Some(bf) = mesa_fn::<extern "C" fn(u32, u32)>(h, b"glBindFramebuffer\0") {
+            bf(0x8D40, 0);
+        }
+        if let Some(dbs) = mesa_fn::<extern "C" fn(i32, *const u32)>(h, b"glDrawBuffers\0") {
+            let back = 0x0405u32;
+            dbs(1, &back);
+        }
+        if let Some(rbuf) = mesa_fn::<extern "C" fn(u32)>(h, b"glReadBuffer\0") {
+            rbuf(0x0405);
+        }
+        // (4) Drive the ENGINE's real emitter ONCE: mode 0 = GL_TRIANGLES
+        // (draw_mode table 0x225780[0]=0x4), first=0, count=6N. One call -> the
+        // whole populated frame. Own guest stack so the emitter's prologue stp
+        // doesn't write below the caller stack (same as render_engine_emitter_quad).
+        let stkbuf = Box::leak(vec![0u8; 0x8000].into_boxed_slice());
+        let stk_top = (stkbuf.as_ptr() as u64).wrapping_add(0x8000) & !15;
+        let mut st = arm64jit::jit::CpuState::new();
+        st.tpidr = arm64jit::jit::current_guest_tp();
+        st.x[31] = stk_top;
+        st.x[0] = g;
+        st.x[1] = 0; // w1 mode_idx -> GL_TRIANGLES
+        st.x[2] = 0; // w2 first
+        st.x[3] = 0; // w3 geom_key
+        st.x[4] = (6 * nq) as u64; // w4 count (6 verts/quad)
+        st.x[5] = 0; // w5 indexed_flag = non-indexed
+        let ret = arm64jit::jit::jit_run(iimg, ibase, 0x105b35288, &mut st as *mut CpuState);
+        let r = match ret {
+            Err(e) => {
+                eprintln!("[elfjit:renderemitter-grid] engine emitter stopped: {e}");
+                return 0;
+            }
+            Ok(r) => r,
+        };
+        let readback: Option<extern "C" fn(i32, i32, i32, i32, u32, u32, *mut i8)> =
+            mesa_fn(h, b"glReadPixels\0");
+        // glFinish so the draw is submitted, then present (engine bind + swap via
+        // ctx-vt[+24]) so the emitted grid moves to the front buffer.
+        if let Some(fn_) = mesa_fn::<extern "C" fn()>(h, b"glFinish\0") {
+            fn_();
+        }
+        let vt = unsafe { *(ctx as *const u64) };
+        let bind = unsafe { *(vt.wrapping_add(16) as *const u64) };
+        let swap = unsafe { *(vt.wrapping_add(24) as *const u64) };
+        let tp = arm64jit::jit::current_guest_tp();
+        let _ = arm64jit::jit::run_guest_callback(bind, [ctx, 0, 0, 0, 0, 0, 0, 0], tp);
+        let sw = arm64jit::jit::run_guest_callback(swap, [ctx, 0, 0, 0, 0, 0, 0, 0], tp);
+        // Read back each tile's center to assert a DISTINCT per-tile color
+        // (proving all N quads rasterized, not just tile 0), plus overall center.
+        if let Some(rp) = readback {
+            eprintln!("[elfjit:renderemitter-grid] engine emitter Ok(ret={r:#x}) draw_mode=0x4(first=0,count={}) quads={nq} swap={sw:?}", 6 * nq);
+            for t in 0..nq {
+                let col = (t % cols) as f32;
+                let row = (t / cols) as f32;
+                let cx = -0.95 + (col + 0.5) * cell_w;
+                let cy = 1.0 - (row + 0.5) * cell_h;
+                let fx = ((cx + 1.0) / 2.0 * 1280.0) as i32;
+                let fy = ((cy + 1.0) / 2.0 * 720.0) as i32;
+                let mut px: [u8; 4] = [0; 4];
+                rp(fx, fy, 1, 1, 0x1908, 0x1401, px.as_mut_ptr() as *mut i8);
+                let want = TASK_FRAME_PALETTE[t % TASK_FRAME_PALETTE.len()];
+                let exp = [
+                    (want[0] * 255.0) as u8, (want[1] * 255.0) as u8,
+                    (want[2] * 255.0) as u8, (want[3] * 255.0) as u8,
+                ];
+                // Tile present iff each channel within +-1 (float->u8 rounding;
+                // palette 0.10*255=25.5 may truncate 25 / Mesa round 26). A real
+                // raster gap would read the dark backdrop (13,13,20), a >=50 delta
+                // on every channel.
+                let diff = [
+                    (px[0] as i32 - exp[0] as i32).abs(),
+                    (px[1] as i32 - exp[1] as i32).abs(),
+                    (px[2] as i32 - exp[2] as i32).abs(),
+                    (px[3] as i32 - exp[3] as i32).abs(),
+                ];
+                let present = diff.iter().all(|d| *d <= 1);
+                eprintln!("[elfjit:renderemitter-grid] tile#{t} center({fx},{fy}) rgba({},{},{},{}) expect {:?} diff={diff:?} present={present}", px[0], px[1], px[2], px[3], exp);
+            }
+        } else {
+            eprintln!("[elfjit:renderemitter-grid] engine emitter Ok(ret={r:#x}) draw_mode=0x4(first=0,count={}) quads={nq} swap={sw:?}", 6 * nq);
+        }
+        r
+    }
+}
 /// Present ONE real task-driven frame on the CURRENT thread (must be the
 /// renderinit thread where EGL current-binding is established — SH61b). Binds
 /// via the engine make-current 0x105b3b358, drives frame-fn 0x105b32c00, swaps
@@ -3609,7 +3807,20 @@ fn main() {
                             // The emitter draws onto the same live ctx; drive it
                             // AFTER this frame's walker so its swap shows the
                             // engine-emitted quad (the walker's swap precedes).
-                            let _ = render_engine_emitter_quad(real_ctx, iimg, ibase, isp);
+                            // RENDEREMITTER_QUADS=N (SH67d): draw a POPULATED
+                            // N-quad 2D frame in ONE engine-emitter jit_run
+                            // (single pre-uploaded VBO, GL_TRIANGLES) — closes
+                            // the SH67c per-drive glBufferData orphan blocker
+                            // by construction and proves a populated
+                            // multi-element engine-emitted frame headlessly.
+                            // Default (unset) keeps the SH67b single quad.
+                            let nq: usize = std::env::var("RENDEREMITTER_QUADS")
+                                .ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+                            if nq > 0 {
+                                let _ = render_engine_emitter_grid(real_ctx, iimg, ibase, isp, nq);
+                            } else {
+                                let _ = render_engine_emitter_quad(real_ctx, iimg, ibase, isp);
+                            }
                         }
                         if ret == 1 {
                             presented += 1;
