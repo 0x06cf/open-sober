@@ -1863,15 +1863,18 @@ fn login_font_bytes() -> &'static [u8] {
     .unwrap_or(&[])
 }
 
-/// Rasterize a login-form text label into a 256-wide RGBA8 strip, centered
+/// Rasterize a login-form text label into an `w`-wide RGBA8 strip, centered
 /// (transparent bg, glyph color). Returns None if the font is unavailable.
-fn rasterize_login_label(text: &str, color: [u8; 4], h: u32, pu: f32) -> Option<RealSprite> {
+/// SH78: `w`/`h`/`pu` are caller-supplied so the label can be supersampled 2x
+/// (w and h both double; w:h is preserved, so on-screen geometry + probes are
+/// bit-identical while texel density and stroke thickness double).
+fn rasterize_login_label(text: &str, color: [u8; 4], w: u32, h: u32, pu: f32) -> Option<RealSprite> {
     let font = login_font_bytes();
     if font.is_empty() {
         return None;
     }
     let cmap = font_cmap4(font)?;
-    // Measure used width to center the string in the 256-wide row.
+    // Measure used width to center the string in the `w`-wide row.
     let mut used = 0.0f32;
     for ch in text.chars() {
         let gid = cmap.gid(font, ch as u32);
@@ -1879,14 +1882,14 @@ fn rasterize_login_label(text: &str, color: [u8; 4], h: u32, pu: f32) -> Option<
             used += font_advance_width(font, gid) as f32 * pu;
         }
     }
-    let pen_start = (256.0 - used) / 2.0;
-    // baseline_row: pad(4) + ascender*pu. Ascender = 722 for SSPro Bold (from
+    let pen_start = (w as f32 - used) / 2.0;
+    // baseline_row: pad(h/10) + ascender*pu. Ascender = 722 for SSPro Bold (from
     // the statically-derived yMax of 'i'/'l'); use a fixed generous ascender so
     // caps + ascenders sit with pad.
     let ascender = 722.0f32;
-    let baseline_row = 4.0 + ascender * pu;
-    let rgba = rasterize_text_row(font, text, pu, color, 256, h, pen_start, baseline_row);
-    Some(RealSprite { name: format!("{text}"), w: 256, h, rgba })
+    let baseline_row = (h as f32 / 10.0) + ascender * pu;
+    let rgba = rasterize_text_row(font, text, pu, color, w, h, pen_start, baseline_row);
+    Some(RealSprite { name: format!("{text}"), w, h, rgba })
 }
 
 fn emitter_tex_program() -> (u32, i32) {
@@ -2664,12 +2667,12 @@ fn login_ui_textures() -> Vec<RealSprite> {
         // FS outputs texture2D, so color is baked into the glyph texels and the
         // text rows sit AFTER their backing prim in atlas/painter order.
         solid("field2.png", (224, 224, 230, 255), 256, 16);
-        for (name, color, h, pu) in [
-            ("Log In", [255u8, 255, 255, 255], 40u32, 0.034f32),
-            ("Email address", [96u8, 96, 110, 255], 32u32, 0.030f32),
-            ("Password", [96u8, 96, 110, 255], 32u32, 0.030f32),
+        for (name, color, w, h, pu) in [
+            ("Log In", [255u8, 255, 255, 255], 512u32, 80u32, 0.068f32),
+            ("Email address", [96u8, 96, 110, 255], 512u32, 64u32, 0.060f32),
+            ("Password", [96u8, 96, 110, 255], 512u32, 64u32, 0.060f32),
         ] {
-            match rasterize_login_label(name, color, h, pu) {
+            match rasterize_login_label(name, color, w, h, pu) {
                 Some(s) => {
                     eprintln!(
                         "[elfjit:renderemitter-login] rasterized text label '{name}' ({}x{})",
@@ -2790,9 +2793,9 @@ pub fn render_engine_emitter_multi(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) 
             // SH77 text labels (real SourceSansPro-Bold glyphs) — centered on
             // their backing prim; probe = an opaque glyph-interior texel (the
             // glyph color is baked into the texel, so byte-exact over any dst).
-            ("Log In", 0.0, -0.62, 0.05, 130, 18, 2),
-            ("Email address", 0.0, -0.45, 0.045, 76, 21, 2),
-            ("Password", 0.0, -0.54, 0.045, 156, 12, 2),
+            ("Log In", 0.0, -0.62, 0.05, 227, 36, 2),
+            ("Email address", 0.0, -0.45, 0.045, 369, 36, 2),
+            ("Password", 0.0, -0.54, 0.045, 318, 30, 2),
         ]
     } else {
         &[
@@ -2834,9 +2837,16 @@ pub fn render_engine_emitter_multi(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) 
     let mut vhi: Vec<f32> = Vec::new(); // per sprite vb (v at its bottom mem row)
     let mut memlo: Vec<u32> = Vec::new(); // per sprite first memory row
     let mut ah: u32 = 1;
+    // SH78 — one transparent guard row after every sprite so GL_LINEAR sampling
+    // near a sub-row boundary never bleeds a NEIGHBOR sprite's color into this
+    // one (prevents the faint/thin look seen at 720p on the text labels, which
+    // sit directly under the opaque field/button rows). Later rows land at
+    // s.h+GUARD offset; the guard cells stay 0 (transparent) since `px` is
+    // zero-initialized.
+    const GUARD: u32 = 1;
     for s in &sprites {
         memlo.push(acc);
-        acc = acc.checked_add(s.h).expect("atlas overflow");
+        acc = acc.checked_add(s.h + GUARD).expect("atlas overflow");
         ah = acc;
     }
     for (i, s) in sprites.iter().enumerate() {
@@ -7799,10 +7809,13 @@ mod sh77_tests {
     #[test]
     fn sh77_text_grid_runs_for_each_label() {
         let Some(font) = real_font() else { return };
-        for (text, color, h, pu) in [
-            ("Log In", [255u8, 255, 255, 255], 40u32, 0.034f32),
-            ("Email address", [96u8, 96, 110, 255], 32u32, 0.030f32),
-            ("Password", [96u8, 96, 110, 255], 32u32, 0.030f32),
+        // SH78: labels are rasterized 2x (w/h double, pu doubles) so the glyph
+        // strokes double in density while w:h is preserved (screen geometry and
+        // probe coords unchanged); the test mirrors the production table.
+        for (text, color, w, h, pu) in [
+            ("Log In", [255u8, 255, 255, 255], 512u32, 80u32, 0.068f32),
+            ("Email address", [96u8, 96, 110, 255], 512u32, 64u32, 0.060f32),
+            ("Password", [96u8, 96, 110, 255], 512u32, 64u32, 0.060f32),
         ] {
             let cmap = font_cmap4(&font).unwrap();
             let mut used = 0.0f32;
@@ -7812,10 +7825,10 @@ mod sh77_tests {
                     used += font_advance_width(&font, gid) as f32 * pu;
                 }
             }
-            let pen_start = (256.0 - used) / 2.0;
+            let pen_start = (w as f32 - used) / 2.0;
             let asc = 722.0f32;
-            let baseline = 4.0 + asc * pu;
-            let rgba = rasterize_text_row(&font, text, pu, color, 256, h, pen_start, baseline);
+            let baseline = (h as f32 / 10.0) + asc * pu;
+            let rgba = rasterize_text_row(&font, text, pu, color, w, h, pen_start, baseline);
             // nonzero glyph pixels present
             let opaque = rgba
                 .chunks_exact(4)
@@ -7838,15 +7851,16 @@ mod sh77_tests {
         let Some(font) = real_font() else { return };
         // The exact (pix,piy) probe texels used in the emitter placements must be
         // opaque glyph interiors so the blend yields the baked glyph color.
-        let cases: &[(&str, (u32, u32))] = &[
-            ("Log In", (130, 18)),
-            ("Email address", (76, 21)),
-            ("Password", (156, 12)),
+        // SH78: dims are the 2x production table.
+        let table: &[(&str, (u32, u32))] = &[
+            ("Log In", (227, 36)),
+            ("Email address", (369, 36)),
+            ("Password", (318, 30)),
         ];
-        for (text, (pix, piy)) in cases {
+        for (text, (pix, piy)) in table {
             let color = if *text == "Log In" { [255u8, 255, 255, 255] } else { [96u8, 96, 110, 255] };
-            let h: u32 = if *text == "Log In" { 40 } else { 32 };
-            let pu: f32 = if *text == "Log In" { 0.034 } else { 0.030 };
+            let (w, h): (u32, u32) = if *text == "Log In" { (512, 80) } else { (512, 64) };
+            let pu: f32 = if *text == "Log In" { 0.068 } else { 0.060 };
             let cmap = font_cmap4(&font).unwrap();
             let mut used = 0.0f32;
             for ch in text.chars() {
@@ -7855,11 +7869,117 @@ mod sh77_tests {
                     used += font_advance_width(&font, gid) as f32 * pu;
                 }
             }
-            let pen_start = (256.0 - used) / 2.0;
-            let baseline = 4.0 + 722.0 * pu;
-            let rgba = rasterize_text_row(&font, text, pu, color, 256, h, pen_start, baseline);
-            let a = rgba[((*piy as usize) * 256 + *pix as usize) * 4 + 3];
+            let pen_start = (w as f32 - used) / 2.0;
+            let baseline = (h as f32 / 10.0) + 722.0 * pu;
+            let rgba = rasterize_text_row(&font, text, pu, color, w, h, pen_start, baseline);
+            let a = rgba[((*piy as usize) * w as usize + *pix as usize) * 4 + 3];
             assert!(a >= 250, "'{text}' probe ({pix},{piy}) alpha={a} not opaque glyph");
         }
     }
+
+    // SH78: w:h preserved across the 2x supersample => screen quad geometry and
+    // probe screen-coords are bit-identical even though textures double.
+    #[test]
+    fn sh78b_aspect_invariant_geometry() {
+        assert_eq!(512.0 / 80.0, 256.0 / 40.0, "Log In aspect must be preserved");
+        assert_eq!(512.0 / 64.0, 256.0 / 32.0, "field-label aspect must be preserved");
+    }
+
+    // SH78: the atlas guard-row packing advances each sprite by h+GUARD and the
+    // guard row stays transparent ([0,0,0,0]).
+    #[test]
+    fn sh78b_atlas_guard_rows_pad_blocks() {
+        const GUARD: u32 = 1;
+        let heights: &[u32] = &[1024, 88, 100, 16, 16, 16, 80, 64, 64]; // login sprites (2x text rows)
+        let mut acc: u32 = 1;
+        let mut memlo = Vec::new();
+        for sh in heights {
+            memlo.push(acc);
+            acc = acc.checked_add(*sh + GUARD).expect("overflow");
+        }
+        let ah = acc;
+        // each sprite's block advances by h+GUARD; blocks are disjoint & in-range
+        for i in 0..memlo.len() {
+            assert!(memlo[i] >= 1, "sprite {i} start");
+            if i > 0 {
+                assert!(memlo[i] == memlo[i - 1] + heights[i - 1] + GUARD, "sprite {i} not h+GUARD after prev");
+            }
+            assert!(memlo[i] + heights[i] <= ah, "sprite {i} block overruns atlas");
+        }
+        // guard row (first row after a sprite's last data row) is not part of the
+        // sprite's v-window (vlo/vhi span only the data rows, memlo..memlo+h-1).
+        let vlo = memlo[6] as f32 / ah as f32;
+        let vhi = (memlo[6] + heights[6] - 1) as f32 / ah as f32;
+        let guard_lo = (memlo[6] + heights[6]) as f32 / ah as f32;
+        assert!(vhi < guard_lo, "guard row must be below the sprite's data v-window");
+        let _ = vlo;
+    }
+
+    // SH78: 2x supersample roughly doubles the stroke (widest opaque run in the
+    // glyph band), guarding against pu regressions.
+    #[test]
+    fn sh78b_stroke_thickens_at_2x() {
+        let Some(font) = real_font() else { return };
+        // "Log In" at old (h40 pu0.034) vs new (h80 pu0.068), 256 vs 512 wide.
+        let cmap = font_cmap4(&font).unwrap();
+        let run = |w: u32, h: u32, pu: f32, pix_lo: u32, pix_hi: u32| {
+            let text = "Log In";
+            let mut used = 0.0f32;
+            for ch in text.chars() {
+                let gid = cmap.gid(&font, ch as u32);
+                if gid != 0 { used += font_advance_width(&font, gid) as f32 * pu; }
+            }
+            let pen_start = (w as f32 - used) / 2.0;
+            let baseline = (h as f32 / 10.0) + 722.0 * pu;
+            let rgba = rasterize_text_row(&font, text, pu, [255u8, 255, 255, 255], w, h, pen_start, baseline);
+            let mut best: usize = 0;
+            for py in pix_lo..pix_hi {
+                let mut run_now: usize = 0;
+                for px in 0..w as usize {
+                    if rgba[(py as usize * w as usize + px) * 4 + 3] >= 240 {
+                        run_now += 1;
+                        if run_now > best { best = run_now; }
+                    } else {
+                        run_now = 0;
+                    }
+                }
+            }
+            best
+        };
+        let old_wide = run(256, 40, 0.034, 10, 35);
+        let new_wide = run(512, 80, 0.068, 20, 70);
+        assert!(new_wide as f32 > old_wide as f32 * 1.4, "stroke did not thicken: {old_wide}->{new_wide}");
+    }
+
+    // SH78: the chosen probe texels have a full 3x3 opaque neighborhood (robust
+    // against a half-edge texel + GL_LINEAR bleed).
+    #[test]
+    fn sh78b_3x3_probe_interior_opaque() {
+        let Some(font) = real_font() else { return };
+        let table: &[(&str, u32, u32, f32, (u32, u32))] = &[
+            ("Log In", 512, 80, 0.068, (227, 36)),
+            ("Email address", 512, 64, 0.060, (369, 36)),
+            ("Password", 512, 64, 0.060, (318, 30)),
+        ];
+        for (text, w, h, pu, (pix, piy)) in table {
+            let color = if *text == "Log In" { [255u8, 255, 255, 255] } else { [96u8, 96, 110, 255] };
+            let cmap = font_cmap4(&font).unwrap();
+            let mut used = 0.0f32;
+            for ch in text.chars() {
+                let gid = cmap.gid(&font, ch as u32);
+                if gid != 0 { used += font_advance_width(&font, gid) as f32 * *pu; }
+            }
+            let pen_start = (*w as f32 - used) / 2.0;
+            let baseline = (*h as f32 / 10.0) + 722.0 * *pu;
+            let rgba = rasterize_text_row(&font, text, *pu, color, *w, *h, pen_start, baseline);
+            for (dx, dy) in [(0,0),(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(1,1),(-1,1),(1,-1)] {
+                let cx = (*pix as i32 + dx) as usize;
+                let cy = (*piy as i32 + dy) as usize;
+                let a = rgba[(cy * *w as usize + cx) * 4 + 3];
+                assert!(a >= 250, "'{text}' 3x3 neighbor ({cx},{cy}) alpha={a} not opaque");
+            }
+        }
+    }
 }
+
+

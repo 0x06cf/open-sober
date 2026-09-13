@@ -1,14 +1,15 @@
 #!/bin/bash
-# SH77: reproduce the engine's REAL geometry emitter (0x105b35288) drawing the
+# SH77/78: reproduce the engine's REAL geometry emitter (0x105b35288) drawing the
 # Roblox LOGIN form with real TEXT LABELS — "Log In" (white glyphs over the
 # green button), "Email address" / "Password" (dark-slate placeholders over the
 # two input fields) — rasterized from the APK's own SourceSansPro-Bold.ttf by a
-# pure-std TrueType outline rasterizer into a shared vertical atlas, in ONE
+# pure-std TrueType outline rasterizer (SH77) at 2x resolution into a shared
+# vertical atlas with transparent GUARD rows between sprites (SH78), in ONE
 # top-level jit_run with GL_BLEND.
 set -u
 cd "$(dirname "$0")/.."
-LOG=/home/hermes-worker/runs/sh77-emitter-login-text.txt
-PNG=/home/hermes-worker/runs/sh77-emitter-login-text.png
+LOG=/home/hermes-worker/runs/sh78-emitter-login-text-2x.txt
+PNG=/home/hermes-worker/runs/sh78-emitter-login-text-2x.png
 rm -f "$LOG" "$PNG"
 timeout 200 env JIT_DRIVE_LIFECYCLE=1 RENDERINIT_WARMUP_MS=1000 RENDERWALKER_NODES=3 \
   RENDERWALKER_MAX_FRAMES=2 RENDERWALKER_WINDOW_MS=2800 RENDERWALKER_GLDEBUG=1 \
