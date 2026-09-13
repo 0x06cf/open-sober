@@ -2436,21 +2436,44 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
                 //   else [m+0x10] not in {SPAN_HASH,STRING_HASH} -> non-family object -> substitute
                 // (A real family map's +0x10 IS one of those hashes and is never overwritten;
                 // the seeded substitute itself has +0x10==SPAN_HASH so it is never re-substituted.)
+                // SH94: CRITICAL — only substitute x0 unconditionally; substitute x19 ONLY when
+                // x0 is ALSO non-family. In the registrar loop (file 0x29b37e0: `mov x1,x19;
+                // bl 29f3e70; ldr x8,[x19,#16]!; cbnz x8,<loop>`) x19 is the WALK ITERATOR / KEY
+                // (callee-saved, survives the INSERT call), NOT the map. INSERT's prologue
+                // reloads its map from x0 (0x29f3e98 mov x19,x0), so substituting x19 is useless
+                // to the call BUT — because x19 is callee-saved — returns the corrupted value to
+                // the caller whose `[x19+16]` then reads the substitute's +0x10 = SPAN_HASH
+                // (nonzero) FOREVER -> the registrar's `cbnz` never terminates -> 6.6M-iteration
+                // spin. Only clobber x19 when the real crash case applies (x0 is ALSO non-family,
+                // so x0 got the substitute and x19 was observed holding the real span map).
                 const FAMILY_HASHES: [u64; 2] = [0x1029b4a84, 0x102a25dec]; // span + string
                 if pc == 0x1029f3e70 {
                     if let Some(s) = sub {
-                        for reg in [0usize, 19] {
-                            let m = unsafe { (*state).x[reg] };
-                            let non_family = if m == 0 || m < 0x100000000 {
-                                m != 0 // substitute a non-zero non-family candidate (incl .data)
+                        let x0m = unsafe { (*state).x[0] };
+                        let x0_non_family = if x0m == 0 || x0m < 0x100000000 {
+                            x0m != 0
+                        } else {
+                            let h1 = unsafe { *((x0m + 0x10) as *const u64) };
+                            !FAMILY_HASHES.contains(&h1)
+                        };
+                        if x0_non_family {
+                            unsafe { (*state).x[0] = s };
+                            eprintln!(
+                                "[routeb-hashfix] SH92 substituted seeded pb_defaults registry map for non-family map/this 0x{x0m:x} at pc=0x{pc:x} reg=x0"
+                            );
+                            // SH94: only now, when x0 was non-family (the SH92 .data-table crash
+                            // case), also allow x19 repair (it was the sibling real map there).
+                            let x19m = unsafe { (*state).x[19] };
+                            let x19nf = if x19m == 0 || x19m < 0x100000000 {
+                                x19m != 0
                             } else {
-                                let h1 = unsafe { *((m + 0x10) as *const u64) };
+                                let h1 = unsafe { *((x19m + 0x10) as *const u64) };
                                 !FAMILY_HASHES.contains(&h1)
                             };
-                            if non_family {
-                                unsafe { (*state).x[reg] = s };
+                            if x19nf {
+                                unsafe { (*state).x[19] = s };
                                 eprintln!(
-                                    "[routeb-hashfix] SH92 substituted seeded pb_defaults registry map for non-family map/this 0x{m:x} at pc=0x{pc:x} reg=x{reg}"
+                                    "[routeb-hashfix] SH92/94 substituted seeded pb_defaults registry map for non-family x19 0x{x19m:x} at pc=0x{pc:x} (x0 was also non-family)"
                                 );
                             }
                         }
@@ -9272,6 +9295,16 @@ mod fp16_and_fabd_fccmp_exec {
         assert!(non_family(0x1800064));
         // Zero does not (nothing to substitute).
         assert!(!non_family(0));
+        // SH94: the INSERT-entry x19 walk iterator (callee-saved registrar key) must NOT be
+        // clobbered when x0 is a real family map — only x0 is substituted then. Simulate the
+        // hook: x0=family map, x19=registrar iterator (a .data table address / walk cursor).
+        let x0m = fam; // family map (span hash)
+        let x19m = 0x1067da308u64; // registrar iterator (NOT to be clobbered)
+        let x0nf = non_family(x0m);
+        assert!(!x0nf, "family x0 must not be substituted");
+        // The hook substitutes x19 ONLY when x0 is ALSO non-family:
+        let do_clobber_x19 = x0nf; // == false (x0 is family here) -> never clobbers x19
+        assert!(!do_clobber_x19, "x19 must NOT be clobbered when x0 is a real family map");
         eprintln!(
             "[abi] routeb-sh92 pinned: INSERT entry file 0x{} substitutes non-family map/this ({:x?}) via +0x10 family-hash check; family maps untouched; sub-image 0x1800064 substituted",
             INSERT_ENTRY - 0x100000000,
