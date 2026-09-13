@@ -33,6 +33,25 @@ host-register pointer into a guest callee-saved/stack slot. It is NOT a specific
 unshimmed struct call (SH98 class), so per-call struct shims do not fix it; forcing the
 canary check would be UNSAFE (it's active memory corruption, not a false positive).
 
+## Recon refinement (deleg_5e7fec4d)
+Closer analysis corrects the value reading: `x29=0x559097645e20`, stored
+`[x29-16]=0x559097645e50 = x29+0x30` — BOTH in the process 0x55 region, because the
+guest STACK is a host-malloc'd buffer. So the canary slot holds a guest-owned
+self-stack pointer, not a foreign host-execution pointer (a true foreign pointer would
+be 0x7f.../0x7fff...). Verified in code: the host-call bridge (jit.rs ~2227-2237) writes
+only s.x[0] (return) and s.px (pc); guest SP (x31), x1..x18 are untouched by the bridge
+(no live-range syncing from host); memmove/memcmp bind RAW glibc guest-to-guest (no
+foreign bytes); the routeb dispatcher hooks (jit.rs ~2450+) overwrite guest x0/x19 at
+block boundaries. Net: the writer is guest code storing a self-stack pointer into its
+canary slot, downstream of a host-call RETURN value leaking into guest x0 (the SH103
+class — e.g. memmove returns dst; a lengthy out-pointer or a shim returning its guest-buf
+address that guest code then stores onto its frame). The exact guest STR instruction is
+NOT yet named — the JIT_TRACE tail was deleted before the recon ran. Fix direction per
+recon: (a) a bridge sanitize for the string-helper-return class (if a non-pointer
+libc helper's return >= 0x100000000, force 0 — the SH97 safe_cstr_len guard generalized
+to the bridge), OR (b) trace the exact hostcall whose return lands at the canary slot
+first. Blanket-zeroing is WRONG (guest stack pointers are also 0x55).
+
 ## Standing blocker
 The stack-smash persists because the underlying host-pointer-into-guest-state leak
 surfaced at the scheduler/cond frame's canary. Root fix is bridge-level: the JIT
