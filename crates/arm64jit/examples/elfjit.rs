@@ -1146,9 +1146,14 @@ pub fn render_engine_emitter_quad(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) -
         st.x[31] = stk_top;
         st.x[0] = g;
         st.x[1] = 3; // w1 mode_idx -> GL_TRIANGLE_STRIP
-        st.x[2] = 4; // w2 count
+        // SH67-disasm-proven emitter ABI (0x105b35288 decode): the emitter maps
+        // arg2 -> glDrawArrays FIRST and arg4 -> glDrawArrays COUNT (file decode:
+        // w22=w1 mode, w23=w2 first, w20=w4 count). The pre-SH67 drive put
+        // count@x2/first@x4 -> glDrawArrays(first=4, count=0), a legal no-op that
+        // silently drew nothing. Correct: first=0, count=4; verified pixels land.
+        st.x[2] = 0; // w2 first
         st.x[3] = 0; // w3 geom_key
-        st.x[4] = 0; // w4 first
+        st.x[4] = 4; // w4 count
         st.x[5] = 0; // w5 indexed_flag = non-indexed
         let ret = arm64jit::jit::jit_run(iimg, ibase, 0x105b35288, &mut st as *mut CpuState);
         match ret {

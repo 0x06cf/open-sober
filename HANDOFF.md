@@ -1,5 +1,52 @@
 # Open Sober — Agent Handoff
 
+## Session (Sep 13, 2026, hermes-worker, cycle SH67b) — RESOLVED SH66/67: the engine's REAL geometry emitter (0x105b35288) now VISIBLY draws its authored quad — pixel-verified in the presented frame through the engine's own GLES path, presented via the real engine swap. Workspace **509/0** (unchanged). Commit c645a9e (SH67) + pending (SH67b). Doc docs/frontier-sh67b-emitter-draws.md, artifact runs/sh67b-emitter-quad.png + runs/sh66-renderemitter.txt + runs/sh67b-swap.txt.
+
+SH66 proved the emitter's draw path runs headlessly but the authored quad's
+pixels never appeared; SH67 disproved the GL_DRAW_BUFFER==GL_NONE/draw-buffer
+hypothesis. This cycle a read-only research subagent (deleg_b1698660) disasm-
+proved the real cause: a **harness argument-inversion bug**. The emitter's true
+ABI (file 0x5b35288 decode) is `emit(G, modeidx=x1, first=x2, count=x4, ...)` —
+arg2 becomes glDrawArrays FIRST and arg4 becomes COUNT. The SH66 drive put
+`x2=4`("count")/`x4=0`("first") — inverted — so the engine issued
+`glDrawArrays(GL_TRIANGLE_STRIP, first=4, count=0)`, a legal error-free no-op
+(clean return, GL error 0x0, program unchanged, attrib locs 0/1, link 1 — every
+SH67 observation explained). Also verified the @plt GOT slot resolves the real
+`glDrawArrays@Base` Mesa symbol (JUMP_SLOT@0x67d2318) and mode table 0x225780[3]=0x5.
+
+Fix (correct-by-default): `st.x[2]=0`(first), `st.x[4]=4`(count).
+
+**Empirical (real libroblox.so, exit 124, zero crash):** `engine emitter
+Ok(ret=0x0) swap=Ok(1)` — the quad is pixel-verified in BOTH back-buffer-direct
+(RENDEREMITTER_READBACK_BEFORE_SWAP=1) and the presented frame: center
+(640,360)=rgba(64,223,172) teal, a smooth violet->magenta->teal->green->yellow-
+orange gradient across y100..y650 — exactly the authored colored quad's
+interpolated colors — with the dark backdrop and walker's discrete bands gone
+from the sampled line. The walker's 6 real quads + 2 `present walker
+Ok(ret=0x1)` remain in the same run. Captured runs/sh67b-emitter-quad.png.
+
+**Honest scope:** the engine's real geometry emitter now draws engine-detailed
+content (an authored colored quad — the default-Rect primitive a login/home UI
+layer's emitter produces) headlessly, pixel-verified, presented via the real
+engine swap. NOT yet a populated login/home screen: the geometry-context G is a
+fabricated coherent object, and the standing wall is unchanged — the engine
+never self-populates a real render-manager/session (scene-list head/tail
+R+0x180/0x188 has no in-image writer; type-4 producer vector [0x106829ea8] is
+.bss framework-glue-only — re-confirmed this cycle by static scan). This is the
+closest statically-reachable screen precursor.
+
+**Next frontier feed (from the parallel research subagent deleg_b1698660, task-1):**
+(a) route the engine's OWN real geometry emitter as a scene node's render-obj
+vt[+24] consumed by the present-walker's per-node blr (keep it a SEPARATE
+top-level jit_run to avoid the SH64 desync) so the walker presents
+engine-emitted primitives per node; or (b) drive the 3 10-line guest traces the
+subagent derived if the pixel gap re-surfaces on the per-node path (verify
+w2=first/w4=count + mode table + depth-test). A true login/home screen remains
+behind the Lua app-shell (StartLuaAppDM 0x1023efe2c) + session wall:
+nativeGameGlobalInit 0x102206404 runs real init then parks indefinitely
+(SH54/55), and no in-image path constructs a GuiObject and appends to the scene
+list.
+
 ## Session (Sep 13, 2026, hermes-worker, cycle SH66/SH66b) — the engine's REAL geometry emitter (0x105b35288) is now RUNNABLE headlessly via an authored guest geometry-context G, driven as a desync-safe top-level jit_run. Workspace **509/0**. Commits 8531222 + 6f7cb7d. Doc docs/frontier-sh66-renderemitter.md, repro runs/capture_renderemitter.sh.
 
 SH65 delivered real geometry through the WALKER's host-side mesh; SH66 targets
