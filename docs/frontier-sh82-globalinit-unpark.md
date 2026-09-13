@@ -14,6 +14,14 @@ now runs its real do-init** and faults FURTHER at the next gate (guest 0x1021daf
 a downstream null-deref) instead of parking (exit 124). Same one-gate-per-SH
 stepwise pattern as SH80->SH81.
 
+**SH82b follow-on:** seeding the intern/hash-table bucket-array word of the
+JNICall singleton (+0x30 = table base, +0x38 = capacity 0x400) advances the
+ladder one MORE gate — the do-init's hash insert now faults FURTHER at guest
+0x1029f3f7c (a `blr x8` through an invalid per-entry callback ptr at [x19+16]),
+proving the do-init is executing deep real registration work. Product path
+(no --v2boot) unregressed (exit 124, persist 45B byte-exact, present #0 swap
+Ok(0x1), 0 crash).
+
 Recon: read-only subagent deleg_f89a40ab (disasm of the same binary) + my own
 disasm verification + A/B on the real binary.
 
@@ -83,12 +91,15 @@ line + the rung-1 run faulting at guestpc 0x1021daf78 instead of parking).
 
 ## Next (ranked)
 
-The rung-1 do-init now executes and faults at guest 0x1021daf78 — a null deref in
-the next unsynthesized downstream object (same class as the SH80/81 dispatch
-singletons). (a) Disassemble the 0x1021daf78 fault to find its NULL object and
-seed it (mirror routeb_seed_task_singletons) so nativeGameGlobalInit completes
-and rung 2 (nativeUpdateAdapterInit 0x10221c3ec) executes; (b) once rung 1 is
-fully done, re-check whether rungs 2-6 install the type-4 producer vector
+Rung 1 (nativeGameGlobalInit) is now unfolded and its real do-init runs deep
+registration work; each seeded gate exposes the next. Current fault: guest
+0x1029f3f7c — a `blr x8` through an invalid per-entry callback ptr at
+[x19+16] of a hash table the do-init's registration path fills. (a) disassemble
+the hash-table builder to find what [x19+16] should point at (a real per-entry
+fn — likely a haddr/has-empty or deleter) and seed the table object with a
+benign leaf (mirror routeb_singleton_leaf) so the insert completes; (b) once
+nativeGameGlobalInit fully returns, drive rung 2 nativeUpdateAdapterInit
+(0x10221c3ec) and check whether rungs 2-6 install the type-4 producer vector
 [0x106829ea8]; (c) wire the NativeHelper gameActivity_* callbacks into the
 RegisterNatives registry (recon step 2) so StartLuaAppDM can build real
 GuiObjects once reached. Standing structural wall otherwise unchanged.

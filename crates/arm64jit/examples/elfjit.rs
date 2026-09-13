@@ -3949,6 +3949,22 @@ fn main() {
     let singleton_slot = link_to_guest(&el, 0x7333000 + 0x948); // [ptr] slot
     let singleton_obj = link_to_guest(&el, 0x7333000 + 0x950); // object base
     unsafe { *((singleton_slot) as *mut u64) = singleton_obj };
+    // SH82b: the GlobalInit do-init funnels an intern/hash lookup through this
+    // singleton's +0x30 word (table base, read at file 0x21db014 `ldr x10,[x19]`
+    // then `ldr x10,[x10,x24,lsl#3]`). The object is zeroed bss so +0x30 == 0 ->
+    // the table deref reads [0 + x24*8] -> SIGSEGV fault=0x0 at guestpc
+    // 0x1021daf78. Seed +0x30 = a zeroed bucket array (mirrors seed_static_empty_map)
+    // so a lookup reads bucket->0 (cbz -> "not found -> insert new"), and +0x8
+    // (size/capacity) = a non-zero small value so the hashing path is coherent.
+    unsafe {
+        let bucket_arr = Box::leak(vec![0u8; 0x2000].into_boxed_slice());
+        let base = bucket_arr.as_mut_ptr() as u64;
+        *((singleton_obj + 0x30) as *mut u64) = base;
+        *((singleton_obj + 0x38) as *mut u64) = 0x400; // capacity (buckets count)
+        println!(
+            "[JNICall-singleton] SH82b seeded intern-table @ obj+0x30 bucket array 0x{base:x} (+0x38 capacity 0x400) so the GlobalInit do-init hash lookup never derefs NULL"
+        );
+    }
     println!(
         "[JNICall-singleton] seeded ptr 0x{singleton_slot:x} -> object 0x{singleton_obj:x} (zeroed bss ~ PTHREAD_MUTEX_INITIALIZER at +8)"
     );
