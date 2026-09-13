@@ -1,5 +1,21 @@
 # SH69 — the engine's real geometry emitter renders a REAL Roblox APK UI texture
 
+## SH70 addendum (same cycle): decoders now handle PNG color-type 3 (palette)
+
+The offline decoder `decode_png_rgba` now also supports **color type 3
+(indexed/palette)** with optional `tRNS` per-index alpha (real UI sprites are
+commonly palette PNGs — e.g. `ui/InGameMenu/BackgroundGlow@2x.png`). PLTE is
+parsed into RGB, tRNS into per-index alpha (absent tRNS = opaque). Also added a
+clear `WARN: RENDEREMITTER_REAL_TEX=1 but real UI texture failed to load/decode
+— falling back to the palette strip` line so a bad/missing path is not silent.
+
+Verified: 2 new hermetic ct-3 tests (palette-with-tRNS exact RGBA; palette
+without tRNS opaque) pass; and the REAL binary decodes `BackgroundGlow@2x.png`
+(512×512 ct=3) -> `RGBA8` and renders it through the engine emitter
+(`decoded ... 512x512 RGBA8`, `tex 512x513`, emitter Ok, swap Ok, exit 124,
+0 crash). The decoder now covers ct 0/2/3/4/6 — the full PNG surface the real
+UI assets use.
+
 ## Result
 
 The ENGINE's own geometry emitter `0x105b35288`, driven headlessly as one

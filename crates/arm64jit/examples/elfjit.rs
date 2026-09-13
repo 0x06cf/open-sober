@@ -1280,6 +1280,8 @@ fn decode_png_rgba(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     let mut off = 8usize;
     let (mut w, mut h, mut ct) = (0u32, 0u32, 0u8);
     let mut idat: Vec<u8> = Vec::new();
+    let mut plte: Vec<u8> = Vec::new();
+    let mut trns: Vec<u8> = Vec::new();
     while off + 8 <= data.len() {
         let len = u32::from_be_bytes(data[off..off + 4].try_into().ok()?) as usize;
         let typ = &data[off + 4..off + 8];
@@ -1294,13 +1296,15 @@ fn decode_png_rgba(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
                 ct = chunk[9];
             }
             b"IDAT" => idat.extend_from_slice(chunk),
+            b"PLTE" => plte = chunk.to_vec(),
+            b"tRNS" => trns = chunk.to_vec(),
             b"IEND" => break,
             _ => {}
         }
         off += 12 + len;
     }
     let ch: usize = match ct {
-        0 => 1,
+        0 | 3 => 1,
         2 => 3,
         4 => 2,
         6 => 4,
@@ -1366,6 +1370,21 @@ fn decode_png_rgba(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
                     out[o + 2] = cur[x];
                     out[o + 3] = 255;
                 }
+            }
+            // color type 3 (indexed/palette): expand via PLTE + optional tRNS alpha.
+            if ct == 3 {
+                let idx = cur[x] as usize;
+                let (r, g, b) = if idx * 3 + 2 < plte.len() {
+                    (plte[idx * 3], plte[idx * 3 + 1], plte[idx * 3 + 2])
+                } else {
+                    (0, 0, 0)
+                };
+                let a = if idx < trns.len() { trns[idx] } else { 255 };
+                let o = (y * w as usize + x) * 4;
+                out[o] = r;
+                out[o + 1] = g;
+                out[o + 2] = b;
+                out[o + 3] = a;
             }
         }
         prev = cur;
@@ -1802,6 +1821,9 @@ pub fn render_engine_emitter_home(ctx: u64, iimg: &[u8], ibase: u64, isp: u64, l
         // layers keep palette solids so the whole frame still composites.
         let real_tex = std::env::var_os("RENDEREMITTER_REAL_TEX").is_some();
         let real_img = if real_tex { real_ui_texture() } else { None };
+        if real_tex && real_img.is_none() {
+            eprintln!("[elfjit:renderemitter-home] WARN: RENDEREMITTER_REAL_TEX=1 but real UI texture failed to load/decode — falling back to the palette strip");
+        }
         const VW: f32 = 1280.0;
         const VH: f32 = 720.0;
         let mut verts: Vec<f32> = Vec::with_capacity(nq * 48); // 8 floats * 6 verts
@@ -6401,5 +6423,59 @@ mod sh69_tests {
     fn sh69_decode_png_rgba_rejects_non_png() {
         assert!(decode_png_rgba(b"not-a-png").is_none());
         assert!(decode_png_rgba(&[0u8; 8]).is_none());
+    }
+
+    // --- SH70: color-type 3 (indexed/palette) support ---
+
+    fn make_palette_png(w: u32, h: u32, palette: &[[u8; 3]], alpha: &[u8], indices: &[u8]) -> Vec<u8> {
+        let mut p = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&w.to_be_bytes());
+        ihdr.extend_from_slice(&h.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 3, 0, 0, 0]); // bit 8, ct 3 (palette)
+        p.extend_from_slice(&chunk(b"IHDR", &ihdr));
+        let mut plte = Vec::new();
+        for e in palette {
+            plte.extend_from_slice(e);
+        }
+        p.extend_from_slice(&chunk(b"PLTE", &plte));
+        if !alpha.is_empty() {
+            p.extend_from_slice(&chunk(b"tRNS", alpha));
+        }
+        let mut raw = Vec::new();
+        for y in 0..h {
+            raw.push(0); // filter 0
+            raw.extend_from_slice(&indices[(y * w) as usize..((y + 1) * w) as usize]);
+        }
+        let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        e.write_all(&raw).unwrap();
+        p.extend_from_slice(&chunk(b"IDAT", &e.finish().unwrap()));
+        p.extend_from_slice(&chunk(b"IEND", &[]));
+        p
+    }
+
+    #[test]
+    fn sh70_decode_png_rgba_palette_with_trns_alpha() {
+        // 2x2, indices 0,1,1,2. idx0=(10,20,30)a255, idx1=(40,50,60)a128, idx2=(70,80,90)a0.
+        let pal = [[10u8, 20, 30], [40, 50, 60], [70, 80, 90]];
+        let trns = [255u8, 128, 0];
+        let idx = [0u8, 1, 1, 2];
+        let png = make_palette_png(2, 2, &pal, &trns, &idx);
+        let (dw, dh, out) = decode_png_rgba(&png).expect("decode ct3");
+        assert_eq!((dw, dh), (2, 2));
+        let expect: Vec<u8> = [10, 20, 30, 255, 40, 50, 60, 128, 40, 50, 60, 128, 70, 80, 90, 0].to_vec();
+        assert_eq!(out, expect);
+    }
+
+    #[test]
+    fn sh70_decode_png_rgba_palette_without_trns_is_opaque() {
+        let pal = [[200u8, 150, 100], [1, 2, 3]];
+        let idx = [0u8, 1, 0, 1];
+        let png = make_palette_png(2, 2, &pal, &[], &idx);
+        let (_, _, out) = decode_png_rgba(&png).expect("decode ct3 opaque");
+        assert_eq!(&out[0..4], [200, 150, 100, 255]);
+        assert_eq!(&out[4..8], [1, 2, 3, 255]);
+        assert_eq!(&out[8..12], [200, 150, 100, 255]);
+        assert_eq!(&out[12..16], [1, 2, 3, 255]);
     }
 }
