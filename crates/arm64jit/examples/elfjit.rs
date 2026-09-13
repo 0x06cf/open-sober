@@ -6036,7 +6036,20 @@ fn main() {
                 unsafe { std::slice::from_raw_parts(ibase as *const u8, ilen) };
             let mut s3 = arm64jit::jit::CpuState::new();
             s3.tpidr = tpidr;
-            s3.x[31] = isp;
+            // SH108: do NOT seed this render thread's guest SP from the SAME boot
+            // stack as the --v2boot ladder thread (`st.x[31]`/`isp`). When both
+            // threads drive jit_run concurrently, the render thread's GUEST frames
+            // grow down into the ladder thread's live frames and a nested guest
+            // `stp x29,x30` (object-init prologue) overwrites the LADDER frame's
+            // __stack_chk_guard canary slot -> false `*** stack smashing ***`
+            // (SH104/105 layer-2, reproduced with --renderinit). Use a separate,
+            // dedicated leaked 1 MiB guest stack for THIS thread (guest==host
+            // identity map, so a leaked buffer is directly guest-addressable) —
+            // mirroring how run_guest_callback gives each guest re-entry its own
+            // stack. The render guest never addresses a caller stack directly.
+            const RSTACK: usize = 1 << 20;
+            let rstack = Box::leak(vec![0u8; RSTACK].into_boxed_slice());
+            s3.x[31] = rstack.as_mut_ptr() as u64 + RSTACK as u64 - 0x100;
             // render-init's prologue writes a resolved global ptr through its x0
             // param (real caller passes `[parent+344]`; a fresh call leaves x0=0
             // -> NULL store -> SIGSEGV). Point x0 at a guest-writable leaked
