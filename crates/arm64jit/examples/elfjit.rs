@@ -949,6 +949,44 @@ extern "C" fn routeb_singleton_leaf(a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: 
     a0
 }
 
+/// SH87: the Roblox string/span hash-map family's generic dispatch (file 0x29f427c)
+/// `ldp x1,x8,[x19,#16]; cbz x8,<l1>; blr x8; <l1>: blr x1` branches through the
+/// optional hash-2 slot (+0x18) when non-zero. The OTel rehash-copy creates a NEW map
+/// whose +0x18 carries the STABLE constant 0x1800064 (decoded from a static
+/// `.data.rel.ro` protobuf table, file 0x62f5110) instead of 0 — so `blr x8` jumps to
+/// 0x1800064 (unmapped) -> SIGSEGV. hash2 is REDUNDANT in this family (the observed
+/// value 0x1029b4ae8 is just `br x1` — aliases the primary hash), and the hash only
+/// SELECTS a bucket probe (correctness comes from the key-eq comparator at +0x08), so
+/// forcing `blr x1` (always the primary hash) is behavior-preserving and immune to JIT
+/// block-entry coverage gaps. Patch `blr x8` (d63f0100) -> `blr x1` (d63f0020).
+fn routeb_patch_map_dispatch() {
+    const ADDR: u64 = 0x1029f4280; // file 0x29f4280: `blr x8`
+    let want = 0xd63f_0020u32; // blr x1
+    let page = ADDR & !0xfff;
+    unsafe {
+        if libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_WRITE) == 0 {
+            let before = *(ADDR as *const u32);
+            if before == 0xd63f_0100u32 {
+                *(ADDR as *mut u32) = want;
+                eprintln!(
+                    "[elfjit:routeB] SH87 patched map-family dispatch `blr x8` 0x{ADDR:x} ({before:08x}) -> `blr x1` ({want:08x}) — always primary hash, +0x18 hash2 can't blr into 0x1800064"
+                );
+            } else if before == want {
+                eprintln!("[elfjit:routeB] SH87 map-dispatch 0x{ADDR:x} already {want:08x}");
+            } else {
+                eprintln!("[elfjit:routeB] WARN SH87 map-dispatch 0x{ADDR:x} unexpected {before:08x}, not patched");
+            }
+            libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_EXEC);
+        } else {
+            eprintln!(
+                "[elfjit:routeB] WARN SH87 mprotect RW failed for map-dispatch 0x{ADDR:x} errno={}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    arm64jit::jit::block_cache_drop_region(0x1029f4240, 0x1029f4360);
+}
+
 static ROUTEB_LEAF_ADDR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 /// Route-B SH81: seed the two engine dispatch-singleton `.data` records so the
 /// accessor `2b9dee0`'s lazy-create returns a coherent object instead of an
@@ -4173,6 +4211,9 @@ fn main() {
             // the singletons 0x624f4f0 reaches directly (cbz x1) that the gate
             // force does NOT cover (would otherwise null-vtable crash at 0x624f500).
             routeb_seed_task_singletons();
+            // SH87: the map-family generic dispatch can blr through the garbage +0x18
+            // hash2 of a rehash-copied map (0x1800064) — force blr x1 (primary hash).
+            routeb_patch_map_dispatch();
             let boot_sp = st.x[31];
             let tpidr = arm64jit::jit::current_guest_tp();
             let ib = base;
