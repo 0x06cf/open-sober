@@ -1111,10 +1111,33 @@ pub fn render_engine_emitter_quad(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) -
         let stk_top = (stkbuf.as_ptr() as u64).wrapping_add(0x8000) & !15;
         // Normalize the fixed-function state the emitter's draw depends on (the
         // walker's swap may leave viewport/depth/cull/blend/scissor in a state
-        // that silently clips the emitter's quad), same as walker_item_draw_thunk.
+        // that silently clips the emitter's quad), same as walker_item_draw_thunk,
+        // PLUS bind the default framebuffer so the emit lands on the visible
+        // surface (the engine may leave a render-target FBO bound).
         if let (Some(vp), Some(ds)) = (mesa_fn::<extern "C" fn(i32,i32,i32,i32)>(h, b"glViewport\0"), mesa_fn::<extern "C" fn(u32)>(h, b"glDisable\0")) {
             vp(0, 0, 1280, 720);
             ds(0x0B71); ds(0x0B44); ds(0x0BE2); ds(0x0C11);
+        }
+        if let Some(bf) = mesa_fn::<extern "C" fn(u32, u32)>(h, b"glBindFramebuffer\0") {
+            bf(0x8D40 /*GL_FRAMEBUFFER*/, 0); // default framebuffer
+        }
+        if let Some(gi) = mesa_fn::<extern "C" fn(u32, *mut i32)>(h, b"glGetIntegerv\0") {
+            let mut dfbo = 0i32;
+            let mut rb = 0i32;
+            gi(0x8CA9 /*GL_DRAW_FRAMEBUFFER_BINDING*/, &mut dfbo);
+            gi(0x0C01 /*GL_DRAW_BUFFER*/, &mut rb);
+            eprintln!("[elfjit:renderemitter] draw_fbo={dfbo} draw_buffer={rb:#x} (before emit)");
+            if rb == 0 {
+                // GL_DRAW_BUFFER==GL_NONE: the default FBO has no draw buffer
+                // wired to the visible surface, so the emitter's glDrawArrays
+                // silently drops pixels. Wire GL_BACK (0x0405) so the emit lands
+                // on the presented surface (SH66b root cause).
+                if let Some(db) = mesa_fn::<extern "C" fn(u32)>(h, b"glDrawBuffer\0") {
+                    db(0x0405 /*GL_BACK*/);
+                    gi(0x0C01, &mut rb);
+                    eprintln!("[elfjit:renderemitter] draw_buffer -> {rb:#x} (wired GL_BACK)");
+                }
+            }
         }
         let mut st = arm64jit::jit::CpuState::new();
         st.tpidr = arm64jit::jit::current_guest_tp();

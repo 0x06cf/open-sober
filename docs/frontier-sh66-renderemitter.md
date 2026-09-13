@@ -56,17 +56,30 @@ EXIT=124
 ## Honest scope — the pixel-proof gap
 
 The emitter **executes** (returns Ok, primitive-setup runs, attrs ordered,
-engine swap `Ok(1)`), but the authored quad's pixels are NOT confirmed in the
-buffer our readback/X-grab samples — the engine renders the emit into **its own
-render-target FBO binding**, not the default framebuffer we read. So SH66 proves
-the engine's real geometry-emitter path is now *reachable and runnable*
-headlessly (a first — previously only a disasm), but the emitted content's
-pixel landing is not yet captured. Standing structural wall unchanged (the
+engine swap `Ok(1)`), but the authored quad's pixels are NOT confirmed in the buffer our readback/X-grab samples.
+
+**SH66b root-cause probe (draw-buffer binding):** an FBO-binding probe added
+before the emit reads `glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING)` and
+`GL_DRAW_BUFFER` on the current context:
+```
+[elfjit:renderemitter] draw_fbo=0 draw_buffer=0x0 (before emit)
+```
+`GL_FRAMEBUFFER_BINDING=0` (default FBO) is fine, but **`GL_DRAW_BUFFER=0x0`
+(= GL_NONE)** — the context's default framebuffer has NO draw buffer wired to
+the visible surface at the instant the emitter runs. So the emitter's
+glDrawArrays rasterizes into a buffer with no draw target → pixels are dropped
+(not a crash, not a GL error — same silent-no-op class as SH65's
+glDrawElements=UNSIGNED_BYTE finding). The fix for the next cycle: set
+`glDrawBuffer(GL_BACK, 0x0405)` (or `GL_COLOR_ATTACHMENT0` for an FBO) on the
+current context before driving the emitter, so its draw lands on the presented
+surface. This is a concrete, addressable lever — the engine's real
+geometry-emitter path is proven *runnable* end-to-end, and the remaining gap is
+a single state wire (draw buffer), not an ABI/structure problem.
+
+Standing structural wall unchanged (the
 emitter is still driven with a fabricated `G`, not a real UI/GuiObject screen).
-**Next:** query the engine's current draw-framebuffer binding during the emit and
-either read back from that FBO, or force-bind the default framebuffer for the
-emit so the authored quad lands in the sampled/visible surface — converting
-"emitter runs" into "emitter visibly draws".
+**Next:** set the draw buffer to GL_BACK before the emit and read back — closing
+"emitter runs" → "emitter visibly draws".
 
 ## Commands
 
