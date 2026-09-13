@@ -2162,15 +2162,52 @@ struct RealSprite {
     rgba: Vec<u8>,
 }
 
+/// SH73 — the real Roblox AUTH/log-in surface assets (the APK's own login
+/// screen artwork, under ExtraContent/textures/ui/LuaApp/graphic/Auth):
+/// reversevignette.png (the dark blurred login backdrop) + logo_white_1x.png
+/// (the Roblox wordmark). Enable with RENDEREMITTER_LOGIN=1. Entries are
+/// absolute (the auth assets live outside the content/textures/ui root).
+fn login_ui_textures() -> Vec<RealSprite> {
+    static LT: std::sync::OnceLock<Vec<RealSprite>> = std::sync::OnceLock::new();
+    LT.get_or_init(|| {
+        let auth = "/home/hermes-worker/.cache/open-sober/android-env/assets/ExtraContent/textures/ui/LuaApp/graphic/Auth";
+        let mut out = Vec::new();
+        for (name, rel) in [
+            ("reversevignette.png", "reversevignette.png"),
+            ("logo_white_1x.png", "logo_white_1x.png"),
+        ] {
+            let path = format!("{auth}/{rel}");
+            match std::fs::read(&path).ok().and_then(|d| decode_png_rgba(&d)) {
+                Some((w, h, rgba)) => {
+                    eprintln!(
+                        "[elfjit:renderemitter-login] loaded real auth sprite '{name}' ({w}x{h} RGBA8) from {path}"
+                    );
+                    out.push(RealSprite { name: name.to_string(), w, h, rgba });
+                }
+                None => eprintln!(
+                    "[elfjit:renderemitter-login] WARN: failed to load/decode auth sprite '{name}' from {path} — skipped"
+                ),
+            }
+        }
+        out
+    })
+    .clone()
+}
+
 /// SH72 — load SEVERAL REAL Roblox UI textures (default: loading spinner,
 /// robux icon, jump button) as RGBA8. Env RENDEREMITTER_MULTI_TEXTURES = a
 /// comma-separated list overrides the defaults (relative to the extracted
-/// assets/textures/ui root). Each is cached via OnceLock. Sprites that fail to
-/// load/decode are skipped with a warn so the composite still builds from the
-/// successes.
+/// assets/textures/ui root, or absolute if an entry starts with '/'). Each is
+/// cached via OnceLock. Sprites that fail to load/decode are skipped with a
+/// warn so the composite still builds from the successes. When
+/// RENDEREMITTER_LOGIN=1 the real auth surface (login_ui_textures) is used
+/// instead (SH73).
 fn real_ui_textures() -> Vec<RealSprite> {
     static MT: std::sync::OnceLock<Vec<RealSprite>> = std::sync::OnceLock::new();
     MT.get_or_init(|| {
+        if std::env::var_os("RENDEREMITTER_LOGIN").is_some() {
+            return login_ui_textures();
+        }
         let root = "/home/hermes-worker/.cache/open-sober/android-env/assets/content/textures/ui";
         let defs: Vec<&str> = vec![
             "LoadingScreen/LoadingSpinner.png",
@@ -2183,7 +2220,12 @@ fn real_ui_textures() -> Vec<RealSprite> {
             .unwrap_or_else(|| defs.iter().map(|s| s.to_string()).collect());
         let mut out = Vec::new();
         for rel in &list {
-            let path = format!("{root}/{rel}");
+            // Absolute entry (SH73: auth assets live under a different root).
+            let path = if rel.starts_with('/') {
+                rel.clone()
+            } else {
+                format!("{root}/{rel}")
+            };
             let name = rel.rsplit('/').next().unwrap_or(rel).to_string();
             match std::fs::read(&path)
                 .ok()
@@ -2239,14 +2281,25 @@ pub fn render_engine_emitter_multi(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) 
     // aspect-correct box. Positions chosen to resemble a login/home surface.
     const VW: f32 = 1280.0;
     const VH: f32 = 720.0;
-    // (name, cx_ndc, cy_ndc, hh, probe_ix, probe_iy, tol)
-    let placements: &[(&str, f32, f32, f32, u32, u32, u32)] = &[
-        ("LoadingSpinner.png", 0.0, 0.42, 0.40, 33, 88, 6),
-        // robux center img(27,27) is transparent (a=0) — probe an OPAQUE white
-        // corner pixel instead.
-        ("ico_robux@3x.png", 0.72, 0.78, 0.10, 10, 10, 14),
-        ("JumpButtonRegular@2x.png", 0.0, -0.62, 0.16, 84, 120, 6),
-    ];
+    let login = std::env::var_os("RENDEREMITTER_LOGIN").is_some();
+    // (name, cx_ndc, cy_ndc, hh, probe_ix, probe_iy, tol). Login mode (SH73):
+    // the real auth backdrop (reversevignette, nearly-clear where the logo
+    // sits) + the Roblox wordmark. Vignette probe over the solid dark row-0;
+    // logo glyph is alpha=255 white so its probe is byte-exact over ANY dst.
+    let placements: &[(&str, f32, f32, f32, u32, u32, u32)] = if login {
+        &[
+            ("reversevignette.png", 0.0, 0.0, 1.78, 512, 512, 6),
+            ("logo_white_1x.png", 0.0, 0.35, 0.22, 193, 44, 2),
+        ]
+    } else {
+        &[
+            ("LoadingSpinner.png", 0.0, 0.42, 0.40, 33, 88, 6),
+            // robux center img(27,27) is transparent (a=0) — probe an OPAQUE white
+            // corner pixel instead.
+            ("ico_robux@3x.png", 0.72, 0.78, 0.10, 10, 10, 14),
+            ("JumpButtonRegular@2x.png", 0.0, -0.62, 0.16, 84, 120, 6),
+        ]
+    };
     // Build the shared vertical atlas. aw = max sprite width (>=8); ah = 1
     // (backdrop strip row 0) + sum(sprite heights).
     let aw: u32 = sprites.iter().map(|s| s.w).max().unwrap_or(8).max(8);
@@ -2577,29 +2630,32 @@ pub fn render_engine_emitter_multi(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) 
                     s.name, got[0], got[1], got[2], got[3], exp
                 );
             }
-            // Transparent spinner-center probe: no arc body there, so the dark
-            // backdrop shows through => real alpha compositing in the composite.
-            let (scx, scy, shh) = (0.0f32, 0.42f32, 0.40f32);
-            let sw = 100u32;
-            let sh = 100u32;
-            let fcx = (50.5f32) / sw as f32;
-            let fcy = 1.0 - (50.5f32) / sh as f32;
-            let x_ndc = scx - shh * (sw as f32 / sh as f32) * (VH / VW) + fcx * 2.0 * shh * (sw as f32 / sh as f32) * (VH / VW);
-            let y_ndc = (scy - shh) + fcy * (2.0 * shh);
-            let (sx, sy) = ((x_ndc + 1.0) / 2.0 * VW, (1.0 + y_ndc) / 2.0 * VH);
-            let mut got: [u8; 4] = [0; 4];
-            rp(sx as i32, sy as i32, 1, 1, 0x1908, 0x1401, got.as_mut_ptr() as *mut i8);
-            let diff = [
-                (got[0] as i32 - 26).abs(),
-                (got[1] as i32 - 26).abs(),
-                (got[2] as i32 - 31).abs(),
-                (got[3] as i32 - 255).abs(),
-            ];
-            let present = diff.iter().all(|d| *d <= 1);
-            eprintln!(
-                "[elfjit:renderemitter-multi] probe 'spinner-transparent-center' ({sx:.0},{sy:.0}) got rgba({},{},{},{}) expect backdrop(26,26,31,255) diff={diff:?} present={present}",
-                got[0], got[1], got[2], got[3]
-            );
+            // Transparent spinner-center probe (SH72, non-login composite only):
+            // no arc body there, so the dark backdrop shows through => real
+            // alpha compositing in the composite.
+            if !login {
+                let (scx, scy, shh) = (0.0f32, 0.42f32, 0.40f32);
+                let sw = 100u32;
+                let sh = 100u32;
+                let fcx = (50.5f32) / sw as f32;
+                let fcy = 1.0 - (50.5f32) / sh as f32;
+                let x_ndc = scx - shh * (sw as f32 / sh as f32) * (VH / VW) + fcx * 2.0 * shh * (sw as f32 / sh as f32) * (VH / VW);
+                let y_ndc = (scy - shh) + fcy * (2.0 * shh);
+                let (sx, sy) = ((x_ndc + 1.0) / 2.0 * VW, (1.0 + y_ndc) / 2.0 * VH);
+                let mut got: [u8; 4] = [0; 4];
+                rp(sx as i32, sy as i32, 1, 1, 0x1908, 0x1401, got.as_mut_ptr() as *mut i8);
+                let diff = [
+                    (got[0] as i32 - 26).abs(),
+                    (got[1] as i32 - 26).abs(),
+                    (got[2] as i32 - 31).abs(),
+                    (got[3] as i32 - 255).abs(),
+                ];
+                let present = diff.iter().all(|d| *d <= 1);
+                eprintln!(
+                    "[elfjit:renderemitter-multi] probe 'spinner-transparent-center' ({sx:.0},{sy:.0}) got rgba({},{},{},{}) expect backdrop(26,26,31,255) diff={diff:?} present={present}",
+                    got[0], got[1], got[2], got[3]
+                );
+            }
         }
         r
     }
