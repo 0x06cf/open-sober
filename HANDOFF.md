@@ -1,6 +1,41 @@
 # Open Sober — Agent Handoff
 
-## Session (Sep 13, 2026, hermes-worker, cycle SH65) — the engine's REAL per-node PRESENT walker now draws REAL GEOMETRY per populated scene node: a distinct colored mesh band per node, pixel-verified in the live engine context. Workspace **509/0** (unchanged). Commit 27141d1. Doc docs/frontier-sh65-renderwalker-geometry.md, artifact runs/sh65-renderwalker-geometry.png + runs/sh65-final-readbacks.txt, repro runs/capture_renderwalker_geometry.sh.
+## Session (Sep 13, 2026, hermes-worker, cycle SH66/SH66b) — the engine's REAL geometry emitter (0x105b35288) is now RUNNABLE headlessly via an authored guest geometry-context G, driven as a desync-safe top-level jit_run. Workspace **509/0**. Commits 8531222 + 6f7cb7d. Doc docs/frontier-sh66-renderemitter.md, repro runs/capture_renderemitter.sh.
+
+SH65 delivered real geometry through the WALKER's host-side mesh; SH66 targets
+the ENGINE's OWN geometry emitter. New `--renderemitter` builds a guest
+geometry-context `G` from fresh disasm layout (G+0x38=M mesh, G+0x48/0x58=BD
+slots, G+0x78 elem-buf=0 non-indexed, G+0x8e elem-type; M+0x48/0x50=spec
+begin/end 24B entries, M+0x60=stride table; spec +0 attr/+4 offset/+8 format
+idx/+12 attrib-loc-enum/+16 size-add; vertex-format table 0xcecf8c; draw-mode
+table 0x225780[3]=0x5 GL_TRIANGLE_STRIP), uploads an authored colored quad into
+a real VBO, binds the cached shader program, and drives guest
+`emit(G, w1=3, w2=4, w3=0, w4=0, w5=0)` as its OWN top-level jit_run on the
+renderinit thread — never nested inside the present-walker block, so the SH64
+nested-jit_run desync class is closed by construction. Then engine bind + swap
+via ctx-vt[+24]. Builds traced to the exact engine layout (BD slot per attr at
+G+0x48+attr*0x10; stride-table integers; 8-aligned Box-leak buffers; own guest
+stack).
+
+**Empirical (real libroblox.so, exit 124, zero crash):** `engine emitter
+Ok(ret=0x0) swap=Ok(1)` x2 — the engine's own primitive-setup → attribute-bind →
+draw dispatch executes cleanly and the engine swap succeeds. Walker's 6 real
+colored quads intact. Productized baseline green (swap Ok(0x1), persist 45B
+byte-exact). Workspace 509/0.
+
+**SH66b root-cause probe (honest scope):** the authored quad's pixels are NOT yet
+confirmed in the sampled buffer. FBO probe reads
+`GL_DRAW_FRAMEBUFFER_BINDING=0` (default, fine) but `GL_DRAW_BUFFER=0x0`
+(=GL_NONE) — the current context's default framebuffer has NO draw buffer wired
+to the visible surface, so the emit's glDrawArrays silently drops pixels (same
+silent-no-op class as SH65's glDrawElements=UNSIGNED_BYTE finding). Pinned to a
+single addressable state-wire (set DRAW_BUFFER=GL_BACK before the emit), not an
+ABI/structure problem. **Next: set the draw buffer to GL_BACK before the emit so
+"emitter runs" becomes "emitter visibly draws".** Standing structural wall
+unchanged (fabricated G, not a real UI/GuiObject; type-4 producer vector
+glue-installed only).
+
+## Session (Sep 13, 2026, hermes-worker, cycle SH65) — the engine's REAL per-node PRESENT walker now draws REAL GEOMETRY per populated scene node: a distinct colored mesh band per node, pixel-verified. Workspace **509/0**. Commit 27141d1. Doc docs/frontier-sh65-renderwalker-geometry.md, artifacts runs/sh65-renderwalker-geometry.png + runs/sh65-final-readbacks.txt, repro runs/capture_renderwalker_geometry.sh.
 
 SH64 delivered the per-node draw as a flat colored clear; SH65 advances it to
 REAL GEOMETRY through a **cached real-Mesa (libGLESv2.so.2) shader program**
