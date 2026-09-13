@@ -1,5 +1,20 @@
 # SH107 — Route-B standing wall broken: nativeGameGlobalInit RETURNS + rung-2 clears
 
+## V2InitWithParams host-corruption gate (recon deleg_6f0e666b, read-only)
+V2Init (0x2365c54) now drives ~197k JIT block hits then SIGSEGVs EXIT 139 with NO
+JIT fault dump (host-side fault inside transferred run_loop), RUN-VARIABLE (~50%).
+Recon hypothesis: the copy-string ctor `0x1d9d8b0` (reached from `0x2366dbc` and
+the JNI GetStringUTFChars bridge `0x236648c` via slots 0x548/0x550) does a
+size-driven `memmove(x2+1)` where x2 = a guest std::string SIZE field; a block-cache
+desync / host-pointer leak (SH55/64 / SH103 class) corrupts that size -> host
+OOB -> silent crash. Secondary: object vtable blr at 0x2366178/0x2366284 on the
+operator-new'd AppBridgeContext (vtable base write 0x23660dc = 0x635db90, slot 0x28).
+NEXT (careful — a wrong memmove/memcpy length clamp breaks legit host-guest
+copies): instrument the exact caller feeding x2 to 0x1d9d8b0 / 0x236648c BEFORE
+clamping; verify the corruption is a SYNC-object-size desync vs an actual huge
+length. Do NOT blanket-clamp memmove/memcpy/memset — they legitimately move
+host-guest buffers.
+
 ## The win
 The SH106 guard-GOT seed (making the pervasive `__stack_chk_guard` slot 0x67d16f0
 stable) unblocked rung-1: **`nativeGameGlobalInit` now RETURNS** — the standing
