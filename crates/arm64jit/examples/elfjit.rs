@@ -4052,7 +4052,13 @@ fn main() {
                     eprintln!("[elfjit:v2boot] after {label}: [0x106829ea8] = {:#x}", dw(BSS_TASKV4));
                 };
                 // Guest addresses = file vaddr + 0x100000000 (recon quick-ref).
-                let rungs: [(&str, u64, [u64; 8]); 6] = [
+                // rung 0 FIRST = nativeInitializeNativeFlags (0x10232048c) — on
+                // the engine's own flags-loaded write chain for the gameGlobalInit
+                // latch byte [0x72739d4] (recon-routeB). With getFlagsCount>=1 the
+                // JIT-translated engine code writes the latch; then rung 1
+                // nativeGameGlobalInit can leave its nanosleep park.
+                let rungs: [(&str, u64, [u64; 8]); 7] = [
+                    ("nativeInitializeNativeFlags", 0x10232048c, [env_ptr, thiz, 0, 0, 0, 0, 0, 0]),
                     // nativeGameGlobalInit (JNIEnv*, jobject)
                     ("nativeGameGlobalInit", 0x102206404, [env_ptr, thiz, 0, 0, 0, 0, 0, 0]),
                     // nativeUpdateAdapterInit (JNIEnv*, jobject)
@@ -4067,6 +4073,18 @@ fn main() {
                     ("V2StartAppWithParams", 0x10258b144, [env_ptr, thiz, start_params, 0, 0, 0, 0, 0]),
                 ];
                 dump("boot start");
+                // Route-B latch (docs/recon-routeB-globaltinit-unblock.md, verified
+                // file 0x22474e8 `strb w19,[x9,#2516]` with x9=adrp 0x7273000:
+                // nativeGameGlobalInit only leaves its nanosleep park once .bss byte
+                // [0x72739d4] bit0==1 "flags have been loaded"; SH55/62 stalled at
+                // rung 1 because it defaulted 0. Drive nativeInitializeNativeFlags
+                // (0x10232048c) FIRST as rung 0 — it is on the engine's own
+                // flags-loaded write chain (0x2320cec -> 0x2320f2c -> the latch
+                // setter) — so the latch is set through GUEST code (JIT-translated,
+                // safely hits the real RW map) instead of a fragile raw host write.
+                // NativeFlagsInterface getters are stubbed (GetFlagsCount>=1 +
+                // empty jstrings) via the JNI value registry. --v2boot-r246 keeps
+                // the SH58 probe (no GlobalInit); V2BOOT_SEED_LATCH keeps working.
                 for (name, guest, args) in &rungs {
                     eprintln!("[elfjit:v2boot] driving {name} @ guest {guest:#x} (env={env_ptr:#x} thiz={thiz:#x})");
                     let mut s = arm64jit::jit::CpuState::new();

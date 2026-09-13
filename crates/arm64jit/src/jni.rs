@@ -695,6 +695,11 @@ extern "C" fn jni_call_int_method(
 ) -> u64 {
     match method_id_name(mid).as_deref() {
         Some(b"getMembershipType") => 0,
+        // Route-B (recon-routeB-globaltinit-unblock.md): nativeInitializeNativeFlags
+        // (0x10232048c) reads FlagsInterface.getFlagsCount() and bails early when it
+        // returns 0. Returning >=1 lets it walk its flags chain that writes the
+        // gameGlobalInit latch byte [0x72739d4]=1.
+        Some(b"getFlagsCount") => 1,
         _ => 0,
     }
 }
@@ -1635,6 +1640,10 @@ mod tests {
             let mid2 = get_name_id(b"getMembershipType");
             let (g_im, _) = host_call_at(get(CALL_INT_METHOD)).expect("CallIntMethod thunk");
             assert_eq!(g_im(env, 0x4321, mid2, 0, 0, 0, 0, 0), 0, "getMembershipType default 0");
+            // Route-B: nativeInitializeNativeFlags reads FlagsInterface.getFlagsCount();
+            // it must be >=1 so the engine walks its flags chain that sets the
+            // gameGlobalInit latch byte [0x72739d4]=1 (recon-routeB).
+            assert_eq!(g_im(env, 0x4321, get_name_id(b"getFlagsCount"), 0, 0, 0, 0, 0), 1, "getFlagsCount >=1");
             let (g_lm, _) = host_call_at(get(CALL_LONG_METHOD)).expect("CallLongMethod thunk");
             assert_eq!(g_lm(env, 0x4321, get_name_id(b"getAppUserId"), 0, 0, 0, 0, 0), 0, "getAppUserId default 0");
             // PlatformParams.assetFolderPath points at the host assets root when
