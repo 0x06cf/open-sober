@@ -517,6 +517,20 @@ fn routeb_SUBSTITUTE() -> &'static std::sync::OnceLock<u64> {
     &M
 }
 
+/// Shared TRUSTED_BUCKETS set (seed block + scrub block must see the SAME set).
+fn routeb_trusted_buckets() -> &'static std::sync::Mutex<std::collections::HashSet<u64>> {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static TB: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+    TB.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// SH91: register a leaked host bucket array we own so the phantom-slot scrub may
+/// deref its slots (it must NOT deref a foreign/unseeded map's +0x00).
+fn routeb_trust_bucket_array(bbase: u64) {
+    routeb_trusted_buckets().lock().unwrap().insert(bbase);
+}
+
 /// Register `f` as the host call for guest slot `i`. Returns the guest address
 /// the caller should resolve a JUMP_SLOT/intra-image `blr` target to so that the
 /// `jit_run` dispatcher falls through to this host call.
@@ -2445,6 +2459,44 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
                     // generalized hook run here corrupted a rehashed/other map -> glibc
                     // "double free or corruption (out)" abort). The rehash/grow gates are
                     // cleared purely by the non-image +0x18 repair above (no force-empty).
+                    // SH91: scrub PHANTOM IMAGE-RANGE BUCKET SLOTS at every INSERT entry.
+                    // The map header/array are seeded (SH84/90) and valid; but after thousands
+                    // of inserts into the never-grown 1024-slot map a single bucket slot can
+                    // hold an IMAGE address (e.g. 0x1029b37ec, a .text thunk the descriptor-
+                    // iteration wrote into a slot) instead of a managed-heap node ptr. The
+                    // chain-walk `ldr x23,[x22]` (head, file 0x29f3fb4) picks it up and
+                    // `ldr x8,[x23,#16]` faults on unmapped image+16 (guestpc 0x1029f3f7c).
+                    // Managed-heap node pointers / host metadata are NEVER in the guest image
+                    // range [base, base+len), so any image-range 64-bit slot value is a
+                    // phantom head link -> NULL it (chain sees empty -> alloc new node).
+                    // ONLY scrub a bucket array WE OWN (a leaked host array registered in
+                    // TRUSTED_BUCKETS) — a foreign/unseeded map's +0x00 can be an invalid
+                    // host address and dereferencing it panics (jit.rs:2467). Never touch a
+                    // valid node pointer or the map header; honors SH84/86b.
+                    if pc == 0x1029f3e70 {
+                        let slot_image_phantom = |p: u64| p >= base && p - base < image.len() as u64;
+                        let bbase = unsafe { *(((map + 0x00) as *const u64)) as u64 };
+                        let trusted = routeb_trusted_buckets().lock().unwrap().contains(&bbase);
+                        let scrubbed = if bbase != 0 && trusted {
+                            let mut n = 0u64;
+                            for i in 0..1024u64 {
+                                let p = (bbase + i * 8) as *mut u64;
+                                let v = unsafe { *p };
+                                if v != 0 && slot_image_phantom(v) {
+                                    unsafe { *p = 0 };
+                                    n += 1;
+                                }
+                            }
+                            n
+                        } else {
+                            0
+                        };
+                        if scrubbed > 0 {
+                            eprintln!(
+                                "[routeb-hashfix] SH91 scrubbed {scrubbed} phantom image-range bucket slot(s) in map 0x{map:x} (bbase 0x{bbase:x})"
+                            );
+                        }
+                    }
                     if pc == 0x1029f3e70 {
                         // SH90: seed ALSO the SPAN-hash map (the OTel pb_defaults registration
                         // uses it heavily). SH84 only covered the STRING map (+0x10==0x102a25dec);
@@ -2470,6 +2522,10 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
                                 };
                                 if freshly_seeded {
                                     let arr = Box::leak(vec![0u8; 0x2000].into_boxed_slice());
+                                    // SH91: register this leaked array as a trusted scratch
+                                    // bucket base so the phantom-slot scrub may deref it (it
+                                    // must NOT deref a foreign/unseeded map's +0x00).
+                                    routeb_trust_bucket_array(arr.as_mut_ptr() as u64);
                                     *(map as *mut u64) = arr.as_mut_ptr() as u64;
                                     let mk = |off: usize, val: u32| {
                                         let p = (map + off as u64) as *mut u32;
