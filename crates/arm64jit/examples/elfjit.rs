@@ -993,6 +993,206 @@ fn read_visible_u64(a: u64) -> u64 {
     }
 }
 
+/// Guest-arena build of the engine's REAL geometry context G that its own
+/// geometry emitter (0x105b35288, SH66 frontier) consumes to draw an authored
+/// quad through the ENGINE's GL stack (primitive-setup 0x105b353d0 →
+/// glVertexAttribPointer + glDrawArrays via @plt → real Mesa on the live ctx).
+/// Desync-safe: the emitter runs as its OWN top-level jit_run, never nested
+/// inside the present-walker block, so no executing translation is invalidated.
+///
+/// Layout (from fresh disasm of real libroblox.so, confirmed SH66 recon):
+///   emitter(x0=G, w1=mode_idx, w2=count, w3=geom_key, w4=first, w5=indexed):
+///     x19=G; ldrh w8,[G+0x8e] (elem-type); ldr x9,[G+0x78] (elem-buffer);
+///     w22=w1; bl primitive_setup(G, geom_key=w3) -> returns attrib mask in w0;
+///     if !indexed (w5==0): if [G+0x78]!=0 -> glDrawElements; else ->
+///       glDrawArrays(mode=draw_mode_table[w22], first=w4, count=w2) @0x62d7840.
+///   primitive_setup(x0=G, w1=geom_key):
+///     x25=[G+0x38]=M (mesh); spec array [M+0x48..M+0x50), 24B/entry;
+///       BD array at G+0x48, slot[attr]*0x10 = ptr to BD; BD+0x48 = u32 VBO id;
+///       spec+0=attr idx, spec+4=offset-addend, spec+8=format idx,
+///       spec+12=attrib-loc-enum (0->0,1->1,2->+2,3->+4,else -1), spec+16=size-add;
+///       stride = [M+0x60] table[attr] (u64);
+///       format = vform_table[0xcecf8c + fmt*12] = {size u32, type u32, norm u8};
+///       glBindBuffer(0x8892, bd_id) + glEnableVertexAttribArray(loc) +
+///       glVertexAttribPointer(index=loc,size,type,norm,stride,stride*key+offset).
+/// We fabricate the minimal coherent G for a colored quad (pos vec2 @loc0,
+/// color vec4 @loc1, interleaved stride 24), upload verts into a real VBO via
+/// host glGenBuffers/glBufferData, and drive the emitter as its own jit_run.
+pub fn render_engine_emitter_quad(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) -> u64 {
+    if !(ctx >= 0x100000000 && ctx >> 56 == 0) {
+        return 0;
+    }
+    let h = unsafe { libc::dlopen(c"libGLESv2.so.2".as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+    if h.is_null() {
+        eprintln!("[elfjit:renderemitter] WARN: dlopen libGLESv2.so.2 failed");
+        return 0;
+    }
+    let mp = walker_mesh_program();
+    if mp.program == 0 {
+        eprintln!("[elfjit:renderemitter] WARN: mesh program unavailable");
+        return 0;
+    }
+    unsafe {
+        // (1) Real VBO with the authored quad (pos vec2 + color vec4, stride 24).
+        let genbuf: Option<extern "C" fn(i32, *mut u32)> = mesa_fn(h, b"glGenBuffers\0");
+        let bindbuf: Option<extern "C" fn(u32, u32)> = mesa_fn(h, b"glBindBuffer\0");
+        let bufdata: Option<extern "C" fn(u32, isize, *const i8, u32)> = mesa_fn(h, b"glBufferData\0");
+        let useprogram: Option<extern "C" fn(u32)> = mesa_fn(h, b"glUseProgram\0");
+        let (Some(gb), Some(bb), Some(bd), Some(up)) = (genbuf, bindbuf, bufdata, useprogram) else {
+            eprintln!("[elfjit:renderemitter] WARN: required Mesa symbols missing");
+            return 0;
+        };
+        up(mp.program);
+        let mut vbo = 0u32;
+        gb(1, &mut vbo);
+        // A colored quad (4 verts), violet-to-teal gradient, NDC.
+        let verts: [f32; 24] = [
+            -0.95, -0.95, 0.60, 0.20, 0.95, 1.0, // v0 BL violet
+            0.95, -0.95, 0.20, 0.80, 0.95, 1.0, //  v1 BR teal
+            0.95, 0.95, 0.95, 0.60, 0.20, 1.0, //   v2 TR orange
+            -0.95, 0.95, 0.30, 0.95, 0.40, 1.0, //  v3 TL green
+        ];
+        bb(0x8892, vbo);
+        bd(0x8892, 96, verts.as_ptr() as *const i8, 0x88E4);
+        // (2) Build the engine geometry context G. Use ONE aligned host buffer
+        // (Box::leak; guest==host identity map so the emitter's guest derefs land
+        // on it directly). NB: do NOT use the shared guest_arena here — its tick
+        // counter races with the drain-thread deque injector, misaligning
+        // co-allocated buffers (the walker's fab buffers use Box::leak for the
+        // same reason).
+        let gbuf = Box::leak(vec![0u64; 0x400].into_boxed_slice());
+        let raw = gbuf.as_ptr() as u64;
+        let g = (raw + 7) & !7; // 8-aligned base
+        let bd0 = (g + 0x100) & !7;
+        let m = (g + 0x180) & !7;
+        let spec = (g + 0x280) & !7;
+        let stride_tab = (g + 0x300) & !7;
+        eprintln!("[elfjit:renderemitter] g={g:#x}(raw {raw:#x}) bd0={bd0:#x} m={m:#x} spec={spec:#x} stride_tab={stride_tab:#x}");
+        // spec[0]: attr 0 (pos), offset 0, format idx 1 (vec2 FLOAT), loc 0.
+        *(spec.wrapping_add(0) as *mut u32) = 0;
+        *(spec.wrapping_add(4) as *mut u32) = 0;
+        *(spec.wrapping_add(8) as *mut u32) = 1; // vform[1]={2,FLOAT}
+        *(spec.wrapping_add(12) as *mut u32) = 0; // attrib-loc 0
+        *(spec.wrapping_add(16) as *mut u32) = 0;
+        // spec[1]: attr 1 (color), offset 8, format idx 3 (vec4 FLOAT), loc 1.
+        *(spec.wrapping_add(24) as *mut u32) = 1;
+        *(spec.wrapping_add(28) as *mut u32) = 8;
+        *(spec.wrapping_add(32) as *mut u32) = 3; // vform[3]={4,FLOAT}
+        *(spec.wrapping_add(36) as *mut u32) = 1; // attrib-loc 1
+        *(spec.wrapping_add(40) as *mut u32) = 0;
+        // BD[0]=BD[1]=bd0: BD+0x48 = u32 VBO id.
+        *(bd0.wrapping_add(0x48) as *mut u32) = vbo;
+        // G+0x48 BD slot array: each 16-byte slot = ptr to BD. primitive-setup
+        // indexes slots by attr*0x10 (attr 0 -> G+0x48, attr 1 -> G+0x58), so
+        // write BOTH slots to the same BD (both attrs share the VBO).
+        *(g.wrapping_add(0x48) as *mut u64) = bd0;
+        *(g.wrapping_add(0x58) as *mut u64) = bd0;
+        // G+0x38 = M (mesh).
+        *(g.wrapping_add(0x38) as *mut u64) = m;
+        // M+0x48 = spec begin, M+0x50 = spec end, M+0x60 = stride table.
+        *(m.wrapping_add(0x48) as *mut u64) = spec;
+        *(m.wrapping_add(0x50) as *mut u64) = spec + 48;
+        *(m.wrapping_add(0x60) as *mut u64) = stride_tab;
+        // stride table: attr 0 and 1 both stride 24 (byte offsets +0 and +8).
+        *(stride_tab.wrapping_add(0) as *mut u64) = 24;
+        *(stride_tab.wrapping_add(8) as *mut u64) = 24;
+        // G+0x78 element-buffer = 0 (non-indexed -> glDrawArrays path), G+0x8e = 0.
+        *(g.wrapping_add(0x78) as *mut u64) = 0;
+        *(g.wrapping_add(0x8e) as *mut u16) = 0;
+        eprintln!(
+            "[elfjit:renderemitter] built engine geometry ctx G={g:#x} M={m:#x} VBO={vbo} spec[2] stride=24 (vec2 pos loc0 + vec4 color loc1)"
+        );
+        // (3) Drive the ENGINE's real emitter as its OWN top-level jit_run.
+        // mode_idx 3 = GL_TRIANGLE_STRIP (draw-mode table[3]=0x5), count 4,
+        // geom_key 0, first 0, non-indexed. Own guest stack (Box::leak; the
+        // caller's `isp` may point at the bottom of a mapped region, and the
+        // emitter's prologue `stp x29,x30,[sp,#-64]!` would write below it).
+        let stkbuf = Box::leak(vec![0u8; 0x8000].into_boxed_slice());
+        let stk_top = (stkbuf.as_ptr() as u64).wrapping_add(0x8000) & !15;
+        // Normalize the fixed-function state the emitter's draw depends on (the
+        // walker's swap may leave viewport/depth/cull/blend/scissor in a state
+        // that silently clips the emitter's quad), same as walker_item_draw_thunk.
+        if let (Some(vp), Some(ds)) = (mesa_fn::<extern "C" fn(i32,i32,i32,i32)>(h, b"glViewport\0"), mesa_fn::<extern "C" fn(u32)>(h, b"glDisable\0")) {
+            vp(0, 0, 1280, 720);
+            ds(0x0B71); ds(0x0B44); ds(0x0BE2); ds(0x0C11);
+        }
+        let mut st = arm64jit::jit::CpuState::new();
+        st.tpidr = arm64jit::jit::current_guest_tp();
+        st.x[31] = stk_top;
+        st.x[0] = g;
+        st.x[1] = 3; // w1 mode_idx -> GL_TRIANGLE_STRIP
+        st.x[2] = 4; // w2 count
+        st.x[3] = 0; // w3 geom_key
+        st.x[4] = 0; // w4 first
+        st.x[5] = 0; // w5 indexed_flag = non-indexed
+        let ret = arm64jit::jit::jit_run(iimg, ibase, 0x105b35288, &mut st as *mut CpuState);
+        match ret {
+            Err(e) => {
+                eprintln!("[elfjit:renderemitter] engine emitter stopped: {e}");
+                0
+            }
+            Ok(r) => {
+                // glFinish so the draw is submitted. RENDEREMITTER_READBACK_BEFORE_SWAP=1
+                // reads the CURRENT (back) buffer right after the emitter's draw,
+                // BEFORE presenting — isolating the emitter's own rasterization from
+                // the walker's prior presented frame. Default: present then read.
+                if std::env::var_os("RENDEREMITTER_READBACK_BEFORE_SWAP").is_some() {
+                    if let Some(fn_) = mesa_fn::<extern "C" fn()>(h, b"glFinish\0") {
+                        fn_();
+                    }
+                    if let Some(rp) = mesa_fn::<extern "C" fn(i32,i32,i32,i32,u32,u32,*mut i8)>(h, b"glReadPixels\0") {
+                        let mut px: [u8; 4] = [0; 4];
+                        rp(640, 360, 1, 1, 0x1908, 0x1401, px.as_mut_ptr() as *mut i8);
+                        let mut line: Vec<String> = Vec::new();
+                        for y in [100u32, 200, 300, 360, 420, 500, 600, 650] {
+                            let mut q: [u8; 4] = [0; 4];
+                            rp(640, y as i32, 1, 1, 0x1908, 0x1401, q.as_mut_ptr() as *mut i8);
+                            line.push(format!("y{y}=({},{},{},{})", q[0], q[1], q[2], q[3]));
+                        }
+                        eprintln!("[elfjit:renderemitter] engine emitter Ok(ret={r:#x}) BACK-BUFFER-DIRECT center=(640,360) rgba({},{},{},{}) | {}", px[0], px[1], px[2], px[3], line.join(" "));
+                    }
+                    return r;
+                }
+                // glFinish so the draw is submitted, then PRESENT it: bind the
+                // engine ctx and swap via ctx-vt[+24] so the emitted quad moves
+                // to the front buffer, then read back the quad center (the walker
+                // already swapped its own frame before we ran).
+                if let Some(fn_) = mesa_fn::<extern "C" fn()>(h, b"glFinish\0") {
+                    fn_();
+                }
+                let vt = unsafe { *(ctx as *const u64) };
+                let bind = unsafe { *(vt.wrapping_add(16) as *const u64) };
+                let swap = unsafe { *(vt.wrapping_add(24) as *const u64) };
+                let tp = arm64jit::jit::current_guest_tp();
+                let _ = arm64jit::jit::run_guest_callback(bind, [ctx, 0, 0, 0, 0, 0, 0, 0], tp);
+                let sw = arm64jit::jit::run_guest_callback(swap, [ctx, 0, 0, 0, 0, 0, 0, 0], tp);
+                let readback: Option<extern "C" fn(i32, i32, i32, i32, u32, u32, *mut i8)> =
+                    mesa_fn(h, b"glReadPixels\0");
+                if let Some(rp) = readback {
+                    let mut px: [u8; 4] = [0; 4];
+                    rp(640, 360, 1, 1, 0x1908, 0x1401, px.as_mut_ptr() as *mut i8);
+                    // Sample a vertical line + corners to detect the emitter's
+                    // gradient (violet->teal->orange->green quad) vs. leftover
+                    // walker bands / backdrop.
+                    let mut line: Vec<String> = Vec::new();
+                    for y in [100u32, 200, 300, 360, 420, 500, 600, 650] {
+                        let mut q: [u8; 4] = [0; 4];
+                        rp(640, y as i32, 1, 1, 0x1908, 0x1401, q.as_mut_ptr() as *mut i8);
+                        line.push(format!("y{y}=({},{},{},{})", q[0], q[1], q[2], q[3]));
+                    }
+                    eprintln!(
+                        "[elfjit:renderemitter] engine emitter Ok(ret={r:#x}) swap={sw:?} center=(640,360) rgba({},{},{},{}) | {}",
+                        px[0], px[1], px[2], px[3], line.join(" ")
+                    );
+                } else {
+                    eprintln!("[elfjit:renderemitter] engine emitter Ok(ret={r:#x})");
+                }
+                r
+            }
+        }
+    }
+}
+
 /// Present ONE real task-driven frame on the CURRENT thread (must be the
 /// renderinit thread where EGL current-binding is established — SH61b). Binds
 /// via the engine make-current 0x105b3b358, drives frame-fn 0x105b32c00, swaps
@@ -3328,10 +3528,23 @@ fn main() {
                         .ok().and_then(|v| v.parse().ok()).unwrap_or(3);
                     let walker_nodes: u64 = std::env::var("RENDERWALKER_NODES")
                         .ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+                    // --renderemitter (SH66): additionally drive the engine's REAL
+                    // geometry emitter 0x105b35288 with a fabricated geometry ctx G
+                    // so an authored quad draws through the ENGINE's own GL stack
+                    // (primitive-setup -> glDrawArrays @plt -> real Mesa), pixel-
+                    // verified. Desync-safe: the emitter is its OWN top-level
+                    // jit_run (not nested in the walker block).
+                    let emit: bool = renderframe_args.iter().any(|a| a == "--renderemitter");
                     let mut presented: u64 = 0;
                     while presented < max_frames && t0.elapsed() < max_window {
                         let ret =
                             render_engine_present_walker(real_ctx, presented, walker_nodes, iimg, ibase, tpidr, isp);
+                        if emit {
+                            // The emitter draws onto the same live ctx; drive it
+                            // AFTER this frame's walker so its swap shows the
+                            // engine-emitted quad (the walker's swap precedes).
+                            let _ = render_engine_emitter_quad(real_ctx, iimg, ibase, isp);
+                        }
                         if ret == 1 {
                             presented += 1;
                         }
