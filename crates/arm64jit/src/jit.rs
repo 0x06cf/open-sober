@@ -2380,39 +2380,45 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
                         eprintln!("[routeb-hashfix] string-hash-map @ 0x{map:x} +0x18 0x{h2:x} (non-image garbage) -> 0");
                     }
                     // SH84 empty-map header + zeroed bucket array: ONLY at the INSERT entry
-                    // (0x1029f3e70), once per distinct map — that is where a freshly built map
-                    // first comes up from uninitialized host heap, so there is nothing to orphan
-                    // and the probe needs a coherent empty bucket. The rehash/grow ops reuse an
-                    // already-populated array and must NOT be force-emptied (they preserve the
-                    // entries SH83/84 let insert write).
+                    // (0x1029f3e70), once per distinct map, AND only for the STRING-HASH map
+                    // (identified by +0x10 == the engine's real string hash) — repointing
+                    // +0x00 to a fresh LeAk'd array + forcing +0x38..0x60 is destructive and
+                    // assumes THIS map's layout, so it must NEVER touch a foreign object (a
+                    // generalized hook run here corrupted a rehashed/other map -> glibc
+                    // "double free or corruption (out)" abort). The rehash/grow gates are
+                    // cleared purely by the non-image +0x18 repair above (no force-empty).
                     if pc == 0x1029f3e70 {
-                        unsafe {
-                            use std::collections::HashSet;
-                            use std::sync::{Mutex, OnceLock};
-                            static SEEN: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
-                            let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
-                            let freshly_seeded = {
-                                let mut g = seen.lock().unwrap();
-                                g.insert(map)
-                            };
-                            if freshly_seeded {
-                                let arr = Box::leak(vec![0u8; 0x2000].into_boxed_slice());
-                                *(map as *mut u64) = arr.as_mut_ptr() as u64;
-                                let mk = |off: usize, val: u32| {
-                                    let p = (map + off as u64) as *mut u32;
-                                    unsafe { *p = val };
+                        const STRING_HASH: u64 = 0x102a25dec; // the string map's primary hash
+                        let h1 = unsafe { *((map + 0x10) as *const u64) };
+                        if h1 == STRING_HASH {
+                            unsafe {
+                                use std::collections::HashSet;
+                                use std::sync::{Mutex, OnceLock};
+                                static SEEN: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+                                let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+                                let freshly_seeded = {
+                                    let mut g = seen.lock().unwrap();
+                                    g.insert(map)
                                 };
-                                mk(0x38, 0x400);
-                                mk(0x3c, 0x400);
-                                mk(0x40, 0);
-                                mk(0x44, 0x400);
-                                mk(0x48, 0x100);
-                                mk(0x60, 0);
-                                unsafe { *((map + 0x58) as *mut u64) = 0 };
-                                eprintln!(
-                                    "[routeb-hashfix] map @ 0x{map:x} empty header + zeroed bucket array (0x{:x}) seeded for a coherent insert probe",
-                                    arr.as_ptr() as u64
-                                );
+                                if freshly_seeded {
+                                    let arr = Box::leak(vec![0u8; 0x2000].into_boxed_slice());
+                                    *(map as *mut u64) = arr.as_mut_ptr() as u64;
+                                    let mk = |off: usize, val: u32| {
+                                        let p = (map + off as u64) as *mut u32;
+                                        unsafe { *p = val };
+                                    };
+                                    mk(0x38, 0x400);
+                                    mk(0x3c, 0x400);
+                                    mk(0x40, 0);
+                                    mk(0x44, 0x400);
+                                    mk(0x48, 0x100);
+                                    mk(0x60, 0);
+                                    unsafe { *((map + 0x58) as *mut u64) = 0 };
+                                    eprintln!(
+                                        "[routeb-hashfix] string hash-map @ 0x{map:x} empty header + zeroed bucket array (0x{:x}) seeded for a coherent insert probe",
+                                        arr.as_ptr() as u64
+                                    );
+                                }
                             }
                         }
                     }
