@@ -2530,27 +2530,53 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
                     // host address and dereferencing it panics (jit.rs:2467). Never touch a
                     // valid node pointer or the map header; honors SH84/86b.
                     if pc == 0x1029f3e70 {
-                        let slot_image_phantom = |p: u64| p >= base && p - base < image.len() as u64;
+                        // SH91+SH96: the INSERT chain-walk (0x29f3fb4 head ldr, 0x29f3fe4
+                        // [x23+16]) faults when the probe's slot ADDRESS overflows the owned
+                        // bucket array into .text — or a slot VALUE is an image address.
+                        // Root cause (recon deleg_9e27d070): the ENGINE'S OWN GROWTH
+                        // (0x29f3ec0, `str x0,[x19]`@0x29f3ee4 + header rewrites) re-writes the
+                        // map's numeric header (mask +0x40, div +0x44, cap +0x3c/load +0x48)
+                        // AFTER the once-per-map SH90 seed fired, so a later insert computes a
+                        // wild idx*8 that wraps the 0x2000-byte owned array into image memory.
+                        // Fix: on EVERY INSERT entry, for a trusted family map, RE-ASSERT the
+                        // coherent fixed-0x400 header (so idx*8 stays within the owned
+                        // 0x2000-byte = 1024-slot array regardless of growth re-writes) AND
+                        // NULL any in-image slot VALUE. Never repoint +0x00 (honors SH84/86b);
+                        // a fixed small header only increases collisions, never crashes.
+                        let h1 = unsafe { *((map + 0x10) as *const u64) };
+                        const SPAN_HASH: u64 = 0x1029b4a84;
+                        const STRING_HASH: u64 = 0x102a25dec;
+                        let family = h1 == SPAN_HASH || h1 == STRING_HASH;
                         let bbase = unsafe { *(((map + 0x00) as *const u64)) as u64 };
                         let trusted = routeb_trusted_buckets().lock().unwrap().contains(&bbase);
-                        let scrubbed = if bbase != 0 && trusted {
-                            let mut n = 0u64;
+                        if family && trusted {
+                            // Re-assert fixed size so the probe stays inside the owned array.
+                            let mk = |off: usize, val: u32| {
+                                let p = (map + off as u64) as *mut u32;
+                                unsafe { *p = val };
+                            };
+                            mk(0x3c, 0x400);
+                            mk(0x40, 0);
+                            mk(0x44, 0x400);
+                            mk(0x48, 0x100);
+                            mk(0x60, 0);
+                            unsafe { *((map + 0x58) as *mut u64) = 0 };
+                            // Scrub any in-image slot VALUE (phantom head-link) inside the array.
+                            let slot_image_phantom = |p: u64| p >= base && p - base < image.len() as u64;
+                            let mut scrubbed = 0u64;
                             for i in 0..1024u64 {
                                 let p = (bbase + i * 8) as *mut u64;
                                 let v = unsafe { *p };
                                 if v != 0 && slot_image_phantom(v) {
                                     unsafe { *p = 0 };
-                                    n += 1;
+                                    scrubbed += 1;
                                 }
                             }
-                            n
-                        } else {
-                            0
-                        };
-                        if scrubbed > 0 {
-                            eprintln!(
-                                "[routeb-hashfix] SH91 scrubbed {scrubbed} phantom image-range bucket slot(s) in map 0x{map:x} (bbase 0x{bbase:x})"
-                            );
+                            if scrubbed > 0 {
+                                eprintln!(
+                                    "[routeb-hashfix] SH91/96 scrubbed {scrubbed} phantom image-range bucket slot(s) + reasserted 0x400 header in map 0x{map:x} (bbase 0x{bbase:x})"
+                                );
+                            }
                         }
                     }
                     if pc == 0x1029f3e70 {
