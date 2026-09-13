@@ -962,6 +962,12 @@ pub fn routeb_seed_pb_registry_map(image: &[u8], base: u64) -> u64 {
         let map = Box::leak(vec![0u8; 0x80usize].into_boxed_slice()).as_mut_ptr() as u64;
         unsafe {
             let arr = Box::leak(vec![0u8; 0x2000usize].into_boxed_slice());
+            // SH95b: register this leaked scratch bucket array in jit's TRUSTED_BUCKETS so the
+            // SH91 phantom-image-slot scrub will deref it. The substitute map is the one SH92
+            // routes ALL INSERT traffic into, so it is the map most likely to accumulate a
+            // phantom image-range slot; without this, SH91 skips it (untrusted) and the
+            // INSERT chain-walk derefs image code as a node (SIGSEGV 0x1029f3f7c).
+            arm64jit::jit::routeb_trust_bucket_array(arr.as_mut_ptr() as u64);
             *(map as *mut u64) = arr.as_mut_ptr() as u64; // +0x00 bucket array
             *((map + 0x10) as *mut u64) = 0x1029b4a84; // +0x10 real span hash (in-image)
             *((map + 0x18) as *mut u64) = 0; // +0x18 single-hash
@@ -974,7 +980,14 @@ pub fn routeb_seed_pb_registry_map(image: &[u8], base: u64) -> u64 {
             *((map + 0x60) as *mut u32) = 0;
         }
         // Install into the pb_defaults BSS registry slots (idempotent data seed).
-        for slot in [0x106838368u64, 0x106838378, 0x106838380] {
+        // NOTE (SH95): 0x106838378 is a pthread_rwlock POINTER slot (the registrar tail
+        // `ldr x0,[x20,#888]`=+888=0x378 unlocks it) — do NOT seed it with the map ptr,
+        // or the do-init's pthread_rwlock_unlock crashes (it was the SH94-trace crash at
+        // guestpc 0x102a1ce5c, fault==rip==heap on a garbage lock word). .bss is zeroed so
+        // 0x378 holds a valid UNLOCKED rwlock natively — leave it untouched. Only seed the
+        // actual registry-MAP slots the registrar reads (0x106838380 at offset 896, and
+        // 0x106838368 which the find-op registration uses).
+        for slot in [0x106838368u64, 0x106838380] {
             unsafe { *(slot as *mut u64) = map };
         }
         eprintln!(

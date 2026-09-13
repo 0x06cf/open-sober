@@ -527,7 +527,7 @@ fn routeb_trusted_buckets() -> &'static std::sync::Mutex<std::collections::HashS
 
 /// SH91: register a leaked host bucket array we own so the phantom-slot scrub may
 /// deref its slots (it must NOT deref a foreign/unseeded map's +0x00).
-fn routeb_trust_bucket_array(bbase: u64) {
+pub fn routeb_trust_bucket_array(bbase: u64) {
     routeb_trusted_buckets().lock().unwrap().insert(bbase);
 }
 
