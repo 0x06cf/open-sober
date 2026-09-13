@@ -737,47 +737,61 @@ fn patch_stack_canary(el: &LoadedElf, wr64: &impl Fn(usize, u64)) {
     // because the runtime maps guest==host (contig), that value doubles as the
     // host addr.
     const CANARY_GOT_LINK: u64 = 0x631a000 + 0xa30; // = 0x631aa30
+    // The REFERENCE slot above is only JNI_OnLoad's prologue. The rest of the
+    // binary's stack-protected functions read their guard base from a DIFFERENT
+    // .got slot — `adrp xN, 0x67d1000; ldr xN,[xN,#1776]` (= 0x67d1000 + 0x6f0
+    // = 0x67d16f0), the last entry of `.got` (0x67c9a28..0x67d16f8). It is the
+    // SAME address the harness's render-init diagnostic reads as "ctx"
+    // (0x1067d16f0), but that read is non-load-bearing (RENDERCTX comes from
+    // the thunk return), so seeding it with a stable canary address is safe and
+    // fixes the false __stack_chk_fail: without it the slot holds a MUTABLE
+    // pointer (the engine's render-ctx), so a canary function's prologue-store
+    // and epilogue-compare read different "canary" values -> __stack_chk_fail.
+    const CANARY_GOT_LINK2: u64 = 0x67d1000 + 0x6f0; // = 0x67d16f0 (pervasive)
+    let links = [CANARY_GOT_LINK, CANARY_GOT_LINK2];
+
+    static CANARY: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    // Resolve the stable canary address ONCE (outside the slot loop) so both
+    // GOT slots point at the SAME canary variable. Prefer libc's real guard so
+    // __stack_chk_fail and our value agree; fall back to a process-static.
+    let canary_addr = unsafe {
+        let libc_guard = libc::dlsym(libc::RTLD_DEFAULT, b"__stack_chk_guard\0".as_ptr() as *const _);
+        if !libc_guard.is_null() {
+            // Seed libc's real canary slot to a stable non-zero value if it
+            // currently reads 0 (mirror jni_shim's static fallback).
+            if std::ptr::read_unaligned(libc_guard as *const u64) == 0 {
+                std::ptr::write_unaligned(libc_guard as *mut u64, 0x2f_2a_1a_0a_0e_0f_10_11u64);
+            }
+            libc_guard as u64
+        } else {
+            CANARY.store(0x2f_2a_1a_0a_0e_0f_10_11u64, std::sync::atomic::Ordering::Relaxed);
+            &CANARY as *const _ as u64
+        }
+    };
+
+    for link in links {
+    let slot = link;
     // Only patch if the slot actually lands inside this module's mapped image.
     // For a small test .so linked at a low origin this link-time address maps
     // far outside the module's PT_LOADs (guest==host), so dereferencing it
     // would SIGSEGV; for the real libroblox.so it resolves to the real GOT slot.
-    let Some(host_addr) = el.host_addr_of(el.guest_of(CANARY_GOT_LINK)) else {
-        eprintln!("[plt] canary slot {CANARY_GOT_LINK:#x} not in this module's image; skipping");
-        return;
+    let Some(host_addr) = el.host_addr_of(el.guest_of(slot)) else {
+        eprintln!("[plt] canary slot {slot:#x} not in this module's image; skipping");
+        continue;
     };
     let host_addr = host_addr as usize;
     let cur = unsafe { std::ptr::read_unaligned(host_addr as *const u64) };
 
-    static CANARY: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
-    let canary_val = CANARY.load(std::sync::atomic::Ordering::Relaxed);
-    let canary_addr = if canary_val != 0 {
-        &canary_val as *const u64 as u64
-    } else {
-        // Prefer libc's real canary so __stack_chk_fail and our value agree.
-        let libc_guard =
-            unsafe { libc::dlsym(libc::RTLD_DEFAULT, b"__stack_chk_guard\0".as_ptr() as *const _) };
-        let addr = if !libc_guard.is_null() {
-            libc_guard as u64
-        } else {
-            // Static fallback: a stable non-zero canary byte pattern.
-            let canary = 0x2f_2a_1a_0a_0e_0f_10_11u64;
-            // If libc guard exists but reads 0, seed it too (mirror jni_shim).
-            if !libc_guard.is_null() {
-                unsafe { std::ptr::write_unaligned(libc_guard as *mut u64, canary) };
-            }
-            CANARY.store(canary, std::sync::atomic::Ordering::Relaxed);
-            &CANARY as *const _ as u64
-        };
-        CANARY.store(addr, std::sync::atomic::Ordering::Relaxed);
-        addr
-    };
-
-    if cur & !0x0000_0000_ffff_ffffu64 == 0 {
-        // Only write when the slot doesn't already reference a real page, so we
-        // never clobber a legitimately-bound canary or an unrelated GOT slot.
+    if cur & !0x0000_0000_ffff_ffffu64 == 0 || slot == 0x67d16f0 {
+        // Always seed the pervasive slot 0x67d16f0 even when it already holds a
+        // page pointer: that pointer is the MUTABLE render-ctx singleton which
+        // is exactly what causes the false stack-smash (a canary fn reads a
+        // different "canary" at prologue vs epilogue). The pre-existing write
+        // is the bug, not a legitimately-bound canary, so overwrite it.
         wr64(host_addr, canary_addr);
-        eprintln!("[plt] patched __stack_chk_guard GOT {:#x} ({:#x}) -> {:#x}", CANARY_GOT_LINK, cur, canary_addr);
+        eprintln!("[plt] patched __stack_chk_guard GOT {slot:#x} ({cur:#x}) -> {canary_addr:#x}");
+    }
     }
 }
 

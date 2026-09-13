@@ -2381,6 +2381,32 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
                     for (i, x) in s.x.iter().enumerate() {
                         line.push_str(&format!(" x{i}={x:#x}"));
                     }
+                    // Also read the guest canary slot [x29-16] and its neighbors
+                    // (the guest stack is guest==host identity-mapped, so reading
+                    // the host address works). This lets a single probe confirm
+                    // WHEN a frame's saved canary is clobbered.
+                    let x29 = s.x[29];
+                    if x29 != 0 {
+                        let base = x29.wrapping_sub(0x40);
+                        let mut mem = String::from(" canarywin");
+                        for off in (0u64..0x40).step_by(8) {
+                            let a = base.wrapping_add(off);
+                            let v = unsafe { std::ptr::read_unaligned(a as *const u64) };
+                            mem.push_str(&format!("[{:#x}]={:#x}", a, v));
+                        }
+                        line.push_str(&mem);
+                    }
+                    // Read the guard GOT slot this canary fn reads (0x67d16f0 ->
+                    // guest 0x1067d16f0) AND the values it dereferences, to check
+                    // for collision with the renderinit ctx-publish slot.
+                    unsafe {
+                        let got: u64 = std::ptr::read_unaligned(0x1067d16f0u64 as *const u64);
+                        line.push_str(&format!(" guardGOT[0x1067d16f0]={got:#x}"));
+                        if got != 0 && got != !0u64 {
+                            line.push_str(&format!(" guardval={:#x}",
+                                std::ptr::read_unaligned(got as *const u64)));
+                        }
+                    }
                     println!("{line}");
                 }
             }
