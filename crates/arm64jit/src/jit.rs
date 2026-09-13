@@ -5412,6 +5412,44 @@ mod tests {
     }
 
     #[test]
+    fn routeb_dispatch_gate_force_reroutes_clean_path() {
+        // Route-B SH81 gate force. The engine dispatch accessor `21730ec` collapses
+        // its "subsystem initialized?" query to bit0 (`and w0,w0,#1`, file 0x2173124,
+        // LE u32 0x12000000); ~255 generated dispatch stubs test it with
+        // `bl 21730ec; tbz w0,#0,<fb>`. On a headless boot the query is 0 so every
+        // site took the crashing singleton-fallback path (SH80 SIGSEGV at
+        // 0x10624f46c). Patching the mask to `mov w0,#1` (LE u32 0x52800020) forces
+        // bit0=1 -> the clean direct path. Pin encodings + the guest patch address,
+        // then prove the reroute with the JIT decoder (exec_bytes).
+        assert_eq!(0x1200_0000u32, 0x1200_0000, "and w0,w0,#1 (LE 00 00 00 12)");
+        assert_eq!(0x5280_0020u32, 0x5280_0020, "mov w0,#1 (LE 20 00 80 52)");
+        assert_eq!(0x102173124u64, 0x2173124 + 0x100000000, "gate patch guest addr");
+
+        // ORIGINAL accessor tail: `and w0,w0,#0x1 ; ret` -> collapses w0 to bit0.
+        let orig = [0x00u8, 0x00, 0x00, 0x12, 0xc0, 0x03, 0x5f, 0xd6];
+        let mut st_odd = CpuState::new();
+        st_odd.x[0] = 5;
+        let r = exec_bytes(&mut st_odd, &orig, 0).expect("orig odd");
+        assert_eq!(r, 1, "query=0b101 -> bit0 = 1");
+        let mut st_zero = CpuState::new();
+        st_zero.x[0] = 0;
+        let r = exec_bytes(&mut st_zero, &orig, 0).expect("orig zero");
+        assert_eq!(r, 0, "query=0 -> bit0 = 0 (the headless-boot case that crashed)");
+
+        // PATCHED tail: `mov w0,#1 ; ret` -> always 1, so `tbz w0,#0` never branches
+        // to the fallback singleton path, regardless of the query value.
+        let patched = [0x20u8, 0x00, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6];
+        let mut st_p0 = CpuState::new();
+        st_p0.x[0] = 0;
+        let r = exec_bytes(&mut st_p0, &patched, 0).expect("patched query0");
+        assert_eq!(r, 1, "patched query=0 -> 1, dispatch takes clean path");
+        let mut st_p5 = CpuState::new();
+        st_p5.x[0] = 5;
+        let r = exec_bytes(&mut st_p5, &patched, 0).expect("patched query5");
+        assert_eq!(r, 1, "patched query=5 -> 1, still clean path");
+    }
+
+    #[test]
     fn bl_compiles_and_calls_leaf() {
         // caller = (x0+5)*2, via `bl h` then `add w0,w0,w0`.
         // 94000003 bl 0xc ; 0b000000 add w0,w0,w0 ; d65f03c0 ret

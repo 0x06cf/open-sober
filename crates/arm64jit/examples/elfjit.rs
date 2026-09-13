@@ -889,6 +889,123 @@ fn walker_patch_full_body() {
     WALKER_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Route-B gate force (recon deleg_5ebaa5f9, docs/recon-routeB-...): the engine
+/// dispatch accessor `21730ec` ends with `and w0,w0,#0x1` (file 0x2173124, LE u32
+/// 0x12000000) which masks the "subsystem initialized?" query from `284f874` down
+/// to its low bit; ~255 generated dispatch stubs all test it with
+/// `bl 21730ec; tbz w0,#0,<path>`. On a headless boot the query returns 0, so every
+/// site takes the FALLBACK singleton-lookup path (`6249e9c`/`6249eb8` ->
+/// `2b9dee0(&0x6829a48/&0x6829a68)`), whose lazy-created stub has a NULL vtable ->
+/// the `ldr x8,[x8,#48]; blr x8` SIGSEGVs (SH80 crush at guest 0x10624f46c during
+/// nativeInitializeNativeFlags). Patching the mask to `mov w0,#1` (LE u32
+/// 0x52800020) forces bit0=1, so every gated site takes its CLEAN DIRECT path
+/// (e.g. 0x624f41c -> bl 1db1050 / 224d550 / 224d5b4 / 224d600 / 240a1b0 — the
+/// latter a StartLuaAppDM-adjacent call) and never touches the singletons. The
+/// mask already collapses w0 to bit0, so all callers only ever observed {0,1};
+/// forcing 1 changes nothing else observable. Idempotent (byte-compare); cache-
+/// drops the accessor block so any thread recompiles the patched bytes.
+static ROUTEB_GATE_PATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+fn routeb_patch_dispatch_gate() {
+    if ROUTEB_GATE_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    // guest addr = file vaddr 0x2173124 + 0x100000000 (identity-mapped .text).
+    let addr = 0x102173124u64;
+    let want = 0x5280_0020u32; // mov w0, #1
+    let page = addr & !0xfff;
+    unsafe {
+        if libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_WRITE) == 0 {
+            let before = *(addr as *const u32);
+            if before == 0x1200_0000u32 {
+                *(addr as *mut u32) = want;
+                eprintln!(
+                    "[elfjit:routeB] patched dispatch-gate `and w0,w0,#1` 0x{addr:x} ({before:08x}) -> `mov w0,#1` ({want:08x}) — gated dispatch sites take the clean direct path, bypassing the singleton null-vtable crash"
+                );
+            } else if before == want {
+                eprintln!("[elfjit:routeB] dispatch-gate 0x{addr:x} already {want:08x}");
+            } else {
+                eprintln!(
+                    "[elfjit:routeB] WARN dispatch-gate 0x{addr:x} unexpected bytes {before:08x}, not patched"
+                );
+            }
+            libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_EXEC);
+        } else {
+            eprintln!(
+                "[elfjit:routeB] WARN mprotect RW failed for dispatch-gate 0x{addr:x} errno={}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    arm64jit::jit::block_cache_drop_region(0x1021730ec, 0x102173138);
+    ROUTEB_GATE_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Benign virtual leaf for the Route-B seeded singletons: returns its first
+/// arg (x0). Many dispatch stubs call `vt[+N](this, ...)` and store the result
+/// into a sink or use it as `this`; identity is the safe default for an
+/// unresolved virtual, and it never dereferences anything, so a null-vtable
+/// stub can't crash on the read (`ldr x8,[x8,#48]; blr x8`) that SH81 hit.
+extern "C" fn routeb_singleton_leaf(a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64) -> u64 {
+    a0
+}
+
+static ROUTEB_LEAF_ADDR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+/// Route-B SH81: seed the two engine dispatch-singleton `.data` records so the
+/// accessor `2b9dee0`'s lazy-create returns a coherent object instead of an
+/// all-zero stub (whose `+0` vtable is NULL). The gate-force (`routeb_patch_
+/// dispatch_gate`) routes the ~255 `bl 21730ec; tbz w0,#0` sites to their clean
+/// path, but callback `0x624f4bc` reaches the same singletons through a DIRECT
+/// `cbz x1,0x624f4f0` branch (bl 6249e9c/6249eb8) the gate never sees, and there
+/// `ldr x8,[objB]; ldr x8,[x8,#48]; blr` SIGSEGVs on the null vtable (SH80/81
+/// crash at 0x10624f500). Records (guest = file vaddr + 0x100000000; .data,
+/// identity-mapped rw-): {+0 size, +8 pow2 allocclass, +16 ticket(lazy), +24 src}.
+/// `2b9dee0` create path (0x2b9e030) memcpys `[addr+24]` (src) `[addr+0]` (size)
+/// bytes into a fresh 8-aligned heap obj and returns it; src==NULL -> memset 0
+/// (the null-vtable stub). Seeding src = a host template whose +0 is a leaked
+/// vtable (every slot = `routeb_singleton_leaf`) makes every objA/objB accessor
+/// result a real polymorphic object whose virtuals are benign leaves.
+fn routeb_seed_task_singletons() {
+    if ROUTEB_SINGLETON_SEEDED.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let leaf = *ROUTEB_LEAF_ADDR.get_or_init(|| {
+        let a = arm64jit::jit::register_host_call_auto(routeb_singleton_leaf);
+        eprintln!("[elfjit:routeB] benign singleton virtual registered at {a:#x}");
+        a
+    });
+    // Leaked 0x60-byte vtable; every 8-byte slot = the benign leaf.
+    let vtable: &'static mut [u8] = Box::leak(vec![0u8; 0x60].into_boxed_slice());
+    for i in 0..(0x60 / 8) {
+        unsafe { *(vtable.as_mut_ptr().wrapping_add(i * 8) as *mut u64) = leaf; }
+    }
+    let vtable_addr = vtable.as_ptr() as u64;
+    // Templates (0x28 bytes) whose +0 is the vtable; rest zero (obj fields the
+    // observed sites pass as args / read are benign or ignored by the leaf).
+    let mk_template = || -> u64 {
+        let t: &'static mut [u8] = Box::leak(vec![0u8; 0x28].into_boxed_slice());
+        unsafe { *(t.as_mut_ptr() as *mut u64) = vtable_addr; }
+        t.as_ptr() as u64
+    };
+    let src_a = mk_template();
+    let src_b = mk_template();
+    // .data records (guest identity-mapped, host-writable — same as LSM seed).
+    unsafe {
+        let ra = 0x106829a48u64;
+        *(ra as *mut u64) = 0x28; // size
+        *((ra + 8) as *mut u64) = 8; // allocclass (pow2)
+        *((ra + 0x18) as *mut u64) = src_a; // src template
+        let rb = 0x106829a68u64;
+        *(rb as *mut u64) = 0x28;
+        *((rb + 8) as *mut u64) = 8;
+        *((rb + 0x18) as *mut u64) = src_b;
+    }
+    println!(
+        "[elfjit:routeB] seeded dispatch singletons .data 0x106829a48/0x106829a68 (size=0x28 alloc=8 src=template 0x{src_a:x}/0x{src_b:x}, vtable@0x{vtable_addr:x}=leaf 0x{leaf:x}) — 2b9dee0 lazy-create returns coherent objects, no null-vtable crash"
+    );
+    ROUTEB_SINGLETON_SEEDED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+static ROUTEB_SINGLETON_SEEDED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Drive the engine's REAL per-node PRESENT walker so a populated 0x28-stride
 /// scene node actually DRAWS (closing SH63's "present side" gap). Entry is the
 /// mid-function present-loop region `0x105b2eec0` (x19=R preset via CpuState —
@@ -4030,6 +4147,16 @@ fn main() {
         // the rungs execute concurrently while StartApp idles. Opt-in.
         if std::env::args().any(|a| a == "--v2boot") {
             const BSS_TASKV4: u64 = 0x106829ea8;
+            // Route-B SH81: force the engine's dispatch-accessor low-bit gate so
+            // every gated dispatch site takes its clean direct path instead of
+            // the NULL-vtable singleton fallback (SH80 crash at 0x10624f46c).
+            // Since the --v2boot ladder is the Route-B driver, apply it here.
+            routeb_patch_dispatch_gate();
+            // SH81: also seed the two dispatch-singleton .data records so the
+            // accessor's lazy-create returns a coherent object (real vtable) —
+            // the singletons 0x624f4f0 reaches directly (cbz x1) that the gate
+            // force does NOT cover (would otherwise null-vtable crash at 0x624f500).
+            routeb_seed_task_singletons();
             let boot_sp = st.x[31];
             let tpidr = arm64jit::jit::current_guest_tp();
             let ib = base;
