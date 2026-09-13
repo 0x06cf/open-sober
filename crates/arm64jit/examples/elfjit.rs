@@ -1183,6 +1183,83 @@ fn routeb_patch_globalinit_cevent_barrier() {
     arm64jit::jit::block_cache_drop_region(0x102206e20, 0x102206f00);
 }
 
+/// SH102: gameGlobalInit do-init reaches a GATED, purely DIAGNOSTIC base-URL
+/// logging block (fn prologue 0x102dadb2c) that derefs a lazily-initialized
+/// singleton slot `*(0x106ED7A28)` (a bss PastEndOfFile address, never set under
+/// the JIT) -> `bl 0x10221364c` returns 0 in x0, and `ldrb w8,[x0]` @0x102dade34
+/// faults 0x0. The block is gated by `ldr w8,[x27,#14]; cmp w8,#1; b.lt 0x194`
+/// (only runs when the ClientRunInfo counter >= 1) and, per recon deleg_76ff96e9,
+/// only composes/emits the "[FLog::ClientRunInfo] The base url is {}" log — no
+/// init-relevant side effects (all stores go to stack locals before the b.lt
+/// skip-target 0x102dadf9c). Patch the gate `b.lt` (0x54000cab) -> unconditional
+/// `b 0x194` (0x14000065) so the null-deref logging body is unreachable. This is
+/// semantically neutral (suppresses only the base-url log) and deterministic.
+fn routeb_patch_clientruninfo_url_log() {
+    const ADDR: u64 = 0x102dade08; // gate: `ldr w8,[x27,#14]; cmp #1; b.lt +0x194`
+    let want = 0x1400_0065u32; // b 0x194 (always skip the logging block)
+    let page = ADDR & !0xfff;
+    unsafe {
+        if libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_WRITE) == 0 {
+            let before = *(ADDR as *const u32);
+            if before == 0x5400_0cabu32 {
+                *(ADDR as *mut u32) = want;
+                eprintln!(
+                    "[elfjit:routeB] SH102 patched ClientRunInfo base-url log gate 0x{ADDR:x} ({before:08x}) -> unconditional b 0x194 — skips the null-singleton *(0x106ED7A28) logging block (diagnostic only)"
+                );
+            } else if before == want {
+                eprintln!("[elfjit:routeB] SH102 ClientRunInfo log gate 0x{ADDR:x} already patched");
+            } else {
+                eprintln!("[elfjit:routeB] WARN SH102 ClientRunInfo log gate 0x{ADDR:x} unexpected {before:08x}, not patched");
+            }
+            libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_EXEC);
+        } else {
+            eprintln!(
+                "[elfjit:routeB] WARN SH102 mprotect RW failed for ClientRunInfo log gate 0x{ADDR:x} errno={}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    arm64jit::jit::block_cache_drop_region(0x102dadb00, 0x102dadfc0);
+}
+
+/// SH103: gameGlobalInit's keyed-registry update (fn 0x101db5cfc) reads the
+/// static [0x106dcb078] via `ldr x24,[x20]` @0x101db5ffc where x20 carries a HOST
+/// pointer (0x5649.../0x7f6a...) that leaks into guest callee-saved x20 across a
+/// host-call excursion (bl @0x101db5ff8 -> 0x101db7d4c -> PLT strlen). The static
+/// S=0x106dcb078 is zeroed .bss and the gate `cbz x24` (0x101db6008) correctly
+/// skips when S==0, so the intended value of the load is ALWAYS 0. Patch the
+/// load to `mov x24,#0` so it yields the intended NULL regardless of the leaked
+/// x20 value (mid-block clobber is immune to block-entry hooks). The residual
+/// host-pointer-into-x20 leak is a real JIT-hosting bug (recon deleg_1450dcdf)
+/// tracked for a bridge-level fix; this site patch unblocks the gate.
+fn routeb_patch_keyed_registry_x24_load() {
+    const ADDR: u64 = 0x101db5ffc; // `ldr x24,[x20]` (word f9400298) -> `mov x24,#0`
+    let want = 0xd280_0018u32; // mov x24, #0
+    let page = ADDR & !0xfff;
+    unsafe {
+        if libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_WRITE) == 0 {
+            let before = *(ADDR as *const u32);
+            if before == 0xf940_0298u32 {
+                *(ADDR as *mut u32) = want;
+                eprintln!(
+                    "[elfjit:routeB] SH103 patched keyed-registry `ldr x24,[x20]` 0x{ADDR:x} ({before:08x}) -> `mov x24,#0` — yields the intended NULL static read regardless of the host-pointer leak in x20"
+                );
+            } else if before == want {
+                eprintln!("[elfjit:routeB] SH103 keyed-registry x24 load 0x{ADDR:x} already patched");
+            } else {
+                eprintln!("[elfjit:routeB] WARN SH103 keyed-registry x24 load 0x{ADDR:x} unexpected {before:08x}, not patched");
+            }
+            libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_EXEC);
+        } else {
+            eprintln!(
+                "[elfjit:routeB] WARN SH103 mprotect RW failed for keyed-registry x24 load 0x{ADDR:x} errno={}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    arm64jit::jit::block_cache_drop_region(0x101db5cfc, 0x101db6210);
+}
+
 fn routeb_patch_map_dispatch() {
     // Two dispatch `blr x8` sites in the Roblox string/span hash-map family, each the
     // optional-hash2 branch of `ldp x1,x8,[x19,#16]; cbz x8;<tail>blr x1`:
@@ -4457,6 +4534,17 @@ fn main() {
             // TaskScheduler worker thread that never runs headlessly -> NOP the barrier so
             // gameGlobalInit RETURNS (unlocks rung 2 nativeUpdateAdapterInit -> type-4 vector).
             routeb_patch_globalinit_cevent_barrier();
+            // SH102: gameGlobalInit's ClientRunInfo base-url log block derefs a
+            // lazily-initialized singleton *(0x106ED7A28) that never initializes
+            // under the JIT -> ldrb [x0]=0 faults at 0x102dade34. The block is a
+            // pure diagnostic log (gated on a run counter); force its gate to
+            // always skip it.
+            routeb_patch_clientruninfo_url_log();
+            // SH103: gameGlobalInit's keyed-registry update reads the zeroed-bss
+            // static [0x106dcb078] through x20, but a mid-block host-call leak
+            // (PLT strlen) puts a HOST pointer in x20 -> `ldr x24,[x20]` faults.
+            // The read is null-guarded (intended value 0); force it.
+            routeb_patch_keyed_registry_x24_load();
             let boot_sp = st.x[31];
             let tpidr = arm64jit::jit::current_guest_tp();
             let ib = base;
