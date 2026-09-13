@@ -575,6 +575,32 @@ pub fn host_float_base() -> u64 {
     HOST_THUNK_BASE + (HOST_THUNK_MAX as u64) * 8
 }
 
+/// SH97: guaranteed-safe `strlen` for guest C-string pointers. A guest string pointer may
+/// legitimately be EITHER in the mapped guest image (static .rodata/.data) OR a host-heap
+/// allocation the guest made via our malloc shim (0x7f...). The crash class the deep-map
+/// walk produces is a NON-CANONICAL / sign-extended small value (e.g. 0xffffff80ffffffc8,
+/// top 16 bits 0xffff — a sign-extended 48-bit tag) or a small sub-image int; raw glibc
+/// strlen on those SIGSEGVs. So: refuse a pointer whose top 16 bits are 0xffff (sign-
+/// extended garbage) or that is < 0x100000000 (sub-image small int, never a mapped
+/// pointer), and otherwise call plain strlen on the canonical pointer (image or host heap).
+pub fn safe_cstr_len(ptr: u64) -> usize {
+    if ptr == 0 || ptr < 0x100000000 || (ptr >> 48) as u16 == 0xffff {
+        return 0; // garbage / non-canonical / unreachable -> empty length, caller fallback
+    }
+    unsafe { libc::strlen(ptr as *const std::ffi::c_char) as usize }
+}
+
+/// Whether `addr` is in the guest's mapped image domain
+/// [base, base+image_len) — true for static strings; used to classify a pointer that is
+/// canonical (host-heap) vs image (both should be scanned) vs non-canonical (refused).
+pub fn image_domain_contains(addr: u64) -> bool {
+    let g = EXEC_CTX.lock().unwrap();
+    match *g {
+        Some(ref ctx) => addr >= ctx.base && addr - ctx.base < ctx.image_len as u64,
+        None => false,
+    }
+}
+
 /// Register a float host fn at an auto-allocated slot; returns its guest addr.
 pub fn register_float_call(f: HostFloatCall) -> u64 {
     let mut hc = HOST_FLOAT_CALLS.lock().unwrap();
@@ -9336,6 +9362,28 @@ mod fp16_and_fabd_fccmp_exec {
             INSERT_ENTRY - 0x100000000,
             FAMILY_HASHES
         );
+    }
+
+    #[test]
+    fn safe_cstr_len_rejects_nonc_canonical_garbage() {
+        // SH97: the deep gameGlobalInit walk passes a garbage C-string pointer (e.g.
+        // 0xffffff80ffffffc8, sign-extended 48-bit tag / sub-image int) to strlen/formatted-
+        // output shims; raw glibc strlen on it SIGSEGVs at guestpc=0x0. safe_cstr_len must
+        // reject the non-canonical class (top 16 bits 0xffff), the sub-image small-int
+        // class (< 0x100000000), and 0 — returning 0 so the caller takes its empty/failure
+        // path — while accepting canonical host-pointers (host heap strings the guest
+        // malloc'd) and guest image strings.
+        let g1: u64 = 0xffffff80ffffffc8; // observed crash pointer (sign-extended garbage)
+        assert!((g1 >> 48) as u16 == 0xffff, "the crash pointer is non-canonical");
+        assert_eq!(crate::jit::safe_cstr_len(g1), 0, "non-canonical garbage -> 0");
+        assert_eq!(crate::jit::safe_cstr_len(0), 0, "NULL -> 0");
+        assert_eq!(crate::jit::safe_cstr_len(0x1234), 0, "sub-image small int -> 0");
+        assert_eq!(crate::jit::safe_cstr_len(0x1800064), 0, "sub-image .data-rel tag -> 0");
+        // A canonical host heap C-string (e.g. a guest malloc via our shim) is accepted.
+        let c = b"hello-roblox\0";
+        let heap = c.as_ptr() as u64;
+        assert!((heap >> 48) as u16 != 0xffff && heap >= 0x100000000);
+        assert_eq!(crate::jit::safe_cstr_len(heap), 12, "canonical host string still measured");
     }
 
     #[test]

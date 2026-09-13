@@ -44,10 +44,25 @@ extern "C" fn bionic_strlen_chk(
     _a6: u64,
     _a7: u64,
 ) -> u64 {
-    if s == 0 {
-        return 0;
-    }
-    unsafe { strlen(s as *const std::ffi::c_char) as u64 }
+    // SH97: a garbage guest pointer (e.g. 0xffffff80ffffffc8 loaded from an unseeded map
+    // field during the deep gameGlobalInit walk) must NOT reach raw glibc strlen (it
+    // SIGSEGVs). safe_cstr_len scans only the mapped guest image domain; a pointer
+    // outside it (or 0) yields length 0 so the caller's failure/empty path runs.
+    crate::jit::safe_cstr_len(s) as u64
+}
+
+// ---- SH97: guarded `strlen` for the generic resolver binding (same crash class) ----
+extern "C" fn bionic_strlen(
+    s: u64,
+    _a1: u64,
+    _a2: u64,
+    _a3: u64,
+    _a4: u64,
+    _a5: u64,
+    _a6: u64,
+    _a7: u64,
+) -> u64 {
+    crate::jit::safe_cstr_len(s) as u64
 }
 
 // ---- `__strncpy_chk2`: bounded strncpy - dst/src/len; ignore dest bound ----
@@ -860,14 +875,17 @@ fn render_vfprintf(fmt: u64, ap: &mut Aapcs64VaList, out: &mut Vec<u8>) -> bool 
             if lconv == b's' || lconv == b'S' {
                 if let Some(p) = read_va_gp(ap) {
                     if p != 0 {
-                        let s = unsafe {
-                            let mut n = 0usize;
-                            while unsafe { *((p as *const u8).add(n)) } != 0 && n < 4096 {
-                                n += 1;
-                            }
-                            std::slice::from_raw_parts(p as *const u8, n)
-                        };
-                        out.extend_from_slice(s);
+                        // SH97: a garbage %s pointer from an unseeded map field must not be
+                        // deref'd (glibc's internal strlen on it SIGSEGVs). safe_cstr_len
+                        // returns 0 for non-canonical/sub-image garbage -> we write "(bad)".
+                        let n = crate::jit::safe_cstr_len(p);
+                        if n > 0 {
+                            let s = unsafe { std::slice::from_raw_parts(p as *const u8, n) };
+                            out.extend_from_slice(s);
+                        } else {
+                            // non-canonical / sub-image garbage, or canonical-unreadable
+                            out.extend_from_slice(b"(bad-ptr)");
+                        }
                     } else {
                         out.extend_from_slice(b"(null)");
                     }
@@ -933,6 +951,42 @@ extern "C" fn bionic_vfprintf(
     let f: F = unsafe { std::mem::transmute(sym) };
     unsafe { f(stream as *mut libc::c_void, fmt as *const libc::c_char, ap as *mut libc::c_void) as u64 }
 }
+
+/// SH97: guarded `vsnprintf(str, size, fmt, va_list)`. The deep gameGlobalInit walk calls
+/// it with a `%s` arg that is a GARBAGE pointer (e.g. 0xffffff80ffffffc8) loaded from an
+/// unseeded map field; glibc's vsnprintf internally strlen()s it and SIGSEGVs. Route it
+/// through render_vfprintf (which now uses safe_cstr_len for %s -> renders "(bad-ptr)"
+/// instead of faulting) and write the result into the guest buffer with a NUL terminator.
+extern "C" fn bionic_vsnprintf(
+    buf: u64, size: u64, fmt: u64, ap: u64,
+    _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    let mut vl = Aapcs64VaList {
+        stack: if ap & 7 == 0 { unsafe { std::ptr::read_unaligned(ap as *const u64) } } else { 0 },
+        gr_top: if ap & 7 == 0 { unsafe { std::ptr::read_unaligned((ap + 8) as *const u64) } } else { 0 },
+        _vr_top: if ap & 7 == 0 { unsafe { std::ptr::read_unaligned((ap + 16) as *const u64) } } else { 0 },
+        gr_offs: if ap & 7 == 0 { unsafe { std::ptr::read_unaligned((ap + 24) as *const i32) } } else { 0 },
+        _vr_offs: 0,
+    };
+    let mut out = Vec::with_capacity(128);
+    render_vfprintf(fmt, &mut vl, &mut out);
+    // Honor size: room for the NUL terminator.
+    let avail = (size as usize).saturating_sub(1).min(out.len());
+    if buf != 0 && size != 0 {
+        unsafe {
+            std::ptr::copy_nonoverlapping(out.as_ptr(), buf as *mut u8, avail);
+            *((buf + avail as u64) as *mut u8) = 0; // NUL terminate
+        }
+    }
+    if std::env::var_os("JIT_TRACE").is_some() {
+        eprintln!(
+            "[shim] vsnprintf(size={size}, fmt@{fmt:#x}) -> {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+    avail as u64
+}
+
 /// Real glibc pthread_create calls the guest start_routine natively (SIGILL).
 /// Interpose: spawn a fresh host thread running the guest start routine through
 /// `jit_run` (per-thread guest stack + TLS), and write its guest tid as the
@@ -1006,6 +1060,11 @@ pub fn register_shims() -> usize {
     let shims: &[(&[u8], HostCall)] = &[
         (b"__errno\0", bionic_errno),
         (b"__strlen_chk\0", bionic_strlen_chk),
+        // SH97: route `strlen` through the mapped-domain-guarded shim (register_named
+        // takes precedence over the generic dlsym binding), so a garbage guest C-string
+        // pointer from an unseeded map field returns length 0 instead of SIGSEGV'ing in
+        // raw glibc strlen.
+        (b"strlen\0", bionic_strlen),
         (b"__strncpy_chk2\0", bionic_strncpy_chk2),
         (b"__android_log_print\0", bionic_android_log),
         // glibc dl_iterate_phdr drives a GUEST callback pointer; route it back
@@ -1022,6 +1081,9 @@ pub fn register_shims() -> usize {
         // the guest hands it a bionic FILE* + AAPCS64 va_list that glibc can't
         // read (SIGSEGV). Divert guest streams -> fd 2, decoding the va_list.
         (b"vfprintf\0", bionic_vfprintf),
+        // SH97: guard vsnprintf — the deep gameGlobalInit walk calls it with a garbage %s
+        // pointer; glibc internally strlen()s it and SIGSEGVs. Route through the renderer.
+        (b"vsnprintf\0", bionic_vsnprintf),
         // Android asset manager
         (b"AAssetManager_fromJava\0", aassetmanager_fromjava),
         (b"AAssetManager_open\0", aassetmanager_open),
