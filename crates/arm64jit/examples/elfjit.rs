@@ -1001,6 +1001,35 @@ extern "C" fn routeb_singleton_leaf(a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: 
     a0
 }
 
+/// SH101: dispatch-1 in the gameGlobalInit do-init walker (`ldr x10,[obj];
+/// ldr x8,[x10,#0x10]; blr x8` at 0x1022084f0/4fc/500) returns the leaf's x0 in
+/// guest x0, and the guest then run a memzero loop starting at
+/// `x11 = leaf_ret + (x25<<4)` (0x102208508, x25 = empty-vector element count =
+/// 0), so x11 == leaf_ret. `routeb_singleton_leaf` returns a0 (== obj, the caller
+/// passed obj as the first arg) -> the memzero erases obj[0]/obj[8] and
+/// dispatch-2 (`ldr x9,[obj]; ldr x9,[x9,#0x18]` @0x102208574/578) then faults
+/// [0x18] with x9=0. Fix: the dispatched leaf must return a DEDICATED WRITABLE
+/// scratch pointer != obj, so the guest memzero hits scratch and obj[0] stays
+/// 0x106846970. (Option (d) from the dispatch-2 recon; deterministic, no block
+/// boundary needed.)
+static SH101_SCRATCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+extern "C" fn routeb_disptch1_scratch_leaf(
+    _a0: u64,
+    _a1: u64,
+    _a2: u64,
+    _a3: u64,
+    _a4: u64,
+    _a5: u64,
+    _a6: u64,
+    _a7: u64,
+) -> u64 {
+    *SH101_SCRATCH.get_or_init(|| {
+        let s = Box::leak(vec![0u8; 0x100usize].into_boxed_slice()).as_mut_ptr() as u64;
+        eprintln!("[elfjit:routeB] SH101 dispatch-1 scratch leaf registered; scratch 0x{s:x}");
+        s
+    })
+}
+
 /// SH99: the deep nativeGameGlobalInit do-init probes a GLOBAL 0x10-element-stride
 /// vector whose object lives at guest 0x106dcae08 (probe block: `adrp x19,0x106dca000;
 /// add x19,x19,#0xe08` @ 0x102208484/488; `ldp x10,x8,[x19]` @ 0x102208490 -> +0x08 is the
@@ -1031,6 +1060,14 @@ pub fn routeb_seed_game_global_vector() -> u64 {
                 eprintln!("[elfjit:routeB] SH99 benign dispatch leaf registered at {a:#x}");
                 a
             });
+        // SH101: dispatch-1's virtual at [0x106846980] must be the SCRATCH leaf
+        // (returns a dedicated writable pointer != obj), because dispatch-1's
+        // return in x0 becomes the guest memzero base (x11=x0+(x25<<4), x25=0);
+        // the identity leaf returning obj would let the memzero wipe obj[0] and
+        // make dispatch-2 fault [0x18]. dispatch-2's slot ([0x106846988]) keeps
+        // the identity leaf (its return goes into a branch, not a memzero).
+        let disp1_leaf = arm64jit::jit::register_host_call_auto(routeb_disptch1_scratch_leaf);
+        eprintln!("[elfjit:routeB] SH101 dispatch-1 scratch leaf registered at {disp1_leaf:#x}");
         let obj = Box::leak(vec![0u8; 0x70usize].into_boxed_slice()).as_mut_ptr() as u64;
         unsafe {
             *(0x106dcae08u64 as *mut u64) = node; // +0x00 end
@@ -1046,6 +1083,13 @@ pub fn routeb_seed_game_global_vector() -> u64 {
             for i in 0..(0x30 / 8) {
                 *((vtab + i as u64 * 8) as *mut u64) = leaf;
             }
+            // SH101: dispatch-1 reads [obj[0]+0x10] = [vtab+0x10] (obj[0]==vtab).
+            // The guest's post-dispatch memzero loop (`x11 = dispatch-1-ret +
+            // (x25<<4)`, x25=0) starts at dispatch-1's RETURN; the identity leaf
+            // returning obj (its a0) made the memzero wipe obj[0]. Install the
+            // scratch-returning leaf at vtab+0x10 so dispatch-1 returns a
+            // dedicated writable scratch pointer (not obj).
+            *((vtab + 0x10) as *mut u64) = disp1_leaf;
             *(0x106dcae20u64 as *mut u64) = obj; // +0xe20 object (dispatch target)
             // SH99SCHED: fill the ENTIRE obj (0x70) with the leaf-vtab so EVERY field
             // offset the walk derefs — obj+0 (1st dispatch vtable), obj+0x48 (2nd
@@ -1074,7 +1118,7 @@ pub fn routeb_seed_game_global_vector() -> u64 {
             *(0x106846ba0u64 as *mut u8) = 1; // once-guard -> cached-path return 0x106846970
             *(0x106846970u64 as *mut u64) = node; // +0x00 vector end
             *(0x106846978u64 as *mut u64) = node; // +0x08 vector begin (readable probe)
-            *(0x106846980u64 as *mut u64) = leaf; // +0x10 vtable dispatch-1
+            *(0x106846980u64 as *mut u64) = disp1_leaf; // +0x10 vtable dispatch-1 (SH101: scratch-return leaf so guest memzero base hits scratch, not obj)
             *(0x106846988u64 as *mut u64) = leaf; // +0x18 vtable dispatch-2
             // SH99b: the do-init walk then iterates a SECOND 8-byte-pointer vector at
             // [0x106dcaEA8] (end) / [0x106dcaEB0] (begin): `ldp x21,x22,[..]` @0x1022085c8
