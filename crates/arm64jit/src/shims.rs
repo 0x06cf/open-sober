@@ -987,6 +987,140 @@ extern "C" fn bionic_vsnprintf(
     avail as u64
 }
 
+/// SH98: marshal a host `stat` into the guest's bionic-aarch64 `struct stat`.
+/// Host glibc's x86-64 `struct stat` is 144 bytes; bionic's aarch64 struct is
+/// 128. When the guest passes a stack-local bionic `struct stat` (the deep
+/// gameGlobalInit walk does), raw glibc `stat` overruns the buffer by 16 bytes
+/// and clobbers the adjacent stack canary (`__stack_chk_guard` / fortify) ->
+/// the post-SH97 `*** stack smashing detected ***` abort. Run the real stat
+/// into a host-side buffer, then write only the bionic 128-byte layout. Guests
+/// read `st_mode`/`st_size` mostly (dir/file checks), which we populate.
+///
+/// bionic aarch64 `struct stat` layout (from AArch64 Linux UAPI, 128 B):
+///   0x00 st_dev u64, 0x08 st_ino u64, 0x10 st_mode u32, 0x14 st_nlink u32,
+///   0x18 st_uid u32, 0x1c st_gid u32, 0x20 st_rdev u64, 0x28 st_size i64,
+///   0x30 st_blksize i32, 0x38 st_blocks i64, 0x40 st_atime i64,
+///   0x48 st_mtime i64, 0x50 st_ctime i64, 0x58.. = reserved (zero).
+struct BionicStatHost {
+    st_dev: u64,
+    st_ino: u64,
+    st_mode: u32,
+    st_nlink: u32,
+    st_uid: u32,
+    st_gid: u32,
+    st_rdev: u64,
+    st_size: i64,
+    st_blksize: i32,
+    st_blocks: i64,
+    st_atime: i64,
+    st_mtime: i64,
+    st_ctime: i64,
+}
+
+fn write_bionic_stat(buf: u64, s: &BionicStatHost) {
+    if buf == 0 {
+        return;
+    }
+    let b = buf as *mut u8;
+    unsafe {
+        *b.cast::<u64>() = s.st_dev;
+        (b.add(8)).cast::<u64>().write_unaligned(s.st_ino);
+        (b.add(0x10)).cast::<u32>().write_unaligned(s.st_mode);
+        (b.add(0x14)).cast::<u32>().write_unaligned(s.st_nlink);
+        (b.add(0x18)).cast::<u32>().write_unaligned(s.st_uid);
+        (b.add(0x1c)).cast::<u32>().write_unaligned(s.st_gid);
+        (b.add(0x20)).cast::<u64>().write_unaligned(s.st_rdev);
+        (b.add(0x28)).cast::<i64>().write_unaligned(s.st_size);
+        (b.add(0x30)).cast::<i32>().write_unaligned(s.st_blksize);
+        (b.add(0x38)).cast::<i64>().write_unaligned(s.st_blocks);
+        (b.add(0x40)).cast::<i64>().write_unaligned(s.st_atime);
+        (b.add(0x48)).cast::<i64>().write_unaligned(s.st_mtime);
+        (b.add(0x50)).cast::<i64>().write_unaligned(s.st_ctime);
+        // 0x58..0x80 reserved stays 0 (buffer may hold garbage; zero it).
+        std::ptr::write_bytes(b.add(0x58), 0, 0x80 - 0x58);
+    }
+}
+
+/// Marshal the host `libc::stat` fields (glibc x86-64 layout) into the bionic
+/// aarch64 layout. `c_st` is a `*const libc::stat` (the 144-byte host struct).
+unsafe fn marshal_host_stat(c_st: *const libc::stat, buf: u64) {
+    let st = &*c_st;
+    // `from` returns the interval of filesystem objects st_ino spans (used as a
+    // st_blocks proxy when st_blocks is 0 for dirs on some kernels).
+    let blocks: i64 = if st.st_blocks > 0 {
+        st.st_blocks
+    } else {
+        // Leave 0 for regular files; dirs report 0 blocks, keep it.
+        0
+    };
+    let s = BionicStatHost {
+        st_dev: st.st_dev as u64,
+        st_ino: st.st_ino as u64,
+        st_mode: st.st_mode as u32,
+        st_nlink: st.st_nlink as u32,
+        st_uid: st.st_uid as u32,
+        st_gid: st.st_gid as u32,
+        st_rdev: st.st_rdev as u64,
+        st_size: st.st_size,
+        st_blksize: st.st_blksize as i32,
+        st_blocks: blocks,
+        st_atime: st.st_atime,
+        st_mtime: st.st_mtime,
+        st_ctime: st.st_ctime,
+    };
+    write_bionic_stat(buf, &s);
+}
+
+/// `stat(path, buf)` — bionic ABI (x2 = the glibc-era 4th-arg compat slot, ignored).
+extern "C" fn bionic_stat(
+    path: u64, buf: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if buf == 0 {
+        return unsafe { libc::stat(path as *const libc::c_char, std::ptr::null_mut()) as u64 };
+    }
+    // Use a dedicated ENOENT-style path: the walk probes existence; a missing
+    // file must report -1/ENOENT, not fill a zeroed struct.
+    let mut raw: libc::stat = unsafe { std::mem::zeroed() };
+    let r = unsafe { libc::stat(path as *const libc::c_char, &mut raw) };
+    if r != 0 {
+        return (r as i32) as u64;
+    }
+    unsafe { marshal_host_stat(&raw, buf) };
+    0
+}
+
+/// `fstat(fd, buf)`.
+extern "C" fn bionic_fstat(
+    fd: u64, buf: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if buf == 0 {
+        return unsafe { libc::fstat(fd as i32, std::ptr::null_mut()) as u64 };
+    }
+    let mut raw: libc::stat = unsafe { std::mem::zeroed() };
+    let r = unsafe { libc::fstat(fd as i32, &mut raw) };
+    if r != 0 {
+        return (r as i32) as u64;
+    }
+    unsafe { marshal_host_stat(&raw, buf) };
+    0
+}
+
+/// `lstat(path, buf)`.
+extern "C" fn bionic_lstat(
+    path: u64, buf: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if buf == 0 {
+        return unsafe { libc::lstat(path as *const libc::c_char, std::ptr::null_mut()) as u64 };
+    }
+    let mut raw: libc::stat = unsafe { std::mem::zeroed() };
+    let r = unsafe { libc::lstat(path as *const libc::c_char, &mut raw) };
+    if r != 0 {
+        return (r as i32) as u64;
+    }
+    unsafe { marshal_host_stat(&raw, buf) };
+    0
+}
+
 /// Real glibc pthread_create calls the guest start_routine natively (SIGILL).
 /// Interpose: spawn a fresh host thread running the guest start routine through
 /// `jit_run` (per-thread guest stack + TLS), and write its guest tid as the
@@ -1067,6 +1201,13 @@ pub fn register_shims() -> usize {
         (b"strlen\0", bionic_strlen),
         (b"__strncpy_chk2\0", bionic_strncpy_chk2),
         (b"__android_log_print\0", bionic_android_log),
+        // SH98: marshal stat/fstat/lstat into the bionic-aarch64 struct stat
+        // (128 B). Raw glibc's x86-64 struct is 144 B and overruns stack-local
+        // bionic structs by 16 B, clobbering the guest stack canary. register_named
+        // takes precedence over the generic resolve() dlsym for these imports.
+        (b"stat\0", bionic_stat),
+        (b"fstat\0", bionic_fstat),
+        (b"lstat\0", bionic_lstat),
         // glibc dl_iterate_phdr drives a GUEST callback pointer; route it back
         // through the JIT dispatcher instead of letting host libc SIGILL.
         (b"dl_iterate_phdr\0", bionic_dl_iterate_phdr),
@@ -1550,5 +1691,38 @@ mod tests {
         let ks: Vec<u32> = data.iter().map(|r| key(r)).collect();
         assert_eq!(ks, vec![0x0f, 0x141, 0x3ff]);
         eprintln!("[abi] qsort interpose pinned: known comparator guest 0x{KNOWN:x}; +24 u32-key ordering verified");
+    }
+
+    /// SH98: bionic_stat marshals a host glibc `struct stat` (144 B x86-64) into
+    /// the guest's bionic-aarch64 `struct stat` (128 B) so the guest stack-local
+    /// struct is NOT overrun by 16 bytes (which would clobber the stack canary).
+    /// Pins: (a) exactly the bionic field offsets, (b) a real file's st_mode/
+    /// st_size round-trip, (c) writes never exceed 0x80 bytes total.
+    #[test]
+    fn bionic_stat_marshals_into_128_byte_aarch64_layout() {
+        let dir = std::env::temp_dir().join(format!("os-statshim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("sample.bin");
+        let payload = b"SH98-stat-marshaler";
+        std::fs::write(&f, payload).unwrap();
+        let cpath = std::ffi::CString::new(f.to_str().unwrap()).unwrap();
+
+        // A 128-byte guest buffer with a canary sentinel pattern AFTER the
+        // expected struct end — if bionic_stat overruns, this gets clobbered.
+        let mut buf = vec![0xABu8; 0x100];
+        let r = bionic_stat(cpath.as_ptr() as u64, buf.as_mut_ptr() as u64, 0, 0, 0, 0, 0, 0);
+        assert_eq!(r, 0);
+        // The last 0x20 bytes (beyond the 0x80 struct) must be untouched.
+        assert!(
+            buf[0x80..].iter().all(|&b| b == 0xAB),
+            "bionic_stat overran the 128-byte guest struct"
+        );
+        // st_mode at 0x10 must be a regular-file mode (S_IFREG high bits set).
+        let mode = u32::from_le_bytes(buf[0x10..0x14].try_into().unwrap()) & 0o170000;
+        assert_eq!(mode, 0o100000, "st_mode@0x10 S_IFREG"); // S_IFREG
+        // st_size at 0x28 = exact payload length.
+        let size = i64::from_le_bytes(buf[0x28..0x30].try_into().unwrap());
+        assert_eq!(size, payload.len() as i64, "st_size@0x28");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

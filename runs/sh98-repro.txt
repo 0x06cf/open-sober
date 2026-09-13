@@ -1,0 +1,227 @@
+[fsmap] armed persistence root SOBER_ANDROID_ROOT=/home/hermes-worker/.local/share/open-sober/android-root
+[persist] live datastore roundtrip: write=45B fsync=0 read_back_byte_exact=true on_disk=Some(true) host=/home/hermes-worker/.local/share/open-sober/android-root/data/user/0/com.roblox.client/databases/session.db
+[plt] patched __stack_chk_guard GOT 0x631aa30 (0x0) -> 0x55ce78201400
+[plt] bound 534 JUMP_SLOT + 77 GLOB_DAT/ABS64 (0 unresolved), 1 unresolved
+PLT imports bound: 534 to host thunks (0 unbound)
+[mempool] big-alloc 0x1d9801c routed to host calloc (thunk @ 0x1062d9000)
+[mempool] thunk bytes: e0 03 01 aa 11 0a 40 f9 20 02 1f d6 00 00 00 00 08 00 00 00 (JIT-readable via guest image)
+loaded '/home/hermes-worker/.cache/open-sober/robbox/libroblox.so': is_pie=true base_load_vaddr=0x0 e_entry=0x100000000
+  segment guest=[0x100000000,0x1062d8190) host=same prot=r-x
+  segment guest=[0x1062dc1c0,0x1067d3000) host=same prot=rw-
+  segment guest=[0x1067d67c0,0x107333c3c) host=same prot=rw-
+[tail] reserved 402653184B guest RW tail @0x107334000
+[lsm-map] allocator 0x1d97744 routed to host calloc(x0) (thunk @ 0x1062d9800)
+[lsm-map] NOP'd LSM init store at 0x101d975f8 (guest 0x1d975f8) to keep seeded empty map
+[lsm-map] seeded static empty LocalStorageManager map: global 0x10726f8c0 -> bucket array 0x7f913e761010 (4194304 buckets, shared zero sub @0x7f9140761010)
+[JNICall-singleton] SH82b seeded intern-table @ obj+0x30 bucket array 0x55ce804070a0 (+0x38 capacity 0x400) so the GlobalInit do-init hash lookup never derefs NULL
+[JNICall-singleton] seeded ptr 0x107333948 -> object 0x107333950 (zeroed bss ~ PTHREAD_MUTEX_INITIALIZER at +8)
+[lsm-map] readback global 0x10726f8c0 = 0x7f913e761010 (must be non-zero)
+running entry guest=0x102173ff4 host=0x102173ff4 (segment base guest=0x100000000 size=0x7333c3c)
+guest sp=0x55ce80808fb0 tls(tpidr)=0x55ce808090c0
+JNI boot: x0 = JavaVM* 0x55ce803ed950
+[roblox:JNIMain] TelemetryProtocol::setProcessTimeOverride: %ld
+[roblox:JNIMain] DeviceStaticParams is null.
+[elfjit] jit_run returned Ok(0x10006) — entering post-run phase
+JIT(no-QEMU) entry() -> 65542 (0x10006)
+[elfjit] driving StartApp @ guest 0x10258b144 after JNI_OnLoad (env=0x55ce803ed920 jobject=0x55ce80957a50 params=0x55ce80958e50)
+[elfjit:routeB] patched dispatch-gate `and w0,w0,#1` 0x102173124 (12000000) -> `mov w0,#1` (52800020) — gated dispatch sites take the clean direct path, bypassing the singleton null-vtable crash
+[elfjit:routeB] benign singleton virtual registered at 0x7f00000001c0
+[elfjit:routeB] seeded dispatch singletons .data 0x106829a48/0x106829a68 (size=0x28 alloc=8 src=template 0x55ce8095cde0/0x55ce8095d300, vtable@0x55ce80abf290=leaf 0x7f00000001c0) — 2b9dee0 lazy-create returns coherent objects, no null-vtable crash
+[elfjit:routeB] SH87/89 patched map-family dispatch `blr x8` 0x1029f4280 (d63f0100) -> `blr x1` (d63f0020) — always primary hash, +0x18 hash2 can't blr into garbage
+[elfjit:routeB] SH87/89 patched map-family dispatch `blr x8` 0x1029f3f78 (d63f0100) -> `blr x1` (d63f0020) — always primary hash, +0x18 hash2 can't blr into garbage
+[elfjit:routeB] SH93 NOPed globalinit CEvent barrier `bl 2207578` 0x102206e70 (940001c2) -> nop — do-init no longer parks on the never-firing worker thread
+[elfjit:kicker] host thread drives 0x106863af8 (pulse 1->2)
+[elfjit:appcmd] posting APP_CMD_0 (1)
+[elfjit:kicker] t=0 guest_global 0x106863af8=%0x1
+[elfjit:anativewindow] wired real X11 window XID=0x200000 on :263 as the guest ANativeWindow
+[elfjit:appcmd] posting APP_CMD_1 (2)
+[elfjit:appcmd] posting APP_CMD_2 (11)
+[elfjit:kicker] t=100 guest_global 0x106863af8=%0x2
+[elfjit] StartApp returned Ok(0x107273d00)
+[elfjit:kicker] t=200 guest_global 0x106863af8=%0x2
+[elfjit:kicker] t=300 guest_global 0x106863af8=%0x2
+[elfjit:v2boot] after boot start: [0x106829ea8] = 0x0
+[elfjit:v2boot] SH86 seeded CRT allocator-hook globals [0x1067daaf0]=[0x1067d0840]=0 so operator-new takes the fast path (no blr through host garbage)
+[elfjit:routeB] SH88 seeded coherent empty pb_defaults registry map 0x7f912c000d80 (hash 0x1029b4a84) into slots 0x106838368/378/380 + substituted for miss-register tag maps
+[elfjit:v2boot] driving nativeInitializeNativeFlags @ guest 0x10232048c (env=0x55ce803ed920 thiz=0x7f912c000c70)
+[elfjit:v2boot] nativeInitializeNativeFlags stopped: run_loop: pc 0x45d outside image [0x100000000, 0x107333c3c)
+[elfjit:v2boot] after nativeInitializeNativeFlags: [0x106829ea8] = 0x0
+[elfjit:v2boot] driving nativeGameGlobalInit @ guest 0x102206404 (env=0x55ce803ed920 thiz=0x7f912c000c70)
+[elfjit:v2boot] seeded main-thread-id [0x106863a68]=0x7f913c4be6c0 for GlobalInit thread-dispatch (this thread == stored == self -> takes the vt[+48] match path, no park)
+[routeb-hashfix] string hash-map @ 0x7f912c0284e0 empty header + zeroed bucket array (0x7f912c560a30) seeded for a coherent insert probe
+[elfjit:renderinit] driving THUNK 0x105b3a280 after 5000ms warm-up (ctx 0x1067d16f0=0x55ce782013f8, x0=0x200000, x1=0x0)
+[elfjit:renderinit] returned Ok(0x7f911c001d90)
+[elfjit:renderthunk] REAL ctx 0x7f911c001d90 vtable=0x106731ae0 egl: display=0x7f911c08b5e0 surface=0x7f911c00bde0 context=0x7f911c0a6010
+[elfjit:renderthunk] ctx vtable[0..5] = 0x105b3b288 0x105b3b334 0x105b3b358 0x105b3b408 0x101dc7428 — [vt+16](idx2)=disp target
+[elfjit:renderthunk] published RENDERCTX 0x7f911c001d90 — type-4 task frames will render on it
+[elfjit:taskv4-frame] seedgles slot 0 (glDrawBuffers) <- bridge 0x7f0000003018
+[elfjit:taskv4-frame] seedgles slot 1 (glClearBufferiv) <- bridge 0x7f0000003020
+[elfjit:taskv4-frame] seedgles slot 2 (glClearBufferfv) <- bridge 0x7f0000003028
+[elfjit:taskv4-frame] seedgles slot 3 (glClearBufferfi) <- bridge 0x7f0000018058
+[elfjit:taskv4-frame] seedgles slot 4 (glColorMask) <- bridge 0x7f0000002978
+[elfjit:taskv4-frame] seedgles slot 5 (glDepthMask) <- bridge 0x7f0000002998
+[elfjit:taskv4-frame] seedgles slot 6 (glStencilMask) <- bridge 0x7f00000029b0
+[elfjit:taskv4-frame] seedgles slot 7 (glViewport) <- bridge 0x7f0000002918
+[elfjit:taskv4-frame] seedgles slot 9 (glDrawElements) <- bridge 0x7f0000002a38
+[elfjit:taskv4-frame] seedgles slot 10 (glDrawArrays) <- bridge 0x7f0000002a40
+[elfjit:taskv4-frame] task frame #0 frame-fn Ok(0x7f911dda15f0) ctx=0x7f911c001d90
+[elfjit:taskv4-frame] present #0 swap Ok(0x1) color=[0.4, 0.2, 0.95, 1.0] — real task-driven frame
+[elfjit:renderframe] ctx=0x7f911c001d90 [+32]=display 0x7f911c08b5e0 [+40]=surface 0x7f911c00bde0 [+48]=context 0x7f911c0a6010
+[elfjit:renderframe] swap returned Ok(0x1) (eglSwapBuffers)
+[elfjit:renderframe-drive] clear-color x5 obj 0x7f911e0c75d0 (RGBA [0.4, 0.2, 0.95, 1.0] at [+0..16])
+[elfjit:renderframe-drive] gles-dispatch slot 0 guest 0x106d3b2f0 = 0x7f0000003018
+[elfjit:renderframe-drive] gles-dispatch slot 1 guest 0x106d3b2f8 = 0x7f0000003020
+[elfjit:renderframe-drive] gles-dispatch slot 2 guest 0x106d3b300 = 0x7f0000003028
+[elfjit:renderframe-drive] gles-dispatch slot 3 guest 0x106d3b308 = 0x7f0000018058
+[elfjit:renderframe-drive] gles-dispatch slot 4 guest 0x106d3b310 = 0x7f0000002978
+[elfjit:renderframe-drive] gles-dispatch slot 5 guest 0x106d3b318 = 0x7f0000002998
+[elfjit:renderframe-drive] gles-dispatch slot 6 guest 0x106d3b320 = 0x7f00000029b0
+[elfjit:renderframe-drive] gles-dispatch slot 7 guest 0x106d3b328 = 0x7f0000002918
+[elfjit:renderframe-drive] gles-dispatch values = [139637976739864, 139637976739872, 139637976739880, 139637976825944, 139637976738168, 139637976738200, 139637976738224, 139637976738072]
+[elfjit:renderframe-seedgles] raw slot snapshot (before seed):
+[elfjit:renderframe-seedgles]   slot  0 = 0x00007f0000003018  
+[elfjit:renderframe-seedgles]   slot  1 = 0x00007f0000003020  
+[elfjit:renderframe-seedgles]   slot  2 = 0x00007f0000003028  
+[elfjit:renderframe-seedgles]   slot  3 = 0x00007f0000018058  
+[elfjit:renderframe-seedgles]   slot  4 = 0x00007f0000002978  
+[elfjit:renderframe-seedgles]   slot  5 = 0x00007f0000002998  
+[elfjit:renderframe-seedgles]   slot  6 = 0x00007f00000029b0  
+[elfjit:renderframe-seedgles]   slot  7 = 0x00007f0000002918  
+[elfjit:renderframe-seedgles]   slot  8 = 0x00007f0000003050  
+[elfjit:renderframe-seedgles]   slot  9 = 0x00007f0000002a38  
+[elfjit:renderframe-seedgles]   slot 10 = 0x00007f0000002a40  
+[elfjit:renderframe-seedgles]   slot 11 = 0x00007f0000003098  
+[elfjit:renderframe-seedgles]   slot 12 = 0x00007f0000003090  
+[elfjit:renderframe-seedgles]   slot 13 = 0x00007f00000030a0  
+[elfjit:renderframe-seedgles]   slot 14 = 0x00007f00000030a8  
+[elfjit:renderframe-seedgles]   slot 15 = 0x00007f00000030b0  
+[elfjit:renderframe-seedgles] slot 0 (glDrawBuffers) <- bridge 0x7f0000003018
+[elfjit:renderframe-seedgles] slot 1 (glClearBufferiv) <- bridge 0x7f0000003020
+[elfjit:renderframe-seedgles] slot 2 (glClearBufferfv) <- bridge 0x7f0000003028
+[elfjit:renderframe-seedgles] slot 3 (glClearBufferfi) <- bridge 0x7f0000018060
+[elfjit:renderframe-seedgles] slot 4 (glColorMask) <- bridge 0x7f0000002978
+[elfjit:renderframe-seedgles] slot 5 (glDepthMask) <- bridge 0x7f0000002998
+[elfjit:renderframe-seedgles] slot 6 (glStencilMask) <- bridge 0x7f00000029b0
+[elfjit:renderframe-seedgles] slot 7 (glViewport) <- bridge 0x7f0000002918
+[elfjit:renderframe-seedgles] slot 9 (glDrawElements) <- bridge 0x7f0000002a38
+[elfjit:renderframe-seedgles] slot 10 (glDrawArrays) <- bridge 0x7f0000002a40
+[elfjit:renderframe-drive] fabricated renderer 0x7f911e0c70d0 (+16=1,+24->0x7f911e0c71d0[+552]=1,+40->0x7f911e0c72d0[+140]=1) view 0x7f911e0c73d0 ([+128]=1280 [+132]=720 [+140]=0)
+[elfjit:renderframe-drive] === frame iteration 0 color [0.4, 0.2, 0.95, 1.0] ===
+[elfjit:renderframe-drive] engine frame-fn 0x105b32c00 returned Ok(0x7f911e0c70d0)
+[elfjit:renderframe-drive] post-frame swap returned Ok(0x1)
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x672244bb at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x672244bb at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH92 substituted seeded pb_defaults registry map for non-family map/this 0x7f912c011410 at pc=0x1029f3e70 reg=x0
+[routeb-hashfix] SH92/94 substituted seeded pb_defaults registry map for non-family x19 0x7f912c9888e0 at pc=0x1029f3e70 (x0 was also non-family)
+[routeb-hashfix] string hash-map @ 0x7f912c000d80 empty header + zeroed bucket array (0x7f912c9ab250) seeded for a coherent insert probe
+[routeb-hashfix] string hash-map @ 0x7f912c98a260 empty header + zeroed bucket array (0x7f912cdaf420) seeded for a coherent insert probe
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x1800064 at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x1800012 at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x2000064 at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x20000a3 at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x280007f at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x28000aa at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x300008f at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x30000c7 at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x4000066 at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x400002f at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x4800064 at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x48000b0 at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x5000072 at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x500005f at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x580006e at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x58000b5 at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x68000ab at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x680003a at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x700006e at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x70000fc at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x7800075 at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x78000d3 at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x14800066 at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x1480007b at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x8000073 at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x8000044 at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x10000064 at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x10000031 at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x10800075 at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x10800054 at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x11000076 at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x110000fd at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x11800073 at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x11800077 at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x12000066 at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x12000058 at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x12800064 at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x128000f7 at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x17800084 at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x1780008c at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x1e80006c at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x1e800051 at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x13800065 at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x13800065 at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x14000068 at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x140000f6 at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x17000063 at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x170000cf at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x1c000064 at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x1c00007b at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x1d00008b at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x1d0000b1 at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x1900006c at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x19000079 at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x1b00006b at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x1b00008d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x19800065 at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x1980003e at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x1600006b at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x16000097 at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x1b800064 at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x1b800053 at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x1c8000b8 at pc=0x1029f424c reg=x19
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0x1c800042 at pc=0x1029f4284 reg=x0
+[routeb-hashfix] SH88 substituted seeded pb_defaults registry map for sub-image map/this 0xd5d at pc=0x1029f4284 reg=x0
+*** stack smashing detected ***: terminated
+
+[SIGABRT] tid=179541 fault=0x3e90002bd25 rip=0x7f91408f469c guestpc=0x0 rbx_matches_gueststate=false (reg_state=0x7f913c4b1c98, tid=94345266988640)
+  x0=0x0 x1=0x0 x2=0x0 x3=0x0 x4=0x0
+  x5=0x0 x6=0x0 x7=0x0 x8=0x0 x9=0x0 sp=0x0
+  x10=0x0 x19=0x0 x20=0x0 x21=0x0 x22=0x0
+  x23=0x0 x28=0x0 x29=0x0 lr(x30)=0x0 lsm_map_global=0x7f913e761010
+  HOST rax=0x0 rbx=0x2bd55 rcx=0x7f91408f469c rdx=0x6 rsi=0x2bd55 rdi=0x2bd25
+  HOST rbp=0x1000 rsp=0x7f913c4ba4b0 r8=0xffffffff r9=0x0 r10=0x22 r11=0x246
+  HOST r12=0x7f913c4ba620 r13=0x6 r14=0x7f913c4ba620 r15=0x7f913c4ba620 eflags=0x246
+  GUEST_THREADS (179494:1,0x7f913e038578) (179495:2,0x7f913cb21578) (179541:0,0x7f913c4b1c98) in_jit_run=true
+  raw[]= 00 0f 05 89 c3 e8 92 f4 04 00 44 89 ea 89 de 89 c7 b8 ea 00 00 00 0f 05 89 c3 f7 db 3d 00 f0 ff ff b8 00 00 00 00 0f 47 c3 e9 76 ff ff ff 66 0f
+
+  BT:
