@@ -1056,14 +1056,26 @@ pub fn routeb_seed_game_global_vector() -> u64 {
             for i in 0..(0x70 / 8) {
                 *((obj + i as u64 * 8) as *mut u64) = vtab;
             }
-            // The SAME probe block is dispatched with x19 = a second in-image .bss
-            // singleton (0x106846970) whose +8 begin slot is also NULL under the JIT
-            // (observed: ldrb [x8] / ldp [x8+16] deref it -> fault 0x0/0x10). Point its
-            // begin/end/cap triple at the same non-null zeroed node so the header probe
-            // + count arithmetic validate as an empty span there too.
-            *(0x106846978u64 as *mut u64) = node; // +0x08 begin
-            *(0x106846970u64 as *mut u64) = node; // +0x00 end
-            *(0x106846980u64 as *mut u64) = node; // +0x10 cap
+            // x19 = the singleton getter's result (guest 0x106846970): the do-init
+            // CONSTRUCTS the dispatch obj (bl 0x10220890c) and stores this vtable obj
+            // into obj+0 (`str x19,[x0]` @0x102208450), then virtual-dispatches
+            // `[obj+0]` -> `[vtable+0x10]` (0x1022084fc) and `[vtable+0x18]`
+            // (0x102208574/578). 0x106846970 ALSO doubles as the probe block's vector
+            // BEGIN at 0x102208450 (`ldr x8,[x19,#8]`=begin; `ldrb [x8]` reads it).
+            // So 0x106846970 serves three roles and must be shaped accordingly:
+            //   +0x00 end    = node (vector end; ==begin -> empty span)
+            //   +0x08 begin  = node (vector begin; `ldrb [node]`=0 valid probe)
+            //   +0x10        = leaf (vtable dispatch-1 virtual slot)
+            //   +0x18        = leaf (vtable dispatch-2 virtual slot)
+            // The getter (0x101dc4418) is once-guarded at 0x106846ba0: guard==0 ->
+            // the JIT-unshimmed construct path (may yield 0); seed guard bit0=1 so the
+            // getter takes the cached path and returns this object (adrp 0x101dc4424 ->
+            // 0x106846000, +0x970).
+            *(0x106846ba0u64 as *mut u8) = 1; // once-guard -> cached-path return 0x106846970
+            *(0x106846970u64 as *mut u64) = node; // +0x00 vector end
+            *(0x106846978u64 as *mut u64) = node; // +0x08 vector begin (readable probe)
+            *(0x106846980u64 as *mut u64) = leaf; // +0x10 vtable dispatch-1
+            *(0x106846988u64 as *mut u64) = leaf; // +0x18 vtable dispatch-2
             // SH99b: the do-init walk then iterates a SECOND 8-byte-pointer vector at
             // [0x106dcaEA8] (end) / [0x106dcaEB0] (begin): `ldp x21,x22,[..]` @0x1022085c8
             // skips the per-entry `ldrb [x23+8]` probe when begin==end. Point both at the
