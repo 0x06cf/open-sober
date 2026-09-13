@@ -1031,7 +1031,7 @@ pub fn routeb_seed_game_global_vector() -> u64 {
                 eprintln!("[elfjit:routeB] SH99 benign dispatch leaf registered at {a:#x}");
                 a
             });
-        let obj = Box::leak(vec![0u8; 0x30usize].into_boxed_slice()).as_mut_ptr() as u64;
+        let obj = Box::leak(vec![0u8; 0x70usize].into_boxed_slice()).as_mut_ptr() as u64;
         unsafe {
             *(0x106dcae08u64 as *mut u64) = node; // +0x00 end
             *(0x106dcae10u64 as *mut u64) = node; // +0x08 begin
@@ -1047,11 +1047,13 @@ pub fn routeb_seed_game_global_vector() -> u64 {
                 *((vtab + i as u64 * 8) as *mut u64) = leaf;
             }
             *(0x106dcae20u64 as *mut u64) = obj; // +0xe20 object (dispatch target)
-            // Fill the ENTIRE obj (0x40) with the vtab so EVERY field offset the walk
-            // may deref (obj+0, +8, +0x10, +0x18, +0x48...) reads a non-null vtable whose
-            // slots are all benign leaves (the crash moved to `[obj+0x18]` deref = 0).
-            // Any `ldr xN,[obj+off]` then `ldr [xN+0x10]`/`[xN+0x18]`/`blr` lands on leaf.
-            for i in 0..(0x40 / 8) {
+            // SH99SCHED: fill the ENTIRE obj (0x70) with the leaf-vtab so EVERY field
+            // offset the walk derefs — obj+0 (1st dispatch vtable), obj+0x48 (2nd
+            // dispatch `[obj+0x48]` then `[..+0x18]` — WITHOUT the 0x48 slot the
+            // sub-object pointer at obj+0x48 is 0 and `[0+0x18]` faults 0x18), and any
+            // +0x50/+0x60 the walk may read — is a non-null pointer to the leaf-filled
+            // vtable. (The fault was `obj+0x48==0` because the old obj was only 0x30.)
+            for i in 0..(0x70 / 8) {
                 *((obj + i as u64 * 8) as *mut u64) = vtab;
             }
             // The SAME probe block is dispatched with x19 = a second in-image .bss
