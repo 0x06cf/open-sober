@@ -27,14 +27,14 @@ old strip). Make the real texture the home-layout default and make
 real_ui_texture() log a clear warning + return None → palette fallback. Low
 risk, keeps the SH68 baseline reproducible.
 
-## (C) Animation (real progressed spinner)
+## (C) Animation (real progressed spinner) — DONE (SH71)
 
-The robust loader spinner is conceptually a rotating tween; the emitter path
-can redraw each frame with an updated quad (a cheap screen-space rotation of
-the arc). That is painter's-order geometry on a per-frame jit_run — the SH67d
-multi-frame precedent. Turn RENDEREMITTER_REAL_TEX across the present-walker's
-per-frame draw into a visibly rotating spinner = a real loading-screen
-animation headlessly. Medium effort, high exhibit value.
+Landed SH71: `RENDEREMITTER_SPIN=1` rotates the real spinner's NDC box per
+frame (`frame*15°`), so the fixed texture visibly rotates across the
+present-walker frames — a real loading-screen animation through the engine's
+own emitter path. Verified by a radial-sweep arc-angle that advances
+90→70→50→…→120° across 8 frames (exit 124, 0 crash). A tween/curve could be
+added but the rotation proof is complete.
 
 ## Standing wall (unchanged, out of reach statically)
 
@@ -45,11 +45,13 @@ in-image path constructs a GuiObject and appends to the scene list. A true
 self-driven login screen requires the Lua app-shell / game-activity path beyond
 the park.
 
-## Recommendation
+## Recommendation (all of A/B/C landed: SH69 real texture, SH70 ct=3 + fallback warn, SH71 spin animation)
 
-Land (B) default-self-load + fallback (trivial, makes the feature real), then
-(A) with the ct=3 decoder extension using a login-representative asset — the
-two together remove the last "real asset surface" limitations and let any real
-Roblox UI PNG render through the engine. (C) is a satisfying but optional
-polish. Do NOT attempt per-node emitter vt[+24] (SH64 desync) or the
-self-populated wall (out of reach statically).
+The real-asset surface is now complete: any Roblox UI PNG (ct 0/2/3/4/6) decodes
+offline and renders + animates through the engine's own emitter path headlessly.
+Remaining reachable increments: render a fuller multi-texture login/home
+composite (multiple real sprites in one frame), or drive the per-frame rotation
+with a Roblox-style tween curve for a more authentic animation. The
+self-populated-session wall (Lua app-shell / nativeGameGlobalInit / type-4
+vector) is out of reach statically — per SH68/69/71 honest scope, do NOT attempt
+per-node emitter vt[+24] (SH64 desync).

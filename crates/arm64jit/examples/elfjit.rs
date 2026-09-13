@@ -1824,6 +1824,19 @@ pub fn render_engine_emitter_home(ctx: u64, iimg: &[u8], ibase: u64, isp: u64, l
         if real_tex && real_img.is_none() {
             eprintln!("[elfjit:renderemitter-home] WARN: RENDEREMITTER_REAL_TEX=1 but real UI texture failed to load/decode — falling back to the palette strip");
         }
+        // SH71: RENDEREMITTER_SPIN=1 animates the real-texture image box (a real
+        // loading-screen spinner) by rotating its NDC corners per frame about the
+        // box center — the texture (fixed) rotates with the box. A radial sweep
+        // then measures the arc's angle each frame to prove rotation.
+        let spin = std::env::var_os("RENDEREMITTER_SPIN").is_some() && real_img.is_some();
+        static SPIN_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        let spin_frame = if spin {
+            SPIN_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1
+        } else {
+            0
+        };
+        let spin_deg = (spin_frame as f32 * 15.0) % 360.0;
+        let (sc, sn) = (spin_deg.to_radians().cos(), spin_deg.to_radians().sin());
         const VW: f32 = 1280.0;
         const VH: f32 = 720.0;
         let mut verts: Vec<f32> = Vec::with_capacity(nq * 48); // 8 floats * 6 verts
@@ -1876,6 +1889,22 @@ pub fn render_engine_emitter_home(ctx: u64, iimg: &[u8], ibase: u64, isp: u64, l
                 let half = 0.5 / nq as f32;
                 ua = u - half; ub = u + half;
                 va = 0.5; vb = va;
+            }
+            // SH71: when spinning, rotate the real-image box's four NDC corners
+            // about the center so the fixed texture rotates (loading-spinner).
+            if spin && t2 == 1 {
+                let rot = |xx: f32, yy: f32| (xx * sc - yy * sn, xx * sn + yy * sc);
+                let (ax, ay) = rot(x0, y0);
+                let (bx, by) = rot(x1, y0);
+                let (cx, cy) = rot(x1, y1);
+                let (dx, dy) = rot(x0, y1);
+                push(ax, ay, ua, va, &mut verts);
+                push(bx, by, ub, va, &mut verts);
+                push(cx, cy, ub, vb, &mut verts);
+                push(ax, ay, ua, va, &mut verts);
+                push(cx, cy, ub, vb, &mut verts);
+                push(dx, dy, ua, vb, &mut verts);
+                continue;
             }
             push(x0, y0, ua, va, &mut verts);
             push(x1, y0, ub, va, &mut verts);
@@ -2034,6 +2063,27 @@ pub fn render_engine_emitter_home(ctx: u64, iimg: &[u8], ibase: u64, isp: u64, l
         let readback: Option<extern "C" fn(i32,i32,i32,i32,u32,u32,*mut i8)> = mesa_fn(h, b"glReadPixels\0");
         eprintln!("[elfjit:renderemitter-home] engine emitter Ok(ret={r:#x}) draw_mode=0x4(first=0,count={}) layers={nq} swap={sw:?}", 6 * nq);
         if let Some(rp) = readback {
+            // SH71 spin: radial sweep around the box center locates the arc's
+            // strong-blue direction each frame; as spin_frame advances the angle
+            // must move => real loading-spinner rotation, not a static texture.
+            if spin {
+                let (cx, cy) = (640.0f32, 360.0f32);
+                let (mut best_ang, mut best_s) = (-1.0f32, 0i32);
+                for k in 0..36 {
+                    let th = (k as f32 * 10.0).to_radians();
+                    for rad in [136.0, 158.0] {
+                        let (sx, sy) = (cx + rad * th.cos(), cy - rad * th.sin());
+                        let mut px = [0u8; 4];
+                        rp(sx as i32, sy as i32, 1, 1, 0x1908, 0x1401, px.as_mut_ptr() as *mut i8);
+                        let blu = px[2] as i32 - (px[0] as i32 + px[1] as i32) / 2;
+                        if blu > best_s {
+                            best_s = blu;
+                            best_ang = th.to_degrees();
+                        }
+                    }
+                }
+                eprintln!("[elfjit:renderemitter-home] spin frame={spin_frame} rot={spin_deg:.0}deg arc-angle={best_ang:.0}deg score={best_s}");
+            } else {
             // Verifiable readbacks: backdrop-only corner, the BLEND panel center
             // (must equal src*a+dst*(1-a), proving alpha compositing), button,
             // title. Panel rgba = (45,48,59) for (26,26,31) backdrop (dst) and
@@ -2077,6 +2127,7 @@ pub fn render_engine_emitter_home(ctx: u64, iimg: &[u8], ibase: u64, isp: u64, l
                 let tol = if name == "real-arc-blue" { 4 } else { 1 };
                 let present = diff.iter().all(|d| *d <= tol);
                 eprintln!("[elfjit:renderemitter-home] {name} ({fx},{fy}) rgba({},{},{},{}) expect {:?} diff={diff:?} tol={tol} present={present}", px[0], px[1], px[2], px[3], exp8);
+            }
             }
         }
         r
