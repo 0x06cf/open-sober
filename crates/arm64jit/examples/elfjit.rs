@@ -4668,6 +4668,20 @@ fn main() {
                         r
                     });
                 let _ = adapter_rec;
+                // SH109: V2InitWithParams/V2StartAppWithParams and
+                // setTaskSchedulerBM gate on a version-global read at
+                // [adrp 0x683d000 + 848] = guest 0x10683d350 (`ldr x8,[x8,#848]`;
+                // `and w9,w8,#0xff; and x10,x8,#0xfc00; cmp w9,#6; b.eq <main>`).
+                // BSS leaves it 0, so they take the "not version 6" detour which
+                // ladders into the SH103 host-pointer-leak blr (soft-return pc
+                // 0x40438b.../0x1088b8b5150 outside image). Seed low byte = 6
+                // (and 0xfc00 bits clear) so they stay on the clean main path.
+                // Re-asserted from this thread's own setup (idempotent RW store).
+                unsafe {
+                    *(0x10683d350u64 as *mut u64) = 6; // low byte==6, bits clear
+                    *(0x10683d358u64 as *mut u64) = 0; // version-string ptr slot
+                }
+                eprintln!("[elfjit:v2boot] SH109 seeded version-gate [0x10683d350]=6 so V2Init/V2Start keep the clean main path");
                 let _ = (iimg, ib);
                 // rung index 1 == nativeGameGlobalInit in the rungs array below.
                 for (name, guest, args) in rungs.iter() {
