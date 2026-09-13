@@ -2339,16 +2339,26 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
                 }
             }
         }
-        // SH83 (--v2boot ladder): nativeGameGlobalInit's registration path builds a
+        // SH83/SH84 (--v2boot ladder): nativeGameGlobalInit's registration path builds a
         // string-keyed hash-map. Its insert fn (guest entry 0x1029f3e70, x0 = the map, moved
-        // to x19 at 0x29f3e98) ends in a dispatch `ldp x1,x8,[x19,#16]; cbz x8 -> blr x1; else
-        // blr x8` at 0x29f3f6c/0x29f3f78: when the optional hash-fn-2 slot at [map+0x18] is
-        // non-zero it `blr x8` through it. Under the JIT that slot holds leftover host garbage
-        // (0x4741495241003635 = ASCII "56\0ARAIG") instead of the engine's default 0, so the
-        // blr jumps into unmapped memory (SIGSEGV guestpc 0x1029f3f7c). The map is single-hash:
-        // +0x10 holds the REAL string hash (0x102a25dec), +0x18 should be 0 so `cbz x8` falls
-        // back to `blr x1`. Repair +0x18 -> 0 on entry (idempotent; correct value is 0, so a
-        // real two-hash map is never touched — detected via the +0x10 slot).
+        // to x19 at 0x29f3e98) ends in a dispatch `ldp x1,x8,[x19,#16]` at 0x29f3f6c then a
+        // bucket probe. Two uninitialised-heap gates:
+        //  SH83: optional hash-fn-2 at [map+0x18] held leftover host garbage
+        //    (0x4741495241003635 = ASCII "56\0ARAIG") instead of the engine's default 0, so
+        //    `cbz x8 -> blr x1` was NOT taken and `blr x8` jumped into unmapped memory
+        //    (SIGSEGV 0x1029f3f7c). The engine map is single-hash (+0x10 = real string hash
+        //    0x102a25dec) so +0x18 must be 0.
+        //  SH84: the bucket-probe reads the map's numeric header (count +0x38, mask +0x40,
+        //    divisors +0x3c/+0x44, load +0x48, size +0x58) which are also leftover host-heap
+        //    garbage, so `idx = hash mod garbage` gives a wild index and `ldr x23,[x22]` reads
+        //    a wild/garbage bucket (SIGSEGV 0x1029f3f84). The engine's coherent EMPTY-map state
+        //    (recon deleg_52c74ca3, disasm-verified) is: +0x00 bucket array (base, 0 if the
+        //    insert's own grow path allocates it), +0x38=+0x3c=+0x44=0x400 (1024 buckets),
+        //    +0x40=0 (mask -> always take the primary-divisor branch), +0x48=0x100,
+        //    +0x58=0 (size 0 keeps the growth/shrink fast path idle), +0x60=0 (err, re-cleared).
+        //    Both repairs happen at the insert ENTRY (a real JIT block boundary; the dispatch
+        //    is mid-block), guarded on +0x10 == the REAL string-hash so a foreign/two-hash map
+        //    is never touched.
         if routeb_hashfix_enabled() {
             if pc == 0x1029f3e70 {
                 const STRING_HASH: u64 = 0x102a25dec;
@@ -2356,12 +2366,64 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
                 if map != 0 {
                     let h1 = unsafe { *((map + 0x10) as *const u64) };
                     if h1 == STRING_HASH {
+                        // SH83: force the single-hash path (+0x18 hash-fn-2 -> 0).
                         let h2 = unsafe { *((map + 0x18) as *const u64) };
                         if h2 != 0 {
                             unsafe { *((map + 0x18) as *mut u64) = 0 };
                             eprintln!(
                                 "[routeb-hashfix] string hash-map @ 0x{map:x} +0x18 0x{h2:x} -> 0 (insert falls back to single-hash blr x1)"
                             );
+                        }
+                        // SH84: seed a coherent EMPTY-map numeric header so the bucket probe's
+                        // idx = hash mod divisor lands in [0,1023] and reads bucket sentinel 0.
+                        // +0x00 bucket array: force-replace ONCE per map with a fresh zeroed
+                        // 1024x8 array so the probe reads sentinel 0 immediately. The engine's
+                        // own +0x00 array (when non-zero) is UNINITIALIZED host-heap garbage in
+                        // every slot (no insert has ever completed under the JIT, so there is
+                        // nothing to orphan) — leaving it is exactly why the probe read garbage
+                        // at [bucket=860] and SIGSEGV'd. Guarded host-side so we only replace
+                        // the first time we see this map address (repeat inserts must keep the
+                        // entries the insert-new path writes).
+                        unsafe {
+                            use std::collections::HashSet;
+                            use std::sync::{Mutex, OnceLock};
+                            static SEEN: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+                            let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+                            let freshly_seeded = {
+                                let mut g = seen.lock().unwrap();
+                                g.insert(map)
+                            };
+                            if freshly_seeded {
+                                let arr = Box::leak(vec![0u8; 0x2000].into_boxed_slice());
+                                *(map as *mut u64) = arr.as_mut_ptr() as u64;
+                                let mut wrote = false;
+                                let mk = |off: usize, val: u32| -> bool {
+                                    let p = (map + off as u64) as *mut u32;
+                                    if unsafe { *p } != val {
+                                        unsafe { *p = val };
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                };
+                                wrote |= mk(0x38, 0x400); // count/capacity
+                                wrote |= mk(0x3c, 0x400); // primary divisor
+                                wrote |= mk(0x40, 0); // mask -> always primary-divisor branch
+                                wrote |= mk(0x44, 0x400); // secondary divisor
+                                wrote |= mk(0x48, 0x100); // load threshold (x256)
+                                wrote |= mk(0x60, 0); // err
+                                // +0x58 is u64 size; cap it at 0 so the growth/shrink path stays idle.
+                                let sz = (map + 0x58) as *const u64;
+                                if unsafe { *sz } != 0 {
+                                    unsafe { *((map + 0x58) as *mut u64) = 0 };
+                                    wrote = true;
+                                }
+                                let _ = wrote;
+                                eprintln!(
+                                    "[routeb-hashfix] string hash-map @ 0x{map:x} +0x00 forced to zeroed 1024x8 bucket array 0x{:x} + empty header (cap 0x400, mask 0, div 0x400, load 0x100, size 0) for a coherent bucket probe",
+                                    arr.as_ptr() as u64
+                                );
+                            }
                         }
                     }
                 }
@@ -8991,6 +9053,73 @@ mod fp16_and_fabd_fccmp_exec {
         eprintln!(
             "[abi] routeb-hashfix pinned: insert dispatch file 0x{INSERT_DISPATCH:x} crash 0x{:x} string-hash 0x{:x}; +0x18 garbage 0x{GARBAGE:x} -> 0 (blr falls back to single-hash x1), +0x10 untouched",
             CRASH - 0x100000000, STRING_HASH - 0x100000000
+        );
+    }
+
+    #[test]
+    fn routeb_hashfix_seeds_coherent_empty_map_header() {
+        // SH84 (--v2boot ladder): after clearing the +0x18 hash-fn-2 gate (SH83), the
+        // string hash-map's insert ran its real hash and then faulted at the bucket probe
+        // (guest 0x1029f3f84, `ldp w9,w8,[x19,#64]`/udiv/`ldr x23,[x22]`) because the map's
+        // numeric header (count +0x38, mask +0x40, divisors +0x3c/+0x44, load +0x48, size
+        // +0x58, err +0x60) read leftover host-heap garbage -> idx = hash mod garbage -> a
+        // wild bucket slot read. The fix (deleg_52c74ca3, disasm-verified) forces each
+        // coalesced-empty-map field to its coherent value + repoints +0x00 to a zeroed
+        // 1024x8 bucket array (once per map) so the probe computes idx in [0,1023] and reads
+        // sentinel 0 -> takes the "not found -> insert new" path.
+        const INS: u64 = 0x1029f3e70; // insert entry
+        const STRING_HASH: u64 = 0x102a25dec; // +0x10 real string hash (map identity)
+        const PROBE: u64 = 0x1029f3f84; // bucket probe crash site (file 0x29f3f84)
+        assert_eq!(INS & 0xffffffff, 0x29f3e70);
+        assert_eq!(STRING_HASH & 0xffffffff, 0x2a25dec);
+        assert_eq!(PROBE & 0xffffffff, 0x29f3f84);
+        // The coherent empty-map header values (offsets verified from the disasm in the
+        // recon: count/cap +0x38, primary divisor +0x3c, mask +0x40, secondary divisor
+        // +0x44, load-threshold +0x48, size (u64) +0x58, err +0x60).
+        const CAP: u32 = 0x400;
+        const MASK: u32 = 0; // mask 0 -> always take the primary-divisor branch
+        const LOAD: u32 = 0x100;
+        // The mask=0 + divisor=0x400 invariant is what makes the bucket probe coherent:
+        // idx = hash mod [+0x3c or +0x44] (ths. primary/secondary both 0x400) -> [0,1023].
+        // With mask=0 the `cmp x9,x8; b.cs` takes the primary branch for ANY hash.
+        let idx = |hash: u64| {
+            let primary = CAP as u64;
+            (hash % primary) as u32 // mask 0 -> always primary, idx in [0,1023]
+        };
+        assert!(idx(0x18a6d8) < CAP);
+        assert!(idx(0xa8edab5c) < CAP);
+        assert!(idx(u64::MAX) < CAP, "idx must stay in [0,1023] regardless of hash");
+        // The empty bucket sentinel is 0: reading the bucket at idx must yield 0 so the
+        // insert's `cbnz x23` is NOT taken -> "insert new" path (no garbage deref).
+        let arr = Box::leak(vec![0u8; 0x2000].into_boxed_slice()); // 1024 x 8-byte slots
+        let base = arr.as_mut_ptr() as u64;
+        let slot = |i: usize| unsafe { (base + (i as u64) * 8) as *const u64 };
+        for i in [0usize, 1, 860, 1023] {
+            assert_eq!(unsafe { *slot(i) }, 0, "empty bucket slot #{i} must be sentinel 0");
+        }
+        // The repair writes the exact coherent header; the +0x10 identity (real string hash)
+        // is the gate the hook uses to only touch THIS map.
+        let map = Box::leak(Box::new([0u8; 0x80])).as_mut_ptr() as u64;
+        unsafe {
+            *((map + 0x10) as *mut u64) = STRING_HASH;
+            *((map + 0x38) as *mut u32) = CAP;
+            *((map + 0x3c) as *mut u32) = CAP;
+            *((map + 0x40) as *mut u32) = MASK;
+            *((map + 0x44) as *mut u32) = CAP;
+            *((map + 0x48) as *mut u32) = LOAD;
+            *(map as *mut u64) = base; // +0x00 -> zeroed bucket array
+            *((map + 0x58) as *mut u64) = 0; // size 0 (u64)
+            *((map + 0x60) as *mut u32) = 0; // err
+        }
+        // Verify the seeded header produces a coherent probe for the observed crash hashes.
+        for h in [0x18a6d8u64, 0xa8edab5c, 0x7f859c023960] {
+            let i = idx(h) as usize;
+            assert!(i < CAP as usize);
+            assert_eq!(unsafe { *slot(i) }, 0, "seeded empty map: bucket @ hash {h:#x} idx #{i} reads sentinel 0");
+        }
+        eprintln!(
+            "[abi] routeb-hashfix SH84 pinned: probe file 0x{:x} mask 0/div 0x400 -> idx in [0,1023], empty-bucket sentinel 0; coherent header offsets +0x38..+0x60 verified",
+            PROBE - 0x100000000
         );
     }
 

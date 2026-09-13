@@ -53,32 +53,56 @@ consistent: the insert now takes `blr x1` and the REAL string-hash runs.
 
 ## New (hermetic) regression
 
-`routeb_hashfix_repairs_garbage_hash_fn2_slot` pins:
+`routeb_hashfix_repairs_garbage_hash_fn2_slot` pins (SH83):
 - insert entry guest 0x1029f3e70 (file 0x29f3e70) and crash 0x1029f3f7c (file
   0x29f3f7c),
 - the +0x10 primary single string-hash 0x102a25dec (file 0x2a25dec),
 - the repair: garbage non-zero +0x18 -> written 0, +0x10 untouched.
+`routeb_hashfix_seeds_coherent_empty_map_header` pins (SH84):
+- the bucket-probe crash site 0x1029f3f84 (file 0x29f3f84),
+- the coherent empty-map numeric header (count/cap +0x38, divisors +0x3c/+0x44 =
+  0x400, mask +0x40=0, load +0x48=0x100, size u64 +0x58=0, err +0x60=0),
+- idx = hash mod 0x400 stays in [0,1023] for ANY hash, and empty bucket slots read
+  sentinel 0 (the "not found -> insert new" path).
 
-Workspace **512/0** (+1). Product path (no --v2boot, hook off) unregressed:
+Workspace **513/0** (+2). Product path (no --v2boot, hook off) unregressed:
 exit 124, persist 45B byte-exact, present #0 swap Ok(0x1), 0 crash.
+
+## SH84 addendum (same hook, cleared the bucket-probe gate)
+
+The insert now runs its REAL string-hash (0x102a25dec) and faulted FURTHER at the
+bucket probe (guest 0x1029f3f84: `ldp w9,w8,[x19,#64]` (mask/divisor) -> udiv/msub ->
+`ldr x9,[x19]` bucket base -> `add x22,x9,x8,asr#29` -> `ldr x23,[x22]` wild bucket).
+Root cause: map numeric header (+0x38..+0x60) uninitialised host-heap garbage -> idx =
+hash mod garbage -> wild slot read -> `ldr x23,[x22]` reads garbage (x23 still showed
+0x4741495241003635 in the fault dump). Fix extends the same hook at insert entry
+0x1029f3e70 (guarded on +0x10==0x102a25dec): force +0x00 bucket array to a fresh
+zeroed 1024x8 array ONCE per map (host-side SEEN set; repeat inserts keep the entries
+the insert-new path writes) + set count/divs/mask/load/err/size. Empirically (real
+libroblox.so --v2boot, 2 clean runs): the probe now computes idx in [0,1023], reads
+bucket sentinel 0, and the first entry INSERT COMPLETES — the ladder faults FURTHER at
+a NEW deeper region, file 0x28bbfc0 (a qsort comparator of the enum-registration
+path). Note: this run the +0x18 slot held 0x102a25ee0 (a near-hash value, not the SH83
+"56\0ARAIG" garbage) — the +0x18-zero repair is still required and works.
 
 ## Repro
 
 `runs/capture_v2boot_sh82.sh` (JIT_ROUTEB_HASHFIX=1). Expect the `seeded
-main-thread-id` line, then nativeGameGlobalInit's real do-init running the
-string-hash insert, and the OLD SH82b fault `guestpc=0x1029f3f7c` GONE (advances
-to the next gate ~0x1029f3f84 bucket probe).
+main-thread-id` line, then the run's `+0x00 forced to zeroed 1024x8 bucket array` +
+`EMPTY header seeded` lines, the OLD SH82b fault `0x1029f3f7c` AND the bucket-probe
+`0x1029f3f84` both GONE, and the ladder faulting further at `rip=0x1028bbfc0` (the
+qsort comparator gate).
 
 ## Next (ranked)
 
-The ladder clears the hash-dispatch gate and now faults at the map insert's
-bucket lookup (guest 0x1029f3f84: `ldp w9,w8,[x19,#64]` mask/count cols ->
-udiv/msub -> `ldr x9,[x19]` bucket array -> `ldr x23,[x22]`). The map's
-size/count/mask fields (+0x58 size, +0x38 count, +0x3c/40/44 masks, +0x00 bucket
-array) are uninitialised host heap -> wild bucket read. Next: (a) disassemble the
-map's ctor/empty-init to seed a coherent empty map (bucket array + size/mask so
-the probe reads bucket->0 and takes the "not found -> insert new" path); (b) once
-the insert completes, continue toward nativeGameGlobalInit returning -> rung 2
-nativeUpdateAdapterInit (0x10221c3ec) and check whether rungs 2-6 install the
-type-4 producer vector [0x106829ea8]; (c) wire NativeHelper callbacks. Standing
-structural wall otherwise unchanged.
+SH83 cleared the hash-dispatch gate (+0x18 garbage); SH84 cleared the bucket-probe
+gate (the do-init's string-hash-map insert now COMPLETES its first entry headlessly).
+The ladder faults FURTHER at a NEW deeper region — file 0x28bbfc0, a qsort
+COMPARATOR (`ldr w8,[x0,#24]`, comparing 0x50-byte record [+24] fields), reached
+from the enum-registration path at file 0x28bbf80 (3× qsort@plt on record arrays).
+That is the next gate. (a) identify the array being sorted + where it should come
+from (the comparator crash reads a bad element ptr / the base/mask fields of the
+record array are garbage) and seed/repair so the sort completes; (b) continue
+toward nativeGameGlobalInit returning -> rung 2 nativeUpdateAdapterInit
+(0x10221c3ec) -> check rungs 2-6 install the type-4 producer vector [0x106829ea8];
+(c) wire NativeHelper callbacks. Standing structural wall otherwise unchanged.

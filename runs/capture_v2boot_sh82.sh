@@ -6,12 +6,15 @@
 # ladder to ADVANCE past rung 1 and fault FURTHER at guestpc 0x1021daf78 (the next
 # gate) rather than parking (pre-SH82: exit 124, never prints "after
 # nativeGameGlobalInit").
-# SH83 repro: same --v2boot ladder; JIT_ROUTEB_HASHFIX=1 repairs the string hash-map's
-# garbage +0x18 hash-fn-2 slot at the insert ENTRY (guest 0x1029f3e70, x0 = the map) so
-# the nativeGameGlobalInit do-init registration insert's dispatch `ldp x1,x8,[x19,#16]`
-# falls back to the real single string-hash (blr x1, 0x102a25dec) instead of `blr x8`
-# into unmapped memory (SH82b fault guestpc 0x1029f3f7c). Expect the ladder to advance
-# past that gate (fault moves further in, next gate ~0x1029f3f84 bucket probe).
+# SH83/84 repro: same --v2boot ladder; JIT_ROUTEB_HASHFIX=1
+#  SH83: repairs the string hash-map's garbage +0x18 hash-fn-2 slot at insert ENTRY
+#  (guest 0x1029f3e70, x0=the map) so the dispatch falls back to the real string-hash
+#  (blr x1, 0x102a25dec) instead of blr x8 into unmapped memory (SH82b fault 0x1029f3f7c).
+#  SH84: seeds the map's coherent EMPTY header (count/mask/divs/load) + force-replaces
+#  +0x00 bucket array with a zeroed 1024x8 array (once per map) so the probe's
+#  idx=hash mod 0x400 reads sentinel 0 -> "not found -> insert new" instead of garbage
+#  (SH83-second-gate fault 0x1029f3f84). Expect the ladder to advance past BOTH and fault
+#  further (~file 0x28bbfc0 qsort comparator of the enum-registration path).
 set -u
 cd "$(dirname "$0")/.."
 LOG=/home/hermes-worker/runs/open-sober/runs/sh83-v2boot-regtab.txt
