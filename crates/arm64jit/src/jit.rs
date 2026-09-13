@@ -2352,17 +2352,27 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // Also (SH84) seed the map's coherent EMPTY numeric header + zeroed bucket array the
         // first time we see each distinct map, so its probe (idx = hash mod divisor) lands in
         // [0,0x3ff] and reads sentinel 0 instead of a wild slot.
-        let routeb_map_op_entry: Option<u64> = match pc {
-            0x1029f3e70 | 0x1029f4258 | 0x1029f4088 | 0x1029f4348 => Some(unsafe { (*state).x[0] }),
+        let routeb_map_op_entry: Option<(u64, u64)> = match pc {
+            0x1029f3e70 | 0x1029f4258 | 0x1029f4088 | 0x1029f4348 => {
+                Some((unsafe { (*state).x[0] }, unsafe { (*state).x[19] }))
+            }
             _ => None,
         };
         if routeb_hashfix_enabled() {
-            if let Some(map) = routeb_map_op_entry {
-                if map != 0 {
+            if let Some((x0map, x19map)) = routeb_map_op_entry {
+                // The map arg may arrive in x0 (the ABI register, later `mov x19,x0`) OR be
+                // already-live in x19 when the dispatcher restores registers on a mid-block
+                // re-entry (observed heap map 0x7f9ba49bdce0 in x19 while x0 held the .data
+                // registry map). Check BOTH (repair is idempotent: only zeroes non-image
+                // garbage, so double-checking a valid map is a no-op).
+                for map in [x0map, x19map] {
+                    if map == 0 {
+                        continue;
+                    }
                     // Universal (all map-op entries): a real hash fn lives in .text; garbage
                     // (host heap / small ints) does not. Zero +0x18 when non-image -> the op's
                     // `cbz x8 -> blr x1` takes the single-hash path instead of `blr x8` into
-                    // unmapped memory. Safe for every map of the family (string and span hashes).
+                    // unmapped memory. Safe for every map of the family (string and span).
                     let h2 = unsafe { *((map + 0x18) as *const u64) };
                     let in_image = |a: u64| a >= base && a - base < image.len() as u64;
                     if h2 != 0 && !in_image(h2) {

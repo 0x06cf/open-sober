@@ -4251,6 +4251,24 @@ fn main() {
                 // restored after only for rung 1, main-thread id untouched).
                 let main_id_cell: u64 = 0x106863a68;
                 let orig_main_id = unsafe { *(main_id_cell as *const u64) };
+                // SH86: the OTel/pb_defaults registration path (reached deep inside
+                // nativeGameGlobalInit's do-init) allocates via the CRT `operator new`
+                // wrapper (file 0x2a0d9b8) whose allocator-hook dispatch compares the ACTIVE
+                // hook global [0x1067daaf0] against the DEFAULT hook global [0x1067d0840].
+                // Both are 0 in the file, so on a correct load the two `ldr`s are equal and
+                // the `b.eq` takes the fast path (TLS allocator) with NO blr. Under the JIT
+                // the RW segment leaves [0x1067daaf0] as host-heap garbage (observed
+                // 0x7fcd98dd52e0), so `cmp` differs -> `blr x8` jumps to the heap -> SIGSEGV
+                // (matched crash guestpc 0x1029b43f0, fault==heap). Seed BOTH to 0 (the
+                // canonical default) before driving rung 1; idempotent and safe (a real boot
+                // would install an override here, which never happens headlessly).
+                unsafe {
+                    *(0x1067daaf0u64 as *mut u64) = 0; // active allocator-hook global
+                    *(0x1067d0840u64 as *mut u64) = 0; // default allocator-hook global
+                }
+                eprintln!(
+                    "[elfjit:v2boot] SH86 seeded CRT allocator-hook globals [0x1067daaf0]=[0x1067d0840]=0 so operator-new takes the fast path (no blr through host garbage)"
+                );
                 // rung index 1 == nativeGameGlobalInit in the rungs array below.
                 for (name, guest, args) in rungs.iter() {
                     eprintln!("[elfjit:v2boot] driving {name} @ guest {guest:#x} (env={env_ptr:#x} thiz={thiz:#x})");
