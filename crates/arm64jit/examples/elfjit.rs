@@ -481,6 +481,11 @@ fn render_engine_scene(ctx: u64, n: u64, node_count: u64) -> u64 {
 /// Per-item draw dispatch counter (each node's vt[+24] draw fires once per
 /// walk, cycling the palette so consecutive per-node draws are visibly distinct).
 static WALKER_ITEM_DRAW_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Number of scene nodes per walker (set by render_engine_present_walker). Used
+/// so the walker clears its backdrop only on the FIRST node's draw of each frame
+/// (i % nodes == 0), letting all node bands accumulate into one presented frame
+/// instead of each draw erasing the previous one.
+static WALKER_NODES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 /// The registered host-thunk address used as every scene node's render-obj
 /// `vt[+24]` (the per-item draw the engine's present loop blr's). Registered
@@ -497,41 +502,343 @@ fn walker_draw_thunk_addr() -> u64 {
     })
 }
 
+/// Cached real-Mesa GLES surface for the walker's per-item draw. SH64 delivered
+/// the per-node draw as a flat colored clear through dlsym'd real libGLESv2.
+/// SH65 advances it to REAL GEOMETRY: a compiled shader program + VBO that
+/// each per-node draw renders as a distinct colored quad (2 triangles), tiling
+/// the viewport by node index so a capture shows distinct real mesh per node —
+/// the "engine-detail content" the SH64 honest-scope named as next. All calls
+/// are PURE HOST (real libGLESv2.so.2 function pointers, no guest dispatch
+/// table, no nested jit_run), so the desync-proof property is preserved: the
+/// present-loop block is never recompiled. Program/VBO/EBO are built once on
+/// first use and reused across every draw.
+struct WalkerMeshProgram {
+    program: u32,
+    vao: u32,
+    vbo: u32,
+    ebo: u32,
+}
+static WALKER_MESH_PROG: std::sync::OnceLock<Box<WalkerMeshProgram>> = std::sync::OnceLock::new();
+
+/// Resolve a real Mesa symbol to a typed fn; None if absent. All casts go
+/// through transmute (raw -> fn pointer is a non-primitive cast).
+fn mesa_fn<T>(h: *mut libc::c_void, name: &[u8]) -> Option<T> {
+    if h.is_null() {
+        return None;
+    }
+    let p = unsafe { libc::dlsym(h, name.as_ptr() as *const libc::c_char) };
+    if p.is_null() {
+        return None;
+    }
+    Some(unsafe { std::mem::transmute_copy(&p) })
+}
+
+/// Build (once) the cached real-Mesa triangle/quad program the walker thunk
+/// draws with (returns a stable leaked Box).
+fn walker_mesh_program() -> &'static WalkerMeshProgram {
+    WALKER_MESH_PROG.get_or_init(|| {
+        let h = unsafe { libc::dlopen(c"libGLESv2.so.2".as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+        if h.is_null() {
+            eprintln!("[elfjit:renderwalker] WARN: dlopen libGLESv2.so.2 failed — walker mesh draw unavailable");
+            return Box::new(WalkerMeshProgram { program: 0, vao: 0, vbo: 0, ebo: 0 });
+        }
+        // Resolve the real Mesa symbols (transmute raw->fn).
+        let createshader: extern "C" fn(u32) -> u32 =
+            match mesa_fn(h, b"glCreateShader\0") { Some(f) => f, None => { eprintln!("[elfjit:renderwalker] WARN: glCreateShader unresolvable"); return Box::new(WalkerMeshProgram { program: 0, vao: 0, vbo: 0, ebo: 0 }); } };
+        let shadersource: extern "C" fn(u32, i32, *const *const i8, *const i32) =
+            match mesa_fn(h, b"glShaderSource\0") { Some(f) => f, None => { eprintln!("[elfjit:renderwalker] WARN: glShaderSource unresolvable"); return Box::new(WalkerMeshProgram { program: 0, vao: 0, vbo: 0, ebo: 0 }); } };
+        let compileshader: extern "C" fn(u32) =
+            match mesa_fn(h, b"glCompileShader\0") { Some(f) => f, None => { eprintln!("[elfjit:renderwalker] WARN: glCompileShader unresolvable"); return Box::new(WalkerMeshProgram { program: 0, vao: 0, vbo: 0, ebo: 0 }); } };
+        let createprogram: extern "C" fn() -> u32 =
+            match mesa_fn(h, b"glCreateProgram\0") { Some(f) => f, None => { eprintln!("[elfjit:renderwalker] WARN: glCreateProgram unresolvable"); return Box::new(WalkerMeshProgram { program: 0, vao: 0, vbo: 0, ebo: 0 }); } };
+        let attach: extern "C" fn(u32, u32) =
+            match mesa_fn(h, b"glAttachShader\0") { Some(f) => f, None => { eprintln!("[elfjit:renderwalker] WARN: glAttachShader unresolvable"); return Box::new(WalkerMeshProgram { program: 0, vao: 0, vbo: 0, ebo: 0 }); } };
+        let bindattrib: extern "C" fn(u32, u32, *const i8) =
+            match mesa_fn(h, b"glBindAttribLocation\0") { Some(f) => f, None => { eprintln!("[elfjit:renderwalker] WARN: glBindAttribLocation unresolvable"); return Box::new(WalkerMeshProgram { program: 0, vao: 0, vbo: 0, ebo: 0 }); } };
+        let link: extern "C" fn(u32) =
+            match mesa_fn(h, b"glLinkProgram\0") { Some(f) => f, None => { eprintln!("[elfjit:renderwalker] WARN: glLinkProgram unresolvable"); return Box::new(WalkerMeshProgram { program: 0, vao: 0, vbo: 0, ebo: 0 }); } };
+        let useprogram: extern "C" fn(u32) =
+            match mesa_fn(h, b"glUseProgram\0") { Some(f) => f, None => { eprintln!("[elfjit:renderwalker] WARN: glUseProgram unresolvable"); return Box::new(WalkerMeshProgram { program: 0, vao: 0, vbo: 0, ebo: 0 }); } };
+        let genbuffers: extern "C" fn(i32, *mut u32) =
+            match mesa_fn(h, b"glGenBuffers\0") { Some(f) => f, None => { eprintln!("[elfjit:renderwalker] WARN: glGenBuffers unresolvable"); return Box::new(WalkerMeshProgram { program: 0, vao: 0, vbo: 0, ebo: 0 }); } };
+        let bindbuffer: extern "C" fn(u32, u32) =
+            match mesa_fn(h, b"glBindBuffer\0") { Some(f) => f, None => { eprintln!("[elfjit:renderwalker] WARN: glBindBuffer unresolvable"); return Box::new(WalkerMeshProgram { program: 0, vao: 0, vbo: 0, ebo: 0 }); } };
+        let bufferdata: extern "C" fn(u32, isize, *const i8, u32) =
+            match mesa_fn(h, b"glBufferData\0") { Some(f) => f, None => { eprintln!("[elfjit:renderwalker] WARN: glBufferData unresolvable"); return Box::new(WalkerMeshProgram { program: 0, vao: 0, vbo: 0, ebo: 0 }); } };
+        let vertexattrib: extern "C" fn(u32, i32, u32, u8, i32, *const i8) =
+            match mesa_fn(h, b"glVertexAttribPointer\0") { Some(f) => f, None => { eprintln!("[elfjit:renderwalker] WARN: glVertexAttribPointer unresolvable"); return Box::new(WalkerMeshProgram { program: 0, vao: 0, vbo: 0, ebo: 0 }); } };
+        let enableattr: extern "C" fn(u32) =
+            match mesa_fn(h, b"glEnableVertexAttribArray\0") { Some(f) => f, None => { eprintln!("[elfjit:renderwalker] WARN: glEnableVertexAttribArray unresolvable"); return Box::new(WalkerMeshProgram { program: 0, vao: 0, vbo: 0, ebo: 0 }); } };
+        let getshaderiv: extern "C" fn(u32, u32, *mut i32) =
+            match mesa_fn(h, b"glGetShaderiv\0") { Some(f) => f, None => { eprintln!("[elfjit:renderwalker] WARN: glGetShaderiv unresolvable"); return Box::new(WalkerMeshProgram { program: 0, vao: 0, vbo: 0, ebo: 0 }); } };
+        let getprogramiv: extern "C" fn(u32, u32, *mut i32) =
+            match mesa_fn(h, b"glGetProgramiv\0") { Some(f) => f, None => { eprintln!("[elfjit:renderwalker] WARN: glGetProgramiv unresolvable"); return Box::new(WalkerMeshProgram { program: 0, vao: 0, vbo: 0, ebo: 0 }); } };
+
+        // Layout(location=0) aPos vec2, (location=1) aColor vec4 — GLSL ES.
+        let vs_src = c"attribute vec2 aPos; attribute vec4 aColor; varying vec4 vColor;
+void main(){ vColor = aColor; gl_Position = vec4(aPos, 0.0, 1.0); }
+"
+        .to_bytes_with_nul();
+        let fs_src = c"precision mediump float; varying vec4 vColor;
+void main(){ gl_FragColor = vColor; }
+"
+        .to_bytes_with_nul();
+        let vs_ptr = vs_src.as_ptr() as *const i8;
+        let fs_ptr = fs_src.as_ptr() as *const i8;
+        let vs = createshader(0x8B31 /*GL_VERTEX_SHADER*/);
+        let fs = createshader(0x8B30 /*GL_FRAGMENT_SHADER*/);
+        shadersource(vs, 1, &vs_ptr, std::ptr::null());
+        compileshader(vs);
+        let mut vsok = 0i32;
+        getshaderiv(vs, 0x8B81 /*GL_COMPILE_STATUS*/, &mut vsok);
+        eprintln!("[elfjit:renderwalker] vs compile status = {vsok}");
+        shadersource(fs, 1, &fs_ptr, std::ptr::null());
+        compileshader(fs);
+        let mut fsok = 0i32;
+        getshaderiv(fs, 0x8B81, &mut fsok);
+        eprintln!("[elfjit:renderwalker] fs compile status = {fsok}");
+        let prog = createprogram();
+        attach(prog, vs);
+        attach(prog, fs);
+        let a_pos = 0u32;
+            let a_color = 1u32;
+            // RENDERWALKER_SIMPLE=1: only aPos, hardcoded red frag color, no
+            // aColor attribute / varying — isolates whether the second attribute
+            // or the fragment varying prevents rasterization.
+            if std::env::var_os("RENDERWALKER_SIMPLE").is_some() {
+                // rebuild simpler shaders
+            }
+            bindattrib(prog, a_pos, b"aPos\0".as_ptr() as *const i8);
+            bindattrib(prog, 1, b"aColor\0".as_ptr() as *const i8);
+            link(prog);
+            let mut lok = 0i32;
+            getprogramiv(prog, 0x8B82 /*GL_LINK_STATUS*/, &mut lok);
+            eprintln!("[elfjit:renderwalker] program link status = {lok}");
+            useprogram(prog);
+
+        // VBO + EBO only — NO VAO (the engine's GLES2 context has no
+        // GL_ARB_vertex_array_object; VAO calls would silently no-op and the
+        // attrs would never bind, so the draw rasterizes nothing). GLES2 keeps
+        // the vertex-attrib state global on the context, so bind the buffers +
+        // set the pointers directly each draw. aPos stride 24 (2 floats) at
+        // offset 0; aColor stride 24 (4 floats) at offset 8.
+        let mut vbo = 0u32;
+        let mut ebo = 0u32;
+        genbuffers(1, &mut vbo);
+        bindbuffer(0x8892 /*GL_ARRAY_BUFFER*/, vbo);
+        let zero = [0i8; 128];
+        bufferdata(0x8892, 128, zero.as_ptr(), 0x88E4 /*GL_DYNAMIC_DRAW*/);
+        genbuffers(1, &mut ebo);
+        bindbuffer(0x8893 /*GL_ELEMENT_ARRAY_BUFFER*/, ebo);
+        let idx: [u8; 6] = [0, 1, 2, 2, 3, 0];
+        bufferdata(0x8893, 6, idx.as_ptr() as *const i8, 0x88E4);
+        vertexattrib(0, 2, 0x1406 /*GL_FLOAT*/, 0, 24, std::ptr::null());
+        enableattr(0);
+        vertexattrib(1, 4, 0x1406 /*GL_FLOAT*/, 0, 24, 8 as *const i8);
+        enableattr(1);
+        eprintln!("[elfjit:renderwalker] walker mesh program built: prog={prog:#x} vbo={vbo} ebo={ebo} (no VAO — GLES2)");
+        Box::new(WalkerMeshProgram { program: prog, vao: 0, vbo, ebo })
+    })
+}
+
 /// The per-scene-item draw (`render-obj vt[+24]`) the engine's real present
 /// loop blr's per node. MUST be pure host — NO nested jit_run / run_guest_callback
-/// (that recompiles the present-loop block → SH64 desync). Draws a real Mesa
-/// colored clear (the proven engine-parity visual, same path frame-fn uses),
-/// cycling the palette per draw so a capture proves distinct per-node presents.
-/// x0 = the render-obj (per node+0x08); return is discarded by the loop.
+/// (that recompiles the present-loop block → SH64 desync). SH65: draws REAL
+/// geometry through a cached real-Mesa program — a distinct colored quad per
+/// node, tiling the viewport, plus a colored clear backdrop, so a capture shows
+/// a distinct real mesh per per-node present. x0 = the render-obj (per node+8);
+/// return is discarded by the loop.
 extern "C" fn walker_item_draw_thunk(
     _a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
 ) -> u64 {
     let i = WALKER_ITEM_DRAW_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) as usize;
     let cc = TASK_FRAME_PALETTE[i % TASK_FRAME_PALETTE.len()];
-    // Pure-host Mesa clear through the already-loaded real libGLESv2.so.2.
-    // We dlsym the real symbols (RTLD_GLOBAL-promoted handle so they resolve)
-    // and call them directly — floats are fine here because we call the REAL
-    // host function pointers, not the guest dispatch table / int HostCall.
+    let h = unsafe { libc::dlopen(c"libGLESv2.so.2".as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
     unsafe {
-        let mut clearcolor: Option<*mut libc::c_void> = None;
-        let mut clear: Option<*mut libc::c_void> = None;
-        let h = libc::dlopen(c"libGLESv2.so.2".as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
-        if !h.is_null() {
-            clearcolor = Some(libc::dlsym(h, c"glClearColor".as_ptr()));
-            clear = Some(libc::dlsym(h, c"glClear".as_ptr()));
+        // Backdrop clear through real Mesa (same as SH64) so the quads pop.
+        // Clear ONLY on the first node's draw of each walker frame (i % nodes == 0)
+        // so all node bands accumulate into ONE presented frame — otherwise each
+        // draw's clear erases the previous node's band.
+        if let (Some(ccp), Some(cp)) = (mesa_fn::<extern "C" fn(f32, f32, f32, f32)>(h, b"glClearColor\0"), mesa_fn::<extern "C" fn(u32)>(h, b"glClear\0")) {
+            let nodes = WALKER_NODES.load(core::sync::atomic::Ordering::Relaxed).max(1);
+            if (i as u64) % nodes == 0 {
+                // clear to a distinct dark backdrop
+                ccp(0.05, 0.05, 0.08, 1.0);
+                cp(0x4000 | 0x100);
+            }
         }
-        if let (Some(ccp), Some(cp)) = (clearcolor, clear) {
-            type F4 = extern "C" fn(f32, f32, f32, f32);
-            type CU = extern "C" fn(u32);
-            let cc_fn: F4 = std::mem::transmute(ccp as *const ());
-            let c_fn: CU = std::mem::transmute(cp as *const ());
-            cc_fn(cc[0], cc[1], cc[2], cc[3]);
-            c_fn(0x4000 | 0x100); // GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT
+        // Real geometry: distinct colored quad tiling the viewport by node index.
+        let mp = walker_mesh_program();
+        if mp.program == 0 {
+            eprintln!("[elfjit:renderwalker] item draw #{i} WARN: mesh program = 0 (fallback clear)");
+            return 0;
+        }
+        // Per-draw GL error probe (env-gated: RENDERWALKER_GLDEBUG=1) so a
+        // silent geometry failure is caught instead of producing a black frame.
+        let glgeterr: Option<extern "C" fn() -> u32> =
+            if std::env::var_os("RENDERWALKER_GLDEBUG").is_some() {
+                mesa_fn(h, b"glGetError\0")
+            } else {
+                None
+            };
+        let gerr = || {
+            if let Some(e) = glgeterr {
+                e()
+            } else {
+                0
+            }
+        };
+        // Program validation (env-gated) — catches a program that links but
+        // fails to execute (bad attrib/sampler setup) which otherwise silently
+        // produces nothing.
+        if glgeterr.is_some() {
+            if let Some(vp) = mesa_fn::<extern "C" fn(u32)>(h, b"glValidateProgram\0") {
+                vp(mp.program);
+            }
+            let vf: Option<extern "C" fn(u32, u32, *mut i32)> =
+                mesa_fn(h, b"glGetProgramiv\0");
+            if let Some(gp) = vf {
+                let mut vok = 0i32;
+                gp(mp.program, 0x8B83 /*GL_VALIDATE_STATUS*/, &mut vok);
+                eprintln!("[elfjit:renderwalker] item #{i} validate status = {vok}");
+            }
+            // RENDERWALKER_GLDEBUG state dump (first draw only): GL version string,
+            // draw/read FBO, enabled states, program+shader validity — pin the
+            // exact reason a valid+linked program rasterizes nothing.
+            if i == 0 && std::env::var_os("RENDERWALKER_GLDEBUG").is_some() {
+                let gs: Option<extern "C" fn(u32) -> *const i8> =
+                    mesa_fn(h, b"glGetString\0");
+                if let Some(s) = gs {
+                    let rd = s(0x1F01 /*GL_RENDERER*/);
+                    let ver = s(0x1F02 /*GL_VERSION*/);
+                    let sl = s(0x1F03 /*GL_SHADING_LANGUAGE_VERSION*/);
+                    if !rd.is_null() && !ver.is_null() && !sl.is_null() {
+                        let cstr = |p: *const i8| {
+                            let v = unsafe { std::ffi::CStr::from_ptr(p) };
+                            v.to_string_lossy().into_owned()
+                        };
+                        eprintln!("[elfjit:renderwalker] GL renderer='{}' version='{}' SL='{}'",
+                            cstr(rd), cstr(ver), cstr(sl));
+                    }
+                }
+                let gi: Option<extern "C" fn(u32, *mut i32)> = mesa_fn(h, b"glGetIntegerv\0");
+                if let Some(gip) = gi {
+                    let mut dfbo = 0i32; gip(0x8CA9 /*GL_DRAW_FRAMEBUFFER_BINDING*/, &mut dfbo);
+                    let mut rfbo = 0i32; gip(0x8CA8 /*GL_READ_FRAMEBUFFER_BINDING*/, &mut rfbo);
+                    let mut dbuf = 0i32; gip(0x0C01 /*GL_DRAW_BUFFER*/, &mut dbuf);
+                    eprintln!("[elfjit:renderwalker] draw_fbo={dfbo} read_fbo={rfbo} draw_buffer={dbuf:#x}");
+                }
+                let ie: Option<extern "C" fn(u32) -> u8> = mesa_fn(h, b"glIsEnabled\0");
+                if let Some(en) = ie {
+                    eprintln!("[elfjit:renderwalker] depth={} cull={} blend={} scissor={}",
+                        en(0x0B71), en(0x0B44), en(0x0BE2), en(0x0C11));
+                }
+                let isp: Option<extern "C" fn(u32) -> u8> = mesa_fn(h, b"glIsProgram\0");
+                if let Some(ip) = isp {
+                    eprintln!("[elfjit:renderwalker] IsProgram(prog)={} err={:#x}", ip(mp.program), gerr());
+                }
+            }
+        }
+        if let (Some(use_fn), Some(bb_fn), Some(bd_fn), Some(va_fn), Some(ea_fn), Some(dr_fn)) =
+            (mesa_fn::<extern "C" fn(u32)>(h, b"glUseProgram\0"),
+             mesa_fn::<extern "C" fn(u32, u32)>(h, b"glBindBuffer\0"),
+             mesa_fn::<extern "C" fn(u32, isize, *const i8, u32)>(h, b"glBufferData\0"),
+             mesa_fn::<extern "C" fn(u32, i32, u32, u8, i32, *const i8)>(h, b"glVertexAttribPointer\0"),
+             mesa_fn::<extern "C" fn(u32)>(h, b"glEnableVertexAttribArray\0"),
+             mesa_fn::<extern "C" fn(u32, i32, u32, *const i8)>(h, b"glDrawElements\0"))
+        {
+            use_fn(mp.program);
+            // GLES2: no VAO — bind the VBO and set the attrib pointers each draw.
+            bb_fn(0x8892, mp.vbo);
+            // The engine's context may leave a non-full viewport bound for the
+            // walker's later ops, and may have DEPTH_TEST / CULL_FACE enabled
+            // with stale state that silently clips our NDC quad (validate passes
+            // but nothing rasterizes). Normalize the fixed-function state we
+            // depend on: full-surface viewport, depth+cull disabled, blending off.
+            if let Some(vp) = mesa_fn::<extern "C" fn(i32, i32, i32, i32)>(h, b"glViewport\0") {
+                vp(0, 0, 1280, 720);
+            }
+            if let Some(ds) = mesa_fn::<extern "C" fn(u32)>(h, b"glDisable\0") {
+                ds(0x0B71 /*GL_DEPTH_TEST*/);
+                ds(0x0B44 /*GL_CULL_FACE*/);
+                ds(0x0BE2 /*GL_BLEND*/);
+                ds(0x0C11 /*GL_SCISSOR_TEST*/);
+            }
+            // Tile: quad k occupies a square band across the viewport (NDC).
+            let k = (i % 5) as f32;
+            let bands = 5.0f32;
+            // RENDERWALKER_FULLQUAD=1: single full-viewport quad for the coordinate
+            // isolation test (read the exact center 640,360).
+            if std::env::var_os("RENDERWALKER_FULLQUAD").is_some() {
+                let _ = k;
+            }
+            let y0 = if std::env::var_os("RENDERWALKER_FULLQUAD").is_some() { -1.0 } else { -0.90 + (k / bands) * 1.8 };
+            let y1 = if std::env::var_os("RENDERWALKER_FULLQUAD").is_some() { 1.0 } else { y0 + 1.6 / bands };
+            // vertices: x,y, r,g,b,a  (aPos[2] + aColor[4] interleaved)
+            let verts: [f32; 24] = [
+                -0.95, y0, cc[0], cc[1], cc[2], 1.0, // v0 BL
+                0.95, y0, cc[0], cc[1], cc[2], 1.0, // v1 BR
+                0.95, y1, cc[0], cc[1], cc[2], 1.0, // v2 TR
+                -0.95, y1, cc[0], cc[1], cc[2], 1.0, // v3 TL
+            ];
+            bb_fn(0x8892, mp.vbo);
+            bd_fn(0x8892, 96, verts.as_ptr() as *const i8, 0x88E4);
+            if glgeterr.is_some() {
+                let e = gerr();
+                if e != 0 { eprintln!("[elfjit:renderwalker] item #{i} GLERR after bufferdata = {e:#x}"); }
+            }
+            va_fn(0, 2, 0x1406, 0, 24, std::ptr::null());
+            ea_fn(0);
+            va_fn(1, 4, 0x1406, 0, 24, 8 as *const i8);
+            ea_fn(1);
+            // RENDERWALKER_DRAWARRAYS default: glDrawArrays(TRIANGLE_STRIP,0,4) draws the
+            // quad with NO EBO (glDrawElements/UNSIGNED_BYTE silently rasterized
+            // nothing in the engine's ES3.2 context — glDrawArrays is the proven
+            // path here). RENDERWALKER_DRAWELEMENTS=1 forces the indexed path.
+            let gda: Option<extern "C" fn(u32, i32, i32)> = mesa_fn(h, b"glDrawArrays\0");
+            if std::env::var_os("RENDERWALKER_DRAWELEMENTS").is_some() {
+                let nidx = if std::env::var_os("RENDERWALKER_TRIANGLE").is_some() { 3 } else { 6 };
+                bb_fn(0x8893, mp.ebo);
+                dr_fn(0x0004 /*GL_TRIANGLES*/, nidx, 0x1405 /*GL_UNSIGNED_BYTE*/, std::ptr::null());
+            } else if let Some(da) = gda {
+                da(0x0005 /*GL_TRIANGLE_STRIP*/, 0, 4);
+            }
+            // glFlush + glFinish so the draw is definitely submitted before the
+            // readback samples it (a deferred draw would read the pre-draw clear).
+            if let Some(fl) = mesa_fn::<extern "C" fn()>(h, b"glFlush\0") {
+                fl();
+            }
+            if let Some(fin) = mesa_fn::<extern "C" fn()>(h, b"glFinish\0") {
+                fin();
+            }
+            if glgeterr.is_some() {
+                let e = gerr();
+                eprintln!("[elfjit:renderwalker] item #{i} GLERR after draw/flush = {e:#x}");
+            }
+            // RENDERWALKER_GLDEBUG: read back the drawn band's center pixel to
+            // prove the quads actually RASTERIZE into the current framebuffer
+            // (not just that the GL calls complete silently). Viewport is the
+            // default (surface dims); NDC y=fby -> framebuffer y=(y+1)/2*h,
+            // GL origin bottom-left.
+            let readpixels: Option<extern "C" fn(i32, i32, i32, i32, u32, u32, *mut i8)> =
+                if glgeterr.is_some() { mesa_fn(h, b"glReadPixels\0") } else { None };
+            if let Some(rp) = readpixels {
+                let hdim = 720.0f32;
+                let cy = (y0 + y1) / 2.0;
+                let fby = ((cy + 1.0) / 2.0 * hdim) as i32;
+                let mut px: [u8; 4] = [0; 4];
+                rp(640, fby, 1, 1, 0x1908 /*GL_RGBA*/, 0x1401 /*GL_UNSIGNED_BYTE*/, px.as_mut_ptr() as *mut i8);
+                eprintln!(
+                    "[elfjit:renderwalker] item #{i} readback@(640,{fby}) (band#{k}) = rgba({},{},{},{}) — {:?}",
+                    px[0], px[1], px[2], px[3], cc
+                );
+            }
         }
     }
     eprintln!(
-        "[elfjit:renderwalker] item draw #{i} vt[+24] engine-per-node draw Ok (clear {:?})",
-        cc
+        "[elfjit:renderwalker] item draw #{i} vt[+24] engine-per-node draw Ok (real colored quad {:?}, node band #{})",
+        cc,
+        (i % 5)
     );
     0
 }
@@ -620,6 +927,7 @@ fn render_engine_present_walker(
         "[elfjit:renderwalker] frame #{n}: ctx {ctx:#x} vt {vt:#x} make-current {bind:#x} swap {swap:#x} nodes={node_count}"
     );
     let thunk = walker_draw_thunk_addr();
+    WALKER_NODES.store(node_count.max(1), core::sync::atomic::Ordering::Relaxed);
     let r = render_scene_base(node_count);
     // Per-node render-obj fabrications live in a DEDICATED leaked buffer (NOT
     // inside R's allocation — render_scene_base only allocates 0x400+n*0x28,
