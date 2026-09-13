@@ -1423,6 +1423,24 @@ fn imgpix_screen(ix: u32, iy: u32, imw: u32, imh: u32, hh: f32, vw: f32, vh: f32
     ((x_ndc + 1.0) / 2.0 * vw, (1.0 - y_ndc) / 2.0 * vh)
 }
 
+/// SH72-generalization: image pixel (ix,iy) top-first -> screen window (sx,sy)
+/// for an aspect-correct box whose CENTER is (cx_ndc, cy_ndc) in NDC (not
+/// necessarily the screen center) with half-height hh, viewport VWxVH. Reduces
+/// to imgpix_screen when cx_ndc==cy_ndc==0. Same vUV-linear math the shader's
+/// aTex interpolation yields, so multi-sprite probe coords are exact.
+fn imgpix_rect(
+    ix: u32, iy: u32, imw: u32, imh: u32,
+    cx_ndc: f32, cy_ndc: f32, hh: f32, vw: f32, vh: f32,
+) -> (f32, f32) {
+    let corr = vh / vw;
+    let half_w = hh * (imw as f32 / imh as f32) * corr;
+    let u = (ix as f32 + 0.5) / imw as f32;
+    let v = (iy as f32 + 0.5) / imh as f32;
+    let x_ndc = cx_ndc - half_w + u * 2.0 * half_w;
+    let y_ndc = cy_ndc + (hh - v * 2.0 * hh);
+    ((x_ndc + 1.0) / 2.0 * vw, (1.0 - y_ndc) / 2.0 * vh)
+}
+
 fn emitter_tex_program() -> (u32, i32) {
     static TP: std::sync::OnceLock<(u32, i32)> = std::sync::OnceLock::new();
     *TP.get_or_init(|| {
@@ -2134,6 +2152,458 @@ pub fn render_engine_emitter_home(ctx: u64, iimg: &[u8], ibase: u64, isp: u64, l
     }
 }
 
+/// SH72 — a MULTI-SPRITE real-Roblox-UI composite. One decoded real sprite.
+#[allow(dead_code)]
+#[derive(Clone)]
+struct RealSprite {
+    name: String,
+    w: u32,
+    h: u32,
+    rgba: Vec<u8>,
+}
+
+/// SH72 — load SEVERAL REAL Roblox UI textures (default: loading spinner,
+/// robux icon, jump button) as RGBA8. Env RENDEREMITTER_MULTI_TEXTURES = a
+/// comma-separated list overrides the defaults (relative to the extracted
+/// assets/textures/ui root). Each is cached via OnceLock. Sprites that fail to
+/// load/decode are skipped with a warn so the composite still builds from the
+/// successes.
+fn real_ui_textures() -> Vec<RealSprite> {
+    static MT: std::sync::OnceLock<Vec<RealSprite>> = std::sync::OnceLock::new();
+    MT.get_or_init(|| {
+        let root = "/home/hermes-worker/.cache/open-sober/android-env/assets/content/textures/ui";
+        let defs: Vec<&str> = vec![
+            "LoadingScreen/LoadingSpinner.png",
+            "InspectMenu/ico_robux@3x.png",
+            "Input/JumpButtonRegular@2x.png",
+        ];
+        let list: Vec<String> = std::env::var("RENDEREMITTER_MULTI_TEXTURES")
+            .ok()
+            .map(|v| v.split(',').map(|s| s.to_string()).collect())
+            .unwrap_or_else(|| defs.iter().map(|s| s.to_string()).collect());
+        let mut out = Vec::new();
+        for rel in &list {
+            let path = format!("{root}/{rel}");
+            let name = rel.rsplit('/').next().unwrap_or(rel).to_string();
+            match std::fs::read(&path)
+                .ok()
+                .and_then(|d| decode_png_rgba(&d))
+            {
+                Some((w, h, rgba)) => {
+                    eprintln!("[elfjit:renderemitter-multi] loaded real sprite '{name}' ({w}x{h} RGBA8) from {path}");
+                    out.push(RealSprite { name, w, h, rgba });
+                }
+                None => eprintln!(
+                    "[elfjit:renderemitter-multi] WARN: failed to load/decode real sprite '{name}' from {path} — skipped"
+                ),
+            }
+        }
+        out
+    })
+    .clone()
+}
+
+/// SH72 — the engine's REAL geometry emitter 0x105b35288 draws a FULL
+/// MULTI-SPRITE "login/home" composite frame in ONE top-level jit_run: a dark
+/// backdrop + one aspect-correct box per REAL Roblox UI sprite (spinner, robux
+/// icon, jump button), all sampled from a single shared vertical atlas (row 0 =
+/// solid backdrop strip, then each sprite in its own memory-row block),
+/// composited with GL_BLEND. Verified by per-sprite glReadPixels probes: each
+/// probe's expected color is read from the DECODED sprite rgba (not
+/// hard-coded), mapped to screen coords via imgpix_rect (the same vUV-linear
+/// math the shader's aTex interpolation yields), so a present sprite proves
+/// its real pixels landed at the right place in the composite.
+pub fn render_engine_emitter_multi(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) -> u64 {
+    if !(ctx >= 0x100000000 && ctx >> 56 == 0) {
+        return 0;
+    }
+    let sprites = real_ui_textures();
+    if sprites.is_empty() {
+        eprintln!("[elfjit:renderemitter-multi] WARN: no real sprites loaded");
+        return 0;
+    }
+    // RENDEREMITTER_MULTI_INDEX=N: render ONLY sprite N (+ backdrop) — a
+    // diagnostic lever to isolate a multi-quad vertex-index mix-up.
+    let only: Option<usize> = std::env::var("RENDEREMITTER_MULTI_INDEX")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let h = unsafe { libc::dlopen(c"libGLESv2.so.2".as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+    if h.is_null() {
+        return 0;
+    }
+    let (tprog, uloc) = emitter_tex_program();
+    if tprog == 0 {
+        return 0;
+    }
+    // Layout (NDC): dark backdrop full-screen; then each sprite in its own
+    // aspect-correct box. Positions chosen to resemble a login/home surface.
+    const VW: f32 = 1280.0;
+    const VH: f32 = 720.0;
+    // (name, cx_ndc, cy_ndc, hh, probe_ix, probe_iy, tol)
+    let placements: &[(&str, f32, f32, f32, u32, u32, u32)] = &[
+        ("LoadingSpinner.png", 0.0, 0.42, 0.40, 33, 88, 6),
+        // robux center img(27,27) is transparent (a=0) — probe an OPAQUE white
+        // corner pixel instead.
+        ("ico_robux@3x.png", 0.72, 0.78, 0.10, 10, 10, 14),
+        ("JumpButtonRegular@2x.png", 0.0, -0.62, 0.16, 84, 120, 6),
+    ];
+    // Build the shared vertical atlas. aw = max sprite width (>=8); ah = 1
+    // (backdrop strip row 0) + sum(sprite heights).
+    let aw: u32 = sprites.iter().map(|s| s.w).max().unwrap_or(8).max(8);
+    let mut acc: u32 = 1;
+    let mut vlo: Vec<f32> = Vec::new(); // per sprite va (v at its top memory row)
+    let mut vhi: Vec<f32> = Vec::new(); // per sprite vb (v at its bottom mem row)
+    let mut memlo: Vec<u32> = Vec::new(); // per sprite first memory row
+    let mut ah: u32 = 1;
+    for s in &sprites {
+        memlo.push(acc);
+        acc = acc.checked_add(s.h).expect("atlas overflow");
+        ah = acc;
+    }
+    for (i, s) in sprites.iter().enumerate() {
+        vlo.push(memlo[i] as f32 / ah as f32);
+        vhi.push((memlo[i] + s.h - 1) as f32 / ah as f32);
+    }
+    // Backdrop strip color (dark) fills row 0.
+    let mut px: Vec<u8> = vec![0u8; (aw as usize) * (ah as usize) * 4];
+    for i in 0..aw as usize {
+        let o = i * 4;
+        px[o..o + 4].copy_from_slice(&[26, 26, 31, 255]);
+    }
+    // Upload each sprite upright into its memory-row block (memory row m = z+k
+    // holds PNG top-first row imh-1-k — same reversal as SH69 so v=high -> top).
+    for (i, s) in sprites.iter().enumerate() {
+        let iu = s.w as usize;
+        for k in 0..s.h as usize {
+            let png_row = s.h as usize - 1 - k;
+            let src = &s.rgba[png_row * iu * 4..(png_row + 1) * iu * 4];
+            let dst = (memlo[i] as usize + k) * aw as usize * 4;
+            px[dst..dst + iu * 4].copy_from_slice(src);
+        }
+    }
+    unsafe {
+        let (Some(gb), Some(bb), Some(bd), Some(up)) = (
+            mesa_fn::<extern "C" fn(i32, *mut u32)>(h, b"glGenBuffers\0"),
+            mesa_fn::<extern "C" fn(u32, u32)>(h, b"glBindBuffer\0"),
+            mesa_fn::<extern "C" fn(u32, isize, *const i8, u32)>(h, b"glBufferData\0"),
+            mesa_fn::<extern "C" fn(u32)>(h, b"glUseProgram\0"),
+        ) else {
+            return 0;
+        };
+        // Fixed-function state + GL_BLEND compositing (same as SH68/71 home).
+        if let (Some(vp), Some(ds), Some(en), Some(bfs)) = (
+            mesa_fn::<extern "C" fn(i32, i32, i32, i32)>(h, b"glViewport\0"),
+            mesa_fn::<extern "C" fn(u32)>(h, b"glDisable\0"),
+            mesa_fn::<extern "C" fn(u32)>(h, b"glEnable\0"),
+            mesa_fn::<extern "C" fn(u32, u32, u32, u32)>(h, b"glBlendFuncSeparate\0"),
+        ) {
+            vp(0, 0, VW as i32, VH as i32);
+            ds(0x0B71);
+            ds(0x0B44);
+            ds(0x0C11);
+            en(0x0BE2);
+            bfs(0x0302, 0x0303, 0x0302, 0x0303);
+        }
+        if let Some(bf) = mesa_fn::<extern "C" fn(u32, u32)>(h, b"glBindFramebuffer\0") {
+            bf(0x8D40, 0);
+        }
+        if let Some(dbs) = mesa_fn::<extern "C" fn(i32, *const u32)>(h, b"glDrawBuffers\0") {
+            let back = 0x0405u32;
+            dbs(1, &back);
+        }
+        if let Some(rbuf) = mesa_fn::<extern "C" fn(u32)>(h, b"glReadBuffer\0") {
+            rbuf(0x0405);
+        }
+        up(tprog);
+        // Vertex list: 1 backdrop quad + one quad per sprite. Stride 32 =
+        // [x,y, r,g,b,a, u,v]. Backdrop samples strip row0 (v=0.5); each sprite
+        // samples its own v-block (vlo[i]..vhi[i]).
+        let nq = 1 + sprites.len();
+        let mut verts: Vec<f32> = Vec::with_capacity(nq * 48);
+        let mut push = |x: f32, y: f32, u: f32, v: f32, vv: &mut Vec<f32>| {
+            vv.extend_from_slice(&[x, y, 1.0, 1.0, 1.0, 1.0, u, v]);
+        };
+        // backdrop: full screen, dark strip row 0 (v = center of texel row 0 =
+        // 0.5/ah, NOT 0.5 which is the middle of the multi-row atlas — see SH72
+        // bug). Row 0 is fully filled (26,26,31,255) so any u in it is opaque.
+        {
+            let ua = 0.001f32 / aw as f32;
+            let ub = ua + 1.0 / aw as f32;
+            let vb0 = 0.5f32 / ah as f32;
+            push(-1.0, -1.0, ua, vb0, &mut verts);
+            push(1.0, -1.0, ub, vb0, &mut verts);
+            push(1.0, 1.0, ub, vb0, &mut verts);
+            push(-1.0, -1.0, ua, vb0, &mut verts);
+            push(1.0, 1.0, ub, vb0, &mut verts);
+            push(-1.0, 1.0, ua, vb0, &mut verts);
+        }
+        for (i, s) in sprites.iter().enumerate() {
+            if let Some(o) = only {
+                if i != o {
+                    continue;
+                }
+            }
+            let (_, cx, cy, hh, _, _, _) = placements[i];
+            let corr = VH / VW;
+            let half_w = hh * (s.w as f32 / s.h as f32) * corr;
+            // The emitter projects NDC Y unmoved into glReadPixels y (0=bottom):
+            // sy = (1+y_ndc)/2*VH. The image (top-first, vb at y1) maps to the
+            // box top (y1 = cy+hh) consistently, so NO y-negation is applied;
+            // the probe mirrors exactly this (SH72).
+            let (x0, x1, y0, y1) = (cx - half_w, cx + half_w, cy - hh, cy + hh);
+            // u maps image columns [0, s.w) across the atlas row (aw wide) —
+            // NOT the full row, or the image squishes into the left s.w/aw of
+            // the box (SH72 bug). v spans the sprite's atlas row block.
+            let (ua, ub, va, vb) = (
+                0.0f32,
+                s.w as f32 / aw as f32,
+                vlo[i],
+                vhi[i],
+            );
+            // Painter's-order triangle pair (top-left origin): the box top
+            // vertex (y1) gets the high-v = sprite's top memory row (upright).
+            push(x0, y0, ua, va, &mut verts);
+            push(x1, y0, ub, va, &mut verts);
+            push(x1, y1, ub, vb, &mut verts);
+            push(x0, y0, ua, va, &mut verts);
+            push(x1, y1, ub, vb, &mut verts);
+            push(x0, y1, ua, vb, &mut verts);
+        }
+        let total_verts = verts.len() / 8;
+        let nbytes = verts.len() * 4;
+        if std::env::var_os("RENDEREMITTER_GLTRAP").is_some() {
+            eprintln!("[elfjit:renderemitter-multi] verts_count={total_verts} first-12 verts (x,y,u,v):");
+            for i in 0..12usize.min(total_verts) {
+                eprintln!(
+                    "  v{i}: x={:.3} y={:.3} u={:.3} v={:.3}",
+                    verts[i * 8], verts[i * 8 + 1], verts[i * 8 + 6], verts[i * 8 + 7]
+                );
+            }
+        }
+        let mut vbo = 0u32;
+        gb(1, &mut vbo);
+        bb(0x8892, vbo);
+        bd(0x8892, nbytes as isize, verts.as_ptr() as *const i8, 0x88E4);
+        let (Some(gt), Some(at), Some(bt), Some(tp_), Some(te)) = (
+            mesa_fn::<extern "C" fn(i32, *mut u32)>(h, b"glGenTextures\0"),
+            mesa_fn::<extern "C" fn(u32)>(h, b"glActiveTexture\0"),
+            mesa_fn::<extern "C" fn(u32, u32)>(h, b"glBindTexture\0"),
+            mesa_fn::<extern "C" fn(u32, u32, i32, i32)>(h, b"glTexParameteri\0"),
+            mesa_fn::<extern "C" fn(u32, i32, i32, i32, i32, i32, u32, u32, *const i8)>(h, b"glTexImage2D\0"),
+        ) else {
+            return 0;
+        };
+        let mut texid = 0u32;
+        gt(1, &mut texid);
+        at(0x84C0);
+        bt(0x0DE1, texid);
+        for (p, v) in [(0x2800, 0x2601i32), (0x2801, 0x2601), (0x2802, 0x812F), (0x2803, 0x812F)] {
+            tp_(0x0DE1, p, v, 0);
+        }
+        te(0x0DE1, 0, 0x1908, aw as i32, ah as i32, 0, 0x1908, 0x1401, px.as_ptr() as *const i8);
+        if uloc >= 0 {
+            if let Some(ui) = mesa_fn::<extern "C" fn(i32, i32)>(h, b"glUniform1i\0") {
+                ui(uloc, 0);
+            }
+        }
+        eprintln!(
+            "[elfjit:renderemitter-multi] sprites={} atlas {aw}x{ah} RGBA backdrop+{nq} quads total_verts={total_verts} GL_TRIANGLES stride=32 blend=SRC_ALPHA prog={tprog:#x}",
+            sprites.len()
+        );
+        // Geometry context G (stride 32, spec[3]: pos/color/aTex).
+        let gbuf = Box::leak(vec![0u64; 0x400].into_boxed_slice());
+        let raw = gbuf.as_ptr() as u64;
+        let g = (raw + 7) & !7;
+        let bd0 = (g + 0x100) & !7;
+        let m = (g + 0x180) & !7;
+        let spec = (g + 0x280) & !7;
+        let stride_tab = (g + 0x300) & !7;
+        let stride: u64 = 32;
+        *(spec.wrapping_add(0) as *mut u32) = 0;
+        *(spec.wrapping_add(4) as *mut u32) = 0;
+        *(spec.wrapping_add(8) as *mut u32) = 1;
+        *(spec.wrapping_add(12) as *mut u32) = 0;
+        *(spec.wrapping_add(16) as *mut u32) = 0;
+        *(spec.wrapping_add(24) as *mut u32) = 1;
+        *(spec.wrapping_add(28) as *mut u32) = 8;
+        *(spec.wrapping_add(32) as *mut u32) = 3;
+        *(spec.wrapping_add(36) as *mut u32) = 1;
+        *(spec.wrapping_add(40) as *mut u32) = 0;
+        *(spec.wrapping_add(48) as *mut u32) = 2; // aTex attr 2
+        *(spec.wrapping_add(52) as *mut u32) = 24;
+        *(spec.wrapping_add(56) as *mut u32) = 1;
+        *(spec.wrapping_add(60) as *mut u32) = 2;
+        *(spec.wrapping_add(64) as *mut u32) = 0;
+        *(bd0.wrapping_add(0x48) as *mut u32) = vbo;
+        *(g.wrapping_add(0x48) as *mut u64) = bd0;
+        *(g.wrapping_add(0x58) as *mut u64) = bd0;
+        *(g.wrapping_add(0x68) as *mut u64) = bd0;
+        *(g.wrapping_add(0x38) as *mut u64) = m;
+        *(m.wrapping_add(0x48) as *mut u64) = spec;
+        *(m.wrapping_add(0x50) as *mut u64) = spec + 72;
+        *(m.wrapping_add(0x60) as *mut u64) = stride_tab;
+        *(stride_tab.wrapping_add(0) as *mut u64) = stride;
+        *(stride_tab.wrapping_add(8) as *mut u64) = stride;
+        *(stride_tab.wrapping_add(16) as *mut u64) = stride;
+        *(g.wrapping_add(0x78) as *mut u64) = 0;
+        *(g.wrapping_add(0x8e) as *mut u16) = 0;
+        // Drive the engine's real emitter ONCE: GL_TRIANGLES, count=6*nq.
+        let stkbuf = Box::leak(vec![0u8; 0x8000].into_boxed_slice());
+        let stk_top = (stkbuf.as_ptr() as u64).wrapping_add(0x8000) & !15;
+        let mut st = arm64jit::jit::CpuState::new();
+        st.tpidr = arm64jit::jit::current_guest_tp();
+        st.x[31] = stk_top;
+        st.x[0] = g;
+        st.x[1] = 0;
+        st.x[2] = 0;
+        st.x[3] = 0;
+        st.x[4] = total_verts as u64;
+        st.x[5] = 0;
+        let ret = arm64jit::jit::jit_run(iimg, ibase, 0x105b35288, &mut st as *mut CpuState);
+        let r = match ret {
+            Err(e) => {
+                eprintln!("[elfjit:renderemitter-multi] engine emitter stopped: {e}");
+                return 0;
+            }
+            Ok(r) => r,
+        };
+        if let Some(da) = mesa_fn::<extern "C" fn(u32)>(h, b"glDisableVertexAttribArray\0") {
+            da(2);
+        }
+        if let Some(fin) = mesa_fn::<extern "C" fn()>(h, b"glFinish\0") {
+            fin();
+        }
+        let vt = unsafe { *(ctx as *const u64) };
+        let bind = unsafe { *(vt.wrapping_add(16) as *const u64) };
+        let swap = unsafe { *(vt.wrapping_add(24) as *const u64) };
+        let tp = arm64jit::jit::current_guest_tp();
+        // SH72-diagnostic: GL error + link status + a PRE-SWAP backdrop probe so
+        // a silent-no-draw is attributable (env-gated like SH67 GLTRAP).
+        if std::env::var_os("RENDEREMITTER_GLTRAP").is_some() {
+            if let (Some(ge), Some(gpi), Some(rp)) = (
+                mesa_fn::<extern "C" fn() -> u32>(h, b"glGetError\0"),
+                mesa_fn::<extern "C" fn(u32, u32, *mut i32)>(h, b"glGetProgramiv\0"),
+                mesa_fn::<extern "C" fn(i32, i32, i32, i32, u32, u32, *mut i8)>(h, b"glReadPixels\0"),
+            ) {
+                let mut link: i32 = 0;
+                gpi(tprog, 0x8B82, &mut link);
+                let err = ge();
+                let mut bx: [u8; 4] = [0; 4];
+                rp(640, 630, 1, 1, 0x1908, 0x1401, bx.as_mut_ptr() as *mut i8);
+                eprintln!(
+                    "[elfjit:renderemitter-multi] GLTRAP err={err:#x} link={link} program={tprog:#x} pre-swap backdrop(640,630)=rgba({},{},{},{})",
+                    bx[0], bx[1], bx[2], bx[3]
+                );
+                // Row scan: sample x at y=360 (spinner arc / mid) and y=80 (robux
+                // box) to see what actually rasterized vs pure backdrop.
+                let mut scan: Vec<(i32, u8, u8, u8)> = Vec::new();
+                for y in [360i32, 80] {
+                    for x in (0..1280).step_by(64) {
+                        let mut p: [u8; 4] = [0; 4];
+                        rp(x, y, 1, 1, 0x1908, 0x1401, p.as_mut_ptr() as *mut i8);
+                        scan.push((x, p[0], p[1], p[2]));
+                    }
+                    eprintln!(
+                        "[elfjit:renderemitter-multi] GLTRAP row y={y}: {}",
+                        scan.iter().map(|(x, r, g, b)| format!("({x},{r},{g},{b})")).collect::<Vec<_>>().join(" ")
+                    );
+                    scan.clear();
+                }
+            }
+        }
+        let _ = arm64jit::jit::run_guest_callback(bind, [ctx, 0, 0, 0, 0, 0, 0, 0], tp);
+        let sw = arm64jit::jit::run_guest_callback(swap, [ctx, 0, 0, 0, 0, 0, 0, 0], tp);
+        eprintln!(
+            "[elfjit:renderemitter-multi] engine emitter Ok(ret={r:#x}) count={} sprites={} swap={sw:?}",
+            total_verts,
+            sprites.len()
+        );
+        let readback: Option<extern "C" fn(i32, i32, i32, i32, u32, u32, *mut i8)> =
+            mesa_fn(h, b"glReadPixels\0");
+        if let Some(rp) = readback {
+            if std::env::var_os("RENDEREMITTER_GLTRAP").is_some() {
+                // Full-frame dump for offline analysis of the actual raster.
+                let mut frame = vec![0u8; (VW as usize) * (VH as usize) * 4];
+                rp(0, 0, VW as i32, VH as i32, 0x1908, 0x1401, frame.as_mut_ptr() as *mut i8);
+                let path = "/tmp/sh72-multi.raw";
+                std::fs::write(path, &frame).ok();
+                eprintln!("[elfjit:renderemitter-multi] wrote /tmp/sh72-multi.raw GL_RGBA ({VW}x{VH} u8)");
+            }
+            // Per-sprite probe: expected = decoded rgba at (ix,iy), screen coord
+            // via imgpix_rect (the exact vUV-linear math the shader uses).
+            for (i, s) in sprites.iter().enumerate() {
+                let (_, cx, cy, hh, pix, piy, tol) = placements[i];
+                let o4 = (piy as usize * s.w as usize + pix as usize) * 4;
+                // Expected == the GL_BLEND (SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
+                // composite of the sprite texel over the opaque dark backdrop:
+                // out = src*a + dst*(1-a). A straightforward rgb==src compare
+                // false-fails on semi-transparent sprites (robux transparent
+                // center, jump-white a=0x66, SH72 finding).
+                let (sr, sg, sb, sa) = (
+                    s.rgba[o4] as f32,
+                    s.rgba[o4 + 1] as f32,
+                    s.rgba[o4 + 2] as f32,
+                    s.rgba[o4 + 3] as f32 / 255.0,
+                );
+                let exp = [
+                    (sr * sa + 26.0 * (1.0 - sa)) as u8,
+                    (sg * sa + 26.0 * (1.0 - sa)) as u8,
+                    (sb * sa + 31.0 * (1.0 - sa)) as u8,
+                    255u8,
+                ];
+                // Probe coords IN THE EMITTER'S PROJECTION (screen_y =
+                // (1+y_ndc)/2*VH, y negated in authoring): mirror the quad
+                // vertex mapping so a present sprite proves exact placement.
+                let corr = VH / VW;
+                let half_w = hh * (s.w as f32 / s.h as f32) * corr;
+                let fx = (pix as f32 + 0.5) / s.w as f32;
+                let fy = 1.0 - (piy as f32 + 0.5) / s.h as f32;
+                let x_ndc = cx - half_w + fx * 2.0 * half_w;
+                let y_ndc = (cy - hh) + fy * (2.0 * hh);
+                let sx = (x_ndc + 1.0) / 2.0 * VW;
+                let sy = (1.0 + y_ndc) / 2.0 * VH;
+                let mut got: [u8; 4] = [0; 4];
+                rp(sx as i32, sy as i32, 1, 1, 0x1908, 0x1401, got.as_mut_ptr() as *mut i8);
+                let diff = [
+                    (got[0] as i32 - exp[0] as i32).abs(),
+                    (got[1] as i32 - exp[1] as i32).abs(),
+                    (got[2] as i32 - exp[2] as i32).abs(),
+                    (got[3] as i32 - exp[3] as i32).abs(),
+                ];
+                let tol_i = tol as i32;
+                let present = diff.iter().all(|d| *d <= tol_i);
+                eprintln!(
+                    "[elfjit:renderemitter-multi] probe '{}' ({sx:.0},{sy:.0}) img({pix},{piy}) got rgba({},{},{},{}) expect {:?} diff={diff:?} tol={tol} present={present}",
+                    s.name, got[0], got[1], got[2], got[3], exp
+                );
+            }
+            // Transparent spinner-center probe: no arc body there, so the dark
+            // backdrop shows through => real alpha compositing in the composite.
+            let (scx, scy, shh) = (0.0f32, 0.42f32, 0.40f32);
+            let sw = 100u32;
+            let sh = 100u32;
+            let fcx = (50.5f32) / sw as f32;
+            let fcy = 1.0 - (50.5f32) / sh as f32;
+            let x_ndc = scx - shh * (sw as f32 / sh as f32) * (VH / VW) + fcx * 2.0 * shh * (sw as f32 / sh as f32) * (VH / VW);
+            let y_ndc = (scy - shh) + fcy * (2.0 * shh);
+            let (sx, sy) = ((x_ndc + 1.0) / 2.0 * VW, (1.0 + y_ndc) / 2.0 * VH);
+            let mut got: [u8; 4] = [0; 4];
+            rp(sx as i32, sy as i32, 1, 1, 0x1908, 0x1401, got.as_mut_ptr() as *mut i8);
+            let diff = [
+                (got[0] as i32 - 26).abs(),
+                (got[1] as i32 - 26).abs(),
+                (got[2] as i32 - 31).abs(),
+                (got[3] as i32 - 255).abs(),
+            ];
+            let present = diff.iter().all(|d| *d <= 1);
+            eprintln!(
+                "[elfjit:renderemitter-multi] probe 'spinner-transparent-center' ({sx:.0},{sy:.0}) got rgba({},{},{},{}) expect backdrop(26,26,31,255) diff={diff:?} present={present}",
+                got[0], got[1], got[2], got[3]
+            );
+        }
+        r
+    }
+}
 /// Present ONE real task-driven frame on the CURRENT thread (must be the
 /// renderinit thread where EGL current-binding is established — SH61b). Binds
 /// via the engine make-current 0x105b3b358, drives frame-fn 0x105b32c00, swaps
@@ -4505,8 +4975,20 @@ fn main() {
                             // with GL_BLEND alpha compositing, sized from the real
                             // scene list (R+0x180/0x188). Overrides the grid.
                             let layout = std::env::var("RENDEREMITTER_LAYOUT").unwrap_or_default();
+                            // RENDEREMITTER_MULTI=1 (SH72): the engine's real
+                            // emitter draws a FULL multi-sprite "login/home"
+                            // composite — a dark backdrop + one aspect-correct
+                            // box per REAL Roblox UI sprite (spinner, robux
+                            // icon, jump button) sampled from a shared vertical
+                            // atlas in ONE top-level jit_run, composited with
+                            // GL_BLEND. Overrides the single-spinner home path.
+                            let multi = std::env::var_os("RENDEREMITTER_MULTI").is_some();
                             if layout == "home" {
-                                let _ = render_engine_emitter_home(real_ctx, iimg, ibase, isp, 5);
+                                if multi {
+                                    let _ = render_engine_emitter_multi(real_ctx, iimg, ibase, isp);
+                                } else {
+                                    let _ = render_engine_emitter_home(real_ctx, iimg, ibase, isp, 5);
+                                }
                             } else if nq > 0 {
                                 let _ = render_engine_emitter_grid(real_ctx, iimg, ibase, isp, nq, tex);
                             } else {
@@ -6395,7 +6877,7 @@ fn main() {
 // engine's own emitter path. Self-contained (no host files, no network).
 #[cfg(test)]
 mod sh69_tests {
-    use super::{decode_png_rgba, imgpix_screen};
+    use super::{decode_png_rgba, imgpix_rect, imgpix_screen};
     use std::io::Write;
 
     fn chunk(chunk_type: &[u8; 4], data: &[u8]) -> Vec<u8> {
@@ -6528,5 +7010,66 @@ mod sh69_tests {
         assert_eq!(&out[4..8], [1, 2, 3, 255]);
         assert_eq!(&out[8..12], [200, 150, 100, 255]);
         assert_eq!(&out[12..16], [1, 2, 3, 255]);
+    }
+
+    // --- SH72: multi-sprite composite geometry ---
+
+    // imgpix_rect must reduce to imgpix_screen when the box is centered.
+    #[test]
+    fn sh72_imgpix_rect_centered_reduces_to_imgpix_screen() {
+        for (ix, iy, imw, imh) in
+            [(0u32, 0u32, 100u32, 100u32), (33, 88, 100, 100), (27, 27, 54, 54), (120, 120, 240, 240)]
+        {
+            let (a, b) = imgpix_screen(ix, iy, imw, imh, 0.4, 1280.0, 720.0);
+            let (c, d) = imgpix_rect(ix, iy, imw, imh, 0.0, 0.0, 0.4, 1280.0, 720.0);
+            assert!((a - c).abs() < 1e-3 && (b - d).abs() < 1e-3, "{ix},{iy} centered mismatch {a},{b} vs {c},{d}");
+        }
+    }
+
+    // An offset box's probe coords shift by the translated NDC center.
+    #[test]
+    fn sh72_imgpix_rect_offset_box_shifts_probe_screen_coords() {
+        // Center (0.72, 0.78) NDC with hh=0.10 vs centered hh=0.10 for a 54x54
+        // sprite: the box center in pixels = ((0.72+1)/2*1280, (1-0.78)/2*720)
+        // = (1100.8, 79.2).
+        let (sx, sy) = imgpix_rect(27, 27, 54, 54, 0.72, 0.78, 0.10, 1280.0, 720.0);
+        assert!((sx - 1100.8).abs() < 4.0 && (sy - 79.2).abs() < 4.0, "got {sx},{sy}");
+    }
+
+    // The shared vertical atlas UV layout: sprite blocks are disjoint, in
+    // [0,1], and each sprite's full width maps to u in [0,1].
+    #[test]
+    fn sh72_atlas_uv_layout_is_disjoint_within_unit_range() {
+        let heights: &[u32] = &[100, 54, 240];
+        let widths: &[u32] = &[100, 54, 240];
+        let aw: u32 = *widths.iter().max().unwrap().max(&8);
+        let mut memlo: Vec<u32> = Vec::new();
+        let mut ah: u32 = 1;
+        for sh in heights {
+            memlo.push(ah);
+            ah += sh;
+        }
+        let mut vlo = Vec::new();
+        let mut vhi = Vec::new();
+        for (i, sh) in heights.iter().enumerate() {
+            vlo.push(memlo[i] as f32 / ah as f32);
+            vhi.push((memlo[i] + sh - 1) as f32 / ah as f32);
+        }
+        assert_eq!(aw, 240);
+        assert_eq!(ah, 1 + 100 + 54 + 240);
+        // Each block strictly within [0,1] and ordered/disjoint.
+        for i in 0..vlo.len() {
+            assert!(vlo[i] >= 0.0 && vhi[i] <= 1.0 && vlo[i] < vhi[i], "block {i} out of range");
+            if i > 0 {
+                assert!(vlo[i] > vhi[i - 1], "blocks {i} and {} overlap", i - 1);
+            }
+        }
+        // Sprite block k's v-window spans (sh-1) texel-gap units of the atlas
+        // height (rows [memlo, memlo+sh-1] cover sh rows; same off-by-one the
+        // SH69 single-image mapping uses and proved byte-exact).
+        for (i, sh) in heights.iter().enumerate() {
+            let span = (vhi[i] - vlo[i]) * ah as f32;
+            assert!((span - (*sh as f32 - 1.0)).abs() < 1e-3, "block {i} span {span} != height-1 {sh}");
+        }
     }
 }
