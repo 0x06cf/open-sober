@@ -2353,7 +2353,13 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // first time we see each distinct map, so its probe (idx = hash mod divisor) lands in
         // [0,0x3ff] and reads sentinel 0 instead of a wild slot.
         let routeb_map_op_entry: Option<(u64, u64)> = match pc {
-            0x1029f3e70 | 0x1029f4258 | 0x1029f4088 | 0x1029f4348 => {
+            // Real JIT block entries for the Roblox string/span hash-map family ops, verified
+            // by JIT_REGION_WATCH on the live binary: insert 0x1029f3e70; the rehash/grow
+            // family buttons at 0x1029f424c (fn prologue), 0x1029f4284 (dispatch-return, the
+            // block that carries x19=the crashing map mid rehash loop), and 0x1029f4310
+            // (inner rehash loop); erase/lookup ops 0x1029f4088 / 0x1029f4348. (0x1029f4258/
+            // 0x1029f42d4 are MID-block — not JIT block boundaries, so a hook there never fires.)
+            0x1029f3e70 | 0x1029f424c | 0x1029f4284 | 0x1029f4310 | 0x1029f4088 | 0x1029f4348 => {
                 Some((unsafe { (*state).x[0] }, unsafe { (*state).x[19] }))
             }
             _ => None,
@@ -2366,15 +2372,22 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
                 // registry map). Check BOTH (repair is idempotent: only zeroes non-image
                 // garbage, so double-checking a valid map is a no-op).
                 for map in [x0map, x19map] {
-                    if map == 0 {
+                    if map == 0 || map < 0x100000000 {
                         continue;
                     }
                     // Universal (all map-op entries): a real hash fn lives in .text; garbage
                     // (host heap / small ints) does not. Zero +0x18 when non-image -> the op's
                     // `cbz x8 -> blr x1` takes the single-hash path instead of `blr x8` into
                     // unmapped memory. Safe for every map of the family (string and span).
-                    let h2 = unsafe { *((map + 0x18) as *const u64) };
                     let in_image = |a: u64| a >= base && a - base < image.len() as u64;
+                    // A real map always has an in-image hash at +0x10 — require that before
+                    // touching +0x18 so a coincidentally-host-shaped NON-map object is never
+                    // corrupted (its +0x18 might be a live pointer, not a hash fn slot).
+                    let h1 = unsafe { *((map + 0x10) as *const u64) };
+                    if !in_image(h1) {
+                        continue;
+                    }
+                    let h2 = unsafe { *((map + 0x18) as *const u64) };
                     if h2 != 0 && !in_image(h2) {
                         unsafe { *((map + 0x18) as *mut u64) = 0 };
                         eprintln!("[routeb-hashfix] string-hash-map @ 0x{map:x} +0x18 0x{h2:x} (non-image garbage) -> 0");
