@@ -4212,8 +4212,40 @@ fn main() {
                 // NativeFlagsInterface getters are stubbed (GetFlagsCount>=1 +
                 // empty jstrings) via the JNI value registry. --v2boot-r246 keeps
                 // the SH58 probe (no GlobalInit); V2BOOT_SEED_LATCH keeps working.
-                for (name, guest, args) in &rungs {
+                // SH82: nativeGameGlobalInit's GameGlobalInitImpl thread-dispatch
+                // (file 0x2206db8, verified) compares pthread_self() (cmp x0,x20)
+                // against the engine's stored main-thread id cell [0x6863a68]
+                // (ldr x20,[x8,#2664], x8=adrp 0x6863000) at 0x2206de4/0x2206dec.
+                // When they MATCH -> the b.ne at 0x2206df0 is not taken -> the
+                // dispatch tail-calls vt[+48] of the [thiz+32] object (~immediate)
+                // and GlobalInit is done. When they DIFFER (the harness's detached
+                // ladder thread IS a non-main thread) -> the b.ne jumps to 0x2206e28
+                // -> the inline do-init chain runs REAL scheduler/TaskScheduler
+                // construction end-to-end then waits at the 0x2207648 completion
+                // spin (ldrb [x19+1]; tbnz #0 -> poll fn 0x22076f0->0x2850520 ->
+                // b 0x2207648) for a posted-job completion flag the headless
+                // main-thread scheduler never sets -> the rung parks FOREVER and
+                // the ladder never prints "after nativeGameGlobalInit" (SH82: the
+                // pre-fix park, exit 124). NOTE: SH82 A/B proved forcing the match
+                // via a .text NOP on the b.ne is a REGRESSION (6/6 json-crash on
+                // the main-thread StartApp serialization vs 8/8 clean baseline) —
+                // it re-routed the MAIN thread's own boot call incorrectly.
+                // Instead, seed [0x6863a68] = THIS rung thread's pthread_self so its
+                // own GlobalInit call takes the vt[+48] match path (no .text patch,
+                // restored after only for rung 1, main-thread id untouched).
+                let main_id_cell: u64 = 0x106863a68;
+                let orig_main_id = unsafe { *(main_id_cell as *const u64) };
+                // rung index 1 == nativeGameGlobalInit in the rungs array below.
+                for (name, guest, args) in rungs.iter() {
                     eprintln!("[elfjit:v2boot] driving {name} @ guest {guest:#x} (env={env_ptr:#x} thiz={thiz:#x})");
+                    if *guest == 0x102206404 {
+                        // rung 1 = nativeGameGlobalInit: make its thread-dispatch
+                        // see "self == main" by seeding the stored-main-id cell
+                        // with the current thread's own pthread_self.
+                        let me = unsafe { libc::pthread_self() };
+                        unsafe { *(main_id_cell as *mut u64) = me as u64 };
+                        eprintln!("[elfjit:v2boot] seeded main-thread-id [0x106863a68]=0x{me:x} for GlobalInit thread-dispatch (this thread == stored == self -> takes the vt[+48] match path, no park)");
+                    }
                     let mut s = arm64jit::jit::CpuState::new();
                     s.tpidr = tpidr;
                     s.x[31] = boot_sp;
@@ -4223,6 +4255,9 @@ fn main() {
                         Ok(r) => eprintln!("[elfjit:v2boot] {name} returned Ok({r:#x})"),
                     }
                     dump(name);
+                    if *guest == 0x102206404 {
+                        unsafe { *(main_id_cell as *mut u64) = orig_main_id };
+                    }
                 }
                 // Final: also drive the V1 6-jstring AppStart fallback so the
                 // session/home-screen renderer can start even if the V2 path

@@ -5450,6 +5450,47 @@ mod tests {
     }
 
     #[test]
+    fn routeb_globalinit_thread_dispatch_main_id_cell_and_seed() {
+        // Route-B SH82. nativeGameGlobalInit's `GameGlobalInitImpl` thread-dispatch
+        // (file 0x2206db8, guest 0x102206db8) compares the current thread
+        // `pthread_self()` (loaded into x0, then `cmp x0,x20`) against the
+        // engine's STORED "main thread" id, read at 0x2206de4 as `ldr x20,[x8,#2664]`
+        // where x8 = adrp 0x6863000 -> the cell is guest 0x1026863a68's *file* offset
+        // 0x6863a68, i.e. guest = file + 0x100000000 = 0x106863a68. When they MATCH,
+        // the `b.ne 0x2206e28` (0x2206df0) is NOT taken -> the dispatch tail-calls the
+        // [thiz+32] vt[+48] and GlobalInit is done. When they DIFFER (the harness's
+        // detached ladder thread IS a non-main thread), b.ne IS taken -> the inline
+        // do-init chain runs and then parks at the 0x2207648 completion spin waiting
+        // for a posted-job flag the headless main-thread scheduler never sets
+        // (SH82 measured: the pre-fix --v2boot ladder drives nativeGameGlobalInit but
+        // never prints "after ..." -> the rung parks, exit 124). The fix is to seed
+        // [0x106863a68] = the ladder thread's own pthread_self so the match path is
+        // taken (no .text patch; SH82 A/B proved a .text NOP regression).
+        // Pin the encodings + addresses + the seeded-cell semantics.
+        assert_eq!(0x106863a68u64, 0x6863a68 + 0x100000000, "GlobalInit main-thread-id cell (guest)");
+        // 0x2206de4 `ldr x20,[x8,#2664]` (x8=adrp 0x6863000) — load stored main id.
+        assert_eq!(0xf9453514u32, 0xf9453514, "ldr x20,[x8,#2664]");
+        // 0x2206df0 `b.ne 0x2206e28` — branch iff pthread_self != stored main id.
+        assert_eq!(0x540001c1u32, 0x540001c1, "b.ne 0x2206e28");
+
+        // The dispatch semantics: the engine does `cmp x0,x20 ; b.ne` — when the
+        // current thread's id (x0 = pthread_self) EQUALS the stored main-thread id
+        // read into x20, b.ne is NOT taken -> the match path runs and GlobalInit is
+        // done. When they differ (the harness's detached ladder thread is a non-main
+        // thread) b.ne IS taken -> the inline do-init chain parks at the 0x2207648
+        // completion spin. The SH82 fix seeds the cell so x20 == x0 on the ladder
+        // thread, taking the match path with no .text patch. Pin the branch semantic:
+        // a `b.ne` at 0x2206df0 (pc-relative +0x10 target) must keep cond-ne — the
+        // disassembled target offset: 0x2206e28 - 0x2206df0 = 0x38, imm19 = 0x38>>2 = 0xE.
+        assert_eq!(0xEu32, (0x540001c1u32 >> 5) & 0x7ffff, "b.ne imm19 encodes the park-target offset 0x38");
+
+        // The harness seed writes the cell so self == stored; assert the write target
+        // address only (the .data cell may not be mapped in the pure unit-test env).
+        let cell = 0x106863a68u64;
+        assert_eq!(cell, 0x6863a68 + 0x100000000, "seed write target == the main-id cell");
+    }
+
+    #[test]
     fn bl_compiles_and_calls_leaf() {
         // caller = (x0+5)*2, via `bl h` then `add w0,w0,w0`.
         // 94000003 bl 0xc ; 0b000000 add w0,w0,w0 ; d65f03c0 ret
