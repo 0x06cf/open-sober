@@ -18,6 +18,7 @@
 use arm64jit::jit::{CpuState, jit_run};
 use arm64jit::shims::set_anativewindow_xid;
 use input_wrapper::x11;
+use std::io::Read;
 
 // Guest-arena: allocate guest-visible RW buffer (node/vtable for the deque
 // injector) in the reserved guest RW tail, so the allocated address (a) is a
@@ -1268,6 +1269,141 @@ pub fn render_engine_emitter_quad(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) -
 /// FS outputs texture2D(uTex, vUV) (texture source of color — a tile whose
 /// texture isn't sampled reads black/backdrop, proving the sampler is live).
 /// Returns (program, uTex uniform loc).
+/// SH69 — minimal offline PNG->RGBA8 decoder (supports color types 0,2,4,6,
+/// 8-bit, non-interlaced). Zero new network dep: rides `flate2` (already in
+/// Cargo.lock via `zip`). Returns (w, h, RGBA8 top-first).
+fn decode_png_rgba(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    const SIG: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if data.len() < 8 || &data[..8] != SIG {
+        return None;
+    }
+    let mut off = 8usize;
+    let (mut w, mut h, mut ct) = (0u32, 0u32, 0u8);
+    let mut idat: Vec<u8> = Vec::new();
+    while off + 8 <= data.len() {
+        let len = u32::from_be_bytes(data[off..off + 4].try_into().ok()?) as usize;
+        let typ = &data[off + 4..off + 8];
+        let chunk = &data[off + 8..off + 8 + len];
+        match typ {
+            b"IHDR" if chunk.len() >= 13 => {
+                w = u32::from_be_bytes(chunk[0..4].try_into().ok()?);
+                h = u32::from_be_bytes(chunk[4..8].try_into().ok()?);
+                if chunk[8] != 8 || chunk[10] != 0 || chunk[12] != 0 {
+                    return None; // 8-bit deflate non-interlaced only
+                }
+                ct = chunk[9];
+            }
+            b"IDAT" => idat.extend_from_slice(chunk),
+            b"IEND" => break,
+            _ => {}
+        }
+        off += 12 + len;
+    }
+    let ch: usize = match ct {
+        0 => 1,
+        2 => 3,
+        4 => 2,
+        6 => 4,
+        _ => return None,
+    };
+    let stride = w as usize * ch;
+    let mut raw = Vec::new();
+    flate2::read::ZlibDecoder::new(std::io::Cursor::new(&idat))
+        .read_to_end(&mut raw)
+        .ok()?;
+    if raw.len() < stride.checked_mul(h as usize)? {
+        return None;
+    }
+    let mut out = vec![0u8; w as usize * h as usize * 4];
+    let mut prev = vec![0u8; stride];
+    for y in 0..h as usize {
+        let f = raw[y * (stride + 1)];
+        let row = &raw[y * (stride + 1) + 1..(y + 1) * (stride + 1)];
+        let mut cur: Vec<u8> = Vec::with_capacity(stride);
+        for x in 0..stride {
+            let a = if x >= ch { cur[x - ch] as i32 } else { 0 };
+            let b = prev[x] as i32;
+            let c = if x >= ch { prev[x - ch] as i32 } else { 0 };
+            let r = match f {
+                1 => a,
+                2 => b,
+                3 => (a + b) / 2,
+                4 => {
+                    let p = a + b - c;
+                    let (pa, pb, pc) = ((p - a).abs(), (p - b).abs(), (p - c).abs());
+                    if pa <= pb && pa <= pc {
+                        a
+                    } else if pb <= pc {
+                        b
+                    } else {
+                        c
+                    }
+                }
+                _ => 0,
+            };
+            cur.push(((row[x] as i32 + r) & 0xFF) as u8);
+        }
+        for x in 0..w as usize {
+            let o = (y * w as usize + x) * 4;
+            match ct {
+                6 => out[o..o + 4].copy_from_slice(&cur[x * 4..x * 4 + 4]),
+                2 => {
+                    out[o] = cur[x * 3];
+                    out[o + 1] = cur[x * 3 + 1];
+                    out[o + 2] = cur[x * 3 + 2];
+                    out[o + 3] = 255;
+                }
+                4 => {
+                    let g = cur[x * 2];
+                    out[o] = g;
+                    out[o + 1] = g;
+                    out[o + 2] = g;
+                    out[o + 3] = cur[x * 2 + 1];
+                }
+                _ => {
+                    out[o] = cur[x];
+                    out[o + 1] = cur[x];
+                    out[o + 2] = cur[x];
+                    out[o + 3] = 255;
+                }
+            }
+        }
+        prev = cur;
+    }
+    Some((w, h, out))
+}
+
+/// SH69 — load the REAL Roblox UI texture (the loading-spinner, part of the
+/// login/loading/home surface) as RGBA8. Cached; path overridable via env
+/// RENDEREMITTER_REAL_TEXTURE (default the extracted APK assets path). Reads
+/// the guest-identity-mapped host filesystem directly (in-process JIT).
+fn real_ui_texture() -> Option<(u32, u32, Vec<u8>)> {
+    static RT: std::sync::OnceLock<Option<(u32, u32, Vec<u8>)>> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        let path = std::env::var("RENDEREMITTER_REAL_TEXTURE")
+            .unwrap_or_else(|_| {
+                "/home/hermes-worker/.cache/open-sober/android-env/assets/content/textures/ui/LoadingScreen/LoadingSpinner.png".to_string()
+            });
+        let data = std::fs::read(&path).ok()?;
+        let (w, h, rgba) = decode_png_rgba(&data)?;
+        eprintln!("[elfjit:renderemitter-real] decoded real UI texture from {path}: {w}x{h} RGBA8");
+        Some((w, h, rgba))
+    })
+    .clone()
+}
+
+/// SH69-sampler: image pixel (ix,iy) top-first -> screen window (sx,sy) for a
+/// centered aspect-correct box (hh half-height, VW/VH viewport). Same math the
+/// shader's linear vUV interpolation yields, so probe coords are exact.
+fn imgpix_screen(ix: u32, iy: u32, imw: u32, imh: u32, hh: f32, vw: f32, vh: f32) -> (f32, f32) {
+    let corr = vh / vw;
+    let half_w = hh * (imw as f32 / imh as f32) * corr;
+    let u = (ix as f32 + 0.5) / imw as f32;
+    let x_ndc = -half_w + u * 2.0 * half_w;
+    let y_ndc = hh - ((iy as f32 + 0.5) / imh as f32) * 2.0 * hh;
+    ((x_ndc + 1.0) / 2.0 * vw, (1.0 - y_ndc) / 2.0 * vh)
+}
+
 fn emitter_tex_program() -> (u32, i32) {
     static TP: std::sync::OnceLock<(u32, i32)> = std::sync::OnceLock::new();
     *TP.get_or_init(|| {
@@ -1660,31 +1796,71 @@ pub fn render_engine_emitter_home(ctx: u64, iimg: &[u8], ibase: u64, isp: u64, l
             (-0.40, 0.10, 0.10, 0.17, 0.9, 0.0, [0.35, 0.38, 0.45, 0.85]), // field
         ];
         let nq = n_layers;
+        // SH69: optional REAL Roblox UI texture (RENDEREMITTER_REAL_TEX=1). The
+        // layer-1 "panel" slot is replaced by a real APK texture (the Roblox
+        // loading-spinner) placed in a centered aspect-correct box; the other
+        // layers keep palette solids so the whole frame still composites.
+        let real_tex = std::env::var_os("RENDEREMITTER_REAL_TEX").is_some();
+        let real_img = if real_tex { real_ui_texture() } else { None };
+        const VW: f32 = 1280.0;
+        const VH: f32 = 720.0;
         let mut verts: Vec<f32> = Vec::with_capacity(nq * 48); // 8 floats * 6 verts
         for t2 in 0..nq {
-            let (x0, x1, y0, y1, u) = if t2 < 5 {
-                let l = layers[t2];
-                (l.0, l.1, l.2, l.3, l.4)
+            let mut push = |x: f32, y: f32, u: f32, v: f32, vv: &mut Vec<f32>| {
+                vv.extend_from_slice(&[x, y, 1.0, 1.0, 1.0, 1.0, u, v]);
+            };
+            let (x0, x1, y0, y1, ua, ub, va, vb);
+            if let Some((imw, imh, _)) = real_img.as_ref() {
+                if t2 == 1 {
+                    // image layer: centered aspect-correct box, real texture.
+                    let hh = 0.5f32;
+                    let corr = VH / VW;
+                    let half_w = hh * (*imw as f32 / *imh as f32) * corr;
+                    x0 = -half_w; x1 = half_w; y0 = -hh; y1 = hh;
+                    let a_h = (*imh as f32) + 1.0;
+                    ua = 0.0; ub = 1.0;
+                    // image occupies memory rows 1..=imh (upright via reversed
+                    // upload); top vertex -> high v (PNG top memory row 1).
+                    va = 1.0 / a_h;
+                    vb = (*imh as f32) / a_h;
+                } else {
+                    // palette layers: strip row 0 (solid block [t/nq,(t+1)/nq)).
+                    let (lx0, lx1, ly0, ly1) = if t2 < 5 {
+                        let l = layers[t2];
+                        (l.0, l.1, l.2, l.3)
+                    } else {
+                        let k = (t2 - 5) as f32;
+                        let ys = 0.10 - (k + 1.0) * 0.09;
+                        (-0.40, 0.40, ys - 0.04, ys + 0.04)
+                    };
+                    x0 = lx0; x1 = lx1; y0 = ly0; y1 = ly1;
+                    let nqf = nq as f32;
+                    ua = t2 as f32 / nqf;
+                    ub = (t2 as f32 + 1.0) / nqf;
+                    let a_h = (*imh as f32) + 1.0;
+                    va = 0.5 / a_h; vb = va;
+                }
             } else {
-                // surplus node text-strip: full-width low band, split by index
-                let k = (t2 - 5) as f32;
-                let ys = 0.10 - (k + 1.0) * 0.09;
-                (-0.40, 0.40, ys - 0.04, ys + 0.04, 0.1)
-            };
-            let mut push = |x: f32, y: f32, uu: f32, v: &mut Vec<f32>| {
-                v.extend_from_slice(&[x, y, 1.0, 1.0, 1.0, 1.0, uu, 0.5]);
-            };
-            // NOTE: u is the texture column center (texel index/layer count), each
-            // quad maps a thin slice [u-1/(2nq), u+1/(2nq)]; NEAREST picks the solid
-            // texel. Use the SLICE edges so a layer never bleeds into the neighbor.
-            let half = 0.5 / nq as f32;
-            let (ua, ub) = (u - half, u + half);
-            push(x0, y0, ua, &mut verts);
-            push(x1, y0, ub, &mut verts);
-            push(x1, y1, ub, &mut verts);
-            push(x0, y0, ua, &mut verts);
-            push(x1, y1, ub, &mut verts);
-            push(x0, y1, ua, &mut verts);
+                // SH68 default: palette strip columns [u-1/(2nq), u+1/(2nq)], v=0.5.
+                let (lx0, lx1, ly0, ly1, u) = if t2 < 5 {
+                    let l = layers[t2];
+                    (l.0, l.1, l.2, l.3, l.4)
+                } else {
+                    let k = (t2 - 5) as f32;
+                    let ys = 0.10 - (k + 1.0) * 0.09;
+                    (-0.40, 0.40, ys - 0.04, ys + 0.04, 0.1)
+                };
+                x0 = lx0; x1 = lx1; y0 = ly0; y1 = ly1;
+                let half = 0.5 / nq as f32;
+                ua = u - half; ub = u + half;
+                va = 0.5; vb = va;
+            }
+            push(x0, y0, ua, va, &mut verts);
+            push(x1, y0, ub, va, &mut verts);
+            push(x1, y1, ub, vb, &mut verts);
+            push(x0, y0, ua, va, &mut verts);
+            push(x1, y1, ub, vb, &mut verts);
+            push(x0, y1, ua, vb, &mut verts);
         }
         let total_verts = verts.len() / 8;
         let nbytes = verts.len() * 4;
@@ -1692,7 +1868,10 @@ pub fn render_engine_emitter_home(ctx: u64, iimg: &[u8], ibase: u64, isp: u64, l
         gb(1, &mut vbo);
         bb(0x8892, vbo);
         bd(0x8892, nbytes as isize, verts.as_ptr() as *const i8, 0x88E4);
-        // Texture: nq-texel RGBA strip (one solid straight-alpha per layer).
+        // Texture: default = nq-texel RGBA strip. Real mode = 2-D atlas
+        // (A_W x A_H = imw x (imh+1)): row 0 = palette strip row (solid blocks
+        // [t/nq,(t+1)/nq)), rows 1..=imh = the real image REVERSED (uploaded
+        // memory row M holds PNG top-first row (imh-M)) so the image is upright.
         let (Some(gt), Some(at), Some(bt), Some(tp_), Some(te)) = (
             mesa_fn::<extern "C" fn(i32, *mut u32)>(h, b"glGenTextures\0"),
             mesa_fn::<extern "C" fn(u32)>(h, b"glActiveTexture\0"),
@@ -1702,25 +1881,55 @@ pub fn render_engine_emitter_home(ctx: u64, iimg: &[u8], ibase: u64, isp: u64, l
         ) else {
             return 0;
         };
+        let (mut aw, mut ah) = (((nq * 8).max(8)) as u32, 1u32);
+        let (mut tex_mag, mut tex_min) = (0x2600u32, 0x2600u32); // NEAREST
+        let wrap: i32 = 0x812F; // GL_CLAMP_TO_EDGE
+        let mut px: Vec<u8> = Vec::new();
+        if let Some((imw, imh, rgba)) = real_img.as_ref() {
+            aw = (*imw).max(nq as u32);
+            ah = *imh + 1;
+            let mut cur = vec![0u8; aw as usize * 4]; // strip row 0
+            for t2 in 0..nq {
+                let cc = if t2 < 5 { layers[t2].6 } else { [0.45, 0.48, 0.55, 0.85] };
+                let rg = [(cc[0]*255.0) as u8, (cc[1]*255.0) as u8, (cc[2]*255.0) as u8, (cc[3]*255.0) as u8];
+                let b0 = (t2 as u32 * aw / nq as u32) as usize;
+                let b1 = (((t2 as u32 + 1) * aw) / nq as u32) as usize;
+                for i in b0..b1 { cur[i*4..i*4+4].copy_from_slice(&rg); }
+            }
+            px = cur;
+            px.resize(aw as usize * ah as usize * 4, 0);
+            let iu = *imw as usize;
+            for m in 1..=(*imh as usize) {
+                let png_row = *imh as usize - m; // 0 = image top
+                let src = &rgba[png_row * iu * 4..(png_row + 1) * iu * 4];
+                let dst = m * aw as usize * 4;
+                px[dst..dst + iu * 4].copy_from_slice(src);
+            }
+            tex_mag = 0x2601; // GL_LINEAR for the smooth arc
+            tex_min = 0x2601;
+        } else {
+            let w = (nq * 8).max(8);
+            for t2 in 0..nq {
+                let cc = if t2 < 5 { layers[t2].6 } else { [0.45, 0.48, 0.55, 0.85] };
+                let rg = [(cc[0]*255.0) as u8, (cc[1]*255.0) as u8, (cc[2]*255.0) as u8, (cc[3]*255.0) as u8];
+                for _ in 0..8 { px.extend_from_slice(&rg); }
+            }
+            while px.len() < w * 4 { px.extend_from_slice(&[0,0,0,255]); }
+            aw = w as u32;
+        }
         let mut texid = 0u32;
         gt(1, &mut texid);
         at(0x84C0);
         bt(0x0DE1, texid);
-        tp_(0x0DE1, 0x2800, 0x2600, 0);
-        tp_(0x0DE1, 0x2801, 0x2600, 0);
-        let w = (nq * 8).max(8);
-        let mut px: Vec<u8> = Vec::with_capacity(w * 4);
-        for t2 in 0..nq {
-            let cc = if t2 < 5 { layers[t2].6 } else { [0.45, 0.48, 0.55, 0.85] };
-            let rg = [(cc[0]*255.0) as u8, (cc[1]*255.0) as u8, (cc[2]*255.0) as u8, (cc[3]*255.0) as u8];
-            for _ in 0..8 { px.extend_from_slice(&rg); }
-        }
-        while px.len() < w * 4 { px.extend_from_slice(&[0,0,0,255]); }
-        te(0x0DE1, 0, 0x1908, w as i32, 1, 0, 0x1908, 0x1401, px.as_ptr() as *const i8);
+        tp_(0x0DE1, 0x2800, tex_mag as i32, 0);
+        tp_(0x0DE1, 0x2801, tex_min as i32, 0);
+        tp_(0x0DE1, 0x2802, wrap, 0);
+        tp_(0x0DE1, 0x2803, wrap, 0);
+        te(0x0DE1, 0, 0x1908, aw as i32, ah as i32, 0, 0x1908, 0x1401, px.as_ptr() as *const i8);
         if uloc >= 0 {
             if let Some(ui) = mesa_fn::<extern "C" fn(i32, i32)>(h, b"glUniform1i\0") { ui(uloc, 0); }
         }
-        eprintln!("[elfjit:renderemitter-home] LAYOUT=home layers={nq} blend=enabled(SRC_ALPHA,ONE_MINUS_SRC_ALPHA) tex {w}x1 RGBA uploaded (glTexImage2D 0x1908) uTex loc={uloc} prog={tprog:#x}");
+        eprintln!("[elfjit:renderemitter-home] LAYOUT=home layers={nq} real_tex={} blend=enabled(SRC_ALPHA,ONE_MINUS_SRC_ALPHA) tex {aw}x{ah} RGBA uploaded (glTexImage2D 0x1908) uTex loc={uloc} prog={tprog:#x}", real_tex);
         // Geometry context G (stride 32, spec[3]: pos/color/aTex) — same layout as
         // render_engine_emitter_grid textured branch.
         let gbuf = Box::leak(vec![0u64; 0x400].into_boxed_slice());
@@ -1807,14 +2016,33 @@ pub fn render_engine_emitter_home(ctx: u64, iimg: &[u8], ibase: u64, isp: u64, l
             // (must equal src*a+dst*(1-a), proving alpha compositing), button,
             // title. Panel rgba = (45,48,59) for (26,26,31) backdrop (dst) and
             // (61,66,82) panel (src) at a=0.55: r=61*.55+26*.45=45.2, g=66*.55+26*.45=48, b=82*.55+31*.45=59.1.
-            let probes: [(i32, i32, [u8;4], &str); 4] = [
-                (51, 691, [26,26,31,255], "backdrop"),
-                (640, 360, [45,48,59,255], "panel-blend"),
-                (640, 281, [41,152,109,255], "button"),
-                (640, 472, [193,189,175,255], "title-bar"),
-            ];
+            let probes: [(i32, i32, [u8; 4], &str); 4] = if let Some((imw, imh, _)) = real_img.as_ref() {
+                // SH69 real-texture probes: backdrop corner (unchanged); the arc's
+                // OPAQUE sky-blue body img(33,88)->(49,180,255) = a REAL texture
+                // pixel (blend-free, alpha 255); the transparent CENTER (real
+                // alpha 0 -> backdrop shows through, NOT the old 0.55 panel); and
+                // the transparent RIGHT half (the arc is left-only -> proves
+                // correct orientation). Screen coords from the same aspect math.
+                let (bx, by) = imgpix_screen(33, 88, *imw, *imh, 0.5, VW, VH);
+                let (cx, cy) = imgpix_screen(50, 50, *imw, *imh, 0.5, VW, VH);
+                let (rx, ry) = imgpix_screen(80, 50, *imw, *imh, 0.5, VW, VH);
+                eprintln!("[elfjit:renderemitter-home] real probes: arc-blue@{bx:.0},{by:.0} transparent-center@{cx:.0},{cy:.0} transparent-right@{rx:.0},{ry:.0}");
+                [
+                    (51, 691, [26, 26, 31, 255], "backdrop"),
+                    (bx as i32, by as i32, [49, 180, 255, 255], "real-arc-blue"),
+                    (cx as i32, cy as i32, [26, 26, 31, 255], "transparent-center"),
+                    (rx as i32, ry as i32, [26, 26, 31, 255], "transparent-right"),
+                ]
+            } else {
+                [
+                    (51, 691, [26, 26, 31, 255], "backdrop"),
+                    (640, 360, [45, 48, 59, 255], "panel-blend"),
+                    (640, 281, [41, 152, 109, 255], "button"),
+                    (640, 472, [193, 189, 175, 255], "title-bar"),
+                ]
+            };
             for (fx, fy, exp8, name) in probes {
-                let mut px: [u8;4] = [0;4];
+                let mut px: [u8; 4] = [0; 4];
                 rp(fx, fy, 1, 1, 0x1908, 0x1401, px.as_mut_ptr() as *mut i8);
                 let diff = [
                     (px[0] as i32 - exp8[0] as i32).abs(),
@@ -1822,8 +2050,11 @@ pub fn render_engine_emitter_home(ctx: u64, iimg: &[u8], ibase: u64, isp: u64, l
                     (px[2] as i32 - exp8[2] as i32).abs(),
                     (px[3] as i32 - exp8[3] as i32).abs(),
                 ];
-                let present = diff.iter().all(|d| *d <= 1);
-                eprintln!("[elfjit:renderemitter-home] {name} ({fx},{fy}) rgba({},{},{},{}) expect {:?} diff={diff:?} present={present}", px[0], px[1], px[2], px[3], exp8);
+                // Real-arc-blue may sit on GL_LINEAR interpolation boundary; allow
+                // a small tolerance there. Everything else exact (<=1 rounding).
+                let tol = if name == "real-arc-blue" { 4 } else { 1 };
+                let present = diff.iter().all(|d| *d <= tol);
+                eprintln!("[elfjit:renderemitter-home] {name} ({fx},{fy}) rgba({},{},{},{}) expect {:?} diff={diff:?} tol={tol} present={present}", px[0], px[1], px[2], px[3], exp8);
             }
         }
         r
@@ -6083,5 +6314,92 @@ fn main() {
     let (compiles, hits) = arm64jit::jit::block_cache_stats();
     if compiles > 0 || hits > 0 {
         eprintln!("[elfjit] block-cache: {compiles} compiles / {hits} hits");
+    }
+}
+
+// SH69 hermetic regression: the offline PNG->RGBA8 decoder + the aspect-correct
+// screen-placement math used to render the REAL Roblox UI texture through the
+// engine's own emitter path. Self-contained (no host files, no network).
+#[cfg(test)]
+mod sh69_tests {
+    use super::{decode_png_rgba, imgpix_screen};
+    use std::io::Write;
+
+    fn chunk(chunk_type: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut c = Vec::new();
+        c.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        c.extend_from_slice(chunk_type);
+        c.extend_from_slice(data);
+        c.extend_from_slice(&[0, 0, 0, 0]); // dummy crc (decode_png_rgba ignores CRC)
+        c
+    }
+    fn make_png(w: u32, h: u32, ct: u8, raw: &[u8]) -> Vec<u8> {
+        let mut p = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&w.to_be_bytes());
+        ihdr.extend_from_slice(&h.to_be_bytes());
+        ihdr.extend_from_slice(&[8, ct, 0, 0, 0]); // bit 8, ct, comp 0, filter 0, interlace 0
+        p.extend_from_slice(&chunk(b"IHDR", &ihdr));
+        let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        e.write_all(raw).unwrap();
+        let idat = e.finish().unwrap();
+        p.extend_from_slice(&chunk(b"IDAT", &idat));
+        p.extend_from_slice(&chunk(b"IEND", &[]));
+        p
+    }
+
+    #[test]
+    fn sh69_decode_png_rgba_type6_filter0_roundtrip() {
+        let (w, h) = (3u32, 3u32);
+        let mut raw = Vec::new();
+        let mut expect = Vec::new();
+        for _ in 0..h {
+            raw.push(0); // filter 0
+            for _ in 0..w {
+                for c in [1u8, 2, 3, 4] {
+                    raw.push(c);
+                    expect.push(c);
+                }
+            }
+        }
+        let png = make_png(w, h, 6, &raw);
+        let (dw, dh, out) = decode_png_rgba(&png).expect("decode ct6");
+        assert_eq!((dw, dh), (w, h));
+        assert_eq!(out, expect);
+    }
+
+    #[test]
+    fn sh69_decode_png_rgba_gray_expands_opaque_alpha() {
+        let (w, h) = (2u32, 2u32);
+        let mut raw = Vec::new();
+        for _ in 0..h {
+            raw.push(0);
+            for _ in 0..w {
+                raw.push(200);
+            }
+        }
+        let png = make_png(w, h, 0, &raw);
+        let (_, _, out) = decode_png_rgba(&png).expect("decode gray");
+        assert_eq!(out.len(), (w * h * 4) as usize);
+        for i in (0..out.len()).step_by(4) {
+            assert_eq!(&out[i..i + 3], [200, 200, 200]);
+            assert_eq!(out[i + 3], 255);
+        }
+    }
+
+    #[test]
+    fn sh69_imgpix_screen_centers_square_image_and_aspect_math() {
+        // square 100x100, hh=0.5, VW=1280, VH=720: center pixel lands at screen center.
+        let (sx, sy) = imgpix_screen(50, 50, 100, 100, 0.5, 1280.0, 720.0);
+        assert!((sx - 640.0).abs() < 2.0 && (sy - 360.0).abs() < 2.0, "center got {sx},{sy}");
+        // top-left image corner maps to the box's top-left (top of frame).
+        let (tlx, tly) = imgpix_screen(0, 0, 100, 100, 0.5, 1280.0, 720.0);
+        assert!(tlx < 640.0 && tly < 360.0, "top-left got {tlx},{tly}");
+    }
+
+    #[test]
+    fn sh69_decode_png_rgba_rejects_non_png() {
+        assert!(decode_png_rgba(b"not-a-png").is_none());
+        assert!(decode_png_rgba(&[0u8; 8]).is_none());
     }
 }
