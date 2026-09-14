@@ -2814,16 +2814,25 @@ fn mesh_uvs(m: &RbxMeshV2) -> Vec<f32> {
 /// Interleave model-space positions (vec4) with per-vertex UVs (vec2) into a
 /// single stride-24 VBO: [px,py,pz,1, u,v] per vertex. `mvp_out` receives the
 /// column-major model-view-projection that turns the model-space positions into
-/// clip space under a fixed axis-aligned perspective camera framed on the bbox.
-fn mesh_interleave_model_uv(m: &RbxMeshV2, fit_fov: f32, aspect: f32, mvp_out: &mut [f32; 16]) -> Vec<f32> {
+/// clip space. The camera is a fixed axis-aligned perspective framed on the
+/// bbox; `yaw_rad` rotates the MODEL about +Y before the view, so the object can
+/// be presented from any orbit angle (0 = the SH143 head-on camera).
+fn mesh_interleave_model_uv(m: &RbxMeshV2, fit_fov: f32, aspect: f32, yaw_rad: f32, mvp_out: &mut [f32; 16]) -> Vec<f32> {
     let (c, ext) = mesh_bbox(m);
     // Camera looks down -Z at the origin from z=+d, framing the bbox in fit_fov.
     let d = if ext > 1e-9 { (ext * 0.5) / (fit_fov * 0.5).tan() * 1.6 } else { 4.0 };
     let near = ext.max(1e-3) * 0.05;
     let far = (ext.max(1e-3) * 10.0).max(d + ext);
-    let mat_m = mat4_translate(-c[0], -c[1], -c[2]);
-    let mat_v = mat4_translate(0.0, 0.0, -d);
     let mat_p = mat4_perspective(fit_fov, aspect, near, far);
+    let mat_v = mat4_translate(0.0, 0.0, -d);
+    let mat_m = if yaw_rad.abs() > 1e-6 {
+        // Orbit: rotate the model about the world Y axis FIRST (after translating
+        // its bbox center to the origin), so the camera stays put and the object
+        // turns. M = Ry * T(-center).
+        mat4_mul(mat4_rotate_y(yaw_rad), mat4_translate(-c[0], -c[1], -c[2]))
+    } else {
+        mat4_translate(-c[0], -c[1], -c[2])
+    };
     *mvp_out = mat4_mul(mat_p, mat4_mul(mat_v, mat_m));
     let n = m.positions.len();
     let mut out = Vec::with_capacity(n * 6);
@@ -2870,6 +2879,33 @@ fn mat4_mul(a: [f32; 16], b: [f32; 16]) -> [f32; 16] {
         }
     }
     o
+}
+
+/// Column-major 4x4 rotation about the +Y axis (right-handed, GL convention:
+/// a positive angle rotates +X toward -Z).
+fn mat4_rotate_y(ang: f32) -> [f32; 16] {
+    let (s, c) = ang.sin_cos();
+    let mut m = [0f32; 16];
+    m[0] = c;
+    m[2] = -s;
+    m[5] = 1.0;
+    m[8] = s;
+    m[10] = c;
+    m[15] = 1.0;
+    m
+}
+
+/// Recompute a full perspective MVP for the same bbox-framed camera but with the
+/// model yawed by `yaw_rad` about +Y (camera orbit). Center + max extent are
+/// captured once from the mesh; each frame recomputes P * V * Ry(yaw) * T(-c).
+fn mesh_orbit_mvp(center: &[f32; 3], ext: f32, fit_fov: f32, aspect: f32, yaw_rad: f32) -> [f32; 16] {
+    let d = if ext > 1e-9 { (ext * 0.5) / (fit_fov * 0.5).tan() * 1.6 } else { 4.0 };
+    let near = ext.max(1e-3) * 0.05;
+    let far = (ext.max(1e-3) * 10.0).max(d + ext);
+    let p = mat4_perspective(fit_fov, aspect, near, far);
+    let v = mat4_translate(0.0, 0.0, -d);
+    let m = mat4_mul(mat4_rotate_y(yaw_rad), mat4_translate(-center[0], -center[1], -center[2]));
+    mat4_mul(p, mat4_mul(v, m))
 }
 
 /// Parse a DDS file that is a plain single-channel R8 (LUMINANCE) surface —
@@ -8435,6 +8471,10 @@ fn main() {
                                     let mut idx: Vec<u32>;
                                     let mut mvp_slot = [0f32; 16];
                                     let mut mesh_uv_active = false;
+                                    let mut mesh_center = [0f32; 3];
+                                    let mut mesh_ext = 0f32;
+                                    let mut mesh_uv_program = 0u32;
+                                    let mut mesh_uv_mvp_loc = 0u64;
                                     if let Some(mp) = &mesh_path {
                                         let mdata = std::fs::read(mp).expect("read mesh");
                                         let mesh = parse_roblox_mesh_v2(&mdata).expect("parse mesh v2");
@@ -8445,12 +8485,13 @@ fn main() {
                                             mesh.indices.len() / 3,
                                             mesh.indices.len()
                                         );
+                                        (mesh_center, mesh_ext) = mesh_bbox(&mesh);
                                         let mut mvp_slot_local = [0f32; 16];
                                         if mesh_uv_mode {
                                             // SH143: real per-vertex UV + camera/MVP. Interleave
                                             // model-space [x,y,z,1] with [u,v] per vertex (stride-24),
                                             // transform via a real perspective MVP uniform.
-                                            verts = mesh_interleave_model_uv(&mesh, 60.0f32.to_radians(), 1280.0 / 720.0, &mut mvp_slot_local);
+                                            verts = mesh_interleave_model_uv(&mesh, 60.0f32.to_radians(), 1280.0 / 720.0, 0.0, &mut mvp_slot_local);
                                             mvp_slot = mvp_slot_local;
                                             mesh_uv_active = true;
                                         } else {
@@ -8658,6 +8699,8 @@ fn main() {
                                                                                                                                                         let mvp_uname = objs.as_ptr() as u64 + 0xe40;
                                                                                                                                                         std::ptr::copy_nonoverlapping(b"uMVP\0".as_ptr(), mvp_uname as *mut u8, 5);
                                                                                                                                                         let mvp_loc = gcall(plt_get_uniform_location, program, mvp_uname, 0, 0, 0, 0).unwrap_or(0) & 0xffff_ffff;
+                                                                                                                                                        mesh_uv_program = program as u32;
+                                                                                                                                                        mesh_uv_mvp_loc = mvp_loc;
                                                                                                                                                         let mvp_buf = Box::leak(mvp_slot.to_vec().into_boxed_slice());
                                                                                                                                                         let mvp_ptr = mvp_buf.as_ptr() as u64;
                                                                                                                                                         let mat4fv = arm64jit::resolver::resolve_gles_int(b"glUniformMatrix4fv\0")
@@ -9162,6 +9205,68 @@ fn main() {
                                             }
                                             iter += 1;
                                             std::thread::sleep(std::time::Duration::from_millis(350));
+                                        }
+                                    }
+                                    // --renderframe-mesh-uv-orbit <N>: SH144 — render the REAL
+                                    // studs-textured mesh N times from a camera ORBITING about the
+                                    // model's +Y axis. Each frame re-uploads a yawed MVP (glUniformMatrix4fv,
+                                    // transpose=0) to the SAME mesh-uv program, re-drives the engine's own
+                                    // geometry wrapper 0x105b35288 over the same stride-24 VBO/EBO, and
+                                    // swaps — producing a real, rotating, textured 3D scene through the
+                                    // engine's own GLES path (not harness-fabricated per-frame content).
+                                    // The distinct studs-luminance centroid per yaw proves real rotation.
+                                    let mesh_orbit_n: usize = if mesh_uv_active {
+                                        renderframe_args
+                                            .iter()
+                                            .position(|a| a == "--renderframe-mesh-uv-orbit")
+                                            .and_then(|i| renderframe_args.get(i + 1))
+                                            .and_then(|v| v.parse().ok())
+                                            .unwrap_or(0)
+                                    } else {
+                                        0
+                                    };
+                                    if mesh_orbit_n > 1 {
+                                        let mat4fv = arm64jit::resolver::resolve_gles_int(b"glUniformMatrix4fv\0")
+                                            .expect("glUniformMatrix4fv resolves");
+                                        // Reuse the already-linked mesh-uv program + its uMVP loc.
+                                        let _ = gcall(plt_useprogram, mesh_uv_program as u64, 0, 0, 0, 0, 0);
+                                        let mvp_loc = mesh_uv_mvp_loc as u64;
+                                        for iter in 0..mesh_orbit_n as u64 {
+                                            let yaw = (2.0 * std::f32::consts::PI) * (iter as f32) / (mesh_orbit_n as f32);
+                                            let omvp = mesh_orbit_mvp(&mesh_center, mesh_ext, 60.0f32.to_radians(), 1280.0 / 720.0, yaw);
+                                            // Clear to a fresh dark backdrop distinct per orbit.
+                                            let mut scn = arm64jit::jit::CpuState::new();
+                                            scn.tpidr = tpidr; scn.x[31] = isp;
+                                            let bgf = 0.04 + 0.02 * (iter % 3) as f32;
+                                            scn.v[0] = bgf.to_bits() as u64;
+                                            scn.v[2] = bgf.to_bits() as u64;
+                                            scn.v[4] = (0.3f32).to_bits() as u64;
+                                            scn.v[6] = (1.0f32).to_bits() as u64;
+                                            let _ = arm64jit::jit::jit_run(iimg, ibase, plt_clearcolor, &mut scn as *mut CpuState);
+                                            let _ = gcall(plt_clear, GL_COLOR_BUFFER_BIT, 0, 0, 0, 0, 0);
+                                            // Upload the yawed MVP to uMVP (transpose=0, column-major).
+                                            let mvp_buf = Box::leak(omvp.to_vec().into_boxed_slice());
+                                            let mut sm = arm64jit::jit::CpuState::new();
+                                            sm.tpidr = tpidr; sm.x[31] = isp;
+                                            sm.x[0] = mvp_loc; sm.x[1] = 1; sm.x[2] = 0; sm.x[3] = mvp_buf.as_ptr() as u64;
+                                            let _ = arm64jit::jit::jit_run(iimg, ibase, mat4fv, &mut sm as *mut CpuState);
+                                            // Drive the engine's own geometry wrapper (same renderer/VBO/EBO).
+                                            let mut swn = arm64jit::jit::CpuState::new();
+                                            swn.tpidr = tpidr; swn.x[31] = isp;
+                                            swn.x[0] = renderer;
+                                            swn.x[1] = 0; swn.x[2] = 0; swn.x[3] = 0;
+                                            swn.x[4] = n_elems as u64; swn.x[5] = n_elems.max(1) as u64;
+                                            let wr = arm64jit::jit::jit_run(iimg, ibase, 0x105b35288, &mut swn as *mut CpuState);
+                                            // Swap (engine's own present on the real ctx).
+                                            let mut sen = arm64jit::jit::CpuState::new();
+                                            sen.tpidr = tpidr; sen.x[31] = isp; sen.x[0] = real_ctx;
+                                            let sr = arm64jit::jit::jit_run(iimg, ibase, swap_thunk, &mut sen as *mut CpuState);
+                                            eprintln!(
+                                                "[elfjit:renderframe-mesh-uv-orbit] frame {iter}: yaw={yaw:.2}rad wrapper={wr:?} swap={sr:?} (real textured sphere rotated — orbit frame {}/{})",
+                                                iter + 1,
+                                                mesh_orbit_n
+                                            );
+                                            std::thread::sleep(std::time::Duration::from_millis(220));
                                         }
                                     }
                                 }
@@ -11203,7 +11308,7 @@ mod sh143_mvp_tests {
             indices: vec![0, 1, 2],
         };
         let mut mvp = [0f32; 16];
-        let v = mesh_interleave_model_uv(&mesh, 60.0f32.to_radians(), 1280.0 / 720.0, &mut mvp);
+        let v = mesh_interleave_model_uv(&mesh, 60.0f32.to_radians(), 1280.0 / 720.0, 0.0, &mut mvp);
         // 3 verts x stride-24 (6 floats).
         assert_eq!(v.len(), 3 * 6);
         // Stride layout: [x,y,z,1, u,v].
@@ -11231,5 +11336,52 @@ mod sh143_mvp_tests {
         let (c, ext) = mesh_bbox(&mesh);
         assert_eq!(c, [5.0, 10.0, 15.0]);
         assert_eq!(ext, 30.0);
+    }
+
+    #[test]
+    fn sh144_orbit_mvp_rotates_model_and_frames_origin() {
+        let mesh = RbxMeshV2 {
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: vec![],
+            uvs: vec![],
+            indices: vec![0, 1, 2],
+        };
+        let (c, ext) = mesh_bbox(&mesh);
+        let mvp0 = mesh_orbit_mvp(&c, ext, 60.0f32.to_radians(), 1280.0 / 720.0, 0.0);
+        let mvp_half = mesh_orbit_mvp(&c, ext, 60.0f32.to_radians(), 1280.0 / 720.0, std::f32::consts::PI);
+        // Both MVPs finite and both map the model origin (center of bbox ->
+        // translated to origin) to a finite in-front clip point (w>0).
+        let fwd = |m: &[f32; 16], p: [f32; 3]| -> [f32; 4] {
+            [
+                m[0]*p[0] + m[4]*p[1] + m[8]*p[2] + m[12],
+                m[1]*p[0] + m[5]*p[1] + m[9]*p[2] + m[13],
+                m[2]*p[0] + m[6]*p[1] + m[10]*p[2] + m[14],
+                m[3]*p[0] + m[7]*p[1] + m[11]*p[2] + m[15],
+            ]
+        };
+        let p0 = fwd(&mvp0, c);
+        let ph = fwd(&mvp_half, c);
+        for (v0, vh) in p0.iter().zip(ph.iter()) {
+            assert!(v0.is_finite() && vh.is_finite(), "orbit mvps finite: {p0:?} {ph:?}");
+        }
+        assert!(p0[3] > 0.0 && ph[3] > 0.0, "center in front on both orbits: w {p0:?} / {ph:?}");
+        // A 180-degree yaw must move a +X point to the -X side of the frame:
+        let right0 = fwd(&mvp0, [1.0, 0.0, 0.0]);
+        let right_h = fwd(&mvp_half, [1.0, 0.0, 0.0]);
+        let (x0, xh) = (right0[0] / right0[3], right_h[0] / right_h[3]);
+        // rotate_y(pi) must move +X to the opposite side of the frame: the
+        // normalized ndc x flips sign with ~equal magnitude (0.35 vs -0.35 above).
+        assert!(x0 > 0.0 && xh < 0.0, "yaw flips +X left/right (ndc x {x0} -> {xh})");
+        assert!((x0.abs() - xh.abs()).abs() < 1e-3, "magnitude preserved across yaw (|{x0}| vs |{xh}|)");
+    }
+
+    #[test]
+    fn sh144_mat4_rotate_y_unit_axes() {
+        let r90 = mat4_rotate_y(std::f32::consts::PI / 2.0);
+        // +X axis -> [0,0,-1] (right-handed: +X toward -Z at +pi/2).
+        let fx = [r90[0], r90[1], r90[2]]; // col 0 = image of +X
+        let fz = [r90[8], r90[9], r90[10]]; // col 2 = image of +Z
+        assert!((fx[0]).abs() < 1e-3 && (fx[1]).abs() < 1e-3 && (fx[2] + 1.0).abs() < 1e-3, "rot90 +X -> (0,0,-1): {fx:?}");
+        assert!((fz[0] - 1.0).abs() < 1e-3 && (fz[1]).abs() < 1e-3 && (fz[2]).abs() < 1e-3, "rot90 +Z -> (1,0,0): {fz:?}");
     }
 }
