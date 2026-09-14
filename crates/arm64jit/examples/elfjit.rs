@@ -1494,6 +1494,27 @@ fn routeb_seed_task_singletons() {
     ROUTEB_SINGLETON_SEEDED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 static ROUTEB_SINGLETON_SEEDED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static ROUTEB_DISPATCHER_NODE_PATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// SH120: SendAppEventOnAppReady's app-bridge path crashes at guest 0x102b561b0
+/// (a GENERIC ~40-site leaf, do NOT code-patch it) because the shared dispatcher-
+/// node .bss global guest 0x10683a460 (file 0x683a460) has +0 (an intrusive
+/// nav/back header ptr) = 0 -> [*x1 - 24] = [0-24] faults. Seed the DATA to the
+/// benign empty-singleton state: node[+0] = 0x10683a000 (a zeroed .bss page whose
+/// [..-24]=0, so base==node), node[+0x20] = 1 (base[+32] active flag -> the leaf
+/// returns bool=0 -> the caller's `cbz` skips dispatch work). Constrained by
+/// construction to only paths passing &0x10683a460; no code patch, idempotent,
+/// opt-in.
+fn routeb_seed_dispatcher_node() {
+    if ROUTEB_DISPATCHER_NODE_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    unsafe {
+        *(0x10683a460u64 as *mut u64) = 0x10683a000u64; // node[+0] -> 0-clean .bss (self-link base==node)
+        *(0x10683a480u64 as *mut u64) = 1u64; // node[+0x20] = base[+32] active bit -> leaf returns 0
+    }
+    eprintln!("[elfjit:routeB] SH120 seeded dispatcher-node global 0x10683a460 (+0=self-link 0x10683a000, +0x20=1) — app-bridge event dispatch resolves to benign 'nothing registered' instead of [*x1-24]=[0-24] fault");
+    ROUTEB_DISPATCHER_NODE_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
 
 // ---- SH115: scoped singleton-dispatch patch (make V2Init/V2Start/V1AppStart/  ----
 // ---- SendAppEventOnAppReady bodies complete instead of soft-returning)     ----
@@ -5025,6 +5046,10 @@ fn main() {
                 // materialize the stable object into x0 at both so the body
                 // completes towards the app-data-model / GuiObjects.
                 routeb_patch_sendapp_singleton_lambdas();
+                // SH120: the app-bridge event dispatch reads the shared dispatcher-
+                // node .bss global (0x10683a460) with an unseeded self-link; seed
+                // the DATA (NOT the generic shared leaf) to the benign empty state.
+                routeb_seed_dispatcher_node();
             }
             // SH87: the map-family generic dispatch can blr through the garbage +0x18
             // hash2 of a rehash-copied map (0x1800064) — force blr x1 (primary hash).
