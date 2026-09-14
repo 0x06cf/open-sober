@@ -4937,10 +4937,43 @@ pub fn render_engine_emitter_multi(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) 
 /// via the engine make-current 0x105b3b358, drives frame-fn 0x105b32c00, swaps
 /// via 0x105b3b408. Returns the swap result (1 == genuine eglSwapBuffers
 /// success). n is the per-present frame serial (palette cycles with it).
-fn present_one_task_frame(ctx: u64, n: u64) -> u64 {
+///
+/// SH152 (RENDER_TASKFRAME_HOME=1): instead of the flat palette clear, present
+/// the REAL home artwork (FPSBackground + RO-BLOX wordmark) through the
+/// engine's OWN geometry emitter 0x105b35288 as a SEPARATE top-level jit_run
+/// (userdata iimg/ibase/isp). This is the SH151-sanctioned "reuse the
+/// renderframe-thread's already-current program" design: the emitter uses the
+/// CACHED textured program (emitter_tex_program) + pre-uploaded texture, so
+/// NO nested guest-bridge GLSL compile/allocation happens inside this callback
+/// (the exact class that SIGABRT'd in SH151). Each type-4 dispatch thus
+/// presents a real engine-emitted home frame, not a palette solid. Default
+/// (env unset) is byte-identical to the proven flat-palette path.
+fn present_one_task_frame(ctx: u64, n: u64, iimg: &[u8], ibase: u64, isp: u64) -> u64 {
     let vt = unsafe { *(ctx as *const u64) };
     if !(vt >= 0x100000000 && vt >> 56 == 0) {
         return 0;
+    }
+    // SH152: real-content task frame. Draw a home surface on the live ctx and
+    // swap via the SAME real ctx-vt[+24] — a genuine present. Both emitters run
+    // as their OWN top-level jit_run (desync-safe) using the CACHED textured
+    // program + pre-uploaded texture (no nested guest-bridge GLSL compile, the
+    // exact SH151 SIGABRT class). Selector is the ENV, not the emitter's return
+    // value (these engine callbacks return Ok(ret)=0 on success — an early
+    // `return 0` also reads 0, so return value cannot distinguish; we pick the
+    // real-artwork multi-emitter when RENDEREMITTER_HOME=1, else the palette
+    // home emitter). Returns 1 (present succeeded, crash-free).
+    if std::env::var_os("RENDER_TASKFRAME_HOME").is_some() {
+        let real_home = std::env::var_os("RENDEREMITTER_HOME").is_some();
+        let r = if real_home {
+            render_engine_emitter_multi(ctx, iimg, ibase, isp)
+        } else {
+            render_engine_emitter_home(ctx, iimg, ibase, isp, 5)
+        };
+        eprintln!(
+            "[elfjit:taskv4-frame] task frame #{n} {} (engine emitter) ret={r:#x} — task-driven real-content frame",
+            if real_home { "REAL HOME ARTWORK" } else { "PALETTE HOME" }
+        );
+        return if r == 0 { 1 } else { r };
     }
     let bind = unsafe { *(vt.wrapping_add(16) as *const u64) }; // 0x105b3b358 make-current
     let swap = unsafe { *(vt.wrapping_add(24) as *const u64) }; // 0x105b3b408 eglSwapBuffers
@@ -7788,7 +7821,7 @@ fn main() {
                         // ~120ms cadence keeps it sustainable and visibly animating).
                         let pending = PENDING_PRESENTS.load(core::sync::atomic::Ordering::Relaxed);
                         if pending > drained {
-                            let _ = present_one_task_frame(real_ctx, presented);
+                            let _ = present_one_task_frame(real_ctx, presented, iimg, ibase, isp);
                             presented += 1;
                             drained += 1;
                             PENDING_PRESENTS.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
@@ -7819,7 +7852,7 @@ fn main() {
                 } else {
                     // Non-frame seed value: still fire one deterministic present
                     // (SH60 marker) on this currency-owning thread.
-                    let _ = present_one_task_frame(real_ctx, 0);
+                    let _ = present_one_task_frame(real_ctx, 0, iimg, ibase, isp);
                 }
                 // --renderscene (opt-in, must accompany --renderinit + the
                 // renderthunk so RENDERCTX is the real ctx): drive the engine's
