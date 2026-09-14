@@ -842,6 +842,74 @@ unsafe fn write_guest_statfs(buf: u64, s: &libc::statfs) {
     }
 }
 
+/// Host futex dispatch for the guest `futex` syscall (AArch64 nr 98).
+///
+/// `a` = raw syscall args [uaddr, op, val, val2/timeout, uaddr2, val3].
+/// Forwards the ops the engine's multithreaded path legitimately uses to the
+/// real kernel futex so wait/wake/requeue semantics actually hold:
+///   FUTEX_WAIT(0)         -> real (blocks)
+///   FUTEX_WAKE(1)         -> real
+///   FUTEX_REQUEUE(4)      -> real (bionic pthread_cond broadcast re-parks
+///                           wakees onto the condvar's private futex; faking
+///                           success strands the waiter forever)
+///   FUTEX_CMP_REQUEUE(6)  -> real (same, with *uaddr==val3 compare)
+///   FUTEX_WAIT_BITSET(9)  -> real (engine idle barrier, 0x89 = PRIVATE)
+/// Unknown ops return -ENOSYS rather than a fake 0, so a condvar/rwlock/futex
+/// user sees a real error instead of assuming its waiter was parked or woken.
+/// Only a genuine unknown (WAKE_OP/PI/WAIT_REQUEUE_PI/robust) hits the error.
+#[allow(clippy::unnecessary_cast)]
+fn handle_futex(a: &[u64; 6]) -> libc::c_long {
+    use libc::{c_long, FUTEX_CMP_REQUEUE};
+    let op = a[1] as i32;
+    let fut = a[0] as *mut libc::c_int;
+    let om = (op as u32) & 0x7f;
+    unsafe {
+        let r: libc::c_long = if om == libc::FUTEX_WAKE as u32 {
+            libc::syscall(libc::SYS_futex, fut as usize, op, a[2] as c_long, 0 as usize) as c_long
+        } else if om == libc::FUTEX_WAIT as u32 {
+            libc::syscall(
+                libc::SYS_futex,
+                fut as usize,
+                op,
+                a[2] as c_long,
+                a[3] as *const libc::timespec,
+            ) as c_long
+        } else if om == libc::FUTEX_WAIT_BITSET as u32 {
+            libc::syscall(
+                libc::SYS_futex,
+                fut as usize,
+                op,
+                a[2] as c_long,
+                a[3] as *const libc::timespec,
+                0 as usize,
+                a[5] as c_long, // val3 = the bitset
+            ) as c_long
+        } else if om == libc::FUTEX_REQUEUE as u32 {
+            libc::syscall(
+                libc::SYS_futex,
+                fut as usize,
+                op,
+                a[2] as c_long,
+                a[3] as c_long,
+                a[4] as usize,
+            ) as c_long
+        } else if om == FUTEX_CMP_REQUEUE as u32 {
+            libc::syscall(
+                libc::SYS_futex,
+                fut as usize,
+                op,
+                a[2] as c_long,
+                a[3] as c_long,
+                a[4] as usize,
+                a[5] as c_long, // val3 = the expected value comparison
+            ) as c_long
+        } else {
+            -38 // -ENOSYS: operation not implemented for this translation layer
+        };
+        r
+    }
+}
+
 pub extern "C" fn guest_svc(st: *mut CpuState) -> u64 {
     let s = unsafe { &mut *st };
     let nr = s.x[8];
@@ -1070,38 +1138,11 @@ pub extern "C" fn guest_svc(st: *mut CpuState) -> u64 {
             }
         }
         98 => unsafe {
-            // futex: forward WAIT(0)/WAKE(1)/WAIT_BITSET(9) to the host; others
-            // return 0. The engine main loop's idle barrier is a libc
-            // `syscall(nr=futex, uaddr, op=0x89 FUTEX_WAIT_BITSET_PRIVATE,
+            // futex: see handle_futex. The engine main loop's idle barrier is
+            // a libc `syscall(nr=futex, uaddr, op=0x89 FUTEX_WAIT_BITSET_PRIVATE,
             // val, ...)` — must reach a REAL host futex (blocking on the
             // matching value) or the guest busy-loops re-issuing it.
-            let op = a[1] as i32;
-            let fut = a[0] as *mut libc::c_int;
-            let om = (op as u32) & 0x7f;
-            if om == libc::FUTEX_WAKE as u32 {
-                libc::syscall(libc::SYS_futex, fut as usize, op, a[2] as c_long, 0 as usize) as c_long
-            } else if om == libc::FUTEX_WAIT as u32 {
-                libc::syscall(
-                    libc::SYS_futex,
-                    fut as usize,
-                    op,
-                    a[2] as c_long,
-                    a[3] as *const libc::timespec,
-                ) as c_long
-            } else if om == libc::FUTEX_WAIT_BITSET as u32 {
-                // futex(uaddr, op, val, timeout, uaddr2=NULL, val3=bitset).
-                libc::syscall(
-                    libc::SYS_futex,
-                    fut as usize,
-                    op,
-                    a[2] as c_long,
-                    a[3] as *const libc::timespec,
-                    0 as usize,
-                    a[5] as c_long, // val3 = the bitset
-                ) as c_long
-            } else {
-                0
-            }
+            handle_futex(&a)
         },
         // --- misc upper commonly needed ---
         278 => unsafe { libc::syscall(libc::SYS_getrandom, a[0] as usize, a[1] as usize, a[2] as u32) as c_long },
@@ -3723,6 +3764,126 @@ mod tests {
         let mut st2 = CpuState::new();
         let _ = cached_block(image, base, base, &mut st2 as *mut CpuState, 64).expect("recompile");
         assert!(block_cache_stats().0 >= before, "recompile must be served");
+    }
+
+    #[test]
+    fn futex_requeue_actually_moves_waiter() {
+        // Regression for a reachable-path gap (SH133): the futex handler used to
+        // return a fake 0 for REQUEUE(4)/CMP_REQUEUE(6) instead of reaching the
+        // real kernel. bionic pthread_cond broadcast parks wakees onto the
+        // condvar's own futex via REQUEUE; faking success strands the waiter.
+        // Prove the requeue semantics genuinely work through handle_futex:
+        //   src=1 dst=1 ; waiter blocks on W src; drive REQUEUE(src, nwake=0,
+        //   nreq=1, dst); a WAKE on dst must release the requeued waiter.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let src = unsafe { Box::into_raw(Box::new(1 as libc::c_int)) as usize };
+        let dst = unsafe { Box::into_raw(Box::new(1 as libc::c_int)) as usize };
+        let parked = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let p2 = parked.clone();
+        let d2 = done.clone();
+
+        let handle = std::thread::spawn(move || {
+            // Park the waiter on src with a timeout so the test can never hang
+            // even if the requeue is broken (waiter unblocks on timeout instead).
+            let trel = libc::timespec { tv_sec: 5, tv_nsec: 0 };
+            let waiter: [u64; 6] = [
+                src as u64,
+                libc::FUTEX_WAIT as u64, // val must equal *src (1)
+                1,                       // val
+                &trel as *const _ as u64,
+                0,
+                0,
+            ];
+            p2.store(true, Ordering::SeqCst);
+            let r = handle_futex(&waiter);
+            d2.store(r == 0, Ordering::SeqCst); // 0 == woken by futex (not timeout/err)
+        });
+        // Wait for the waiter to actually be parked, then requeue it onto dst.
+        while !parked.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        // Drive REQUEUE until it reports a waiter actually moved (the real
+        // kernel returns the moved count; a waiter may not be fully parked the
+        // instant after it clears `parked`, so spin briefly). Faking would
+        // return 0 forever and this must not.
+        let req: [u64; 6] = [src as u64, libc::FUTEX_REQUEUE as u64, 0, 1, dst as u64, 0];
+        let mut moved: i64 = 0;
+        for _ in 0..20_000 {
+            let r = handle_futex(&req);
+            if r >= 1 {
+                moved = r;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(moved >= 1, "REQUEUE must move a waiter (real kernel), got {moved}");
+        // Wake on dst: must release the requeued waiter.
+        let wake: [u64; 6] = [dst as u64, libc::FUTEX_WAKE as u64, 1, 0, 0, 0];
+        assert!(handle_futex(&wake) >= 1, "WAKE on dst must wake the requeued waiter");
+        let _ = handle.join();
+        assert!(done.load(Ordering::SeqCst), "requeued waiter must have been woken (not timed out)");
+        unsafe { drop(Box::from_raw(src as *mut libc::c_int)); drop(Box::from_raw(dst as *mut libc::c_int)); }
+    }
+
+    #[test]
+    fn futex_cmp_requeue_passes_real_cmp() {
+        // CMP_REQUEUE(6) adds *src==val3 gating. With matching value it behaves
+        // like REQUEUE (moves the waiter) and returns >=0 from the real kernel;
+        // with a mismatched val3 it must return -EAGAIN (real semantics), NOT a
+        // fabricated 0 (which would hide the "didn't move" condition from the
+        // guest's condvar/glibc state machine).
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let src = unsafe { Box::into_raw(Box::new(1 as libc::c_int)) as usize };
+        let dst = unsafe { Box::into_raw(Box::new(1 as libc::c_int)) as usize };
+        let parked = Arc::new(AtomicBool::new(false));
+        let p2 = parked.clone();
+        let handle = std::thread::spawn(move || {
+            let trel = libc::timespec { tv_sec: 5, tv_nsec: 0 };
+            let waiter: [u64; 6] = [src as u64, libc::FUTEX_WAIT as u64, 1, &trel as *const _ as u64, 0, 0];
+            p2.store(true, Ordering::SeqCst);
+            let _ = handle_futex(&waiter);
+        });
+        while !parked.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        // mismatched val3 (dst holds 1, compare 0) -> must report EAGAIN, not 0
+        let bad: [u64; 6] = [src as u64, libc::FUTEX_CMP_REQUEUE as u64, 0, 1, dst as u64, 0];
+        let r = handle_futex(&bad);
+        assert!(r < 0, "mismatched CMP_REQUEUE must return -EAGAIN, got {r}");
+        // matching val3 (compare 1 == *src) -> moves the waiter; spin until the
+        // real kernel reports it moved, then wake on dst.
+        let good: [u64; 6] = [src as u64, libc::FUTEX_CMP_REQUEUE as u64, 0, 1, dst as u64, 1];
+        let mut moved: i64 = -1;
+        for _ in 0..20_000 {
+            let r = handle_futex(&good);
+            if r >= 1 {
+                moved = r;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(moved >= 1, "matching CMP_REQUEUE must move the waiter, got {moved}");
+        let wake: [u64; 6] = [dst as u64, libc::FUTEX_WAKE as u64, 1, 0, 0, 0];
+        assert!(handle_futex(&wake) >= 1, "WAKE on dst must release the cmp-requeued waiter");
+        let _ = handle.join();
+        unsafe { drop(Box::from_raw(src as *mut libc::c_int)); drop(Box::from_raw(dst as *mut libc::c_int)); }
+    }
+
+    #[test]
+    fn futex_unknown_op_returns_enosys_not_zero() {
+        // A bogus / unrecognized futex op must surface an error, never the
+        // prior silent 0 (which let a condvar/rwlock believe its waiter was
+        // parked or woken when nothing happened).
+        let fut: [u64; 6] = [
+            0x1000 as u64,
+            (0x8000_0008u32 & 0x7f) as u64, // an op that maps to an unknown value
+            1, 0, 0, 0,
+        ];
+        let r = handle_futex(&fut);
+        assert!(r < 0, "unknown futex op must return an error, got {r}");
     }
 
     #[test]
