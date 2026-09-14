@@ -3969,6 +3969,12 @@ fn login_ui_textures() -> Vec<RealSprite> {
             ("Log In", [255u8, 255, 255, 255], 512u32, 80u32, 0.068f32),
             ("Email address", [96u8, 96, 110, 255], 512u32, 64u32, 0.060f32),
             ("Password", [96u8, 96, 110, 255], 512u32, 64u32, 0.060f32),
+            // SH140 — the login link row under the button: "Forgot password?" +
+            // "Sign up". "?" is a COMPOSITE glyph in SourceSansPro-Bold — this is
+            // the first visible artifact to exercise SH79's latent composite path
+            // (all prior shipped labels are simple letters).
+            ("Forgot password?", [59u8, 130, 246, 255], 640u32, 48u32, 0.048f32),
+            ("Sign up", [59u8, 130, 246, 255], 512u32, 48u32, 0.048f32),
         ] {
             match rasterize_login_label(name, color, w, h, pu) {
                 Some(s) => {
@@ -3976,6 +3982,42 @@ fn login_ui_textures() -> Vec<RealSprite> {
                         "[elfjit:renderemitter-login] rasterized text label '{name}' ({}x{})",
                         s.w, s.h
                     );
+                    // SH140 diagnostic: report the real opaque + first-opaque texels
+                    // of the ACTUAL sprite so the live probe can target a glyph.
+                    let (mut fx, mut fy, mut fos) = (0u64, 0u64, usize::MAX);
+                    let (mut sx, mut sy, mut n) = (0u64, 0u64, 0u64);
+                    for (t, px) in s.rgba.chunks_exact(4).enumerate() {
+                        if px[3] >= 250 {
+                            if t < fos {
+                                fos = t;
+                                fx = (t % s.w as usize) as u64;
+                                fy = (t / s.w as usize) as u64;
+                            }
+                            sx += (t % s.w as usize) as u64;
+                            sy += (t / s.w as usize) as u64;
+                            n += 1;
+                        }
+                    }
+                    if n > 0 {
+                        // centroid can land in white space (a word gap). Also find
+                        // the first OPAQUE texel at the glyph's mid-row (y = sy/n)
+                        // — guaranteed to be inside a stroke when it exists.
+                        let cy = sy / n;
+                        let mut rowx: Option<u64> = None;
+                        for (t, px) in s.rgba.chunks_exact(4).enumerate() {
+                            let yy = (t / s.w as usize) as u64;
+                            if yy == cy && px[3] >= 250 {
+                                rowx = Some((t % s.w as usize) as u64);
+                                break;
+                            }
+                        }
+                        eprintln!(
+                            "[elfjit:renderemitter-login] '{name}' first-opaque=({fx},{fy}) centroid=({},{}) midrow-{cy} first-opaque-x={:?} {n}px",
+                            sx / n,
+                            sy / n,
+                            rowx
+                        );
+                    }
                     out.push(s);
                 }
                 None => eprintln!(
@@ -4094,6 +4136,12 @@ pub fn render_engine_emitter_multi(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) 
             ("Log In", 0.0, -0.62, 0.05, 227, 36, 2),
             ("Email address", 0.0, -0.45, 0.045, 369, 36, 2),
             ("Password", 0.0, -0.54, 0.045, 318, 30, 2),
+            // SH140: the login link row UNDER the button ("Forgot password?"
+            // then "Sign up") — a recognizable Roblox login's signature
+            // highlighted-link pair. Probe = an opaque glyph-interior texel of
+            // the baked (59,130,246) link color (byte-exact over the dark bg).
+            ("Forgot password?", 0.0, -0.74, 0.030, 464, 5, 4),
+            ("Sign up", 0.0, -0.85, 0.030, 189, 8, 4),
         ]
     } else {
         &[
@@ -9846,7 +9894,7 @@ mod sh77_tests {
     fn sh77_cmap4_maps_ascii_log_in_to_nonzero_gid() {
         let Some(font) = real_font() else { return };
         let cmap = font_cmap4(&font).expect("cmap4");
-        for cp in "Log In Email address Password".chars().map(|c| c as u32) {
+        for cp in "Log In Email address Password Forgot password? Sign up".chars().map(|c| c as u32) {
             let gid = cmap.gid(&font, cp);
             assert!(gid != 0, "char {cp:#x} ({}'') maps to gid 0", char::from_u32(cp).unwrap());
         }
@@ -9862,6 +9910,9 @@ mod sh77_tests {
             ("Log In", [255u8, 255, 255, 255], 512u32, 80u32, 0.068f32),
             ("Email address", [96u8, 96, 110, 255], 512u32, 64u32, 0.060f32),
             ("Password", [96u8, 96, 110, 255], 512u32, 64u32, 0.060f32),
+            // SH140: the link-row labels (composite '?' exercises SH79's path).
+            ("Forgot password?", [59u8, 130, 246, 255], 640u32, 48u32, 0.048f32),
+            ("Sign up", [59u8, 130, 246, 255], 512u32, 48u32, 0.048f32),
         ] {
             let cmap = font_cmap4(&font).unwrap();
             let mut used = 0.0f32;
@@ -10050,6 +10101,84 @@ mod sh79_tests {
             let opaque = rgba.chunks_exact(4).filter(|px| px[3] >= 200).count();
             assert!(opaque > 20, "composite '{ch}' only {opaque} opaque px");
             eprintln!("[sh79] '{ch}' ({}) composite -> {opaque} opaque px", gid);
+        }
+    }
+
+    #[test]
+    fn sh140_forgot_password_link_label_composite_question_rasterizes() {
+        // SH140: the shipped "Forgot password?" label's '?' is a COMPOSITE glyph
+        // in SourceSansPro-Bold — this is the first VISIBLE artifact to exercise
+        // SH79's latent composite-glyph path (all prior shipped labels are simple
+        // letters). Assert the '?' decodes via the composite recursion to contours
+        // and the full shipped label (production dims/pu) rasterizes opaque pixels
+        // at the baked link color.
+        let Some(font) = real_font() else { return };
+        let cmap = font_cmap4(&font).unwrap();
+        let q = cmap.gid(&font, '?' as u32);
+        assert!(q != 0, "'?' gid 0");
+        let contours = font_glyph_contours(&font, q).expect("composite '?' contours");
+        assert!(!contours.is_empty(), "'?' no contours");
+        // Production table entry for the link label.
+        for (text, w, h, pu) in [
+            ("Forgot password?", 640u32, 48u32, 0.048f32),
+            ("Sign up", 512u32, 48u32, 0.048f32),
+        ] {
+            let color = [59u8, 130, 246, 255];
+            let mut used = 0.0f32;
+            for ch in text.chars() {
+                let gid = cmap.gid(&font, ch as u32);
+                if gid != 0 {
+                    used += font_advance_width(&font, gid) as f32 * pu;
+                }
+            }
+            let pen_start = (w as f32 - used) / 2.0;
+            let baseline = (h as f32 / 10.0) + 722.0 * pu;
+            let rgba = rasterize_text_row(&font, text, pu, color, w, h, pen_start, baseline);
+            let opaque = rgba.chunks_exact(4).filter(|px| px[3] >= 250).count();
+            assert!(opaque > 50, "'{text}' only {opaque} opaque px (invisible)");
+            let sample = rgba.chunks_exact(4).find(|px| px[3] >= 250).expect("opaque sample");
+            assert_eq!(&sample[..3], &color[..3], "'{text}' glyph rgb != link color");
+            // opaque CENTROID -> squarely in a glyph body (first-opaque texel is
+            // the anti-aliased glyph edge). Print it as the live probe coordinate.
+            let (mut sx, mut sy, mut n) = (0u64, 0u64, 0u64);
+            for (t, px) in rgba.chunks_exact(4).enumerate() {
+                if px[3] >= 250 {
+                    sx += (t % w as usize) as u64;
+                    sy += (t / w as usize) as u64;
+                    n += 1;
+                }
+            }
+            let (cx, cy) = (sx / n.max(1), sy / n.max(1));
+            // centroid can fall in a word gap; find the densest (max-alpha) texel
+            // AT the glyph mid-row — squarely in a stroke body for a stable probe.
+            let cy = sy / n;
+            let mut best = (0u64, 0u8, cx);
+            for (t, px) in rgba.chunks_exact(4).enumerate() {
+                if (t / w as usize) as u64 == cy && px[3] > best.1 {
+                    best = ((t % w as usize) as u64, px[3], cx);
+                }
+            }
+            let maxrow = best.0;
+            // Find a probe texel that is a SOLID stroke core: x-1, x, x+1 all a=255
+            // (so GL_LINEAR horizontal sampling stays full-strength link blue).
+            let mut core: Option<(u32, u32)> = None;
+            for py in 2u32..(h - 2) {
+                for px in 1u32..(w - 1) {
+                    let mid = (py as usize * w as usize + px as usize) * 4;
+                    let lft = (py as usize * w as usize + (px - 1) as usize) * 4;
+                    let rgt = (py as usize * w as usize + (px + 1) as usize) * 4;
+                    if rgba[mid + 3] == 255 && rgba[lft + 3] == 255 && rgba[rgt + 3] == 255 {
+                        core = Some((px, py));
+                        break;
+                    }
+                }
+                if core.is_some() { break; }
+            }
+            let (score_x, score_y) = core.expect("no 3-wide solid stroke core found");
+            let co = (score_y as usize * w as usize + score_x as usize) * 4;
+            assert!(rgba[co + 3] == 255, "'{text}' core not opaque");
+            assert_eq!(&rgba[co..co + 3], &color[..3], "'{text}' core rgb");
+            eprintln!("[sh140] '{text}' 3-WIDE SOLID CORE probe=({score_x},{score_y}) — use this as the live probe ({n} opaque px)");
         }
     }
 }
