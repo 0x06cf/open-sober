@@ -50,4 +50,37 @@ default product path unchanged and green.
    risks the SH44 block-re-eviction class (the drain body recompiles while
    running) and could hang (drain has no natural exit) — high risk.
 
-Command: runs/capture_sh127.sh (serialized ladder + frame attempt).
+## PREREQUISITE CONFIRMED (Sep 14, 2026, SH127 — runs/sh127-fwdump.txt)
+Recon deleg_b193ac24 + the fwdump run established the precise mechanism and
+confirmed the re-drive is VIABLE:
+- **Mechanism:** the drain pop-loop 0x102856e40 is a CALLEE of the engine's
+  idle-main-loop on guest thread 0 (the MAIN thread) — NOT a worker thread, NOT
+  the render thread (cf. --deque-node-live comment "the LIVE drainer's deque
+  (guest_tid 0 under --drain-poll)"). STANDALONE: StartApp's jit_run parks forever
+  in the idle futex at lr 0x10284d134, so the drain keeps cycling (191 pops).
+  COMBINED: StartApp RETURNS (the SH115-serial chain lets the engine complete its
+  boot / exit its main loop instead of idling), so after "ladder done" NO guest
+  thread is resident in the drain — that is the true cause of 0 frames, not a
+  timing bug and not StartApp "parking".
+- **Prerequisite check PASSED (fwdump):** after StartApp returns in the combined
+  run, the drain's deque-maintenance forward-edges are STILL COHERENT + the type-4
+  vector is STILL SEEDED:
+    deque-fwd 0x1068262e8=0x10620db24  0x106826300=0x102176bfc
+              0x106826308=0x1022199e0  | task-v4 [0x106829ea8]=0x7f00000001d8
+  All in-image; the seeded type4_frame_thunk is still installed. So the drain
+  state survives StartApp's return; only the resident DRIVER is missing.
+- **Low-risk resolution (recommended):** re-enter the engine's idle-main-loop
+  (NOT the drain body) as a BOUNDED top-level jit_run on a single thread AFTER
+  the ladder joined + LADLED_DONE + RENDERCTX published, reusing --drain-poll's
+  finite-timeout heartbeat (NO --drain-force-pop, NO block_cache_drop_region —
+  that re-imports SH44). Because JIT_SERIALIZE_RENDER guarantees the ladder's
+  jit_runs are done, exactly ONE top-level jit_run is in flight at re-drive time
+  (the SH55/64 concurrency half is already gone). Remaining uncertainty: the
+  idle-main-loop ENTRY pc is not yet disasm-pinned (lr 0x10284d134 is the futex
+  inside the loop, and 0x102856e40 the drain body); and a bounded-exit discipline
+  must be applied (TASKFRAME_WINDOW_MS/MAX_FRAMES) or the loop hangs (exit 124
+  lost). A dedicated read-only disasm of the idle-loop entry is the next
+  prerequisite before coding the re-drive.
+
+Command: runs/capture_sh127.sh (serialized ladder + frame attempt);
+runs/sh127-fwdump.txt (deque coherence proof).
