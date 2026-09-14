@@ -47,6 +47,27 @@ fn taskv4_frame_seed_active() -> bool {
         .unwrap_or(false)
 }
 
+/// SH128: opt-in combined-frame re-drive (see frontier-sh127-serial-combined-frame.md).
+/// When active, the main thread re-drives the engine's drain pop-loop
+/// 0x102856e40 as a bounded jit_run after the serialized ladder joins, and the
+/// renderinit presenter + --deque-node-live injector hold themselves open for
+/// the duration so type-4 dispatches become REAL presented frames in the SAME
+/// run that constructs the session. Inert (default-unregressed) without the flag.
+fn redrive_enabled() -> bool {
+    std::env::args().any(|a| a == "--deque-redrive")
+}
+
+/// SH128: is a packed deque head cell ("low48 = node ptr, high16 = tag") coherent
+/// for the re-drive — i.e. its low-48 node pointer is in-guest and its high-16 tag
+/// is a non-zero, plausible 16-bit value? Pure predicate (no deref), used to pick a
+/// head cell for the re-driven drain 0x102856e40 whose entry tag-guard compares
+/// [deque+8] tag against the packed head's high-16.
+fn sh128_packed_has_coherent_node(packed: u64) -> bool {
+    let node = packed & 0xffff_ffff_ffff;
+    let tag = packed >> 48;
+    node >= 0x100000000 && node >> 56 == 0 && tag != 0 && tag < 0x10000
+}
+
 /// Allocate `size` bytes of zeroed guest-visible RW memory from the arena.
 /// Returns 0 if the arena wasn't set. 16-byte aligned.
 fn guest_arena_alloc(size: usize) -> u64 {
@@ -97,6 +118,18 @@ static RENDERSCENE_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::Ato
 /// run concurrent with the ladder's jit_runs (the SH55/64 block-cache/message-
 /// queue desync that makes the combined run 1/3 flaky). 0 = ladder not done yet.
 static LADDER_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// SH128 combined re-drive: when StartApp RETURNS under the serialized ladder
+/// (combined run), no guest thread is resident in the engine's drain pop-loop
+/// 0x102856e40, so the --deque-node-live injector's type-4 nodes are never
+/// popped and the combined run presents 0 frames (frontier-sh127: structural
+/// drain-not-driven). --deque-redrive makes the MAIN thread re-run the drain
+/// as a bounded top-level jit_run AFTER the ladder joins, so injector -> type-4
+/// thunk -> PENDING_PRESENTS -> real frames on the currency thread. These
+/// statics coordinate all three parties around that window.
+static REDRIVE_X1: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static REDRIVE_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static REDRIVE_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Number of scene nodes `render_scene_base` laid out in R (0 = legacy empty
 /// scene). Mirrored so a later node-count change rebuilds R rather than
@@ -6331,6 +6364,21 @@ fn main() {
                         RENDERCTX.load(Ordering::Relaxed)
                     );
                 }
+                // SH128: under --deque-redrive the drain is re-driven by the MAIN
+                // thread after the ladder joins (StartApp returned -> no resident
+                // drainer yet). Wait for that re-drive to start before beginning the
+                // inject budget, so injected nodes dispatch INTO the live re-driver.
+                if redrive_enabled() {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+                    while !REDRIVE_ACTIVE.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    if REDRIVE_ACTIVE.load(Ordering::Relaxed) {
+                        eprintln!("[elfjit:deque-node-live] re-drive active — injecting into the re-driven drain");
+                    } else {
+                        eprintln!("[elfjit:deque-node-live] WARN re-drive never started (bound) — injecting into idle drain anyway");
+                    }
+                }
                 for it in 0..400 {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                     let is_ptr = |p: u64| p >= 0x100000000 && p >> 56 == 0 && p & 7 == 0;
@@ -7145,12 +7193,24 @@ fn main() {
                 // window so the run still exits 124 (stable idle) cleanly.
                 if taskv4_frame_seed_active() {
                     eprintln!("[elfjit:taskv4-frame] presenter thread: draining PENDING_PRESENTS on the currency-owning thread");
-                    // The drain flood (heartbeat-patched w4=4) adds PENDING far
-                    // faster than llvmpipe can present, so a greedy drain never
-                    // terminates. Rate-limit to a bounded, sustainable ~8 fps for a
-                    // bounded window so the run exits 124 (stable idle) cleanly with
-                    // a stream of CLEAN Ok(0x1) presents (the SH61b result: every
-                    // present on THIS thread is a genuine eglSwapBuffers success).
+                    // SH128: under --deque-redrive the MAIN thread re-runs the drain
+                    // pop-loop AFTER the ladder joins (StartApp already returned, so
+                    // no thread would otherwise be resident in the drain). Wait for
+                    // the re-drive to start, then hold the present-window open for
+                    // its whole duration so every type-4 dispatch becomes a frame.
+                    if redrive_enabled() {
+                        let wdl = std::time::Instant::now() + std::time::Duration::from_secs(300);
+                        while !REDRIVE_ACTIVE.load(core::sync::atomic::Ordering::Relaxed)
+                            && std::time::Instant::now() < wdl
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                        if REDRIVE_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
+                            eprintln!("[elfjit:taskv4-frame] re-drive active — presenting task frames for its full window");
+                        } else {
+                            eprintln!("[elfjit:taskv4-frame] WARN re-drive never started (bound) — presenting default window");
+                        }
+                    }
                     let t0 = std::time::Instant::now();
                     let max_window = std::time::Duration::from_millis(
                         std::env::var("TASKFRAME_WINDOW_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(2000),
@@ -7159,7 +7219,11 @@ fn main() {
                         .ok().and_then(|v| v.parse().ok()).unwrap_or(24);
                     let mut presented: u64 = 0;
                     let mut drained: u64 = 0;
-                    while presented < max_frames && t0.elapsed() < max_window {
+                    // Keep presenting during the default bounded window AND for the
+                    // whole --deque-redrive window (which may exceed max_frames/window).
+                    while (presented < max_frames && t0.elapsed() < max_window)
+                        || (redrive_enabled() && REDRIVE_ACTIVE.load(core::sync::atomic::Ordering::Relaxed))
+                    {
                         // Consume up to one pending request into the next frame
                         // (rate-limited: one present per loop iteration with a
                         // ~120ms cadence keeps it sustainable and visibly animating).
@@ -7174,6 +7238,7 @@ fn main() {
                             std::thread::sleep(std::time::Duration::from_millis(20));
                         }
                     }
+                    REDRIVE_DONE.store(true, core::sync::atomic::Ordering::Relaxed);
                     eprintln!(
                         "[elfjit:taskv4-frame] presenter drained: {presented} real task-driven frames presented (all on the currency-owning thread); pending={}",
                         PENDING_PRESENTS.load(core::sync::atomic::Ordering::Relaxed)
@@ -9098,7 +9163,12 @@ fn main() {
 
         // Let any game-start workers run before exiting (or rather: keep the
         // process alive long enough for a real main loop to iterate/block).
-        for _ in 0..4000 {
+        // SH128: --deque-redrive skips this multi-second settle window — the
+        // re-driven drain (below) IS the live main-loop work, and the sooner we
+        // reach it the sooner the designed window (renderinit present + injector
+        // both hold open for REDRIVE_ACTIVE) gets its frames.
+        let settle_iters: i32 = if redrive_enabled() { 3 } else { 4000 };
+        for _ in 0..settle_iters {
             std::thread::sleep(std::time::Duration::from_millis(10));
             if std::env::var_os("JIT_STATS").is_some() {
                 let (c, h) = arm64jit::jit::block_cache_stats();
@@ -9185,10 +9255,122 @@ fn main() {
                 Err(_) => eprintln!("[elfjit:v2boot-join] ladder thread panicked"),
             }
         }
+        // SH128 --deque-redrive: the engine's idle-main-loop drain 0x102856e40 is
+        // normally driven by StartApp's jit_run (guest thread 0). In the serialized
+        // combined run StartApp RETURNS, leaving NO thread resident in the drain, so
+        // --deque-node-live's type-4 nodes are never popped and the combined run
+        // presents 0 frames (frontier-sh127: structural drain-not-driven). Re-drive
+        // the drain here as a bounded top-level jit_run on the MAIN thread (whose TLS
+        // still holds the engine's scheduler object) so the injector's dispatches
+        // become real frames on the currency-owning renderinit presenter, which + the
+        // injector both hold open for the REDRIVE_ACTIVE window.
+        if redrive_enabled() {
+            let rtp = arm64jit::jit::current_guest_tp();
+            // x1 = task-queue obj = *( getter(0x67d67c0) + 0x410 ); the pump resolves
+            // it via TLS getter 0x102b9dee0 on the main thread (the scheduler was set
+            // up here during StartApp's jit_run and the TLS persists post-return).
+            let x1 = arm64jit::jit::run_guest_callback(0x102b9dee0, [0x67d67c0, 0, 0, 0, 0, 0, 0, 0], rtp)
+                .ok()
+                .filter(|&p| p >= 0x100000000 && p >> 56 == 0)
+                .map(|p| unsafe { *(p as *const u64).add(0x410 / 8) })
+                .unwrap_or(0);
+            // Deque head cell: one of the stable image .bss deque head cells the real
+            // per-consumer drain pops. Pick the first with a coherent packed head
+            // (low48 = in-guest node ptr, high16 = non-zero tag).
+            let mut headcell = 0u64;
+            for cand in [0x10682a638u64, 0x10682b338u64] {
+                if sh128_packed_has_coherent_node(unsafe { *(cand as *const u64) }) {
+                    headcell = cand;
+                    break;
+                }
+            }
+            eprintln!(
+                "[elfjit:redrive] x1(task-queue)={:#x} headcell={:#x} tp={:#x} — re-driving drain 0x102856e40",
+                x1, headcell, rtp
+            );
+            if x1 != 0 && headcell != 0 {
+                let tag = unsafe { *(headcell as *const u64) } >> 48;
+                let root = guest_arena_alloc(16);
+                if root != 0 {
+                    unsafe {
+                        *(root as *mut u64) = headcell; // [root+0]
+                        *((root + 8) as *mut u64) = tag; // [root+8]
+                    }
+                    REDRIVE_X1.store(x1, core::sync::atomic::Ordering::Relaxed);
+                    REDRIVE_ACTIVE.store(true, core::sync::atomic::Ordering::Relaxed);
+                    const RDSTACK: usize = 1 << 20;
+                    let rstack = Box::leak(vec![0u8; RDSTACK].into_boxed_slice());
+                    let mut st3 = arm64jit::jit::CpuState::new();
+                    st3.tpidr = rtp;
+                    st3.x[0] = root;
+                    st3.x[1] = x1;
+                    // finite timeout ms so the drain takes the timed-futex path and
+                    // returns cleanly (else it parks forever = exit-124 hang).
+                    let ms: u64 = std::env::var("TASKV4_REDRIVE_MS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(6000);
+                    st3.x[2] = ms;
+                    st3.x[31] = rstack.as_mut_ptr() as u64 + RDSTACK as u64 - 0x100;
+                    eprintln!(
+                        "[elfjit:redrive] running drain 0x102856e40 (root={:#x} tag={:#x} x1={:#x} timeout={}ms) — injector + presenter hold open",
+                        root, tag, x1, ms
+                    );
+                    match arm64jit::jit::jit_run(image, base, 0x102856e40, &mut st3 as *mut CpuState) {
+                        Err(e) => eprintln!("[elfjit:redrive] drain stopped: {e}"),
+                        Ok(r) => eprintln!("[elfjit:redrive] drain returned Ok({r:#x})"),
+                    }
+                    REDRIVE_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
+                    // Let the renderinit presenter flush any queued presents, bounded.
+                    let fdl = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while !REDRIVE_DONE.load(core::sync::atomic::Ordering::Relaxed)
+                        && std::time::Instant::now() < fdl
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    eprintln!(
+                        "[elfjit:redrive] presenter flushed (REDRIVE_DONE={}); combined re-drive complete",
+                        REDRIVE_DONE.load(core::sync::atomic::Ordering::Relaxed)
+                    );
+                } else {
+                    eprintln!("[elfjit:redrive] SKIP — guest arena unavailable for root");
+                }
+            } else {
+                eprintln!("[elfjit:redrive] SKIP — x1={:#x} headcell={:#x} (need both)", x1, headcell);
+            }
+        }
     }
     let (compiles, hits) = arm64jit::jit::block_cache_stats();
     if compiles > 0 || hits > 0 {
         eprintln!("[elfjit] block-cache: {compiles} compiles / {hits} hits");
+    }
+}
+
+// SH128 hermetic regression: the deque-head-cell coherence predicate used by
+// --deque-redrive to pick a head cell for the re-driven drain 0x102856e40.
+// Self-contained; no binary deref (the cells live only in a live run).
+#[cfg(test)]
+mod sh128_tests {
+    use super::sh128_packed_has_coherent_node;
+
+    #[test]
+    fn sh128_coherent_node_in_guest_with_tag() {
+        // node = 0x10682a000 (in guest), tag = 0x0abc (16-bit).
+        let packed: u64 = (0x0abcu64 << 48) | 0x10682a000u64;
+        assert!(sh128_packed_has_coherent_node(packed));
+    }
+
+    #[test]
+    fn sh128_high48_node_is_not_guest() {
+        // node above 2^48 (>>56 != 0) is not guest-addressable -> reject.
+        let packed: u64 = (0x0007u64 << 48) | 0xF0000000000000u64;
+        assert!(!sh128_packed_has_coherent_node(packed));
+    }
+
+    #[test]
+    fn sh128_zero_node_or_tag_rejected() {
+        assert!(!sh128_packed_has_coherent_node(0x10682a000u64)); // tag == 0
+        assert!(!sh128_packed_has_coherent_node(0x0abcu64 << 48)); // node == 0
     }
 }
 
