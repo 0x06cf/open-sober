@@ -84,3 +84,27 @@ confirmed the re-drive is VIABLE:
 
 Command: runs/capture_sh127.sh (serialized ladder + frame attempt);
 runs/sh127-fwdump.txt (deque coherence proof).
+
+## RE-DRIVE ENTRY PINNED (Sep 14, 2026 — deleg_591180f0, read-only disasm)
+The top-level loop to re-drive is the **drain pop-loop guest 0x102856e40** (NOT
+the wait-primitive 0x10284d014 — that is its park point). aarch64 objdump on the
+real binary:
+- **Entry:** jit_run(0x102856e40, x0=deque head/tail struct, x1=task-queue obj,
+  x2=finite_timeout_ms). Loop header 0x102856f04; per-node pop-loop 0x102856f94.
+- **Caller chain (REVERSED vs earlier assumption):** drain 0x102856e40 -> (loop
+  header) `bl 0x284d014` wait-prim at guest 0x102856f44 -> `bl 0x62d62d0`
+  (futex wrapper) at guest 0x10284d130 with lr 0x10284d134; and -> node-processor
+  `bl 0x285682c` at guest 0x102857020 (dispatching type-4 via vt[40]).
+- **Bounded exit recipe:** pass a FINITE x2 (timeout ms) so the wait-prim takes
+  the timed-futex path (else parks forever = the exit-124 hang). The drain also
+  exits on its seq-version guard (x21 = seq>>32; b.ne to exit returning w27&1).
+  So `jit_run(0x102856e40, x0, x1, finite_x2)` terminates cleanly.
+- **LAST OPEN QUESTION (blocks coding the re-drive):** the deque-root x0 and
+  task-queue-obj x1 live pointers. In the STANDALONE path these are recovered
+  from the running drainer's x20 (elfjit.rs:6366-6410, pc in [DRAIN_LO,DRAIN_HI)
+  && is_ptr(x20)); after StartApp returns (combined path) no thread is in the
+  drain, so x20 is unavailable. The re-drive therefore needs the deque root
+  derived from a stable global (candidates: the deque-fwd globals
+  0x1068262e8/300/308 confirmed coherent post-return) OR the root re-captured
+  during the ladder before StartApp parks. Deriving this is the next
+  prerequisite before the re-drive is codeable.
