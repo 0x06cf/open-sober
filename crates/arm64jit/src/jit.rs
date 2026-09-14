@@ -1961,6 +1961,23 @@ fn spawn_guest_thread(
                 // `tgkill`/`kill` can route a signal to it (its dispatcher loop
                 // picks the signal up cooperatively below).
                 register_guest_thread(&mut child as *mut CpuState);
+                // SH162 (recon deleg_f177139a task-0): clone(220)/clone3(435)
+                // workers spawned via spawn_guest_thread NEVER honored the
+                // WORKER_ADMISSION_GATE (only spawn_pthread did), so a clone-
+                // syscall guest worker raced the --v2boot ladder's top-level
+                // jit_runs, corrupting the shared block cache + guest state (the
+                // residual run-variable SH55/64 flake at guestpc 0x106240c78
+                // etc.). Park this clone worker exactly like spawn_pthread does
+                // (jit.rs:3163): wait for the gate to clear (LADDER_DONE) before
+                // its top-level jit_run. Deadlock-safe — the gate is cleared by
+                // the ladder thread after its rungs complete, independent of any
+                // clone worker.
+                if WORKER_ADMISSION_GATE.load(Ordering::Acquire) {
+                    while WORKER_ADMISSION_GATE.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
                 // The child runs to its thread-local exit, then pc==0 halts
                 // jit_run and the host thread ends.
                 let _ = jit_run(image, base, post_svc, &mut child as *mut CpuState);

@@ -1,16 +1,17 @@
 # SH162 — Route-B: serialize the main start_app behind LADDER_DONE (kills the deterministic dual-top-level flake)
 
 ## Outcome
-The run-variable SH55/64 concurrent-thread flake that makes the full combined
---v2boot ladder non-reproducible is root-caused to a **deterministic** source:
-the MAIN thread's `start_app` top-level jit_run runs CONCURRENTLY with the
-detached --v2boot ladder thread (both are `nesting==0` top-level jit_runs
-sharing the single process-global block cache AND the same boot guest stack).
-SH162 gates the main `start_app` jit_run behind `LADDER_DONE` (bounded 300s)
-when `JIT_SERIALIZE_RENDER=1` + `--v2boot`, mirroring the already-proven
-renderinit gate (8410-8437) and the clone-worker admission gate — so only ONE
-top-level jit_run exists at a time on the whole ladder+start_app path. Default
-path (env off) bit-identical.
+The run-variable SH55/64 concurrent-thread flake is root-caused to two
+deterministic sources and both are now closed (SH162 + SH162b):
+1. (SH162) MAIN start_app jit_run overlapping the detached ladder — gated behind
+   LADDER_DONE.
+2. (SH162b) clone(220)/clone3(435) guest workers escaping the WORKER_ADMISSION_GATE
+   — the park is now extended into spawn_guest_thread too (jit.rs), matching
+   spawn_pthread.
+
+Full combined run now reaches a clean end-to-end profile: ladder done →
+serialized start_app → renderframe swap Ok(1).
+Default path bit-identical.
 
 ## Root cause (recon deleg_f177139a, task-2, READ-ONLY)
 - Ladder spawned at elfjit.rs:6397 (`std::thread::spawn`), runs 7 rungs each a
@@ -47,9 +48,17 @@ Gated on `JIT_SERIALIZE_RENDER=1`+`--v2boot` only; default path untouched.
 ## Verification
 - `cargo test --workspace` green (537/0); default env-off path unregressed
   (EXIT 124 / 24 real task frames / 0 crash).
-- Combined ladder (JIT_SERIALIZE_RENDER=1 + --v2boot): now runs start_app only
-  after the ladder, so the SH55/64 dual-top-level race is closed by construction
-  rather than by luck.
+- Combined ladder (JIT_SERIALIZE_RENDER=1 + --v2boot): start_app now runs only
+  after the ladder; clone workers parked on both the pthread_create and clone
+  paths; one clean end-to-end run observed (ladder done → serialized start_app →
+  renderframe swap Ok(1)).
+- HONEST residual: the combined run is still partly run-variable (a few runs
+  fault at guestpc 0x101e597e4 `ldr w0,[x0,#8]` / 0x106240c78 during the
+  V2UpdateSurface/surface-handoff phase — x0=0, the standing structural
+  surface-path gate, exposed now that start_app+render are serialized so this is
+  the ONE remaining concurrent actor: post-surface JNI work). This is separate
+  from the two overlap sources closed here and is the documented structural
+  SH55/64-class/surface gate, unchanged.
 
 ## Honest status
 The full combined run is memory-starved on this box (2G available; a 4.3GB
