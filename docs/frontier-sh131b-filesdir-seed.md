@@ -48,6 +48,18 @@ DataModel wall (SH126); this is a latent-but-correct, boot-safe prerequisite
 (plain data stores, no guest byte changes), test-covered. The 24-frame plane
 and all opt-in gates are unchanged.
 
+## Negative finding (deleg_c42a1ed7, SH131c experiment — do NOT re-attempt)
+Disasm confirmed the seeded files-dir's real *consumers* are nativeInitFastLog
+(0x1021f7720, reads file 0x726d600 into stack [sp+32] long-form, can open a
+logfile under files/), nativeInitCrashpad (0x21faea8), and CrashpadHandlerMain
+(0x2bbf468) — NOT the rbx-storage.db path (that sources from **getCacheDir**,
+rodata 0x35a6f8 "rbx-storage files from CacheDir", behind the SH126 app-shell
+wall). Attempting to drive nativeInitFastLog as a `--v2boot-fastlog` rung
+SEGV'd (EXIT 139, `libc++abi: std::runtime_error`) because it touches
+gJNIEnvTLS `[x19,#1776]` first — the same SH129 structural JNI-arena class no
+harness rung reaches. REVERTED (code removed, tree clean); the set-filesdir
+seed stands as the latent-but-correct persistence prerequisite.
+
 ## Files
 - crates/arm64jit/examples/elfjit.rs: `seed_libcpp_long_string` + the
   `--v2boot-set-filesdir` rung + 2 hermetic tests.
