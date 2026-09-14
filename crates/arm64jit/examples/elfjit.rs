@@ -2772,6 +2772,106 @@ fn mesh_positions_to_ndc(m: &RbxMeshV2, fit: f32) -> Vec<f32> {
     out
 }
 
+/// Bounding-box center + max extent of a mesh's model-space positions (used to
+/// frame the object with a real perspective camera instead of NDC-baking).
+fn mesh_bbox(m: &RbxMeshV2) -> ([f32; 3], f32) {
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for p in &m.positions {
+        for k in 0..3 {
+            min[k] = min[k].min(p[k]);
+            max[k] = max[k].max(p[k]);
+        }
+    }
+    let c = [
+        (min[0] + max[0]) / 2.0,
+        (min[1] + max[1]) / 2.0,
+        (min[2] + max[2]) / 2.0,
+    ];
+    let ext = ((max[0] - min[0]).max(max[1] - min[1])).max(max[2] - min[2]);
+    (c, ext)
+}
+
+/// Raw model-space per-vertex vec4 interleaved [px,py,pz,1.0] — NOT NDC-baked —
+/// so a real projection MVP (a shader uniform) transforms them at draw time.
+fn mesh_positions_model(m: &RbxMeshV2) -> Vec<f32> {
+    let mut out = Vec::with_capacity(m.positions.len() * 4);
+    for p in &m.positions {
+        out.extend_from_slice(&[p[0], p[1], p[2], 1.0]);
+    }
+    out
+}
+
+/// Per-vertex [u,v] vec2 interleaved, exactly as parsed from the mesh file.
+fn mesh_uvs(m: &RbxMeshV2) -> Vec<f32> {
+    let mut out = Vec::with_capacity(m.uvs.len() * 2);
+    for u in &m.uvs {
+        out.extend_from_slice(u);
+    }
+    out
+}
+
+/// Interleave model-space positions (vec4) with per-vertex UVs (vec2) into a
+/// single stride-24 VBO: [px,py,pz,1, u,v] per vertex. `mvp_out` receives the
+/// column-major model-view-projection that turns the model-space positions into
+/// clip space under a fixed axis-aligned perspective camera framed on the bbox.
+fn mesh_interleave_model_uv(m: &RbxMeshV2, fit_fov: f32, aspect: f32, mvp_out: &mut [f32; 16]) -> Vec<f32> {
+    let (c, ext) = mesh_bbox(m);
+    // Camera looks down -Z at the origin from z=+d, framing the bbox in fit_fov.
+    let d = if ext > 1e-9 { (ext * 0.5) / (fit_fov * 0.5).tan() * 1.6 } else { 4.0 };
+    let near = ext.max(1e-3) * 0.05;
+    let far = (ext.max(1e-3) * 10.0).max(d + ext);
+    let mat_m = mat4_translate(-c[0], -c[1], -c[2]);
+    let mat_v = mat4_translate(0.0, 0.0, -d);
+    let mat_p = mat4_perspective(fit_fov, aspect, near, far);
+    *mvp_out = mat4_mul(mat_p, mat4_mul(mat_v, mat_m));
+    let n = m.positions.len();
+    let mut out = Vec::with_capacity(n * 6);
+    for k in 0..n {
+        let p = &m.positions[k];
+        out.extend_from_slice(&[p[0], p[1], p[2], 1.0]);
+        let uv = &m.uvs[k];
+        out.extend_from_slice(&[uv[0], uv[1]]);
+    }
+    out
+}
+
+/// Column-major 4x4 OpenGL perspective projection from a vertical FOV.
+fn mat4_perspective(fov_y: f32, aspect: f32, near: f32, far: f32) -> [f32; 16] {
+    let f = 1.0 / (fov_y / 2.0).tan();
+    let mut m = [0f32; 16];
+    m[0] = f / aspect;
+    m[5] = f;
+    m[10] = (far + near) / (near - far);
+    m[11] = -1.0;
+    m[14] = (2.0 * far * near) / (near - far);
+    m
+}
+
+/// Column-major 4x4 translation matrix.
+fn mat4_translate(x: f32, y: f32, z: f32) -> [f32; 16] {
+    let mut m = [0f32; 16];
+    m[0] = 1.0;
+    m[5] = 1.0;
+    m[10] = 1.0;
+    m[15] = 1.0;
+    m[12] = x;
+    m[13] = y;
+    m[14] = z;
+    m
+}
+
+/// Column-major 4x4 matrix multiply `a * b`.
+fn mat4_mul(a: [f32; 16], b: [f32; 16]) -> [f32; 16] {
+    let mut o = [0f32; 16];
+    for c in 0..4 {
+        for r in 0..4 {
+            o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+        }
+    }
+    o
+}
+
 /// Parse a DDS file that is a plain single-channel R8 (LUMINANCE) surface —
 /// the format Roblox's MaterialManager material maps ship as (e.g.
 /// `android/textures/studs.dds`: DDS, 2048x128, mips=12, DDPF_LUMINANCE,
@@ -8228,9 +8328,26 @@ fn main() {
                                     // context creation silently rasterizes nothing.
                                     let _ = gcall(plt_viewport, 0, 0, 1280, 720, 0, 0);
                                     let _ = gcall(plt_scissor, 0, 0, 1280, 720, 0, 0);
+                                    // --renderframe-mesh-tex <dds> + --renderframe-mesh <path>
+                                    // together: the SH143 REAL-UV + camera/MVP ascent. Instead of
+                                    // screen-space (gl_FragCoord) sampling, the real per-vertex UVs
+                                    // parsed from the .mesh are interpolated and sampled, and a real
+                                    // perspective MVP (computed from the mesh bbox + a fixed camera)
+                                    // transforms model-space positions at draw time (NOT NDC-baked).
+                                    // This is the ranked next render-plane ascent (per-object UV +
+                                    // real camera/MVP) over SH142's planar sampling.
                                     // Vertex shader: pass clip-space position straight
-                                    // through (data is already in NDC).
-                                    let vs_src = b"attribute vec4 aPos;\nvoid main(){ gl_Position = aPos; }\n\0";
+                                    // through (data is already in NDC) — except in the
+                                    // SH143 real-UV+MVP mode where a real uMVP uniform
+                                    // transforms model-space positions and aUV is the
+                                    // per-vertex UV varying.
+                                    let mesh_uv_mode = renderframe_args.iter().any(|a| a == "--renderframe-mesh-tex")
+                                        && renderframe_args.iter().any(|a| a == "--renderframe-mesh");
+                                    let vs_src: &[u8] = if mesh_uv_mode {
+                                        b"attribute vec4 aPos;\nattribute vec2 aUV;\nuniform mat4 uMVP;\nvarying vec2 vUV;\nvoid main(){ vUV = aUV; gl_Position = uMVP * aPos; }\n\0"
+                                    } else {
+                                        b"attribute vec4 aPos;\nvoid main(){ gl_Position = aPos; }\n\0"
+                                    };
                                     // --renderframe-tex: prove the GLES texture/uniform/shader
                                     // bridge path renders a TEXTURED draw through the engine's
                                     // own geometry wrapper. The fragment shader samples a 2x2 RGBA
@@ -8265,7 +8382,12 @@ fn main() {
                                         .position(|a| a == "--renderframe-mesh-tex")
                                         .and_then(|i| renderframe_args.get(i + 1).cloned())
                                         .map(std::path::PathBuf::from);
-                                    let fs_src: &[u8] = if mesh_tex.is_some() {
+                                    let fs_src: &[u8] = if mesh_uv_mode {
+                                        // SH143: sample the real per-vertex UV (interpolated vVarying),
+                                        // not screen-space. The studs atlas is 128x2048; real UV wraps
+                                        // it correctly over the sphere (the ascent over SH142 planar).
+                                        b"precision mediump float;\nuniform sampler2D uTex;\nvarying vec2 vUV;\nvoid main(){ gl_FragColor = texture2D(uTex, vUV); }\n\0"
+                                    } else if mesh_tex.is_some() {
                                         // Sample the full atlas: uv = frag/screen. The studs atlas is
                                         // 128x2048 (128 wide, 2048 rows), so map x to the atlas width and
                                         // scroll y across rows for a recognizable studs strip.
@@ -8311,6 +8433,8 @@ fn main() {
                                         .map(std::path::PathBuf::from);
                                     let mut verts: Vec<f32>;
                                     let mut idx: Vec<u32>;
+                                    let mut mvp_slot = [0f32; 16];
+                                    let mut mesh_uv_active = false;
                                     if let Some(mp) = &mesh_path {
                                         let mdata = std::fs::read(mp).expect("read mesh");
                                         let mesh = parse_roblox_mesh_v2(&mdata).expect("parse mesh v2");
@@ -8321,7 +8445,17 @@ fn main() {
                                             mesh.indices.len() / 3,
                                             mesh.indices.len()
                                         );
-                                        verts = mesh_positions_to_ndc(&mesh, 0.85);
+                                        let mut mvp_slot_local = [0f32; 16];
+                                        if mesh_uv_mode {
+                                            // SH143: real per-vertex UV + camera/MVP. Interleave
+                                            // model-space [x,y,z,1] with [u,v] per vertex (stride-24),
+                                            // transform via a real perspective MVP uniform.
+                                            verts = mesh_interleave_model_uv(&mesh, 60.0f32.to_radians(), 1280.0 / 720.0, &mut mvp_slot_local);
+                                            mvp_slot = mvp_slot_local;
+                                            mesh_uv_active = true;
+                                        } else {
+                                            verts = mesh_positions_to_ndc(&mesh, 0.85);
+                                        }
                                         idx = mesh.indices.clone();
                                     } else {
                                         verts = vec![
@@ -8372,12 +8506,18 @@ fn main() {
                                     let _ = gcall(plt_attachshader, program, fs_shader, 0, 0, 0, 0);
                                     // Bind attrib location 0 = aPos BEFORE link.
                                     let loc_name = objs.as_ptr() as u64 + 0xd20;
+                                    let loc_uv = objs.as_ptr() as u64 + 0xd40;
                                     std::ptr::copy_nonoverlapping(
                                         b"aPos\0".as_ptr(),
                                         loc_name as *mut u8,
                                         5,
                                     );
                                     let _ = gcall(plt_bindattrib, program, 0, loc_name, 0, 0, 0);
+                                    if mesh_uv_mode {
+                                        // SH143: bind per-vertex UV attrib to slot 1 (aUV).
+                                        std::ptr::copy_nonoverlapping(b"aUV\0".as_ptr(), loc_uv as *mut u8, 5);
+                                        let _ = gcall(plt_bindattrib, program, 1, loc_uv, 0, 0, 0);
+                                    }
                                     let _ = gcall(plt_linkprogram, program, 0, 0, 0, 0, 0);
                                     let _ = gcall(plt_useprogram, program, 0, 0, 0, 0, 0);
                                     eprintln!(
@@ -8509,7 +8649,29 @@ fn main() {
                                                                             let ploc = gcall(plt_get_uniform_location, program, uni, 0, 0, 0, 0).unwrap_or(0) & 0xffff_ffff;
                                                                             let _ = gcall(plt_uniform_1i, ploc, 0, 0, 0, 0, 0);
                                                                             eprintln!("[elfjit:renderframe-tex] texture tex_id={tex_id:#x} bound+uploaded uTex loc={ploc:#x}<-unit0");
-                                    }
+                                                                                                                                                    if mesh_uv_mode {
+                                                                                                                                                        // SH143: upload the REAL camera/MVP as uMVP (column-major,
+                                                                                                                                                        // transpose=0, 16 floats) so model-space mesh positions are
+                                                                                                                                                        // transformed at draw time. glUniformMatrix4fv is a
+                                                                                                                                                        // pure-integer+pointer ABI (loc,count,transpose,ptr) -> the
+                                                                                                                                                        // int resolver's Mesa binding, not the float-ABI bridge.
+                                                                                                                                                        let mvp_uname = objs.as_ptr() as u64 + 0xe40;
+                                                                                                                                                        std::ptr::copy_nonoverlapping(b"uMVP\0".as_ptr(), mvp_uname as *mut u8, 5);
+                                                                                                                                                        let mvp_loc = gcall(plt_get_uniform_location, program, mvp_uname, 0, 0, 0, 0).unwrap_or(0) & 0xffff_ffff;
+                                                                                                                                                        let mvp_buf = Box::leak(mvp_slot.to_vec().into_boxed_slice());
+                                                                                                                                                        let mvp_ptr = mvp_buf.as_ptr() as u64;
+                                                                                                                                                        let mat4fv = arm64jit::resolver::resolve_gles_int(b"glUniformMatrix4fv\0")
+                                                                                                                                                            .expect("glUniformMatrix4fv resolves");
+                                                                                                                                                        let mut sm = arm64jit::jit::CpuState::new();
+                                                                                                                                                        sm.tpidr = tpidr; sm.x[31] = isp;
+                                                                                                                                                        sm.x[0] = mvp_loc; sm.x[1] = 1; sm.x[2] = 0; sm.x[3] = mvp_ptr;
+                                                                                                                                                        let _ = arm64jit::jit::jit_run(iimg, ibase, mat4fv, &mut sm as *mut CpuState);
+                                                                                                                                                        eprintln!(
+                                                                                                                                                            "[elfjit:renderframe-mesh-tex] real MVP uploaded to uMVP loc={mvp_loc:#x} ({} verts interleaved stride-24)",
+                                                                                                                                                            verts.len() / 6
+                                                                                                                                                        );
+                                                                                                                                                    }
+                                                                                                                                                }
                                     // Diagnostics: real compile/link status. Reading a
                                     // GL int from a shifted-out 32-bit slot requires a
                                     // predictable result location — use glGetShaderiv/
@@ -8699,19 +8861,25 @@ fn main() {
                                     let prim = base + 0x400;
                                     let ibo = base + 0x500;
                                     let fmt_index: u32 = 3; // format[3]={size4, GL_FLOAT=0x1406} (table @0x100cecf8c). NOT format[5] which is {4, GL_SHORT=0x1402} — GL_SHORT misreads float verts -> degenerate.
+                                    // SH143 (mesh_uv_Active): TWO primitives over ONE interleaved
+                                    // stride-24 VBO — attrib0 = aPos (offset 0, fmt3 size4), attrib1 =
+                                    // aUV (offset 16, fmt1 size2 float) — the proven quad pattern.
+                                    let prim2 = base + 0x418;
+                                    let fmt_uv: u32 = 1; // format[1]={size2, GL_FLOAT}
                                     // descriptor[+72] = vbo id (the ARRAY_BUFFER we created)
                                     *(desc.wrapping_add(72) as *mut u32) = vbo as u32;
-                                    // stride table[vb=0] = 16 (tight vec4)
-                                    *(stride_tbl as *mut u64) = 16;
+                                    // stride table[vb=0]
+                                    *(stride_tbl as *mut u64) = if mesh_uv_active { 24 } else { 16 };
                                     // container
                                     *(renderer.wrapping_add(56) as *mut u64) = container;
                                     *(container.wrapping_add(72) as *mut u64) = prim;
-                                    *(container.wrapping_add(80) as *mut u64) = prim + 0x18; // 1 prim (stride 0x18)
+                                    *(container.wrapping_add(80) as *mut u64) =
+                                        if mesh_uv_active { prim2 + 0x18 } else { prim + 0x18 };
                                     *(container.wrapping_add(96) as *mut u64) = stride_tbl;
                                     // descriptor table is INLINE at renderer+0x48: entry[vb] @ +vb*16 is the
                                     // descriptor pointer (5b3546c ldr x11,[sp,#16] with
                                     // sp+16=renderer+0x48; 5b3547c ldr x10,[x11, w9<<4]).
-                                    // vb=0 -> the desc ptr lives at renderer+0x48.
+                                    // vb=0 -> the desc ptr lives at renderer+0x48. (Both prims share vb=0.)
                                     *(renderer.wrapping_add(0x48) as *mut u64) = desc;
                                     // primitive: [+0]=vb idx(w9=0), [+4]=offset(w21=0),
                                     // [+8]=format idx(w28=fmt_index), [+12]=type(w22=0 ->
@@ -8721,6 +8889,14 @@ fn main() {
                                     *(prim.wrapping_add(8) as *mut u32) = fmt_index;
                                     *(prim.wrapping_add(12) as *mut u32) = 0;
                                     *(prim.wrapping_add(16) as *mut u32) = 0;
+                                    if mesh_uv_active {
+                                        // prim2: vb0, offset 16 bytes, fmt1 (size2 float), attrib1 = aUV.
+                                        *(prim2 as *mut u32) = 0;
+                                        *(prim2.wrapping_add(4) as *mut u32) = 16;
+                                        *(prim2.wrapping_add(8) as *mut u32) = fmt_uv;
+                                        *(prim2.wrapping_add(12) as *mut u32) = 1;
+                                        *(prim2.wrapping_add(16) as *mut u32) = 0;
+                                    }
                                     // IBO: renderer[+120]=ibo ; [ibo+72]=EBO id
                                     *(renderer.wrapping_add(120) as *mut u64) = ibo;
                                     *(ibo.wrapping_add(72) as *mut u32) = ebo as u32;
@@ -10990,3 +11166,70 @@ mod mesh_tests {
     }
 }
 
+
+#[cfg(test)]
+mod sh143_mvp_tests {
+    use super::*;
+
+    #[test]
+    fn sh143_mat4_translate_places_rows() {
+        // Column-major: translate writes +x,+y,+z into the 4th column [12],[13],[14].
+        let m = mat4_translate(3.0, -2.0, 5.0);
+        assert_eq!(m[12], 3.0);
+        assert_eq!(m[13], -2.0);
+        assert_eq!(m[14], 5.0);
+    }
+
+    #[test]
+    fn sh143_mat4_perspective_standard_layout() {
+        let fov = 60.0f32.to_radians();
+        let aspect = 1280.0 / 720.0;
+        let p = mat4_perspective(fov, aspect, 0.1, 100.0);
+        // m[11] = -1 (the w row), m[14] = 2nf/(n-f) < 0, m[10] finite.
+        assert_eq!(p[11], -1.0);
+        assert!(p[14] < 0.0);
+        assert!(p[0] > 0.0, "x scale = f/aspect");
+        assert!(p[5] > p[0], "y scale = f > x scale for wide aspect");
+    }
+
+    #[test]
+    fn sh143_mvp_maps_origin_infront_of_isfinite() {
+        // A unit mesh at origin, camera -Z at distance d: the origin must land in
+        // clip space with finite coords and negative-ish z (in front), and w>0.
+        let mesh = RbxMeshV2 {
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: vec![],
+            uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+            indices: vec![0, 1, 2],
+        };
+        let mut mvp = [0f32; 16];
+        let v = mesh_interleave_model_uv(&mesh, 60.0f32.to_radians(), 1280.0 / 720.0, &mut mvp);
+        // 3 verts x stride-24 (6 floats).
+        assert_eq!(v.len(), 3 * 6);
+        // Stride layout: [x,y,z,1, u,v].
+        assert_eq!(v[0], 0.0); // first position x
+        assert_eq!(v[3], 1.0); // w
+        assert_eq!(v[4], 0.0); // first uv u
+        assert_eq!(v[5], 0.0); // first uv v
+        // MVP maps the origin (translated to camera center) to finite clip z<0, w>0.
+        let x = mvp[0] * 0.0 + mvp[4] * 0.0 + mvp[8] * 0.0 + mvp[12];
+        let y = mvp[1] * 0.0 + mvp[5] * 0.0 + mvp[9] * 0.0 + mvp[13];
+        let z = mvp[2] * 0.0 + mvp[6] * 0.0 + mvp[10] * 0.0 + mvp[14];
+        let w = mvp[3] * 0.0 + mvp[7] * 0.0 + mvp[11] * 0.0 + mvp[15];
+        assert!(x.is_finite() && y.is_finite() && z.is_finite() && w.is_finite());
+        assert!(w > 0.0, "origin w>0 (in front of camera), got {w}");
+    }
+
+    #[test]
+    fn sh143_mesh_bbox_center_and_extent() {
+        let mesh = RbxMeshV2 {
+            positions: vec![[0.0, 0.0, 0.0], [10.0, 20.0, 30.0]],
+            normals: vec![],
+            uvs: vec![],
+            indices: vec![0, 1],
+        };
+        let (c, ext) = mesh_bbox(&mesh);
+        assert_eq!(c, [5.0, 10.0, 15.0]);
+        assert_eq!(ext, 30.0);
+    }
+}
