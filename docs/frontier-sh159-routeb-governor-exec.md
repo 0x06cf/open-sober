@@ -40,15 +40,17 @@ makes the MODERN sub-dispatch (gov 0x2e9fb54 blr) resolvable. Runtime shows this
 did not change the observed fault (identical with/without), so it is inert for this
 gate; kept as harmless opt-in insurance.
 
-## NEXT GATE (honest)
-With the governor entered, it runs into its MODERN appendix and faults at
-**guest 0x102e9fb10** (`ldrb w8,[sp,#408]`) right after `bl 23c1504` returns —
-SIGSEGV fault=0x0, x0=0x0. 0x23c1504 is `nativeAppBridgeV2InitWithParams`'s
-param sub-reader (reads x5 param union). The appendix at 0x2e9faf8 passes x5=
-sp+0x198 (the stack union). Either the union is uninitialized (values feed a NULL
-read) or 23c1504 expects a real param-union content the harness doesn't populate.
-Next work: give the appendix a coherent param union (or seed the specific field
-23c1504 reads), so the governor proceeds to `bl 0x258c6e4 nativeAppBridgeV2StartAppWithParams`.
+## NEXT GATE — CROSSED BY SH159c/d/e (see runs archives)
+With the governor entered it took the faulting MODERN appendix; SH159c routes it
+around (b.cc->b patch) to the ROUTER path; SH159d substitutes the impl[+0x408]
+DISPATCH deref (NULL under partial do-init) with a benign leaf; SH159e makes
+startAppWithParams' param inputs deterministic. The engine now boots PAST the
+entire governor: region-watch 0x102e9fa84 enter -> 0x102e9fb58 (past DISPATCH
+blr) -> 0x102e9fb6c (past bl 0x258c6e4 startAppWithParams) -> 0x102e9fbbc ->
+0x102e9fbc8, and INTO nativePostClientSettingsLoadedInitialization3
+(guest 0x2256510) — the SH156 frontier (governor -> nativeAppBridgeStartAppWithParams)
+is crossed end-to-end. NEXT: the new fault at 0x2256510 (x0=0 at a vtable
+dispatch `ldr x9,[x0]; ldr x9,[x9,#32]; blr x9`).
 
 ## Hermetic tests (elfjit.rs, +0 this commit — probes only; no behavior change to code paths gated by the fix)
 The SH159 regression surface is the runtime governor-reach region-watch, not a
