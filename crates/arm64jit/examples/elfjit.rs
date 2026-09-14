@@ -2835,12 +2835,28 @@ fn mesh_interleave_model_uv(m: &RbxMeshV2, fit_fov: f32, aspect: f32, yaw_rad: f
     };
     *mvp_out = mat4_mul(mat_p, mat4_mul(mat_v, mat_m));
     let n = m.positions.len();
-    let mut out = Vec::with_capacity(n * 6);
+    let has_normals = m.normals.len() == n;
+    let mut out = Vec::with_capacity(n * (if has_normals { 9 } else { 6 }));
     for k in 0..n {
         let p = &m.positions[k];
         out.extend_from_slice(&[p[0], p[1], p[2], 1.0]);
         let uv = &m.uvs[k];
         out.extend_from_slice(&[uv[0], uv[1]]);
+        if has_normals {
+            let nrm = &m.normals[k];
+            out.extend_from_slice(&[nrm[0], nrm[1], nrm[2]]);
+        } else {
+            out.extend_from_slice(&[0.0, 0.0, 1.0]);
+        }
+    }
+    out
+}
+
+/// Per-vertex [nx,ny,nz] normals, mirroring mesh_uvs (SH145 lighting source).
+fn mesh_normals(m: &RbxMeshV2) -> Vec<f32> {
+    let mut out = Vec::with_capacity(m.normals.len() * 3);
+    for n in &m.normals {
+        out.extend_from_slice(n);
     }
     out
 }
@@ -8380,7 +8396,10 @@ fn main() {
                                     let mesh_uv_mode = renderframe_args.iter().any(|a| a == "--renderframe-mesh-tex")
                                         && renderframe_args.iter().any(|a| a == "--renderframe-mesh");
                                     let vs_src: &[u8] = if mesh_uv_mode {
-                                        b"attribute vec4 aPos;\nattribute vec2 aUV;\nuniform mat4 uMVP;\nvarying vec2 vUV;\nvoid main(){ vUV = aUV; gl_Position = uMVP * aPos; }\n\0"
+                                        // SH145: add per-vertex normals + a model-rotation uniform so
+                                        // the light is WORLD-fixed (as the model yaw-orbits, the shading
+                                        // moves) — vN = mat3(uModelRot) * aNormal. aNormal is a 3rd attrib.
+                                        b"attribute vec4 aPos;\nattribute vec2 aUV;\nattribute vec3 aNormal;\nuniform mat4 uMVP;\nuniform mat4 uModelRot;\nvarying vec2 vUV;\nvarying vec3 vN;\nvoid main(){ vUV = aUV; vN = mat3(uModelRot) * aNormal; gl_Position = uMVP * aPos; }\n\0"
                                     } else {
                                         b"attribute vec4 aPos;\nvoid main(){ gl_Position = aPos; }\n\0"
                                     };
@@ -8419,10 +8438,10 @@ fn main() {
                                         .and_then(|i| renderframe_args.get(i + 1).cloned())
                                         .map(std::path::PathBuf::from);
                                     let fs_src: &[u8] = if mesh_uv_mode {
-                                        // SH143: sample the real per-vertex UV (interpolated vVarying),
-                                        // not screen-space. The studs atlas is 128x2048; real UV wraps
-                                        // it correctly over the sphere (the ascent over SH142 planar).
-                                        b"precision mediump float;\nuniform sampler2D uTex;\nvarying vec2 vUV;\nvoid main(){ gl_FragColor = texture2D(uTex, vUV); }\n\0"
+                                        // SH145: diffuse lighting. vN is the world-space normal (varying
+                                        // from the VS's mat3(uModelRot)*aNormal); a fixed world-space
+                                        // light dir. color = tex * (ambient + diffuse*dot(N,L)).
+                                        b"precision mediump float;\nuniform sampler2D uTex;\nvarying vec2 vUV;\nvarying vec3 vN;\nvoid main(){ vec3 L = normalize(vec3(0.4, 0.7, 0.6)); vec3 n = normalize(vN); float d = max(dot(n, L), 0.0); vec4 t = texture2D(uTex, vUV); gl_FragColor = vec4(t.rgb * (0.30 + 0.70*d), 1.0); }\n\0"
                                     } else if mesh_tex.is_some() {
                                         // Sample the full atlas: uv = frag/screen. The studs atlas is
                                         // 128x2048 (128 wide, 2048 rows), so map x to the atlas width and
@@ -8475,6 +8494,7 @@ fn main() {
                                     let mut mesh_ext = 0f32;
                                     let mut mesh_uv_program = 0u32;
                                     let mut mesh_uv_mvp_loc = 0u64;
+                                    let mut mesh_uv_modelrot_loc = 0u64;
                                     if let Some(mp) = &mesh_path {
                                         let mdata = std::fs::read(mp).expect("read mesh");
                                         let mesh = parse_roblox_mesh_v2(&mdata).expect("parse mesh v2");
@@ -8558,6 +8578,9 @@ fn main() {
                                         // SH143: bind per-vertex UV attrib to slot 1 (aUV).
                                         std::ptr::copy_nonoverlapping(b"aUV\0".as_ptr(), loc_uv as *mut u8, 5);
                                         let _ = gcall(plt_bindattrib, program, 1, loc_uv, 0, 0, 0);
+                                        // SH145: bind per-vertex NORMAL attrib to slot 2 (aNormal).
+                                        std::ptr::copy_nonoverlapping(b"aNormal\0".as_ptr(), loc_uv.wrapping_add(0x20) as *mut u8, 8);
+                                        let _ = gcall(plt_bindattrib, program, 2, loc_uv.wrapping_add(0x20), 0, 0, 0);
                                     }
                                     let _ = gcall(plt_linkprogram, program, 0, 0, 0, 0, 0);
                                     let _ = gcall(plt_useprogram, program, 0, 0, 0, 0, 0);
@@ -8709,9 +8732,21 @@ fn main() {
                                                                                                                                                         sm.tpidr = tpidr; sm.x[31] = isp;
                                                                                                                                                         sm.x[0] = mvp_loc; sm.x[1] = 1; sm.x[2] = 0; sm.x[3] = mvp_ptr;
                                                                                                                                                         let _ = arm64jit::jit::jit_run(iimg, ibase, mat4fv, &mut sm as *mut CpuState);
+                                                                                                                                                        // SH145: upload the (identity) model-rotation to uModelRot so the VS's
+                                                                                                                                                        // mat3(uModelRot)*aNormal yields world-space normals for the diffuse light.
+                                                                                                                                                        let mrot_uname = objs.as_ptr() as u64 + 0x1000;
+                                                                                                                                                        std::ptr::copy_nonoverlapping(b"uModelRot\0".as_ptr(), mrot_uname as *mut u8, 10);
+                                                                                                                                                        let mrot_loc = gcall(plt_get_uniform_location, program, mrot_uname, 0, 0, 0, 0).unwrap_or(0) & 0xffff_ffff;
+                                                                                                                                                        mesh_uv_modelrot_loc = mrot_loc;
+                                                                                                                                                        let mrot: [f32; 16] = mat4_rotate_y(0.0);
+                                                                                                                                                        let mrot_buf = Box::leak(mrot.to_vec().into_boxed_slice());
+                                                                                                                                                        let mut sm2 = arm64jit::jit::CpuState::new();
+                                                                                                                                                        sm2.tpidr = tpidr; sm2.x[31] = isp;
+                                                                                                                                                        sm2.x[0] = mrot_loc; sm2.x[1] = 1; sm2.x[2] = 0; sm2.x[3] = mrot_buf.as_ptr() as u64;
+                                                                                                                                                        let _ = arm64jit::jit::jit_run(iimg, ibase, mat4fv, &mut sm2 as *mut CpuState);
                                                                                                                                                         eprintln!(
-                                                                                                                                                            "[elfjit:renderframe-mesh-tex] real MVP uploaded to uMVP loc={mvp_loc:#x} ({} verts interleaved stride-24)",
-                                                                                                                                                            verts.len() / 6
+                                                                                                                                                            "[elfjit:renderframe-mesh-tex] real MVP + uModelRot uploaded (uMVP loc={mvp_loc:#x} uModelRot loc={mrot_loc:#x}; {} verts interleaved stride-36, normals lit)",
+                                                                                                                                                            verts.len() / 9
                                                                                                                                                         );
                                                                                                                                                     }
                                                                                                                                                 }
@@ -8904,20 +8939,23 @@ fn main() {
                                     let prim = base + 0x400;
                                     let ibo = base + 0x500;
                                     let fmt_index: u32 = 3; // format[3]={size4, GL_FLOAT=0x1406} (table @0x100cecf8c). NOT format[5] which is {4, GL_SHORT=0x1402} — GL_SHORT misreads float verts -> degenerate.
-                                    // SH143 (mesh_uv_Active): TWO primitives over ONE interleaved
-                                    // stride-24 VBO — attrib0 = aPos (offset 0, fmt3 size4), attrib1 =
-                                    // aUV (offset 16, fmt1 size2 float) — the proven quad pattern.
+                                    // SH143 (mesh_uv_Active): THREE primitives over ONE interleaved
+                                    // stride-36 VBO — attrib0 = aPos (offset 0, fmt3 size4), attrib1 =
+                                    // aUV (offset 16, fmt1 size2 float), attrib2 = aNormal (offset 24,
+                                    // fmt2 size3 float — SH145 lighting). The proven quad pattern + 1.
                                     let prim2 = base + 0x418;
+                                    let prim3 = base + 0x430;
                                     let fmt_uv: u32 = 1; // format[1]={size2, GL_FLOAT}
+                                    let fmt_norm: u32 = 2; // format[2]={size3, GL_FLOAT} (verified: 0x1406 size3)
                                     // descriptor[+72] = vbo id (the ARRAY_BUFFER we created)
                                     *(desc.wrapping_add(72) as *mut u32) = vbo as u32;
                                     // stride table[vb=0]
-                                    *(stride_tbl as *mut u64) = if mesh_uv_active { 24 } else { 16 };
+                                    *(stride_tbl as *mut u64) = if mesh_uv_active { 36 } else { 16 };
                                     // container
                                     *(renderer.wrapping_add(56) as *mut u64) = container;
                                     *(container.wrapping_add(72) as *mut u64) = prim;
                                     *(container.wrapping_add(80) as *mut u64) =
-                                        if mesh_uv_active { prim2 + 0x18 } else { prim + 0x18 };
+                                        if mesh_uv_active { prim3 + 0x18 } else { prim + 0x18 };
                                     *(container.wrapping_add(96) as *mut u64) = stride_tbl;
                                     // descriptor table is INLINE at renderer+0x48: entry[vb] @ +vb*16 is the
                                     // descriptor pointer (5b3546c ldr x11,[sp,#16] with
@@ -8939,6 +8977,12 @@ fn main() {
                                         *(prim2.wrapping_add(8) as *mut u32) = fmt_uv;
                                         *(prim2.wrapping_add(12) as *mut u32) = 1;
                                         *(prim2.wrapping_add(16) as *mut u32) = 0;
+                                        // prim3: vb0, offset 24 bytes, fmt2 (size3 float), attrib2 = aNormal.
+                                        *(prim3 as *mut u32) = 0;
+                                        *(prim3.wrapping_add(4) as *mut u32) = 24;
+                                        *(prim3.wrapping_add(8) as *mut u32) = fmt_norm;
+                                        *(prim3.wrapping_add(12) as *mut u32) = 2;
+                                        *(prim3.wrapping_add(16) as *mut u32) = 0;
                                     }
                                     // IBO: renderer[+120]=ibo ; [ibo+72]=EBO id
                                     *(renderer.wrapping_add(120) as *mut u64) = ibo;
@@ -9250,6 +9294,17 @@ fn main() {
                                             sm.tpidr = tpidr; sm.x[31] = isp;
                                             sm.x[0] = mvp_loc; sm.x[1] = 1; sm.x[2] = 0; sm.x[3] = mvp_buf.as_ptr() as u64;
                                             let _ = arm64jit::jit::jit_run(iimg, ibase, mat4fv, &mut sm as *mut CpuState);
+                                            // SH145: upload the SAME yaw rotation to uModelRot so the VS's
+                                            // mat3(uModelRot)*aNormal keeps normals world-aligned (lighting
+                                            // tracks the orbit — normals are model-space otherwise).
+                                            if mesh_uv_modelrot_loc != 0 {
+                                                let mrot = mat4_rotate_y(yaw);
+                                                let mrb = Box::leak(mrot.to_vec().into_boxed_slice());
+                                                let mut smr = arm64jit::jit::CpuState::new();
+                                                smr.tpidr = tpidr; smr.x[31] = isp;
+                                                smr.x[0] = mesh_uv_modelrot_loc; smr.x[1] = 1; smr.x[2] = 0; smr.x[3] = mrb.as_ptr() as u64;
+                                                let _ = arm64jit::jit::jit_run(iimg, ibase, mat4fv, &mut smr as *mut CpuState);
+                                            }
                                             // Drive the engine's own geometry wrapper (same renderer/VBO/EBO).
                                             let mut swn = arm64jit::jit::CpuState::new();
                                             swn.tpidr = tpidr; swn.x[31] = isp;
@@ -11309,13 +11364,18 @@ mod sh143_mvp_tests {
         };
         let mut mvp = [0f32; 16];
         let v = mesh_interleave_model_uv(&mesh, 60.0f32.to_radians(), 1280.0 / 720.0, 0.0, &mut mvp);
-        // 3 verts x stride-24 (6 floats).
-        assert_eq!(v.len(), 3 * 6);
-        // Stride layout: [x,y,z,1, u,v].
+        // 3 verts x stride-36 (9 floats: [x,y,z,1, u,v, nx,ny,nz]) — SH145 always
+        // emits per-vertex normals (default [0,0,1] when the mesh has none) for a
+        // uniform stride so the 3-attribute coherent renderer is linear.
+        assert_eq!(v.len(), 3 * 9);
+        // Stride layout: [x,y,z,1, u,v, nx,ny,nz].
         assert_eq!(v[0], 0.0); // first position x
         assert_eq!(v[3], 1.0); // w
         assert_eq!(v[4], 0.0); // first uv u
         assert_eq!(v[5], 0.0); // first uv v
+        assert_eq!(v[6], 0.0); // default normal x
+        assert_eq!(v[7], 0.0); // default normal y
+        assert_eq!(v[8], 1.0); // default normal z
         // MVP maps the origin (translated to camera center) to finite clip z<0, w>0.
         let x = mvp[0] * 0.0 + mvp[4] * 0.0 + mvp[8] * 0.0 + mvp[12];
         let y = mvp[1] * 0.0 + mvp[5] * 0.0 + mvp[9] * 0.0 + mvp[13];
@@ -11383,5 +11443,25 @@ mod sh143_mvp_tests {
         let fz = [r90[8], r90[9], r90[10]]; // col 2 = image of +Z
         assert!((fx[0]).abs() < 1e-3 && (fx[1]).abs() < 1e-3 && (fx[2] + 1.0).abs() < 1e-3, "rot90 +X -> (0,0,-1): {fx:?}");
         assert!((fz[0] - 1.0).abs() < 1e-3 && (fz[1]).abs() < 1e-3 && (fz[2]).abs() < 1e-3, "rot90 +Z -> (1,0,0): {fz:?}");
+    }
+
+    #[test]
+    fn sh145_interleave_includes_real_per_vertex_normals() {
+        // A mesh WITH normals must emit stride-36 (9 floats/vert) with the real
+        // normal values at offset 24 (indices 6,7,8), so SH145's diffuse light
+        // has genuine per-vertex normals, not the [0,0,1] fallback.
+        let mesh = RbxMeshV2 {
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            normals: vec![[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            uvs: vec![[0.0, 0.0], [1.0, 0.0]],
+            indices: vec![0, 1, 0],
+        };
+        let mut mvp = [0f32; 16];
+        let v = mesh_interleave_model_uv(&mesh, 60.0f32.to_radians(), 1280.0 / 720.0, 0.0, &mut mvp);
+        assert_eq!(v.len(), 2 * 9);
+        // v0: [x,y,z,1, u,v, nx,ny,nz] = [0,0,0,1, 0,0, 0,1,0]
+        assert_eq!(&v[0..9], &[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+        // v1: [1,0,0,1, 1,0, 0,0,1]
+        assert_eq!(&v[9..18], &[1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
     }
 }
