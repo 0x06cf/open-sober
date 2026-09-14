@@ -1465,15 +1465,22 @@ fn routeb_patch_gov_dispatch() {
         eprintln!("[elfjit:routeB] SH159d governor DISPATCH leaf registered at {a:#x}");
         a
     });
-    // Inert DISPATCH: [+0]=0, [+0x18]=leaf (only [+0x18] is used by the patch).
-    // Map the .bss page first (0x106a72000 may be a page the engine's boot
-    // leaves unmapped — the SIGSEGV fault=0x1006a72018 proved it).
-    if routeb_map_guest_page(DISPATCH) {
-        eprintln!("[elfjit:routeB] SH159d mapped guest page 0x{:x} for inert DISPATCH", DISPATCH & !0xfff);
-    }
+    // Inert DISPATCH: [+0]=0, [+0x18]=leaf, [+0x30]=leaf (the governor TAIL also
+    // dispatches it via `ldr x8,[x0]; ldr x8,[x8,#48]` at 0x2e9fd90, so vt[+0x48]
+    // [=+0x30 byte] must also be a benign leaf). Recon deleg_19f62ad8.
+    // The DISPATCH vtable object lives at DISPATCH+0x40 (a 0x50-byte all-leaf vt).
+    let dvt = DISPATCH + 0x40;
     let dp = DISPATCH as *mut u64;
     unsafe {
-        *(dp.wrapping_add(0x18 / 8)) = leaf;
+        for s in 0..(0x50 / 8) {
+            *(dvt.wrapping_add(s * 8) as *mut u64) = leaf; // vt all slots benign
+        }
+        *(dp) = dvt; // DISPATCH[+0]=vt (ldr x8,[x0])
+        *(dp.wrapping_add(0x18 / 8)) = leaf; // SH159d's `ldr x9,[x0,#24]` needs +0x18=leaf
+    }
+    // Map the .bss page first (0x106a72000 may be a page the engine's boot leaves unmapped).
+    if routeb_map_guest_page(DISPATCH) {
+        eprintln!("[elfjit:routeB] SH159d mapped guest page 0x{:x} for inert DISPATCH+vtable (+0x40..+0x90)", DISPATCH & !0xfff);
     }
     let page = WINDOW & !0xfff;
     unsafe {
@@ -1526,7 +1533,7 @@ fn routeb_patch_startapp_init3_gates() {
             libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_EXEC);
         }
     }
-    arm64jit::jit::block_cache_drop_region(0x1023f00f0, 0x1023f01c0);
+    arm64jit::jit::block_cache_drop_region(0x102e9fcb0, 0x102ea3b40); // widen: whole governor tail + validator (SH160+ 0x102e9fcc4 block-cache race)
 }
 
 /// SH159e (recon deleg_9ea3f752): nativeAppBridgeV2StartAppWithParams (0x24258c6e4)
