@@ -6398,6 +6398,16 @@ fn main() {
                                 unsafe {
                                     *(0x10635cd10u64 as *mut u64) = 0x102207b50;
                                     *(0x106a68818u64 as *mut u64) = dmobj;
+                                    // SH157 (recon deleg_c4426fe4, governor 0x2e9fa84):
+                                    // the AppBridgeV2 governor's router flag [0x6a70880]
+                                    // (ldrb at 0x2e9fb28, branch at 0x2e9fb2c) selects
+                                    // MODERN-vs-LEGACY. With .bss default 0 it takes
+                                    // LEGACY (a StartLuaAppDM-internal path that NEVER
+                                    // reaches nativeAppBridgeStartAppWithParams 0x258c6e4).
+                                    // Seed =1 so the governor blrs into the real
+                                    // startAppWithParams call on the seeded main thread
+                                    // (see docs/recon-sh156-startluaappdm-postdoinit.md).
+                                    *(0x106a70880u64 as *mut u8) = 1;
                                 }
                                 // SH156 NEXT GATE: the ctor 0x102207b50's body reads
                                 // globals whose pages are LEFT UNMAPPED by the engine's
@@ -6412,6 +6422,7 @@ fn main() {
                                     0x106dcd380u64, // telemetry sched
                                     0x106dca000u64, // app-data-model counter
                                     0x106dce218u64, // flags loader guard
+                                    0x106a70880u64, // SH157 governor router flag
                                     0x107333aacu64, // thread-init mutex
                                     0x106ed9000u64, // string/clock sched
                                 ] {
@@ -6422,6 +6433,13 @@ fn main() {
                                     }
                                 }
                                 eprintln!("[elfjit:v2boot] SH156 seeded DM-root [0x106a68818]=0x{dmobj:x} (object[0]=dispatch vtable 0x10635cce0, vtable[+0x30]=0x102207b50 real global-init ctor) -> do-init match brs into REAL construction");
+                                eprintln!("[elfjit:v2boot] SH157 seeded governor router flag [0x106a70880]=1 -> AppBridgeV2 governor takes MODERN path to nativeAppBridgeStartAppWithParams (0x258c6e4)");
+                                unsafe {
+                                    eprintln!(
+                                        "[elfjit:v2boot] SH157 governor router flag readback = {:#x}",
+                                        *(0x106a70880u64 as *const u8)
+                                    );
+                                }
                             }
                         }
                         eprintln!("[elfjit:v2boot] GATE-FIX seeded main-id cell 0x{me:x} + flags-latch for StartLuaAppDM -> GlobalInit once-guard LEFT CLEAR so __call_once runs and populates DM-root [0x106a68818]");
