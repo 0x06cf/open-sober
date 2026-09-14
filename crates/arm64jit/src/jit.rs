@@ -556,6 +556,38 @@ fn routeb_tail_dispatch_guard(state: *mut CpuState, pc: u64) {
     );
 }
 
+/// SH161b (recon deleg_61f88e9a, authoritative): the governor-TAIL epilogue block at
+/// 0x102e9fe04 (`mov x0,x19; mov w1,#0x2; bl 0x1023c12c0`) calls fn 0x1023c12c0 with
+/// mode=2. That fn begins `ldr w8,[x0,#696](=impl[+0x2b8]); cmp w8,w1; b.eq 0x...1434`
+/// and its b.eq target 0x1023c1434 is a pure stack-canary check + `ret` (benign mode-2
+/// no-op). Under the partial do-init impl is the Box::leak zeroed 0x500 buffer so
+/// impl[+0x2b8]==0 today -> the b.eq is NOT taken -> the fn falls into a fault-prone
+/// transition body (reads global [0x6a70700] version-state, dispatches 0x23c14dc/
+/// 0x23c1504/0x23c1574 + conditional FMOD AAudio 0x626b6d0). Seed impl[+0x2b8]=2 at the
+/// caller-block entry so the b.eq early-return fires and the whole transition body is
+/// bypassed. NOTE: 0x102e9fe04 is a SEPARATE block entry PAST routeb_tail_dispatch_guard's
+/// window [0x102e9fcc4,0x102e9fdc8], so this is its own guard (matches the codebase
+/// one-guard-per-fix pattern). Idempotent (only writes when 0). Gated JIT_ROUTEB_SETFIX.
+fn routeb_tail_eq_guard(state: *mut CpuState, pc: u64) {
+    if pc != 0x102e9fe04 {
+        return;
+    }
+    let s = unsafe { &*state };
+    let implb = s.x[19];
+    if implb == 0 {
+        return;
+    }
+    let slot = implb + 0x2b8;
+    let cur = unsafe { std::ptr::read_unaligned(slot as *const u32) };
+    if cur != 0 {
+        return; // already set — real session / already seeded.
+    }
+    unsafe { std::ptr::write_unaligned(slot as *mut u32, 2) };
+    eprintln!(
+        "[routeb-setfix] SH161b impl[+0x2b8] seeded =2 ({slot:#x}) at pc={pc:#x} -> fn 0x1023c12c0 b.eq (mode-2 no-op) taken, transition body bypassed (was {cur:#x})"
+    );
+}
+
 /// SH161 (recon deleg_c94a8b2f): broad tail-entry probe — log every block entry whose
 /// pc falls in the governor-tail region so we can pin exactly which block contains the
 /// NULL-deref dispatch. Debug-only, gated on JIT_ROUTEB_SETFIX + JIT_ROUTEB_TAILTRACE.
@@ -2935,6 +2967,7 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // live host-heap object address, only known at runtime — hence the hook.
         if routeb_setfix_enabled() {
             routeb_tail_dispatch_guard(state, pc);
+            routeb_tail_eq_guard(state, pc); // SH161b: seed impl[+0x2b8]=2 (governor-tail epilogue b.eq)
             routeb_tail_trace(state, pc);
         }
         unsafe { run(&block, state) };
@@ -3844,6 +3877,45 @@ mod tests {
         let mut st2 = CpuState::new();
         let _ = cached_block(image, base, base, &mut st2 as *mut CpuState, 64).expect("recompile");
         assert!(block_cache_stats().0 >= before, "recompile must be served");
+    }
+
+    #[test]
+    fn sh161b_routeb_tail_eq_guard_seeds_impl_2b8_and_leaves_real() {
+        // SH161b (recon deleg_61f88e9a): the governor-tail epilogue block at
+        // 0x102e9fe04 calls fn 0x1023c12c0 (mode=2) which takes its benign b.eq
+        // early-return only when impl[+0x2b8]==2. Under the partial do-init impl is
+        // the Box::leak zeroed 0x500 buffer so +0x2b8==0 and the fn would fall into
+        // its fault-prone transition body. routeb_tail_eq_guard must seed impl[+0x2b8]=2
+        // at the exact caller-block entry (pc==0x102e9fe04) and leave a real nonzero
+        // value untouched (idempotent, preserves a live session).
+        let impl_buf = Box::leak(vec![0u8; 0x500usize].into_boxed_slice()).as_mut_ptr() as u64;
+        let mut st = CpuState::new();
+        st.x[19] = impl_buf;
+        // Wrong pc (inside the dispatch-guard window) must not seed the eq slot.
+        routeb_tail_eq_guard(&mut st as *mut CpuState, 0x102e9fcc4);
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned((impl_buf + 0x2b8) as *const u32) },
+            0,
+            "tail_eq_guard must not fire outside its 0x102e9fe04 entry"
+        );
+        // Exact entry: seeds 2.
+        routeb_tail_eq_guard(&mut st as *mut CpuState, 0x102e9fe04);
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned((impl_buf + 0x2b8) as *const u32) },
+            2,
+            "impl[+0x2b8] must be seeded 2 at the 0x102e9fe04 entry"
+        );
+        // A real nonzero value is left untouched (idempotent, no clobber).
+        unsafe { std::ptr::write_unaligned((impl_buf + 0x2b8) as *mut u32, 7) };
+        routeb_tail_eq_guard(&mut st as *mut CpuState, 0x102e9fe04);
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned((impl_buf + 0x2b8) as *const u32) },
+            7,
+            "a live nonzero impl[+0x2b8] must be preserved (real session)"
+        );
+        // impl==0 -> no write, no crash.
+        st.x[19] = 0;
+        routeb_tail_eq_guard(&mut st as *mut CpuState, 0x102e9fe04);
     }
 
     #[test]
