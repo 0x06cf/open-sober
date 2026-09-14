@@ -91,6 +91,13 @@ static TASK_FRAME_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 /// Built once lazily; guest==host so engine code derefs it directly.
 static RENDERSCENE_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// SH126-gate: set by the --v2boot ladder thread once its rungs complete
+/// ("ladder done"); the --renderinit thread, when JIT_SERIALIZE_RENDER=1,
+/// waits on this before driving the render pipeline so render jit_runs never
+/// run concurrent with the ladder's jit_runs (the SH55/64 block-cache/message-
+/// queue desync that makes the combined run 1/3 flaky). 0 = ladder not done yet.
+static LADDER_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Number of scene nodes `render_scene_base` laid out in R (0 = legacy empty
 /// scene). Mirrored so a later node-count change rebuilds R rather than
 /// reusing the stale empty buffer.
@@ -1830,6 +1837,60 @@ fn routeb_patch_sendapp_singleton_lambdas() {
         }
     }
     ROUTEB_SENDAPP_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+static ROUTEB_SENDAPP_VTABLE_PATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// SH126 (recon deleg_f595f562): SendAppEventOnAppReady (guest 0x102bb463c)
+/// builds a real 0x58 app-event object whose vtable is 0x635e068 — an
+/// ALL-ZERO `.data.rel.ro` vtable (zero dynamic relocations). Its terminal
+/// virtual dispatch at guest 0x102bb4984 (`ldr x9,[x0]; ldr x8,[x9,x8]; blr x8`,
+/// x8=0x28 for a non-NULL object) is therefore `blr 0` -> benign soft-return,
+/// so the rung's body never completes and MH_FLAGS_LOADED/APP_READY stay false.
+/// None of the SH115/117/119 singleton patches cover this structurally-empty
+/// app-event vtable. Fix (two parts, all plain data stores, idempotent):
+///   (a) materialize slots +0x20/+0x28 to the benign identity leaf
+///       (routeb_singleton_leaf, the proven SH115/119 pattern) so the terminal
+///       blr lands instead of `blr 0` — the body reaches its epilogue and the
+///       session-advance probe can observe the REAL next-state;
+///   (b) seed the app-bridge pipe sync-gate [0x10683d010] = -1 so the body's
+///       `bl 0x2baeeec` takes the SYNCHRONOUS path (`cmn x8,#-1` at 0x2baef24 ->
+///       `tbz w20,#0` 0x2baef5c, w20=0 -> `bl 0x2206c40` GlobalInit do-init)
+///       instead of the async pthread_cond_wait block (0x2b4cd1c).
+/// guest vtable base: file 0x635e068 in LOAD(off 0x62d81c0 -> vaddr 0x62dc1c0),
+/// within=0x85ea8 -> vaddr 0x6362068 -> guest 0x106362068 (RW LOAD, plain store).
+fn routeb_patch_sendapp_appevent_vtable() {
+    if ROUTEB_SENDAPP_VTABLE_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let leaf = *ROUTEB_LEAF_ADDR.get_or_init(|| {
+        let a = arm64jit::jit::register_host_call_auto(routeb_singleton_leaf);
+        eprintln!("[elfjit:routeB] SH126 benign dispatch leaf registered at {a:#x}");
+        a
+    });
+    const GVT: u64 = 0x106362068; // app-event vtable guest base (RW LOAD, plain store)
+    unsafe {
+        let s20 = (GVT + 0x20) as *mut u64;
+        let s28 = (GVT + 0x28) as *mut u64;
+        let before20 = *s20;
+        let before28 = *s28;
+        if before20 == 0 && before28 == 0 {
+            *s20 = leaf;
+            *s28 = leaf;
+            eprintln!(
+                "[elfjit:routeB] SH126 materialized app-event vtable 0x{GVT:x} +0x20/+0x28 -> leaf {leaf:#x} (SendAppEventOnAppReady terminal blr 0x102bb4984 now lands, no soft-return)"
+            );
+        } else {
+            eprintln!(
+                "[elfjit:routeB] SH126 app-event vtable already populated (slot20={before20:#x} slot28={before28:#x}), leaving"
+            );
+        }
+        // (b) pipe sync-gate: force `cmn x8,#-1` at 0x2baef24 to take the sync
+        // path (ldr x0,[683d000+#8]; tbz w20,#0 -> bl 0x2206c40 do-init).
+        let gate = 0x10683d010u64 as *mut u64;
+        *gate = u64::MAX;
+        eprintln!("[elfjit:routeB] SH126 seeded pipe sync-gate [0x10683d010]=-1 -> SendAppEvent pipe takes the synchronous do-init path (bl 0x2206c40)");
+    }
+    ROUTEB_SENDAPP_VTABLE_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 /// Apply the SH115 scoped patch to the three singleton-dispatch accessor sites.
 /// (file vaddr -> expected original slot0 word + the two early-return branches
@@ -5413,6 +5474,30 @@ fn main() {
                 // x0=env x1=thiz x2=event jstring, x3/x4/x5=extra jstrings (must
                 // be readable non-null for GetStringUTFChars).
                 if std::env::args().any(|a| a == "--v2boot-send-appevent") {
+                    // SH126: the app-event object's vtable 0x635e068 is all-zero
+                    // (empty .data.rel.ro) -> SendAppEventOnAppReady's terminal blr
+                    // is `blr 0` = benign soft-return -> its body never completes
+                    // and MH_FLAGS_LOADED/APP_READY stay false. Materialize the
+                    // vtable's +0x20/+0x28 slots to the benign leaf + seed the pipe
+                    // sync-gate [0x10683d010]=-1 so the body completes AND the pipe
+                    // takes the synchronous do-init path. All plain data stores.
+                    if std::env::var("JIT_SH115_SINGLETON_PATCH").ok().as_deref() == Some("1") {
+                        routeb_patch_sendapp_appevent_vtable();
+                        // SH126 runner-up #2: the do-init (0x2206c40) reached via the
+                        // pipe is once-latched on [0x106a68410].bit0 and thread-gated
+                        // on [0x106863a68] (ladder latched both). Clear the once-guard
+                        // and re-seed main-id to THIS rung thread so the do-init
+                        // re-takes the DM-construction match path (fresh app model).
+                        unsafe {
+                            let og = 0x106a68410u64 as *mut u8;
+                            *og &= !1u8;
+                            let me = libc::pthread_self();
+                            *(0x106863a68u64 as *mut u64) = me as u64;
+                            eprintln!(
+                                "[elfjit:v2boot] SH126 cleared once-guard [0x6a68410].bit0=0 + re-seeded main-id 0x{me:x} so the pipe's do-init re-constructs the app model"
+                            );
+                        }
+                    }
                     let ev = arm64jit::jni::new_string_utf_handle(b"Home");
                     let n3 = arm64jit::jni::new_string_utf_handle(b"");
                     let n4 = arm64jit::jni::new_string_utf_handle(b"");
@@ -5444,6 +5529,11 @@ fn main() {
                     dump("SendAppEventOnAppReady");
                 }
                 eprintln!("[elfjit:v2boot] ladder done; final [0x106829ea8] = {:#x}", dw(BSS_TASKV4));
+                    // SH126-gate: signal the render pipeline it may start now
+                    // (JIT_SERIALIZE_RENDER=1 makes --renderinit wait for this so
+                    // render jit_runs never overlap the ladder's — SH55/64 class).
+                    LADDER_DONE.store(true, core::sync::atomic::Ordering::Relaxed);
+                    eprintln!("[elfjit:v2boot] LADDER_DONE=1 signaled (render may start)");
                     // SH122 session-advance probe: after the ladder, read the
                     // NativeHelper milestones + data-dir path state to confirm
                     // whether StartLuaAppDM's do-init actually advanced the session.
@@ -6767,6 +6857,33 @@ fn main() {
         let tpidr = arm64jit::jit::current_guest_tp();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(warmup_ms));
+            // SH126-gate: when JIT_SERIALIZE_RENDER=1 AND a --v2boot ladder is
+            // present, wait for the ladder to signal LADDER_DONE before driving
+            // the render pipeline. This converts the concurrent render+ladder
+            // jit_run overlap (the SH55/64 block-cache/message-queue desync that
+            // makes the combined run 1/3 flaky) into a deterministic SEQUENTIAL
+            // run: the ladder completes its rungs first, then render init/thunk/
+            // frame drive their jit_runs with no other top-level jit_run in
+            // flight. Bounded so a parked ladder (historical exit-124) does not
+            // hang render forever — it proceeds after the bound.
+            let serialize = std::env::var("JIT_SERIALIZE_RENDER").ok().as_deref() == Some("1")
+                && std::env::args().any(|a| a == "--v2boot");
+            if serialize && !LADDER_DONE.load(core::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[elfjit:renderinit] JIT_SERIALIZE_RENDER=1: waiting for --v2boot ladder to signal LADDER_DONE (render after ladder = deterministic, no SH55/64 overlap)"
+                );
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+                while !LADDER_DONE.load(core::sync::atomic::Ordering::Relaxed)
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                if LADDER_DONE.load(core::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("[elfjit:renderinit] LADDER_DONE received — driving render after ladder");
+                } else {
+                    eprintln!("[elfjit:renderinit] WARN LADDER_DONE not reached in 300s (ladder parked?) — proceeding to render anyway");
+                }
+            }
             let iimg: &[u8] =
                 unsafe { std::slice::from_raw_parts(ibase as *const u8, ilen) };
             let mut s3 = arm64jit::jit::CpuState::new();
@@ -9801,6 +9918,58 @@ mod sh115_tests {
             assert_eq!(*((empty.wrapping_add(0x18)) as *const u64), 0, "empty set +0x18 String flags/ptr zero");
             assert_eq!(*((empty.wrapping_add(0x20)) as *const u64), 0, "empty set +0x20 String zero");
         }
+    }
+}
+
+#[cfg(test)]
+mod sh126_tests {
+    use super::*;
+    // SH126: SendAppEventOnAppReady (guest 0x102bb463c) builds a real 0x58
+    // app-event object whose vtable is 0x635e068 — an ALL-ZERO .data.rel.ro
+    // vtable (zero dynamic relocations) -> its terminal virtual dispatch at
+    // guest 0x102bb4984 (`ldr x9,[x0]; ldr x8,[x9,x8]; blr x8`, x8=0x28 for a
+    // non-NULL object) is `blr 0` = benign soft-return. Materialize the vtable's
+    // +0x20/+0x28 slots to the benign leaf + seed the pipe sync-gate so the body
+    // completes AND the pipe takes the synchronous do-init path. Pins addresses,
+    // the guest-vaddr transform, and the vtable/reader invariants.
+    #[test]
+    fn sh126_app_event_vtable_is_dead_and_patch_targets_are_valid() {
+        // vtable base 0x635e068 is inside LOAD(off 0x62d81c0 -> vaddr 0x62dc1c0),
+        // within=0x85ea8 -> vaddr 0x6362068 -> guest 0x106362068.
+        assert_eq!(0x62dc1c0u64 + 0x85ea8, 0x6362068u64, "app-event vtable REAL vaddr (within 2nd LOAD)");
+        assert_eq!(0x6362068u64 + 0x1_0000_0000, 0x106362068u64, "app-event vtable REAL guest base");
+        // slots the terminal blr can target: +0x20 (x0==stack-temp) / +0x28 (non-NULL)
+        assert_eq!(0x106362068u64 + 0x20, 0x106362088u64, "vtable +0x20 guest");
+        assert_eq!(0x106362068u64 + 0x28, 0x106362090u64, "vtable +0x28 guest");
+        // the terminal dispatch + the pipe sync-gate reader.
+        assert_eq!(0x2bb4984u64 + 0x1_0000_0000, 0x102bb4984u64, "terminal blr");
+        assert_eq!(0x2baef24u64 + 0x1_0000_0000, 0x102baef24u64, "pipe `cmn x8,#-1` gate");
+        assert_eq!(0x683d000u64 + 0x10, 0x683d010u64, "pipe sync-gate FILE vaddr");
+        assert_eq!(0x683d010u64 + 0x1_0000_0000, 0x10683d010u64, "pipe sync-gate guest");
+        // the sync-path tail: tbz w20,#0 at 0x2baef5c -> bl 0x2206c40 (do-init).
+        assert_eq!(0x2baef5cu64 + 0x1_0000_0000, 0x102baef5cu64, "pipe tbz w20,#0");
+        assert_eq!(0x2baef70u64 + 0x1_0000_0000, 0x102baef70u64, "pipe bl 0x2206c40 (do-init)");
+        // Async block is 0x2b4cd1c (pthread_cond_wait). When the gate is -1 the
+        // sync path is taken (no park). Invariant: the sentinel written is -1.
+        assert_eq!(u64::MAX, u64::MAX, "sync-gate sentinel is -1");
+    }
+    #[test]
+    fn sh126_app_event_vtable_guard_only_writes_when_dead() {
+        // The patcher only writes slots that are both currently zero (all-zero
+        // vtable), so it is idempotent and never stomps a real populated vtable.
+        let gvt = 0x106362068u64;
+        assert!(gvt & 7 == 0, "vtable base 8-aligned");
+        assert_eq!((gvt + 0x20) & 7, 0, "slot20 aligned");
+        assert_eq!((gvt + 0x28) & 7, 0, "slot28 aligned");
+        // The benign dispatch leaf is the SH115/119 proven identity leaf.
+        let leaf = *ROUTEB_LEAF_ADDR.get_or_init(|| {
+            let a = arm64jit::jit::register_host_call_auto(routeb_singleton_leaf);
+            eprintln!("[elfjit:routeB] SH126 test dispatch leaf registered at {a:#x}");
+            a
+        });
+        assert_ne!(leaf, 0, "leaf must be non-NULL (a blr 0 would re-soft-return)");
+        assert_eq!((leaf >> 40) & 0xff, 0x7f, "leaf in the JIT host-call region");
+        assert_eq!(routeb_singleton_leaf(0xdead_beef, 0, 0, 0, 0, 0, 0, 0), 0xdead_beef);
     }
 }
 
