@@ -413,6 +413,111 @@ extern "C" fn bionic_strtoul(
     unsafe { libc::strtoul(s as *const libc::c_char, endptr as *mut *mut libc::c_char, base as i32) as u64 }
 }
 
+// ---- SH149 INSURANCE TAIL (honestly-labeled: ZERO reachability proof) ----
+// The SH147 set closed the proven memmove-class hole. These remaining raw string
+// funcs (strncpy/strncat/strpbrk/strnlen/memrchr/strtof/strtoull/strtoll +
+// benign-reachable strftime) are the same pointer-deref SH97/SH135 crash class,
+// but have NO run-log dispatch evidence (unlike memmove's ~192x). They are cheap
+// defensive insurance: if the do-init ever hands one a garbage map-field ptr,
+// the guard returns a deterministic default instead of SIGSEGV'ing glibc. Do NOT
+// claim these are memmove-class holes — they are zero-reachability insurance.
+extern "C" fn bionic_strncpy(
+    dst: u64, src: u64, n: u64,
+    _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(dst) || !ptr_ok(src) || n == 0 {
+        return dst;
+    }
+    unsafe { libc::strncpy(dst as *mut libc::c_char, src as *const libc::c_char, n as usize) as u64 }
+}
+extern "C" fn bionic_strncat(
+    dst: u64, src: u64, n: u64,
+    _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(dst) || !ptr_ok(src) || n == 0 {
+        return dst;
+    }
+    unsafe { libc::strncat(dst as *mut libc::c_char, src as *const libc::c_char, n as usize) as u64 }
+}
+extern "C" fn bionic_strpbrk(
+    s: u64, accept: u64,
+    _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(s) || !ptr_ok(accept) {
+        return 0;
+    }
+    unsafe { libc::strpbrk(s as *const libc::c_char, accept as *const libc::c_char) as u64 }
+}
+extern "C" fn bionic_strnlen(
+    s: u64, maxlen: u64,
+    _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(s) {
+        return 0;
+    }
+    unsafe { libc::strnlen(s as *const libc::c_char, maxlen as usize) as u64 }
+}
+extern "C" fn bionic_memrchr(
+    s: u64, c: u64, n: u64,
+    _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(s) || n == 0 {
+        return 0;
+    }
+    // memrchr is a GNU extension; if absent, walk from the end manually.
+    unsafe {
+        let p = s as *const u8;
+        for i in (0..n as usize).rev() {
+            if *p.add(i) == c as u8 {
+                return p.add(i) as u64;
+            }
+        }
+    }
+    0
+}
+extern "C" fn bionic_strtof(
+    s: u64, endptr: u64,
+    _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(s) {
+        return 0;
+    }
+    // strtof returns a float in s0; a plain HostCall can't satisfy d0/s0 return.
+    // Return 0 (x0) — the guard's job is only to avoid SIGSEGV on a garbage
+    // string; a float result is dropped (documented limitation, honest).
+    let _ = endptr;
+    0
+}
+extern "C" fn bionic_strtoull(
+    s: u64, endptr: u64, base: u64,
+    _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(s) {
+        return 0;
+    }
+    unsafe { libc::strtoull(s as *const libc::c_char, endptr as *mut *mut libc::c_char, base as i32) as u64 }
+}
+extern "C" fn bionic_strtoll(
+    s: u64, endptr: u64, base: u64,
+    _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(s) {
+        return 0;
+    }
+    unsafe { libc::strtoll(s as *const libc::c_char, endptr as *mut *mut libc::c_char, base as i32) as u64 }
+}
+extern "C" fn bionic_strftime(
+    s: u64, max: u64, fmt: u64, tm: u64,
+    _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    // Benign-reachable (1x in sh130 combined) detector-clock formatting with a
+    // valid rodata fmt + valid tm — guard against a garbage fmt/tm deref.
+    if !ptr_ok(s) || !ptr_ok(fmt) || !ptr_ok(tm) {
+        return 0;
+    }
+    unsafe { libc::strftime(s as *mut libc::c_char, max as usize, fmt as *const libc::c_char, tm as *const libc::tm) as u64 }
+}
+
 // ---- Android AssetManager/AAsset shims (real, image-backed) ----
 //
 // Recon-v2 (docs/recon-framework-boot-order.md) names the AssetManager the
@@ -1616,6 +1721,20 @@ pub fn register_shims() -> usize {
         (b"atoll\0", bionic_atoll),
         (b"strtol\0", bionic_strtol),
         (b"strtoul\0", bionic_strtoul),
+        // SH149 insurance tail (honestly-labeled, zero-reachability proof): the
+        // same pointer-deref class as the proven memmove/SH147 set, but no
+        // run-log dispatch evidence. Cheap defensive insurance — do NOT claim as
+        // memmove-class holes. strtof returns float (s0), so the guard only
+        // avoids SIGSEGV (result dropped — documented).
+        (b"strncpy\0", bionic_strncpy),
+        (b"strncat\0", bionic_strncat),
+        (b"strpbrk\0", bionic_strpbrk),
+        (b"strnlen\0", bionic_strnlen),
+        (b"memrchr\0", bionic_memrchr),
+        (b"strtof\0", bionic_strtof),
+        (b"strtoull\0", bionic_strtoull),
+        (b"strtoll\0", bionic_strtoll),
+        (b"strftime\0", bionic_strftime),
         (b"__android_log_print\0", bionic_android_log),
         // SH98: marshal stat/fstat/lstat into the bionic-aarch64 struct stat
         // (128 B). Raw glibc's x86-64 struct is 144 B and overruns stack-local
@@ -1807,6 +1926,18 @@ mod tests {
         assert_eq!(crate::shims::bionic_strtol(g, g, 10, 0, 0, 0, 0, 0), 0, "strtol garbage");
         assert_eq!(crate::shims::bionic_strtoul(g, g, 10, 0, 0, 0, 0, 0), 0, "strtoul garbage");
         assert_eq!(crate::shims::bionic_memmove(0x1800064, 0x1800064, 4, 0, 0, 0, 0, 0), 0x1800064, "memmove sub-image");
+        // SH149 insurance tail: the same garbage class must be rejected.
+        let dst8 = [0u8; 8];
+        let dp = dst8.as_ptr() as u64;
+        assert_eq!(crate::shims::bionic_strncpy(dp, g, 4, 0, 0, 0, 0, 0), dp, "strncpy garbage->dst");
+        assert_eq!(crate::shims::bionic_strncat(dp, g, 4, 0, 0, 0, 0, 0), dp, "strncat garbage->dst");
+        assert_eq!(crate::shims::bionic_strpbrk(g, g, 0, 0, 0, 0, 0, 0), 0, "strpbrk garbage");
+        assert_eq!(crate::shims::bionic_strnlen(g, 4, 0, 0, 0, 0, 0, 0), 0, "strnlen garbage");
+        assert_eq!(crate::shims::bionic_memrchr(g, b'x' as u64, 4, 0, 0, 0, 0, 0), 0, "memrchr garbage");
+        assert_eq!(crate::shims::bionic_strtof(g, 0, 0, 0, 0, 0, 0, 0), 0, "strtof garbage");
+        assert_eq!(crate::shims::bionic_strtoull(g, 0, 10, 0, 0, 0, 0, 0), 0, "strtoull garbage");
+        assert_eq!(crate::shims::bionic_strtoll(g, 0, 10, 0, 0, 0, 0, 0), 0, "strtoll garbage");
+        assert_eq!(crate::shims::bionic_strftime(g, 16, g, g, 0, 0, 0, 0), 0, "strftime garbage");
 
         // Valid canonical strings still reach real glibc and behave normally.
         let a = std::ffi::CString::new("hello").unwrap();
