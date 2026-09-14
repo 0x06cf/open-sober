@@ -1492,6 +1492,40 @@ fn routeb_patch_gov_dispatch() {
     arm64jit::jit::block_cache_drop_region(0x102e9fb40, 0x102e9fb90);
 }
 
+/// SH159e (recon deleg_9ea3f752): nativeAppBridgeV2StartAppWithParams (0x24258c6e4)
+/// reads the param union: x22=[x0+8]=capacity, count=[x19+24], float=[x19+32].
+/// The governor passes x0=sp+0x198 whose union we never initialized (we skip the
+/// appendix that fills it), so garbage -> hash-walk NULL deref. Make these inputs
+/// deterministic: cap=0 (allocate path), count=0, float=1.0.
+fn routeb_patch_startapp_params() {
+    // (addr, orig_word, new_word)
+    let sites: [(u64, u32, u32); 3] = [
+        (0x10258c6f8, 0xf940_0416, 0xd280_0016), // ldr x22,[x0,#8] -> mov x22,#0
+        (0x10258c7b4, 0xf940_0e68, 0xd280_0008), // ldr x8,[x19,#24] -> mov x8,#0
+        (0x10258c7c0, 0xbd40_2261, 0x1e2e_1001), // ldr s1,[x19,#32] -> fmov s1,#1.0
+    ];
+    for (addr, orig, new) in sites {
+        let page = addr & !0xfff;
+        unsafe {
+            if libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_WRITE) != 0 {
+                eprintln!("[elfjit:routeB] WARN SH159e mprotect RW failed @0x{addr:x} errno={}", std::io::Error::last_os_error());
+                continue;
+            }
+            let before = *(addr as *const u32);
+            if before == orig {
+                *(addr as *mut u32) = new;
+                eprintln!("[elfjit:routeB] SH159e patched startAppWithParams @0x{addr:x} ({before:08x}) -> {new:08x} (deterministic param input)");
+            } else if before == new {
+                eprintln!("[elfjit:routeB] SH159e startAppWithParams @0x{addr:x} already patched");
+            } else {
+                eprintln!("[elfjit:routeB] WARN SH159e startAppWithParams @0x{addr:x} unexpected {before:08x}, not patched");
+            }
+            libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_EXEC);
+        }
+    }
+    arm64jit::jit::block_cache_drop_region(0x10258c6e0, 0x10258c8d0);
+}
+
 fn routeb_patch_globalinit_cevent_barrier() {
     const ADDR: u64 = 0x102206e70; // file 0x2206e70: `bl 2207578` = CEvent::wait (futex park)
     let want = 0xd503_201fu32; // nop
@@ -6530,6 +6564,9 @@ fn main() {
                                     // Substitute an inert DISPATCH so it reaches
                                     // bl 0x258c6e4 startAppWithParams.
                                     routeb_patch_gov_dispatch();
+                                    // SH159e: make startAppWithParams' param inputs
+                                    // deterministic (skipped appendix didn't fill union).
+                                    routeb_patch_startapp_params();
                                     // SH159b (recon deleg_0eff24ca): the governor
                                     // (0x102e9fa84) reads x19=[x0+0x20] at 0x2e9fac0
                                     // (x0=wrapper @ [0x106a705e8]... actually GetOrCreate
