@@ -4054,26 +4054,17 @@ enum KickerMode {
 /// (kept alive) so the window outlives this function. Returns the wired XID,
 /// or 0 if no window could be opened (caller keeps the sentinel fallback).
 fn wire_real_window() -> u64 {
-    let display_num = 220 + (std::process::id() % 50) as usize;
-    let display = format!(":{display_num}");
-    let mut xvfb = None;
-    for _ in 0..20 {
-        if std::path::Path::new(&format!("/tmp/.X11-unix/X{display_num}")).exists() {
-            break;
-        }
-        if xvfb.is_none() {
-            xvfb = std::process::Command::new("Xvfb")
-                .arg(&display)
-                .arg("-screen").arg("0").arg("1280x720x24")
-                .arg("-nolisten").arg("tcp")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .ok();
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    for _ in 0..40 {
+    // SH112: a stale /tmp/.X11-unix/X<n> socket from a dead prior session must
+    // NOT be trusted — the old code saw the file and "broke", skipping the
+    // spawn, then every connect failed and the boot silently kept the sentinel
+    // ANativeWindow (so the render surface could never be real on the boot
+    // window). Rewritten to be connect-first: try the display as-is, and only
+    // if that fails unlink the stale socket and spawn our own Xvfb on it.
+    let pid = std::process::id();
+    for attempt in 0..24usize {
+        let display_num = 220 + (((pid as usize) + attempt * 7) % 250);
+        let display = format!(":{display_num}");
+        // 1) Try the display as-is (it may already be a live server).
         if let Ok((conn, win)) = x11::open_window_sized(Some(&display), 1280, 720) {
             Box::leak(Box::new(conn)); // keep the window alive for the boot
             unsafe {
@@ -4087,14 +4078,42 @@ fn wire_real_window() -> u64 {
             );
             return xid;
         }
+        // 2) Connect failed. Clear any stale socket then start our own server.
+        let sock = format!("/tmp/.X11-unix/X{display_num}");
+        if std::path::Path::new(&sock).exists() {
+            let _ = std::fs::remove_file(&sock);
+        }
+        if let Ok(mut c) = std::process::Command::new("Xvfb")
+            .arg(&display)
+            .arg("-screen").arg("0").arg("1280x720x24")
+            .arg("-nolisten").arg("tcp")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            for _ in 0..20 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if let Ok((conn, win)) = x11::open_window_sized(Some(&display), 1280, 720) {
+                    Box::leak(Box::new(conn));
+                    unsafe {
+                        std::env::set_var("DISPLAY", &display);
+                        std::env::set_var("EGL_PLATFORM", "x11");
+                    }
+                    let xid = win as u64;
+                    set_anativewindow_xid(xid);
+                    eprintln!(
+                        "[elfjit:anativewindow] wired real X11 window XID=0x{xid:x} on {display} as the guest ANativeWindow"
+                    );
+                    return xid;
+                }
+            }
+            let _ = c.kill(); // never came up here; try a different display below
+        }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     eprintln!(
         "[elfjit:anativewindow] could not open an X11 window (Xvfb absent?) — keeping the sentinel ANativeWindow"
     );
-    if let Some(mut c) = xvfb {
-        let _ = c.kill();
-    }
     0
 }
 
@@ -6178,7 +6197,43 @@ fn main() {
             // passed scratch as x0 -> inner took win=scratch (not the XID) and the
             // surface create rejected it. Correct drive: thunk(x0=win=XID, x1=parent=0).
             let render_thunk = renderframe_args.iter().any(|a| a == "--renderthunk");
-            let xid = arm64jit::shims::anativewindow_xid();
+            // SH112 (recon deleg_9935787c): the renderinit thread must NOT reuse the
+            // boot ANativeWindow XID — the boot/ladder path already created an EGL
+            // surface on it, so a second eglCreateWindowSurface on the renderinit
+            // thread returns EGL_BAD_SURFACE (0x300b) and the engine throws
+            // `std::runtime_error: Error creating context: eglCreateWindowSurface`
+            // -> whole-process abort EXIT 139, killing the combined ladder before it
+            // reaches StartLuaAppDM. Give the renderinit thread a FRESH, never-
+            // surfaced X11 window XID (same size as the framebuffer) so Mesa x11 EGL
+            // can build a real window surface there.
+            let fresh_xid = || -> u64 {
+                let display = std::env::var("DISPLAY").unwrap_or_default();
+                if display.is_empty() {
+                    return 0;
+                }
+                for _ in 0..20 {
+                    if let Ok((conn, win)) = x11::open_window_sized(Some(&display), 1280, 720) {
+                        Box::leak(Box::new(conn)); // keep the window alive
+                        return win as u64;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                0
+            };
+            let boot_xid = arm64jit::shims::anativewindow_xid();
+            // Prefer a FRESH window when one opens; fall back to the boot window
+            // only if the display is unavailable (fresh_xid returns 0).
+            let xid = if render_thunk {
+                let fresh = fresh_xid();
+                if fresh != 0 { fresh } else { boot_xid }
+            } else {
+                boot_xid
+            };
+            if render_thunk {
+                eprintln!(
+                    "[elfjit:renderinit] using FRESH render-thread window XID=0x{xid:x} (boot shared xid was 0x{boot_xid:x}) so eglCreateWindowSurface does not re-surface the already-bound boot window"
+                );
+            }
             // Scratch is still needed: render-init's prologue stores the resolved
             // parent-global ptr through x0 only for the inner-fn path; the thunk's
             // inner call gets its OWN freshly-allocated ctx as x0, so it never touches
