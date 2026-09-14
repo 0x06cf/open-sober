@@ -1141,6 +1141,60 @@ extern "C" fn bionic_vsnprintf(
     avail as u64
 }
 
+/// Decode an AAPCS64 va_list (`ap`, the opaque register-backed struct a caller
+/// built into its own 32-byte area) into the renderer's view so a formatted
+/// guard can re-drive it. Shared by vsnprintf and its fortified sibling so the
+/// va-arg offsets for the "extra fixed args" variants don't drift.
+fn decode_aapcs64_va_list(ap: u64) -> Aapcs64VaList {
+    if ap & 7 == 0 {
+        Aapcs64VaList {
+            stack: unsafe { std::ptr::read_unaligned(ap as *const u64) },
+            gr_top: unsafe { std::ptr::read_unaligned((ap + 8) as *const u64) },
+            _vr_top: unsafe { std::ptr::read_unaligned((ap + 16) as *const u64) },
+            gr_offs: unsafe { std::ptr::read_unaligned((ap + 24) as *const i32) },
+            _vr_offs: 0,
+        }
+    } else {
+        Aapcs64VaList { stack: 0, gr_top: 0, _vr_top: 0, gr_offs: 0, _vr_offs: 0 }
+    }
+}
+
+/// render_vfprintf into a bounded guest buffer, honoring `size` (NUL room);
+/// returns bytes written (not counting NUL). Returns 0 and writes nothing when
+/// `size == 0` (a zero-size chk call is a fortify contract violation, never a
+/// real write). Shared tail of vsnprintf + __vsnprintf_chk.
+fn render_to_buf(buf: u64, size: u64, fmt: u64, vl: &mut Aapcs64VaList) -> u64 {
+    let mut out = Vec::with_capacity(128);
+    render_vfprintf(fmt, vl, &mut out);
+    let avail = (size as usize).saturating_sub(1).min(out.len());
+    if buf != 0 && size != 0 {
+        unsafe {
+            std::ptr::copy_nonoverlapping(out.as_ptr(), buf as *mut u8, avail);
+            *((buf + avail as u64) as *mut u8) = 0; // NUL terminate
+        }
+    }
+    avail as u64
+}
+
+// SH136-harden: bionic fortify reroutes printf-family calls into __vsnprintf_chk.
+// Signature (dest, supplied_size, flag, slen, fmt, va_list ap): 6 fixed args,
+// fmt@x4, ap@x5 (verified at call site file 0x2631414). Runs the SAME guarded
+// renderer as vsnprintf (safe_cstr_len %s -> "(bad-ptr)" on the SH97 garbage
+// class), so a garbage %s in the deep walk can't SIGSEGV.
+extern "C" fn bionic_vsnprintf_chk(
+    buf: u64, size: u64, _flag: u64, _slen: u64, fmt: u64, ap: u64,
+    _a6: u64, _a7: u64,
+) -> u64 {
+    let mut vl = decode_aapcs64_va_list(ap);
+    let avail = render_to_buf(buf, size, fmt, &mut vl);
+    if std::env::var_os("JIT_TRACE").is_some() {
+        eprintln!(
+            "[shim] __vsnprintf_chk(size={size}, fmt@{fmt:#x}) -> {avail}B",
+        );
+    }
+    avail
+}
+
 /// SH98: marshal a host `stat` into the guest's bionic-aarch64 `struct stat`.
 /// Host glibc's x86-64 `struct stat` is 144 bytes; bionic's aarch64 struct is
 /// 128. When the guest passes a stack-local bionic `struct stat` (the deep
@@ -1401,6 +1455,11 @@ pub fn register_shims() -> usize {
         // SH97: guard vsnprintf — the deep gameGlobalInit walk calls it with a garbage %s
         // pointer; glibc internally strlen()s it and SIGSEGVs. Route through the renderer.
         (b"vsnprintf\0", bionic_vsnprintf),
+        // SH136-harden: bionic fortify reroutes printf-family calls into
+        // __vsnprintf_chk (6 fixed args, fmt@x4, va_list@x5). Same guarded
+        // renderer as vsnprintf so a garbage %s can't SIGSEGV glibc's internal
+        // strlen (the SH97 class).
+        (b"__vsnprintf_chk\0", bionic_vsnprintf_chk),
         // Android asset manager
         (b"AAssetManager_fromJava\0", aassetmanager_fromjava),
         (b"AAssetManager_open\0", aassetmanager_open),
@@ -1894,6 +1953,61 @@ mod tests {
         );
         // No dangling bytes beyond the last '=' string (the earlier over-read guard).
         assert!(!s.ends_with('\u{10}'), "no stray trailing byte: {s:?}");
+    }
+
+    /// SH136-harden: `__vsnprintf_chk` (6 fixed args: dest, supplied_size, flag,
+    /// slen, fmt, va_list ap) reuses the same guarded renderer as vsnprintf, so a
+    /// GARBAGE %s pointer (0xffffff80ffffffc8 — the SH97 class) renders "(bad-ptr)"
+    /// into the bounded buffer instead of SIGSEGV'ing glibc's internal strlen. A
+    /// valid %s renders as real bytes; size==0 writes nothing; truncation caps the
+    /// output with a NUL terminator.
+    #[test]
+    fn vsnprintf_chk_guards_garbage_renders_real_bounded() {
+        // va_list with one GP arg (a %s pointer). Same guest-layout builder as the
+        // vfprintf test: __gr_top points just past one 8B GP slot, __gr_offs=-8.
+        let fmt = Box::leak(b"status: %s\\0".to_vec().into_boxed_slice());
+        let gpr_area = Box::leak(vec![0u8; 64].into_boxed_slice()).as_mut_ptr() as u64;
+        let base = if gpr_area & 15 == 0 { gpr_area } else { (gpr_area + 8) & !15 };
+        unsafe {
+            std::ptr::write_unaligned((base as *mut u64).add(0), 0); // slot fills later
+        }
+        let vl = Box::leak(vec![0u8; 32].into_boxed_slice());
+        let vlp = vl.as_mut_ptr() as *mut u64;
+        unsafe {
+            std::ptr::write_unaligned(vlp, 0);
+            std::ptr::write_unaligned(vlp.add(1), base + 8); // __gr_top past one arg
+            std::ptr::write_unaligned(vlp.add(2), 0);
+            std::ptr::write_unaligned((vlp.add(3)) as *mut i32, -8);
+            std::ptr::write_unaligned((vlp.add(3) as *mut u8).add(4) as *mut i32, 0);
+        }
+
+        // -- GARBAGE %s: 0xffffff80ffffffc8 (the SH97 crash class). Must not fault.
+        unsafe { std::ptr::write_unaligned((base as *mut u64).add(0), 0xffffff80ffffffc8u64); }
+        let mut buf = Box::leak(vec![0xccu8; 64].into_boxed_slice()).as_mut_ptr() as u64;
+        let n = bionic_vsnprintf_chk(buf, 64, 3, 0, fmt.as_ptr() as u64, vl.as_mut_ptr() as u64, 0, 0);
+        let written = unsafe { std::slice::from_raw_parts(buf as *const u8, n as usize) };
+        let s = String::from_utf8_lossy(written);
+        assert!(s.contains("(bad-ptr)"), "garbage %s renders (bad-ptr): {s:?}");
+        // NUL-terminated at n.
+        assert_eq!(unsafe { *((buf + n as u64) as *const u8) }, 0);
+
+        // -- Valid %s.
+        let good = Box::leak(b"all-good\\0".to_vec().into_boxed_slice());
+        unsafe { std::ptr::write_unaligned((base as *mut u64).add(0), good.as_ptr() as u64); }
+        let n2 = bionic_vsnprintf_chk(buf, 64, 3, 0, fmt.as_ptr() as u64, vl.as_mut_ptr() as u64, 0, 0);
+        let s2 = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(buf as *const u8, n2 as usize) });
+        assert!(s2.contains("all-good"), "valid %s renders: {s2:?}");
+
+        // -- size==0 -> writes nothing, returns 0.
+        unsafe { std::ptr::write_unaligned((buf as *mut u8), 0xee); }
+        let n0 = bionic_vsnprintf_chk(buf, 0, 3, 0, fmt.as_ptr() as u64, vl.as_mut_ptr() as u64, 0, 0);
+        assert_eq!(n0, 0, "size==0 writes nothing");
+        assert_eq!(unsafe { *((buf) as *const u8) }, 0xee, "buf untouched at size==0");
+
+        // -- Truncation: tiny size caps output + NUL-terminates.
+        let n3 = bionic_vsnprintf_chk(buf, 5, 3, 0, fmt.as_ptr() as u64, vl.as_mut_ptr() as u64, 0, 0);
+        assert!(n3 <= 4, "truncated to size-1: {n3}");
+        assert_eq!(unsafe { *((buf + n3 as u64) as *const u8) }, 0, "truncated NUL");
     }
 
     /// The SH85 qsort interpose: guest ARM64 comparator bytes must never be
