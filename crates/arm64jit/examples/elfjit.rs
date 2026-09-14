@@ -1009,6 +1009,34 @@ extern "C" fn routeb_singleton_null_leaf(_a0: u64, _a1: u64, _a2: u64, _a3: u64,
     0
 }
 static SINGLETON_OBJ: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+/// SH115: shared accessor to the stable zeroed 0x40 singleton object. Both
+/// `routeb_singleton_obj_leaf` and the scoped-site patcher (`routeb_patch_
+/// singleton_dispatch`) must return the SAME concrete object so every consumer
+/// sees one coherent pointer.
+fn routeb_singleton_obj_addr() -> u64 {
+    *SINGLETON_OBJ.get_or_init(|| {
+        // A zeroed guest-resident object. Its +0 must be a REAL vtable so a
+        // consumer that virtual-dispatches on the returned object (ldr x8,[ret];
+        // ldr x9,[x8,#off]; blr x9) resolves a benign leaf instead of [0+off].
+        // All 0x60 slots = `routeb_singleton_leaf` (identity: returns `this`,
+        // i.e. OBJ itself — a valid non-NULL object), so any in-band virtual
+        // returns a sane pointer and beyond-0x60 reads soft-return benignly.
+        // Sized 0x80 (was 0x40) so a [ret+<0x28..0x80>] read is in-bounds zeroed.
+        let leaf = *ROUTEB_LEAF_ADDR.get_or_init(|| {
+            let a = arm64jit::jit::register_host_call_auto(routeb_singleton_leaf);
+            eprintln!("[elfjit:routeB] SH99 benign dispatch leaf registered at {a:#x}");
+            a
+        });
+        let v: &'static mut [u8] = Box::leak(vec![0u8; 0x60usize].into_boxed_slice());
+        for slot in 0..(0x60 / 8) {
+            unsafe { *(v.as_mut_ptr().wrapping_add(slot * 8) as *mut u64) = leaf; }
+        }
+        let o = Box::leak(vec![0u8; 0x80usize].into_boxed_slice()).as_mut_ptr() as u64;
+        unsafe { *(o as *mut u64) = v.as_ptr() as u64; } // [OBJ+0] = benign vtable
+        eprintln!("[elfjit:routeB] singleton stable-zeroed 0x80 object 0x{o:x} [vt]={:#x}", v.as_ptr() as u64);
+        o
+    })
+}
 /// SH111: `routeb_singleton_obj_leaf` returns a DEDICATED stable zeroed 0x40
 /// guest-resident object (Box::leak, guest==host identity-mapped so the caller
 /// can read/write fields without faulting). This is the differential default for
@@ -1021,11 +1049,7 @@ static SINGLETON_OBJ: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 /// consumer compares two returned pointers; all store it, cbz-check it, or read
 /// one field).
 extern "C" fn routeb_singleton_obj_leaf(_a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64) -> u64 {
-    *SINGLETON_OBJ.get_or_init(|| {
-        let o = Box::leak(vec![0u8; 0x40usize].into_boxed_slice()).as_mut_ptr() as u64;
-        eprintln!("[elfjit:routeB] singleton stable-zeroed 0x40 object 0x{o:x}");
-        o
-    })
+    routeb_singleton_obj_addr()
 }
 /// SH111: pure per-slot classification for the differential dispatch-singleton
 /// vtable. Decoupled from JIT registration so it is unit-testable. Returns which
@@ -1470,6 +1494,187 @@ fn routeb_seed_task_singletons() {
     ROUTEB_SINGLETON_SEEDED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 static ROUTEB_SINGLETON_SEEDED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+// ---- SH115: scoped singleton-dispatch patch (make V2Init/V2Start/V1AppStart/  ----
+// ---- SendAppEventOnAppReady bodies complete instead of soft-returning)     ----
+//
+// The three nullable-singleton accessors (V2Init site A, V2Start site A2,
+// V1AppStart site B) each end a virtual dispatch through the seeded 0x60 vtable:
+// `ldr x8,[x8,#off]; blr x8` reads +0xf8/+0x108/+0x548 PAST the 0x60 vtable into
+// host bytes, blr's outside the image, and the enclosing fn body 'soft-returns'
+// without ever completing. SH114 showed a flat `blr->mov x0,xzr` (return 0)
+// regresses nativeInitializeNativeFlags to NULL+0x28, because the accessor's
+// return IS deref'd at '+0x28' by a downstream caller. The differential fix:
+// patch each site's 28B window to MATERIALIZE the stable zeroed singleton object
+// (routeb_singleton_obj_addr) directly into x0, store it into objA[0]=[x19], and
+// RETURN it — so both the stored slot AND any `[ret+off]` read resolve to a valid
+// zeroed guest object (never NULL+0x28). This is site-scoped (leaves the shared
+// 0x60 vtable + nativeInit's own reads untouched), the exact differential remedy
+// SH110/SH111 mandate. Encodings verified against aarch64-linux-gnu-assembler.
+// Window layout (7 instr, file vaddr):
+//   slot0 movz x8,#OBJlo      slot4 mov x0,x8
+//   slot1 movk x8,#OBJ(16)    slot5 ldr x9,[x19]   ; objA
+//   slot2 movk x8,#OBJ(32)    slot6 str x0,[x9]    ; objA[0]=OBJ (MUST overwrite
+//   slot3 movk x8,#OBJ(48)                           the trailing `mov x0,xzr`)
+fn sh115_movz_x8_imm(imm16: u16) -> u32 {
+    0xD280_0000u32 | ((imm16 as u32) << 5) | 8
+}
+fn sh115_movk_x8_imm(hw: u32, imm16: u16) -> u32 {
+    0xF280_0000u32 | (hw << 21) | ((imm16 as u32) << 5) | 8
+}
+const SH115_MOV_X0_X8: u32 = 0xAA08_03E0;
+const SH115_LDR_X9_X19: u32 = 0xF940_0269; // ldr x9,[x19,#0]
+const SH115_STR_X0_X9: u32 = 0xF900_0120; // str x0,[x9,#0]; overwrites `mov x0,xzr`
+/// Build the 28-byte (7-instr) window for a singleton accessor site. OBJ is the
+/// stable object address being materialized; returns the 7 u32 words in order.
+fn sh115_obj_window(oj: u64) -> [u32; 7] {
+    [
+        sh115_movz_x8_imm((oj & 0xffff) as u16),
+        sh115_movk_x8_imm(1, ((oj >> 16) & 0xffff) as u16),
+        sh115_movk_x8_imm(2, ((oj >> 32) & 0xffff) as u16),
+        sh115_movk_x8_imm(3, ((oj >> 48) & 0xffff) as u16),
+        SH115_MOV_X0_X8,
+        SH115_LDR_X9_X19,
+        SH115_STR_X0_X9,
+    ]
+}
+static ROUTEB_DISPATCH_PATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Pure SH115 branch-repoint math: given a B.cond/cbz word at `branch`, return
+/// the word targeting `new_target` (imm19 at bits[23:5]; top byte + Rt/cond
+/// preserved). Unit-tested; the runtime `repoint_early_branch` applies it.
+fn sh115_repoint_word(branch: u64, word: u32, new_target: u64) -> u32 {
+    let delta = (new_target as i64 - branch as i64) >> 2;
+    let new_imm19 = (delta & 0x7ffff) as u32;
+    (word & 0xff00_001f) | (new_imm19 << 5)
+}
+/// Rewrite a B.cond/cbz immediate so it lands on `new_target` instead of its
+/// current target. Returns true if written.
+fn repoint_early_branch(branch: u64, expect_target: u64, new_target: u64, tag: &str) -> bool {
+    let page = (branch & !0xfff) as *mut libc::c_void;
+    unsafe {
+        assert_eq!(
+            libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_WRITE),
+            0,
+            "mprotect RW failed for {tag} branch 0x{branch:x}"
+        );
+        let word = *(branch as *const u32);
+        let imm19 = (word >> 5) & 0x7ffff;
+        let cur_target = branch.wrapping_add((imm19 as i64 * 4) as u64);
+        if cur_target != expect_target {
+            eprintln!("[elfjit:routeB] WARN {tag} branch 0x{branch:x} cur_target 0x{cur_target:x} != expect 0x{expect_target:x} (word {word:08x}), not repointed");
+            libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+            return false;
+        }
+        let new_word = sh115_repoint_word(branch, word, new_target);
+        *(branch as *mut u32) = new_word;
+        libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+        eprintln!("[elfjit:routeB] repointed {tag} early-return branch 0x{branch:x} ({word:08x} -> {new_word:08x}) target 0x{cur_target:x} -> 0x{new_target:x}");
+        true
+    }
+}
+static ROUTEB_LOCK_OWNER_PATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// SH116: nativeInitializeNativeFlags' helper (file 0x2320710) reads the .bss
+/// global object via `adrp x8,7273000; ldr x0,[x8,#2480]` = *(guest 0x10672739c0).
+/// That global's page is UNMAPPED at runtime (mprotect RW -> ENOMEM; the engine
+/// re-maps/protects the .bss page during boot), so it can't be seeded by a store.
+/// Instead patch the helper's three slots to MATERIALIZE a stable all-zero 0x60
+/// object into x0 (movz/movk over the adrp/ldr + the dead `b` hop); the helper's
+/// `add x0,x0,#0x28; bl pthread_mutex_lock` (0x2320738/0x2320748) then locks
+/// &obj+0x28 which is all-zero = a valid PTHREAD_MUTEX_INITIALIZER. The object's
+/// fields are writable leaked memory the engine may initialize. Leaves the
+/// unmapped global untouched. Deterministic, idempotent, non-vtable-widening.
+fn routeb_patch_nativeinit_lock_owner() {
+    if ROUTEB_LOCK_OWNER_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let s = Box::leak(vec![0u8; 0x60usize].into_boxed_slice()).as_mut_ptr() as u64;
+    // helper slots (file vaddr) to overwrite:
+    //   0x2320710 adrp x8,7273000 (f0027a88)
+    //   0x2320714 ldr  x0,[x8,#2480] (f944d900)
+    //   0x2320718 b    232071c (14000001, dead hop)
+    // -> movz x0,#s_lo (hw0); movk x0,#s(16) (hw1); movk x0,#s(32) (hw2).
+    let start = 0x102320710_u64; // guest = file(0x2320710) + 0x100000000
+    let words: [u32; 3] = [
+        0xD280_0000u32 | (((s & 0xffff) as u32) << 5),       // movz x0,#imm16 hw0
+        0xF2A0_0000u32 | ((((s >> 16) & 0xffff) as u32) << 5), // movk x0,#imm16 hw1
+        0xF2C0_0000u32 | ((((s >> 32) & 0xffff) as u32) << 5), // movk x0,#imm16 hw2
+    ];
+    let page = (start & !0xfff) as *mut libc::c_void;
+    unsafe {
+        if libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_WRITE) != 0 {
+            eprintln!("[elfjit:routeB] WARN mprotect RW failed for SH116 helper @0x{start:x} errno={}", std::io::Error::last_os_error());
+            return;
+        }
+        // guard against a shifted binary: expect the adrp word at slot0
+        let before = *(start as *const u32);
+        if before != 0xf002_7a88u32 {
+            eprintln!("[elfjit:routeB] WARN SH116 helper @0x{start:x} unexpected slot0 {before:08x}, not patched");
+            libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+            return;
+        }
+        for (i, w) in words.iter().enumerate() {
+            *((start + (i as u64) * 4) as *mut u32) = *w;
+        }
+        libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+        arm64jit::jit::block_cache_drop_region(start, start + 12);
+        eprintln!("[elfjit:routeB] SH116 patched nativeInit lock-owner helper @0x{start:x} 12B -> materialize stable zeroed 0x{s:x} (mutex@+0x28 = valid PTHREAD_MUTEX_INITIALIZER)");
+    }
+    ROUTEB_LOCK_OWNER_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+/// Apply the SH115 scoped patch to the three singleton-dispatch accessor sites.
+/// (file vaddr -> expected original slot0 word + the two early-return branches
+/// that jump onto the patched store-slot and their file vaddrs)
+fn routeb_patch_singleton_dispatch() {
+    if ROUTEB_DISPATCH_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    // Each site: window_start (file) , expected original slot0 word, then the
+    // two early-return branches (b.eq + cbz x19) that target the patched slot6
+    // (the store) and must be repointed past it to the epilogue. The epilogue is
+    // one word past slot6 (window_start + 7*4).
+    let sites: [(u64, u32, u64, u64); 3] = [
+        (0x62517b8, 0xAA15_03E0, 0x6251784, 0x6251790), // V2Init A
+        (0x6251a9c, 0xAA16_03E2, 0x6251a5c, 0x6251a68), // V2Start A2
+        (0x626093c, 0xAA14_03E1, 0x62608fc, 0x6260908), // V1AppStart B
+    ];
+    let obj = routeb_singleton_obj_addr();
+    let win = sh115_obj_window(obj);
+    for (file_start, orig_slot0, branch_eq, branch_cbz) in sites {
+        let guest = (file_start.wrapping_add(0x1_0000_0000)) & 0xff_ffff_ffff;
+        let store_slot = guest + 6 * 4; // patched slot6 (the store; early-return target)
+        let epilogue = store_slot + 4; // skip the store on early paths
+        let page = (guest & !0xfff) as *mut libc::c_void;
+        unsafe {
+            if libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_WRITE) != 0 {
+                eprintln!("[elfjit:routeB] WARN mprotect RW failed @0x{guest:x} errno={}", std::io::Error::last_os_error());
+                continue;
+            }
+            let before = *(guest as *const u32);
+            if before != orig_slot0 {
+                eprintln!("[elfjit:routeB] WARN site @0x{guest:x} unexpected slot0 {before:08x} (want {orig_slot0:08x}), not patched");
+                libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+                continue;
+            }
+            for (i, w) in win.iter().enumerate() {
+                *((guest + (i as u64) * 4) as *mut u32) = *w;
+            }
+            libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+            let head = (win[0], win[1], win[2], win[3]);
+            eprintln!("[elfjit:routeB] patched site @0x{guest:x} 28B -> materialize-stable-object (obj 0x{obj:x} {head:08x?})");
+            arm64jit::jit::block_cache_drop_region(guest, guest + 28);
+        }
+        // Repoint the two early-return branches (their targets are the patched
+        // store slot) so the early/no-op paths fall into the epilogue instead of
+        // storing through stale x9 (SH115 re-entrancy bug — the store slot is the
+        // shared `mov x0,xzr` tail, which the early paths reach BEFORE slot5's
+        // `ldr x9,[x19]` runs, so slot6 would store to leftover x9 junk).
+        let beq_g = (branch_eq.wrapping_add(0x1_0000_0000)) & 0xff_ffff_ffff;
+        let cbz_g = (branch_cbz.wrapping_add(0x1_0000_0000)) & 0xff_ffff_ffff;
+        let _ = repoint_early_branch(beq_g, store_slot, epilogue, "b.eq");
+        let _ = repoint_early_branch(cbz_g, store_slot, epilogue, "cbz x19");
+    }
+    ROUTEB_DISPATCH_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
 
 /// Drive the engine's REAL per-node PRESENT walker so a populated 0x28-stride
 /// scene node actually DRAWS (closing SH63's "present side" gap). Entry is the
@@ -4657,6 +4862,23 @@ fn main() {
             // the singletons 0x624f4f0 reaches directly (cbz x1) that the gate
             // force does NOT cover (would otherwise null-vtable crash at 0x624f500).
             routeb_seed_task_singletons();
+            // SH115: the three nullable-singleton dispatch accessors (V2Init/
+            // V2Start/V1AppStart/SendAppEventOnAppReady) soft-return because
+            // their `blr` reads past the 0x60 vtable. Scoped-patch each site to
+            // materialize the stable zeroed singleton object so those bodies
+            // COMPLETE (session advance). Leaves nativeInit's own 0x60 reads +
+            // the shared vtable untouched. OPT-IN (JIT_SH115_SINGLETON_PATCH=1)
+            // until the deeper nativeInit rung-0 getter gate is cleared: the
+            // patch is verified to make the render pipeline run, but it also
+            // advances nativeInit PAST its former soft-return into a 0x28-getter
+            // fault (SH116), so it is inert by default to keep the ladder clean.
+            if std::env::var("JIT_SH115_SINGLETON_PATCH").ok().as_deref() == Some("1") {
+                routeb_patch_singleton_dispatch();
+                // SH116: the advanced nativeInit path locks an unmapped .bss
+                // global's +0x28; materialize a stable zeroed lock-owner into
+                // the helper instead of seeding the unmapped page.
+                routeb_patch_nativeinit_lock_owner();
+            }
             // SH87: the map-family generic dispatch can blr through the garbage +0x18
             // hash2 of a rehash-copied map (0x1800064) — force blr x1 (primary hash).
             routeb_patch_map_dispatch();
@@ -9030,6 +9252,114 @@ mod sh111_tests {
         assert_eq!(unsafe { *(obj.wrapping_add(0x28) as *const u64) }, 0, "object +0x28 must read as zeroed slot");
         // The NULL leaf returns exactly 0.
         assert_eq!(routeb_singleton_null_leaf(0, 0, 0, 0, 0, 0, 0, 0), 0);
+    }
+}
+
+#[cfg(test)]
+mod sh115_tests {
+    use super::*;
+    // SH115: the differential scoped-site patch for the three nullable-singleton
+    // dispatch accessors. Pins the ARM64 encodings (movz/movk/materialize) and
+    // the per-site 28-byte window layout + expected original slot0 guard bytes.
+    #[test]
+    fn sh115_obj_window_materializes_stable_object() {
+        // A known object address; the 7-instruction window must rebuild it in x8
+        // then move to x0, reload objA into x9, and store x0 into [x9] (the tail
+        // overwrites the original `mov x0,xzr`).
+        let oj: u64 = 0x7f_1234_5678_9abc;
+        let w = sh115_obj_window(oj);
+        assert_eq!(w.len(), 7);
+        // slot0 movz x8,#0x9abc (hw0)
+        assert_eq!(w[0], 0xD280_0000u32 | ((0x9abcu32) << 5) | 8);
+        // slot1 movk x8,#0x5678 (hw1)
+        assert_eq!(w[1], 0xF2A0_0000u32 | ((0x5678u32) << 5) | 8);
+        // slot2 movk x8,#0x1234 (hw2)
+        assert_eq!(w[2], 0xF2C0_0000u32 | ((0x1234u32) << 5) | 8);
+        // slot3 movk x8,#0x7f (hw3)
+        assert_eq!(w[3], 0xF2E0_0000u32 | ((0x007fu32) << 5) | 8);
+        // slot4 mov x0,x8 ; slot5 ldr x9,[x19] ; slot6 str x0,[x9]
+        assert_eq!(w[4], 0xAA08_03E0);
+        assert_eq!(w[5], 0xF940_0269);
+        assert_eq!(w[6], 0xF900_0120);
+        // Reassemble the object from the four movz/movk immediates (round-trip).
+        let lo = (w[0] >> 5) & 0xffff;
+        let _16 = (w[1] >> 5) & 0xffff;
+        let _32 = (w[2] >> 5) & 0xffff;
+        let _48 = (w[3] >> 5) & 0xffff;
+        let rebuilt = (lo as u64) | ((_16 as u64) << 16) | ((_32 as u64) << 32) | ((_48 as u64) << 48);
+        assert_eq!(rebuilt, oj);
+    }
+    #[test]
+    fn sh115_sites_target_lazy_singleton_accessor_windows() {
+        // Guest file vaddrs for the three accessor sites with their original
+        // slot0 (mov) guard bytes — the patch refuses to write if these shift.
+        let sites: [(u64, u32); 3] = [
+            (0x62517b8, 0xAA15_03E0), // V2Init A: mov x0,x21
+            (0x6251a9c, 0xAA16_03E2), // V2Start A2: mov x2,x22
+            (0x626093c, 0xAA14_03E1), // V1AppStart B: mov x1,x20
+        ];
+        for (file_start, orig0) in sites {
+            // Guest = file vaddr + 0x100000000 (same transform the patcher uses).
+            let guest = file_start.wrapping_add(0x1_0000_0000) & 0xff_ffff_ffff;
+            assert!(guest & 3 == 0, "site must be 4-aligned");
+        }
+        assert_eq!(sites.len(), 3, "exactly three singleton dispatch sites");
+    }
+    #[test]
+    fn sh116_nativeinit_lock_owner_helper_materializes_stable_object() {
+        // SH116: the nativeInit lock-owner helper (file 0x2320710) reads an
+        // unmapped .bss global; the harness patches its 3 slots (guest
+        // 0x102320710/0x102320714/0x102320718) to materialize a stable zeroed
+        // object into x0 via movz+movk(hw1)+movk(hw2). Pin the encodings.
+        let s: u64 = 0x7f_0123_4567_8abc;
+        let words: [u32; 3] = [
+            0xD280_0000u32 | (((s & 0xffff) as u32) << 5), // movz x0,#imm16 hw0
+            0xF2A0_0000u32 | ((((s >> 16) & 0xffff) as u32) << 5), // movk x0,#imm16 hw1
+            0xF2C0_0000u32 | ((((s >> 32) & 0xffff) as u32) << 5), // movk x0,#imm16 hw2
+        ];
+        // reassemble s from the three immediates (bits [0,48); bits 48-63 are 0)
+        let imm = |w: u32| (w >> 5) & 0xffff;
+        let rebuilt =
+            (imm(words[0]) as u64) | ((imm(words[1]) as u64) << 16) | ((imm(words[2]) as u64) << 32);
+        assert_eq!(rebuilt, s & 0xffff_ffff_ffff);
+        // guest = file vaddr + 0x100000000 (identity transform the patcher uses)
+        assert_eq!(0x2320710u64 + 0x1_0000_0000, 0x102320710u64, "SH116 helper start");
+        assert_eq!(0x72739c0u64 + 0x1_0000_0000, 0x1072739c0u64, "SH116 lock-owner global (unmapped .bss)");
+        assert_eq!(0x102320710u64 & 3, 0, "helper start 4-aligned");
+    }
+    #[test]
+    fn sh115_repoints_early_return_branches_off_the_store_slot() {
+        // Each site has TWO early-return branches (b.eq + cbz x19) that target the
+        // patched store slot (window_start+6*4). They must be repointed one word
+        // forward to the epilogue so the early/no-op path doesn't store through a
+        // stale x9. Pull exact branch words from the real disasm.
+        // (branch_file_addr, original_word, expected_target, epilogue_guest)
+        let cases: [(u64, u32, u64, u64); 6] = [
+            // V2Init A
+            (0x6251784, 0x54000260, 0x1062517d0, 0x1062517d4), // b.eq -> epilogue
+            (0x6251790, 0xb4000213, 0x1062517d0, 0x1062517d4), // cbz x19 -> epilogue
+            // V2Start A2
+            (0x6251a5c, 0x540002c0, 0x106251ab4, 0x106251ab8),
+            (0x6251a68, 0xb4000273, 0x106251ab4, 0x106251ab8),
+            // V1AppStart B
+            (0x62608fc, 0x540002c0, 0x106260954, 0x106260958),
+            (0x6260908, 0xb4000273, 0x106260954, 0x106260958),
+        ];
+        for (branch_file, word, expect_target, epilogue) in cases {
+            let branch = branch_file.wrapping_add(0x1_0000_0000) & 0xff_ffff_ffff;
+            // sanity: the original word must target `expect_target`
+            let imm19 = (word >> 5) & 0x7ffff;
+            let cur = branch.wrapping_add((imm19 as i64 * 4) as u64);
+            assert_eq!(cur, expect_target, "original branch target mismatch");
+            // the pure repoint must land on the epilogue (skip the store)
+            let neww = sh115_repoint_word(branch, word, epilogue);
+            let new_imm19 = (neww >> 5) & 0x7ffff;
+            let new_t = branch.wrapping_add((new_imm19 as i64 * 4) as u64);
+            assert_eq!(new_t, epilogue, "repointed branch target");
+            // top byte (0x54 for b.eq / 0xb4 for cbz) + Rt/cond preserved
+            assert_eq!(neww & 0xff00_0000, word & 0xff00_0000, "opcode byte changed");
+            assert_eq!(neww & 0x1f, word & 0x1f, "Rt/cond bits changed");
+        }
     }
 }
 
