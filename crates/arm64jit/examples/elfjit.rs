@@ -1621,6 +1621,43 @@ fn routeb_patch_nativeinit_lock_owner() {
     }
     ROUTEB_LOCK_OWNER_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
+static ROUTEB_FLAGMAP_PATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// SH117: after SH115/116, nativeInitializeNativeFlags advances into its flag-
+/// registration loop and calls a hash-map ramp-probe helper (guest 0x10232090c,
+/// file 0x232090c, sole caller `bl 232090c` @ file 0x23208d8). The flag-map
+/// object it probes has an UNSEEDED +0 bucket-array pointer (stale host-stack
+/// garbage) -> `ldr x8,[x0]; ldr x8,[x8,x11,lsl#3]` SIGSEGVs (fault==[table+0]).
+/// The map object is a per-run leak so a fixed-address seed is unreliable;
+/// instead leaf-rewrite the helper prologue to `ret` (return x0 = the non-zero
+/// map object) so the caller's `cbz x0` takes the "found" path and skips the
+/// insert. Deterministic, idempotent, non-vtable-widening, 8 bytes, single call
+/// site. (libre future: seed a coherent empty flag-map at the 0x102320524
+/// producer for the proper deep fix.)
+fn routeb_patch_nativeinit_flagmap_helper() {
+    if ROUTEB_FLAGMAP_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let start = 0x10232090c_u64; // guest = file(0x232090c) + 0x100000000
+    let page = (start & !0xfff) as *mut libc::c_void;
+    unsafe {
+        if libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_WRITE) != 0 {
+            eprintln!("[elfjit:routeB] WARN mprotect RW failed for SH117 helper @0x{start:x} errno={}", std::io::Error::last_os_error());
+            return;
+        }
+        let before = *(start as *const u32);
+        if before != 0xa9bf_7bfdu32 {
+            eprintln!("[elfjit:routeB] WARN SH117 helper @0x{start:x} unexpected word0 {before:08x}, not patched");
+            libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+            return;
+        }
+        *(start as *mut u32) = 0xd65f_03c0u32; // ret (return x0 = map obj, non-zero)
+        *((start + 4) as *mut u32) = 0xd503_201fu32; // nop (was mov x29,sp)
+        libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+        arm64jit::jit::block_cache_drop_region(start, start + 8);
+        eprintln!("[elfjit:routeB] SH117 patched nativeInit flag-map probe helper @0x{start:x} 8B -> leaf ret (returns x0=flag-map obj) — caller takes 'found' path, skips garbage insert");
+    }
+    ROUTEB_FLAGMAP_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
 /// Apply the SH115 scoped patch to the three singleton-dispatch accessor sites.
 /// (file vaddr -> expected original slot0 word + the two early-return branches
 /// that jump onto the patched store-slot and their file vaddrs)
@@ -4878,6 +4915,10 @@ fn main() {
                 // global's +0x28; materialize a stable zeroed lock-owner into
                 // the helper instead of seeding the unmapped page.
                 routeb_patch_nativeinit_lock_owner();
+                // SH117: nativeInit's flag-map probe helper reads a garbage +0
+                // bucket-array; leaf-rewrite it to `ret` so the caller takes the
+                // 'found' path and the flag-registration loop advances.
+                routeb_patch_nativeinit_flagmap_helper();
             }
             // SH87: the map-family generic dispatch can blr through the garbage +0x18
             // hash2 of a rehash-copied map (0x1800064) — force blr x1 (primary hash).
@@ -9326,6 +9367,18 @@ mod sh115_tests {
         assert_eq!(0x2320710u64 + 0x1_0000_0000, 0x102320710u64, "SH116 helper start");
         assert_eq!(0x72739c0u64 + 0x1_0000_0000, 0x1072739c0u64, "SH116 lock-owner global (unmapped .bss)");
         assert_eq!(0x102320710u64 & 3, 0, "helper start 4-aligned");
+    }
+    #[test]
+    fn sh117_nativeinit_flagmap_probe_helper_leaf_rewrite() {
+        // SH117: the nativeInit flag-map probe helper (guest 0x10232090c, file
+        // 0x232090c) probes a garbage +0 bucket-array -> SIGSEGV. Patch its 8B
+        // prologue to `ret`+`nop` so it returns x0 (the non-zero map object) and
+        // the caller takes the "found" path. Pin the words + address transform.
+        assert_eq!(0x232090cu64 + 0x1_0000_0000, 0x10232090cu64, "flag-map helper start");
+        assert_eq!(0xa9bf_7bfdu32, 0xa9bf_7bfdu32, "word0 = stp x29,x30,[sp,#-16]!");
+        assert_eq!(0xd65f_03c0u32, 0xd65f_03c0u32, "patch word0 = ret");
+        assert_eq!(0xd503_201fu32, 0xd503_201fu32, "patch word1 = nop");
+        assert_eq!(0x10232090cu64 & 3, 0, "helper start 4-aligned");
     }
     #[test]
     fn sh115_repoints_early_return_branches_off_the_store_slot() {
