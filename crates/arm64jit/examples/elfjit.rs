@@ -6274,11 +6274,20 @@ fn main() {
                         let me = unsafe { libc::pthread_self() };
                         unsafe {
                             *(main_id_cell as *mut u64) = me as u64;
-                            // once-guard [FILE 0x6a68410] = guest 0x106a68410 (in the
-                            // mapped rw- segment [0x1067d67c0,0x107333c3c)). Set bit0
-                            // so the GlobalInit do-init falls through its once-guard.
+                            // GATE-FIX (recon deleg_ff125cbc disasm of do-init 0x102206c40):
+                            // do NOT sock once-guard [0x106a68410].bit0=1 here. The do-init's
+                            // first guard check at 0x2206c80 (`ldarb w9,[0x6a68410]; tbz w9,#0`)
+                            // selects std::__call_once (bl 0x284ce54) ONLY when bit0==0, and
+                            // that __call_once is what RUNS the DM-construct lambda whose
+                            // result populates DM-root [0x106a68818] (the +0x20 field of the
+                            // caller app-bridge obj at 0x106a687f8). Forcing bit0=1 SKIPS the
+                            // __call_once entirely, so [0x106a68818] stays NULL and the match
+                            // path's `cbz [x19,#0x20]` at 0x2206df8 dead-ends to the benign
+                            // Ok(0x3e8) soft-return (no session node). Correct order: seed
+                            // flags-latch + main-id, LET the once-lambda populate the DM slot;
+                            // the __call_once sets bit0 itself via stlrb when it completes.
                             let og = 0x106a68410u64 as *mut u8;
-                            *og |= 1;
+                            let _ = og; // left CLEAR (0) so __call_once runs and builds the DM
                             // SH125 (recon deleg_5e2c8480 of do-init 0x102206c40): the
                             // do-init's flags-loaded GETTER (guest 0x10220671c) reads
                             // `ldrb w0,[0x106a683e8]` (file 0x2206738) before the
@@ -6293,7 +6302,7 @@ fn main() {
                             *flags_latch |= 1;
                             eprintln!("[elfjit:v2boot] SH125 seeded flags-loaded latch [0x106a683e8].bit0=1 so the do-init consumes the live DM slot (getter 0x102206738)");
                         }
-                        eprintln!("[elfjit:v2boot] SH122 seeded main-id cell 0x{me:x} + once-guard [0x6a68410].bit0=1 for StartLuaAppDM -> GlobalInit do-init takes the DM-construction match path");
+                        eprintln!("[elfjit:v2boot] GATE-FIX seeded main-id cell 0x{me:x} + flags-latch for StartLuaAppDM -> GlobalInit once-guard LEFT CLEAR so __call_once runs and populates DM-root [0x106a68818]");
                     }
                     let mut s = arm64jit::jit::CpuState::new();
                     s.tpidr = tpidr;
@@ -6304,6 +6313,25 @@ fn main() {
                         Ok(r) => eprintln!("[elfjit:v2boot] {name} returned Ok({r:#x})"),
                     }
                     dump(name);
+                    // SH155: read the DM-root + once-guard IMMEDIATELY after the
+                    // StartLuaAppDM rung returns (the trailing probe is too late —
+                    // the SH126 SendAppEvent rung clears the once-guard first). If the
+                    // do-init's __call_once completed, once-guard is self-set to 1 and
+                    // DM-root [0x106a68818] holds a live object the match path could br into.
+                    if *guest == 0x1023efe2c {
+                        let og_now = unsafe { *(0x106a68410u64 as *const u8) };
+                        let dm_now = unsafe { *(0x106a68818u64 as *const u64) };
+                        let once_slot = unsafe { *(0x106a68408u64 as *const u64) };
+                        let ok = (0x100000000..0x107333c3c).contains(&dm_now);
+                        // The do-init's __call_once store is `str x0,[x23,#1032]`
+                        // (x23=adrp 6a68000) => [0x106a68408] holds the constructed DM
+                        // controller; the match path then reads the appbridge obj's
+                        // +0x20 field [0x106a68818]. Report both.
+                        let once_ok = (0x100000000..0x107333c3c).contains(&once_slot);
+                        eprintln!(
+                            "[elfjit:v2boot] SH155 post-StartLuaAppDM: once-guard[0x6a68410]={og_now:#x} DM-root[0x106a68818]=0x{dm_now:x} liveDM-image={ok} once-slot[0x106a68408]=0x{once_slot:x} once-live={once_ok}"
+                        );
+                    }
                     if *guest == 0x102206404 || *guest == 0x1023efe2c {
                         unsafe { *(main_id_cell as *mut u64) = orig_main_id };
                     }
@@ -6415,21 +6443,21 @@ fn main() {
                         }
                     }
                     let ev = arm64jit::jni::new_string_utf_handle(b"Home");
+                    let n2 = arm64jit::jni::new_string_utf_handle(b"");
                     let n3 = arm64jit::jni::new_string_utf_handle(b"");
                     let n4 = arm64jit::jni::new_string_utf_handle(b"");
-                    let n5 = arm64jit::jni::new_string_utf_handle(b"");
                     eprintln!(
-                        "[elfjit:v2boot] driving SendAppEventOnAppReady @ guest 0x102bb463c (event=\"Home\" jstr={ev:#x})"
+                        "[elfjit:v2boot] driving SendAppEventOnAppReady @ guest 0x102bb463c (event=\"Home\" jstr={ev:#x} IN x5 — ABI-correct; discriminator reads the 4th jstring)"
                     );
                     let mut se = arm64jit::jit::CpuState::new();
                     se.tpidr = tpidr;
                     se.x[31] = boot_sp;
                     se.x[0] = env_ptr;
                     se.x[1] = thiz;
-                    se.x[2] = ev;
+                    se.x[2] = n2;
                     se.x[3] = n3;
                     se.x[4] = n4;
-                    se.x[5] = n5;
+                    se.x[5] = ev;
                     match arm64jit::jit::jit_run(iimg, ib, 0x102bb463c, &mut se as *mut CpuState) {
                         Err(e) => eprintln!("[elfjit:v2boot] SendAppEventOnAppReady stopped: {e}"),
                         Ok(r) => eprintln!(
@@ -6512,6 +6540,31 @@ fn main() {
                     let og = unsafe { *(0x106a68410u64 as *const u8) };
                     eprintln!(
                         "[elfjit:v2boot] SH122 session-advance probe: MH_FLAGS_LOADED={nf} MH_ENGINE_INITIALIZED={ni} MH_APP_READY={ar} once-guard[0x6a68410]={og:#x}"
+                    );
+                    // SH155 REcon-verified DM-root markers (do-init __call_once result):
+                    // (a) once-guard bit0==1 (lambda completed); (b) DM-root
+                    // [0x106a68818] non-NULL AND [[0x106a68818]+0x20] vt+0x30 is a sane
+                    // image code address (a live DataModel/app-shell object the match path
+                    // would `br` into); (c) the app-data-model counter [0x106dca000+0xe88]
+                    // advanced from 0 (the JSON serialization wrote once). Print all three
+                    // so a route-B advance is observable without retro-instrumentation.
+                    let dm_root = unsafe { *(0x106a68818u64 as *const u64) };
+                    let (mark_b, vt30) = if (0x100000000..0x107333c3c).contains(&dm_root) {
+                        let obj20 = unsafe { *((dm_root + 0x20) as *const u64) };
+                        if (0x100000000..0x107333c3c).contains(&obj20) {
+                            let vt30 = unsafe { *((obj20 + 0x30) as *const u64) };
+                            let sane = (0x100000000..0x107333c3c).contains(&vt30);
+                            (sane, vt30)
+                        } else {
+                            (false, 0)
+                        }
+                    } else {
+                        (false, 0)
+                    };
+                    let adc = unsafe { *(0x106dca000u64 as *const u64).add(0xe88 / 8) };
+                    eprintln!(
+                        "[elfjit:v2boot] SH155 DM-root probe: once-guard={og:#x} DM-root[0x106a68818]=0x{dm_root:x} vt+0x30={vt30:#x} mark_b(liveDM)={mark_b} app-data-model-count[0x106dca000+0xe88]={:#x}",
+                        adc
                     );
             }));
         }
