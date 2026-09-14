@@ -4845,6 +4845,40 @@ fn main() {
                     Ok(r) => eprintln!("[elfjit:v2boot] V1 AppStart__ returned Ok({r:#x})"),
                 }
                 dump("V1 AppStart__");
+                // SH113 (recon-sh113-surface-handoff.md): after V2Start/V1 drive
+                // nativeAppBridgeV2UpdateSurfaceAppWithPlatformParams so the REAL
+                // wired XID lands at [0x10683d348] (the window the engine's
+                // EGL-surface path reads) and nudge the app-bridge data model —
+                // the concrete onboard step for "engine renders its own screens".
+                // The JIT's ANativeWindow_fromSurface shim ignores the Surface
+                // arg and returns the SH112-wired XID, so x2 only needs a
+                // non-null token and x3 a readable platformParams sentinel.
+                if std::env::args().any(|a| a == "--v2boot-surface-handoff") {
+                    let surf_token = Box::leak(vec![0x42u8; 64].into_boxed_slice()).as_mut_ptr() as u64;
+                    let params = Box::leak(vec![0u8; 64].into_boxed_slice()).as_mut_ptr() as u64;
+                    eprintln!(
+                        "[elfjit:v2boot] driving V2UpdateSurfaceAppWithPlatformParams @ guest 0x1025f5fec (surface_token={surf_token:#x} params={params:#x})"
+                    );
+                    let mut su = arm64jit::jit::CpuState::new();
+                    su.tpidr = tpidr;
+                    su.x[31] = boot_sp;
+                    su.x[0] = env_ptr;
+                    su.x[1] = thiz;
+                    su.x[2] = surf_token;
+                    su.x[3] = params;
+                    match arm64jit::jit::jit_run(iimg, ib, 0x1025f5fec, &mut su as *mut CpuState) {
+                        Err(e) => eprintln!("[elfjit:v2boot] V2UpdateSurface stopped: {e}"),
+                        Ok(r) => eprintln!("[elfjit:v2boot] V2UpdateSurface returned Ok({r:#x})"),
+                    }
+                    let win = arm64jit::shims::anativewindow_xid();
+                    let stored = unsafe { *(0x10683d348u64 as *const u64) };
+                    let nf = arm64jit::jni::nativehelper_flags_loaded();
+                    let ar = arm64jit::jni::nativehelper_app_ready();
+                    eprintln!(
+                        "[elfjit:v2boot] surface-handoff: wired_xid=0x{win:x} [0x10683d348]=0x{stored:x} MH_FLAGS_LOADED={nf} MH_APP_READY={ar}"
+                    );
+                    dump("V2UpdateSurfaceAppWithPlatformParams");
+                }
                 eprintln!("[elfjit:v2boot] ladder done; final [0x106829ea8] = {:#x}", dw(BSS_TASKV4));
             });
         }
