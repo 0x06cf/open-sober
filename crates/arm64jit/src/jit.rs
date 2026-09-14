@@ -517,6 +517,61 @@ fn routeb_setfix_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("JIT_ROUTEB_SETFIX").is_some())
 }
 
+/// SH161 (recon deleg_c94a8b2f): the AppBridgeV2 governor TAIL (0x2e9fd78-0x2e9fdb0,
+/// reached after startAppWithParams continues) loads `x0 = [x19,#1032]` = impl[+0x408]
+/// then dispatches `ldr x8,[x0]; ldr x8,[x8,#48]; blr x8` (vt[+0x30]) at 0x102e9fd90
+/// (twin 0x102e9fdb0). Under the partial do-init impl is a live host-heap object
+/// (0x7ff6...) and impl[+0x408]==0, so `ldr x8,[x0]` SIGSEGVs fault=0x0 (reported
+/// guestpc 0x102e9fcc4 is just the fresh-block attribution; the real deref is these
+/// two dispatch sites). SH159d patched only the earlier MODERN window (0x2e9fb44) and
+/// cannot extract impl's runtime address to static-seed it. Fix mirrors SH123: at each
+/// dispatch-site block entry, when `[x19+0x408]` is 0/sub-image, write the inert
+/// DISPATCH (0x106a72000, all-leaf vt whose vt[+0x30]=leaf) into the impl slot so the
+/// subsequent `ldr x0,[x19,#1032]; ldr x8,[x0]; ldr x8,[x8,#48]; blr` resolves benignly.
+/// Idempotent (writes the same pointer each entry). Gated on JIT_ROUTEB_SETFIX.
+fn routeb_tail_dispatch_guard(state: *mut CpuState, pc: u64) {
+    const DISPATCH: u64 = 0x106a72000; // MUST match routeb_patch_gov_dispatch's DISPATCH
+    // Fire anywhere in the governor-tail region [0x102e9fcc4, 0x102e9fdc8): the tail is
+    // translated as ONE block that loads x0=[x19,#1032]=impl[+0x408] then derefs it
+    // (`ldr x8,[x0]`) at 0x102e9fd90/0x102e9fdb0. Seeding the impl slot at any entry
+    // into that block (including 0x102e9fcc4 the reported guestpc) makes the load
+    // resolve to the inert DISPATCH before the dispatch runs.
+    if pc < 0x102e9fcc4 || pc > 0x102e9fdc8 {
+        return;
+    }
+    let s = unsafe { &*state };
+    let implb = s.x[19];
+    if implb == 0 {
+        return;
+    }
+    let slot = implb + 0x408;
+    let cur = unsafe { std::ptr::read_unaligned(slot as *const u64) };
+    let sub_image = cur < 0x100000000 && cur != 0;
+    if cur != 0 && !sub_image {
+        return; // already a live pointer — leave it (real session).
+    }
+    unsafe { std::ptr::write_unaligned(slot as *mut u64, DISPATCH) };
+    eprintln!(
+        "[routeb-setfix] SH161 governor-tail DISPATCH seeded into impl[+0x408] ({slot:#x}) = {DISPATCH:#x} (inert all-leaf vt) at pc={pc:#x} -> tail vt[+0x30] dispatch resolves benignly (was {cur:#x})"
+    );
+}
+
+/// SH161 (recon deleg_c94a8b2f): broad tail-entry probe — log every block entry whose
+/// pc falls in the governor-tail region so we can pin exactly which block contains the
+/// NULL-deref dispatch. Debug-only, gated on JIT_ROUTEB_SETFIX + JIT_ROUTEB_TAILTRACE.
+fn routeb_tail_trace(state: *mut CpuState, pc: u64) {
+    if std::env::var_os("JIT_ROUTEB_TAILTRACE").is_none() {
+        return;
+    }
+    if pc >= 0x102e9fb00 && pc <= 0x102e9fe00 {
+        let s = unsafe { &*state };
+        eprintln!(
+            "[routeb-tailtrace] block entry pc={pc:#x} x0={:#x} x19={:#x}",
+            s.x[0], s.x[19]
+        );
+    }
+}
+
 /// SH123: the leaked coherent EMPTY String-hash-set substituted for a dangling host
 /// container at the generic `.find()` leaf. Zeroed 0x30 bytes: +0x08 count=0 (canonical
 /// empty -> `cbz` returns NULL), +0x18/+0x20 = Roblox SSO empty String (flags 0, len 0).
@@ -2856,6 +2911,14 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
                     "[routeb-setfix] SH123 substituted leaked coherent empty String-hash-set 0x{empty:x} for dangling host container 0x{container:x} at pc=0x{pc:x} -> find returns NULL"
                 );
             }
+        }
+        // SH161 (recon deleg_c94a8b2f): governor-tail dispatch guard. Before the tail
+        // derefs impl[+0x408] (x0) at 0x102e9fd90/0x102e9fdb0, seed the inert DISPATCH
+        // into the impl slot so the vt[+0x30] blr resolves benignly. x19(impl) is a
+        // live host-heap object address, only known at runtime — hence the hook.
+        if routeb_setfix_enabled() {
+            routeb_tail_dispatch_guard(state, pc);
+            routeb_tail_trace(state, pc);
         }
         unsafe { run(&block, state) };
         if step_trace {

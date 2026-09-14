@@ -1536,13 +1536,46 @@ fn routeb_patch_startapp_init3_gates() {
     arm64jit::jit::block_cache_drop_region(0x102e9fcb0, 0x102ea3b40); // widen: whole governor tail + validator (SH160+ 0x102e9fcc4 block-cache race)
 }
 
+/// SH161 (recon deleg_c94a8b2f): the governor TAIL's post-dispatch continuation
+/// (guest 0x2e9fdf4, reached after the vt[+0x30] dispatch resolves benignly via the
+/// SH161 impl[+0x408] seed) does `ldr x0,[x19,#1088]` (=impl[+0x440]) ; `mov x1,x20` ;
+/// `bl 24c3768` — a device-display-handler shared_ptr/refcount helper. impl[+0x440]
+/// is a structural live-launch object (NULL under the partial do-init), and the call
+/// derefs `[x0,#320]` (fault=0x140). The return value is DISCARDED by the caller
+/// (`mov x0,x19` at 0x2e9fe00 right after), so NOPing the 3-instruction window
+/// (ldr/mov/bl) is a benign no-op — mirrors SH160's init3-gate NOP. Verified
+/// encodings: `ldr x0,[x19,#1088]`=0xf9422260, `mov x1,x20`=0xaa1403e1, `bl`=0x97d88e5b.
+fn routeb_patch_gov_tail_cont() {
+    let addr = 0x102e9fdf4u64;
+    let orig: [u32; 3] = [0xf942_2260, 0xaa14_03e1, 0x97d8_8e5b];
+    let page = addr & !0xfff;
+    unsafe {
+        if libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_WRITE) != 0 {
+            eprintln!("[elfjit:routeB] WARN SH161 mprotect RW failed @0x{addr:x} errno={}", std::io::Error::last_os_error());
+            return;
+        }
+        let before: [u32; 3] = [*(addr as *const u32), *((addr + 4) as *const u32), *((addr + 8) as *const u32)];
+        if before == orig {
+            for i in 0..3 {
+                *((addr + (i as u64) * 4) as *mut u32) = 0xd503_201f; // nop
+            }
+            eprintln!("[elfjit:routeB] SH161 patched governor-tail refcount call window @0x{addr:x} (ldr/mov/bl 24c3768) -> 3x nop (impl[+0x440] structural NULL; result discarded)");
+        } else if before == [0xd503_201f; 3] {
+            eprintln!("[elfjit:routeB] SH161 governor-tail refcount window @0x{addr:x} already patched");
+        } else {
+            eprintln!("[elfjit:routeB] WARN SH161 governor-tail refcount window @0x{addr:x} unexpected {before:08x?}, not patched");
+        }
+        libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_EXEC);
+    }
+    arm64jit::jit::block_cache_drop_region(0x102e9fdc8, 0x102ea3b40);
+}
+
 /// SH159e (recon deleg_9ea3f752): nativeAppBridgeV2StartAppWithParams (0x24258c6e4)
 /// reads the param union: x22=[x0+8]=capacity, count=[x19+24], float=[x19+32].
 /// The governor passes x0=sp+0x198 whose union we never initialized (we skip the
 /// appendix that fills it), so garbage -> hash-walk NULL deref. Make these inputs
 /// deterministic: cap=0 (allocate path), count=0, float=1.0.
 fn routeb_patch_startapp_params() {
-    // (addr, orig_word, new_word)
     let sites: [(u64, u32, u32); 3] = [
         (0x10258c6f8, 0xf940_0416, 0xd280_0016), // ldr x22,[x0,#8] -> mov x22,#0
         (0x10258c7b4, 0xf940_0e68, 0xd280_0008), // ldr x8,[x19,#24] -> mov x8,#0
@@ -6616,6 +6649,12 @@ fn main() {
                                     // appData[+0x28] 'init3 provider' is a structural
                                     // live-heap object); zero the out-buffer instead.
                                     routeb_patch_startapp_init3_gates();
+                                    // SH161 .text patch: governor-TAIL post-dispatch
+                                    // continuation (0x2e9fdf4) calls the device-display
+                                    // handler refcount helper 24c3768 with x0=impl[+0x440]
+                                    // == NULL under partial do-init (fault [x0,#320]). Its
+                                    // return is discarded; NOP the 3-instruction window.
+                                    routeb_patch_gov_tail_cont();
                                     // SH159b (recon deleg_0eff24ca): the governor
                                     // (0x102e9fa84) reads x19=[x0+0x20] at 0x2e9fac0
                                     // (x0=wrapper @ [0x106a705e8]... actually GetOrCreate
