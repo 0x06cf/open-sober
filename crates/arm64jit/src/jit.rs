@@ -496,6 +496,27 @@ fn routeb_hashfix_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("JIT_ROUTEB_HASHFIX").is_some())
 }
 
+/// SH123: gate for the String-hash-set `.find()` host substitute (dangling container).
+fn routeb_setfix_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("JIT_ROUTEB_SETFIX").is_some())
+}
+
+/// SH123: the leaked coherent EMPTY String-hash-set substituted for a dangling host
+/// container at the generic `.find()` leaf. Zeroed 0x30 bytes: +0x08 count=0 (canonical
+/// empty -> `cbz` returns NULL), +0x18/+0x20 = Roblox SSO empty String (flags 0, len 0).
+/// Leaked once, stable for the whole process (identity-mapped guest view).
+pub fn routeb_setfix_empty_set() -> u64 {
+    use std::sync::OnceLock;
+    static EMPTY: OnceLock<u64> = OnceLock::new();
+    *EMPTY.get_or_init(|| {
+        let set = Box::leak(vec![0u8; 0x30usize].into_boxed_slice()).as_mut_ptr() as u64;
+        // +0x18/+0x20 = SSO empty String (flags=0 frame already zeroed) — leave 0.
+        set
+    })
+}
+
 /// SH88: the coherent empty span-hash map seeded by the --v2boot harness for the
 /// OTel/pb_defaults BSS registry slots, used to substitute for a non-zero sub-image
 /// map/this candidate (a `.data.rel.ro` protobuf TAG constant like 0x1800064, which
@@ -2752,6 +2773,33 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
                         }
                     }
                 }
+            }
+        }
+        // SH123 (opt-in JIT_ROUTEB_SETFIX): the Route-B DM/app-shell construction path
+        // (reached via StartLuaAppDM -> 0x2baeeec -> GlobalInit do-init 0x2206c40)
+        // calls the generic Roblox String-keyed hash-set `.find()` leaf (guest entry
+        // 0x10217582c, file 0x217582c; 429 static bl sites, a ubiquitous utility) with a
+        // DANGLING HOST pointer as the container (recon deleg_c48fbbf5): the telemetry/
+        // stats singleton (`parent->field_0x30`, embedded set at +0xe8) is never
+        // constructed under the JIT, so the arg is an SH103-class host leak
+        // (0x7fe8f4035be0, unmapped behind it) -> `ldr x23,[x20,#8]` SIGSEGV at
+        // 0x102175854. The leaf derefs +0x18 (String) for hashing BEFORE the count, so a
+        // pure .text patch can't save it. Fix mirrors SH88/SH92: at the leaf block
+        // entry, if x0 is NOT in the guest image domain, substitute a leaked coherent
+        // EMPTY String-hash-set (zeroed 0x30: +0x08 count=0 -> leaf's `cbz x23` at
+        // 0x102175858 short-circuits to `mov x22,xzr; ret 0` = NULL; +0x18/+0x20 all-zero
+        // Roblox SSO empty String hashes safely). In-image sets (real lookups) keep their
+        // real pointers. A pure-zero container is safe here because count=0 is the
+        // canonical empty-set and _find(empty,*) == NULL by definition.
+        if routeb_setfix_enabled() && pc == 0x10217582c {
+            let container = unsafe { (*state).x[0] };
+            let in_img = container >= base && container - base < image.len() as u64;
+            if container != 0 && !in_img {
+                let empty = routeb_setfix_empty_set();
+                unsafe { (*state).x[0] = empty };
+                eprintln!(
+                    "[routeb-setfix] SH123 substituted leaked coherent empty String-hash-set 0x{empty:x} for dangling host container 0x{container:x} at pc=0x{pc:x} -> find returns NULL"
+                );
             }
         }
         unsafe { run(&block, state) };

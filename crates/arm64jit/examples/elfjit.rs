@@ -9736,5 +9736,30 @@ mod sh115_tests {
         assert_eq!(0x23efe2cu64 + 0x1_0000_0000, 0x1023efe2cu64, "StartLuaAppDM guest entry");
         assert_eq!(0x2206c40u64 + 0x1_0000_0000, 0x102206c40u64, "GlobalInit do-init (fan-in target)");
     }
+    #[test]
+    fn sh123_string_hashset_find_dangling_container_substitute() {
+        // SH123 (jit.rs, opt-in JIT_ROUTEB_SETFIX): the generic Roblox String-keyed
+        // hash-set `.find()` leaf (guest entry 0x10217582c, file 0x217582c) is called
+        // during the DM/app-shell construction with a DANGLING HOST container (the
+        // telemetry/stats singleton `parent->field_0x30` at +0xe8 never constructs under
+        // the JIT -> SH103-class host leak) -> `ldr x23,[x20,#8]` SIGSEGV at 0x102175854.
+        // The recon (deleg_c48fbbf5) pinned the layout: +0x00 bucket array, +0x08 count,
+        // +0x18 String needle (hashed by 0x1df644c BEFORE the count), +0x20 compare String.
+        // Fix: at the leaf block entry, if x0 is NOT in the image domain, substitute a
+        // leaked coherent EMPTY set (count=0 -> `cbz` returns NULL). Pin addresses + the
+        // empty-set layout invariant (count at +0x08 must be 0 for the cbz short-circuit).
+        assert_eq!(0x217582cu64 + 0x1_0000_0000, 0x10217582cu64, "String-hash-set find leaf entry");
+        assert_eq!(0x2175854u64 + 0x1_0000_0000, 0x102175854u64, "fault site (ldr x23,[x20,#8])");
+        assert_eq!(0x1df644cu64 + 0x1_0000_0000, 0x101df644cu64, "String::hash (hashes +0x18, pre-count)");
+        let empty = arm64jit::jit::routeb_setfix_empty_set();
+        assert_ne!(empty, 0, "empty set must be non-zero");
+        // +0x08 = count -> MUST be 0 (canonical empty set -> leaf cbz -> ret NULL).
+        unsafe { assert_eq!(*((empty.wrapping_add(0x08)) as *const u64), 0, "empty set +0x08 count=0"); }
+        // +0x18/+0x20 = SSO empty String (all-zero flags/ptr/len) hashes safely.
+        unsafe {
+            assert_eq!(*((empty.wrapping_add(0x18)) as *const u64), 0, "empty set +0x18 String flags/ptr zero");
+            assert_eq!(*((empty.wrapping_add(0x20)) as *const u64), 0, "empty set +0x20 String zero");
+        }
+    }
 }
 
