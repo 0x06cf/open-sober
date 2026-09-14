@@ -1439,6 +1439,59 @@ fn routeb_patch_gov_router() {
     arm64jit::jit::block_cache_drop_region(0x102e9fa80, 0x102e9fb30);
 }
 
+/// SH159d (recon deleg_9ea3f752): the governor's MODERN ROUTER path derefs
+/// `impl[+0x408]` (the DISPATCH object) via `ldr x0,[x19,#1032]; ldr x8,[x0];
+/// ldr x9,[x8,#24]; blr x9`. Under the partial do-init impl[+0x408]==0, so
+/// `ldr x8,[x0]` derefs NULL (the recurring guestpc=0x102e9fa84 fault). The
+/// DISPATCH return value is DISCARDED by the governor (x0 is re-set at
+/// 0x2e9fb5c), so we can substitute a stable inert dispatch. Patch the 4-inst
+/// window 0x2e9fb44..0x2e9fb50 -> movz/movk/movk (x0 = fixed guest DISPATCH
+/// 0x106a72000) + `ldr x9,[x0,#0x18]` (leaf), so the original `blr x9` at
+/// 0x2e9fb54 calls our benign leaf and the governor continues to
+/// `bl 0x258c6e4` (nativeAppBridgeV2StartAppWithParams). Leaf written into
+/// [0x106a72000]+0x18.
+fn routeb_patch_gov_dispatch() {
+    const DISPATCH: u64 = 0x106a72000; // fixed .bss fake-DISPATCH (RW LOAD, buildable in 3 movk)
+    const WINDOW: u64 = 0x102e9fb44;   // `ldr x0,[x19,#1032]` (0xf9420660)
+    // Materialize x0 = 0x106a72000 + ldr x9,[x0,#0x18] (leaf) -- verified encodings.
+    let words: [u32; 4] = [
+        0xd284_0000, // movz x0,#0x2000
+        0xf2a0_d4e0, // movk x0,#0x6a7,lsl16
+        0xf2c0_0020, // movk x0,#0x1,lsl32  -> x0 = 0x106a72000
+        0xf940_0c09, // ldr x9,[x0,#24]
+    ];
+    let leaf = *ROUTEB_LEAF_ADDR.get_or_init(|| {
+        let a = arm64jit::jit::register_host_call_auto(routeb_singleton_leaf);
+        eprintln!("[elfjit:routeB] SH159d governor DISPATCH leaf registered at {a:#x}");
+        a
+    });
+    // Inert DISPATCH: [+0]=0, [+0x18]=leaf (only [+0x18] is used by the patch).
+    // Map the .bss page first (0x106a72000 may be a page the engine's boot
+    // leaves unmapped — the SIGSEGV fault=0x1006a72018 proved it).
+    if routeb_map_guest_page(DISPATCH) {
+        eprintln!("[elfjit:routeB] SH159d mapped guest page 0x{:x} for inert DISPATCH", DISPATCH & !0xfff);
+    }
+    let dp = DISPATCH as *mut u64;
+    unsafe {
+        *(dp.wrapping_add(0x18 / 8)) = leaf;
+    }
+    let page = WINDOW & !0xfff;
+    unsafe {
+        if libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_WRITE) == 0 {
+            for (i, w) in words.iter().enumerate() {
+                *((WINDOW + (i as u64) * 4) as *mut u32) = *w;
+            }
+            libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_EXEC);
+            eprintln!(
+                "[elfjit:routeB] SH159d patched governor MODERN dispatch 0x{WINDOW:x} (4 words) -> x0=inert DISPATCH 0x{DISPATCH:x} ldr x9=[+0x18]=leaf 0x{leaf:x}; governor now reaches `bl 0x258c6e4` startAppWithParams"
+            );
+        } else {
+            eprintln!("[elfjit:routeB] WARN SH159d mprotect RW failed for governor dispatch 0x{WINDOW:x} errno={}", std::io::Error::last_os_error());
+        }
+    }
+    arm64jit::jit::block_cache_drop_region(0x102e9fb40, 0x102e9fb90);
+}
+
 fn routeb_patch_globalinit_cevent_barrier() {
     const ADDR: u64 = 0x102206e70; // file 0x2206e70: `bl 2207578` = CEvent::wait (futex park)
     let want = 0xd503_201fu32; // nop
@@ -6472,6 +6525,11 @@ fn main() {
                                     // version-gate to always take the ROUTER path
                                     // (skips the faulting InitWithParams appendix).
                                     routeb_patch_gov_router();
+                                    // SH159d .text patch: governor MODERN dispatch
+                                    // derefs impl[+0x408] (NULL under partial do-init).
+                                    // Substitute an inert DISPATCH so it reaches
+                                    // bl 0x258c6e4 startAppWithParams.
+                                    routeb_patch_gov_dispatch();
                                     // SH159b (recon deleg_0eff24ca): the governor
                                     // (0x102e9fa84) reads x19=[x0+0x20] at 0x2e9fac0
                                     // (x0=wrapper @ [0x106a705e8]... actually GetOrCreate
@@ -6502,7 +6560,6 @@ fn main() {
                                         *(0x106a70608u64 as *mut u64) = impl_buf; // wrapper[+0x20] = impl (governor x19)
                                     }
                                     eprintln!("[elfjit:v2boot] SH159b seeded gov impl@[0x106a70608]=0x{impl_buf:x} impl[+0x408]=DISPATCH@0x{disptch_buf:x} DISPATCH.vt[+0x18]=benign leaf 0x{gov_leaf:x}");
-                                    }
                                 }
                                 // SH156 NEXT GATE: the ctor 0x102207b50's body reads
                                 // globals whose pages are LEFT UNMAPPED by the engine's
