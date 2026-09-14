@@ -979,6 +979,20 @@ pub fn resolve(name: &[u8]) -> Option<u64> {
         );
         return alloc_slot(&mut r, &key, hostf);
     }
+    // SH132: route the guest's dynamic-loader imports (dlopen/dlsym/dlclose/
+    // dlerror) through the fake-AAudio host bridge. This is how FMOD's AAudio
+    // output driver (dlopen("libaaudio.so") + 26×dlsym) succeeds on x86-64 Linux
+    // where those Android libs are absent. Only intercepts when the bridge env
+    // is set (JIT_AAUDIO_BRIDGE=1) and only the dl* family — every other name
+    // falls through to the normal binding, so the default path is unchanged.
+    if let Some(addr) = crate::aaudio::resolve_bridge_name(name) {
+        eprintln!(
+            "[resolver] SH132 routing guest {} (@ {key:?}) -> fake-AAudio bridge (dlopen/dlsym intercept)",
+            name_str(name)
+        );
+        r.slots.insert(key.clone(), addr);
+        return Some(addr);
+    }
     // `eglGetProcAddress` is the guest's dynamic GLES loader (Roblox resolves
     // most ES entry points through it). Route it through the GLES bridge
     // (resolve_egl_get_proc_address) so a returned pointer is one of OUR

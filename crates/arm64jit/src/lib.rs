@@ -7,6 +7,7 @@ pub mod x86;
 pub mod resolver;
 pub mod shims;
 pub mod plt;
+pub mod aaudio;
 pub mod jni;
 pub mod boot;
 pub mod signals;
