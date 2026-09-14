@@ -375,6 +375,20 @@ static EXEC_CTX: Mutex<Option<ExecCtx>> = Mutex::new(None);
 /// rely on kernel pid semantics).
 static NEXT_TID: AtomicU64 = AtomicU64::new(1);
 
+/// SH130: host-side admission gate for engine self-spawned clone-worker guest
+/// threads (pthread_create of start_routine 0x10284d168, the pump/TaskScheduler
+/// workers tids 1/2). In the SERIALIZED combined run (JIT_SERIALIZE_RENDER=1 +
+/// --v2boot) those workers otherwise run guest code CONCURRENTLY with the
+/// ladder's rung jit_run, corrupting shared guest .bss/globals (SH55/64 -> the
+/// false `*** stack smashing ***` at rung-0 nativeInit, ~50-75% flaky). When
+/// this gate is SET, each worker's top-level `jit_run` parks (yields) until the
+/// gate is cleared — i.e. until LADDER_DONE — so NO worker executes guest code
+/// during the ladder. Deadlock-safe: SH93 already NOP'ed the one CEvent barrier
+/// the workers post formain, and bionic_pthread_join is a no-op. Workers are
+/// TaskScheduler/pump latches already idle until the engine posts work, so this
+/// just defers their first run to post-ladder. Default OFF (product path unregressed).
+pub static WORKER_ADMISSION_GATE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 thread_local! {
     static CURRENT_TP: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
     // Depth of nested jit_run dispatch loops on this thread (outer boot loop +
@@ -3038,6 +3052,16 @@ pub fn spawn_pthread(start_routine: u64, arg: u64) -> i64 {
         let tp = fresh_child_tls();
         child.tpidr = if tp != 0 { tp } else { tls.as_ptr() as u64 };
         register_guest_thread(&mut child as *mut CpuState);
+        // SH130: if the serialized-ladder worker gate is set, park this worker's
+        // top-level jit_run until the harness clears it (LADDER_DONE). Kills the
+        // SH55/64 combined-run race (clone workers racing the ladder's rungs)
+        // at its source without touching a single guest byte.
+        if WORKER_ADMISSION_GATE.load(Ordering::Acquire) {
+            while WORKER_ADMISSION_GATE.load(Ordering::Acquire) {
+                std::thread::yield_now();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
         let _ = jit_run(image, base, start_routine, &mut child as *mut CpuState);
     });
     tid as i64

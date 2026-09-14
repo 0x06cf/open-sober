@@ -5126,6 +5126,16 @@ fn main() {
     // PC-driven dispatcher: compiles reachable regions and re-enters on
     // indirect branch (`blr`) / `br` / `ret`, so real (blr-heavy) Roblox code
     // can actually *execute* rather than stopping at the first blr.
+    // SH130: in the SERIALIZED combined run, gate the engine's self-spawned
+    // clone workers (spawned during boot) until LADDER_DONE so they can't race
+    // the ladder's rung jit_runs (SH55/64 false stack-smash). Cleared at
+    // "ladder done". Only engages with JIT_SERIALIZE_RENDER=1 + --v2boot.
+    if std::env::var("JIT_SERIALIZE_RENDER").ok().as_deref() == Some("1")
+        && std::env::args().any(|a| a == "--v2boot")
+    {
+        arm64jit::jit::WORKER_ADMISSION_GATE.store(true, core::sync::atomic::Ordering::Release);
+        eprintln!("[elfjit:worker-gate] SH130 admission gate SET — engine clone workers parked until LADDER_DONE (kills the SH55/64 combined race)");
+    }
     match jit_run(image, base, entry, &mut st as *mut CpuState) {
         Err(e) => {
             eprintln!("arm64jit run_loop stopped: {e}");
@@ -5637,6 +5647,11 @@ fn main() {
                     // render jit_runs never overlap the ladder's — SH55/64 class).
                     LADDER_DONE.store(true, core::sync::atomic::Ordering::Relaxed);
                     eprintln!("[elfjit:v2boot] LADDER_DONE=1 signaled (render may start)");
+                    // SH130: the ladder is cleanly done with no worker racing it —
+                    // release the engine's clone workers now (their free admission
+                    // gate) so post-ladder engine work/drain can use them.
+                    arm64jit::jit::WORKER_ADMISSION_GATE.store(false, core::sync::atomic::Ordering::Release);
+                    eprintln!("[elfjit:worker-gate] SH130 admission gate CLEARED (LADDER_DONE) — engine clone workers may run");
                     // SH122 session-advance probe: after the ladder, read the
                     // NativeHelper milestones + data-dir path state to confirm
                     // whether StartLuaAppDM's do-init actually advanced the session.
@@ -9266,13 +9281,14 @@ fn main() {
         // injector both hold open for the REDRIVE_ACTIVE window.
         if redrive_enabled() {
             let rtp = arm64jit::jit::current_guest_tp();
-            // x1 = task-queue obj = *( getter(0x67d67c0) + 0x410 ); the pump resolves
-            // it via TLS getter 0x102b9dee0 on the main thread (the scheduler was set
-            // up here during StartApp's jit_run and the TLS persists post-return).
-            let x1 = arm64jit::jit::run_guest_callback(0x102b9dee0, [0x67d67c0, 0, 0, 0, 0, 0, 0, 0], rtp)
+            // x1 = task-queue obj (the engine's scheduler/singleton the drain
+            // drives). The pump (DRAIN caller) derives it via helper 0x10284d524
+            // = getter(0x1067d67e0) + bit0-init dance; call THAT directly so we
+            // get the real scheduler obj (post-StartApp it persists on this thread's
+            // TLS). (Earlier attempt wrongly used file-addr 0x67d67c0 -> SIGSEGV.)
+            let x1 = arm64jit::jit::run_guest_callback(0x10284d524, [0, 0, 0, 0, 0, 0, 0, 0], rtp)
                 .ok()
                 .filter(|&p| p >= 0x100000000 && p >> 56 == 0)
-                .map(|p| unsafe { *(p as *const u64).add(0x410 / 8) })
                 .unwrap_or(0);
             // Deque head cell: one of the stable image .bss deque head cells the real
             // per-consumer drain pops. Pick the first with a coherent packed head
