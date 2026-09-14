@@ -1195,6 +1195,24 @@ extern "C" fn bionic_vsnprintf_chk(
     avail
 }
 
+// SH136-harden: bionic fortify reroutes static-size sprintf-family calls into
+// __vsprintf_chk. Signature (dest, flag, slen, fmt, va_list ap): 5 fixed args,
+// fmt@x3, ap@x4 (verified at fast-log call sites file 0x2d9a5e0 etc.). Sprintf
+// semantics: UNBOUNDED dest (flag/slen are not a dest size), so render the whole
+// guarded output + NUL. A garbage %s (SH97 class) renders "(bad-ptr)", never
+// SIGSEGVs raw glibc sprintf's internal strlen.
+extern "C" fn bionic_vsprintf_chk(
+    buf: u64, _flag: u64, _slen: u64, fmt: u64, ap: u64,
+    _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    let mut vl = decode_aapcs64_va_list(ap);
+    let avail = render_to_buf(buf, u64::MAX, fmt, &mut vl); // unbounded dest
+    if std::env::var_os("JIT_TRACE").is_some() {
+        eprintln!("[shim] __vsprintf_chk(fmt@{fmt:#x}) -> {avail}B");
+    }
+    avail
+}
+
 /// SH98: marshal a host `stat` into the guest's bionic-aarch64 `struct stat`.
 /// Host glibc's x86-64 `struct stat` is 144 bytes; bionic's aarch64 struct is
 /// 128. When the guest passes a stack-local bionic `struct stat` (the deep
@@ -1460,6 +1478,10 @@ pub fn register_shims() -> usize {
         // renderer as vsnprintf so a garbage %s can't SIGSEGV glibc's internal
         // strlen (the SH97 class).
         (b"__vsnprintf_chk\0", bionic_vsnprintf_chk),
+        // SH136-harden: __vsprintf_chk (sprintf family, 5 fixed args, fmt@x3,
+        // va_list@x4, unbounded dest) — static-size fortify reroutes land here.
+        // Same guarded renderer, so a garbage %s can't SIGSEGV.
+        (b"__vsprintf_chk\0", bionic_vsprintf_chk),
         // Android asset manager
         (b"AAssetManager_fromJava\0", aassetmanager_fromjava),
         (b"AAssetManager_open\0", aassetmanager_open),
@@ -2008,6 +2030,48 @@ mod tests {
         let n3 = bionic_vsnprintf_chk(buf, 5, 3, 0, fmt.as_ptr() as u64, vl.as_mut_ptr() as u64, 0, 0);
         assert!(n3 <= 4, "truncated to size-1: {n3}");
         assert_eq!(unsafe { *((buf + n3 as u64) as *const u8) }, 0, "truncated NUL");
+    }
+
+    /// SH136-harden: `__vsprintf_chk` (5 fixed args: dest, flag, slen, fmt@x3,
+    /// va_list ap@x4) is the sprintf-family fortify reroute with an UNBOUNDED
+    /// dest — a long render must NOT be clamped (contrast vsnprintf's size-1 cap),
+    /// and a garbage %s (0xffffff80ffffffc8, the SH97 class) renders "(bad-ptr)"
+    /// instead of SIGSEGV'ing raw glibc sprintf's internal strlen.
+    #[test]
+    fn vsprintf_chk_unbounded_guards_garbage_arg_indices() {
+        let fmt = Box::leak(b"mode:%s|n=%d|\\0".to_vec().into_boxed_slice());
+        let gpr_area = Box::leak(vec![0u8; 96].into_boxed_slice()).as_mut_ptr() as u64;
+        let base = if gpr_area & 15 == 0 { gpr_area } else { (gpr_area + 8) & !15 };
+        unsafe {
+            // GP slots: arg0 = %s ptr, arg1 = %d value.
+            std::ptr::write_unaligned((base as *mut u64).add(0), 0);
+            std::ptr::write_unaligned((base as *mut u64).add(1), 7);
+        }
+        let vl = Box::leak(vec![0u8; 32].into_boxed_slice());
+        let vlp = vl.as_mut_ptr() as *mut u64;
+        unsafe {
+            std::ptr::write_unaligned(vlp, 0);
+            std::ptr::write_unaligned(vlp.add(1), base + 16); // past two GP args
+            std::ptr::write_unaligned(vlp.add(2), 0);
+            std::ptr::write_unaligned((vlp.add(3)) as *mut i32, -16);
+            std::ptr::write_unaligned((vlp.add(3) as *mut u8).add(4) as *mut i32, 0);
+        }
+
+        // Garbage %s -> "(bad-ptr)" with the real %d rendered after it.
+        unsafe { std::ptr::write_unaligned((base as *mut u64).add(0), 0xffffff80ffffffc8u64); }
+        let buf = Box::leak(vec![0xccu8; 128].into_boxed_slice()).as_mut_ptr() as u64;
+        let n = bionic_vsprintf_chk(buf, 0, 0x14, fmt.as_ptr() as u64, vl.as_mut_ptr() as u64, 0, 0, 0);
+        let s = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(buf as *const u8, n as usize) });
+        assert!(s.contains("(bad-ptr)") && s.contains("n=7"), "garbage+int render: {s:?}");
+        assert_eq!(unsafe { *((buf + n as u64) as *const u8) }, 0, "NUL-terminated");
+
+        // Valid, LONG render must NOT be clamped to slen (unbounded).
+        let good = Box::leak(b"a-really-long-mode-string-here-that-exceeds-twenty-chars\\0".to_vec().into_boxed_slice());
+        unsafe { std::ptr::write_unaligned((base as *mut u64).add(0), good.as_ptr() as u64); }
+        let n2 = bionic_vsprintf_chk(buf, 0, 0x14, fmt.as_ptr() as u64, vl.as_mut_ptr() as u64, 0, 0, 0);
+        let s2 = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(buf as *const u8, n2 as usize) });
+        assert!(s2.starts_with("mode:a-really-long-mode-string"), "full render not clamped: {s2:?}");
+        assert!(n2 > 20, "unbounded: wrote {n2}B (slen was 0x14=20)");
     }
 
     /// The SH85 qsort interpose: guest ARM64 comparator bytes must never be
