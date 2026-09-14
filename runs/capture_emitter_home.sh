@@ -1,19 +1,17 @@
 #!/bin/bash
-# SH68: reproduce the engine's REAL geometry emitter (0x105b35288) drawing a
-# LAYERED "login/home"-style frame (5 textured quads: backdrop/panel/button/
-# title/field) with GL_BLEND alpha compositing in ONE top-level jit_run, sized
-# from the real scene list (R+0x180/0x188 -> SCENE_NODES). The panel-overlap
-# readback must match the blend equation => genuine UI-style compositing proof.
-# Requires: cargo build -p arm64jit --example elfjit, real libroblox.so, Xvfb, ffmpeg.
+# SH150: the 'home' half of 'login/home' — the REAL FPSBackground.png launcher
+# backdrop (opaque 1024x1024 auth artwork) through the engine's own emitter path,
+# with the RO-BLOX wordmark overlay. Mirrors the proven capture_emitter_multi.sh
+# invocation exactly (RENDEREMITTER_LAYOUT=home + RENDEREMITTER_MULTI + walker).
 set -u
 cd "$(dirname "$0")/.."
-LOG=/home/hermes-worker/runs/sh68-emitter-home.txt
-PNG=/home/hermes-worker/runs/sh68-emitter-home.png
+LOG=/home/hermes-worker/runs/sh150-home.txt
+PNG=/home/hermes-worker/runs/sh150-home.png
 rm -f "$LOG" "$PNG"
-timeout 150 env JIT_DRIVE_LIFECYCLE=1 RENDERINIT_WARMUP_MS=1000 RENDERWALKER_NODES=3 \
-  RENDERWALKER_MAX_FRAMES=2 RENDERWALKER_WINDOW_MS=2600 RENDERWALKER_GLDEBUG=1 \
-  RENDEREMITTER_LAYOUT=home \
-  ./target/debug/examples/elfjit ~/.cache/open-sober/robbox/libroblox.so 0x2173ff4 \
+timeout 180 env JIT_DRIVE_LIFECYCLE=1 RENDERINIT_WARMUP_MS=1000 RENDERWALKER_NODES=3 \
+  RENDERWALKER_MAX_FRAMES=2 RENDERWALKER_WINDOW_MS=2800 RENDERWALKER_GLDEBUG=1 \
+  RENDEREMITTER_LAYOUT=home RENDEREMITTER_MULTI=1 RENDEREMITTER_HOME=1 \
+  ./target/debug/examples/elfjit /home/hermes-worker/.cache/open-sober/robbox/libroblox.so 0x2173ff4 \
   --jni --startapp 0x258b144 \
   --renderinit 0x105b3a280 --renderthunk --renderframe --renderwalker --renderemitter \
   --deque-node-live 0x106829f00 --drain-poll 8 \
@@ -21,8 +19,8 @@ timeout 150 env JIT_DRIVE_LIFECYCLE=1 RENDERINIT_WARMUP_MS=1000 RENDERWALKER_NOD
   > "$LOG" 2>&1 &
 PID=$!
 CAP=0
-for i in $(seq 1 150); do
-  if grep -q "renderemitter-home] engine emitter Ok" "$LOG"; then
+for i in $(seq 1 200); do
+  if grep -q "renderemitter-multi] engine emitter Ok" "$LOG"; then
     sleep 1
     DISPNUM=$(grep -oE "on :[0-9]+" "$LOG" | head -1 | tr -d 'on :')
     if [ -n "$DISPNUM" ] && [ "$CAP" = "0" ]; then
@@ -42,12 +40,16 @@ done
 wait "$PID" 2>/dev/null
 EXIT=$?
 echo "EXIT=$EXIT"
-echo "=== scene-list read (expect match=true) ==="
-grep -E "renderemitter-home] scene list|renderemitter-home] LAYOUT=" "$LOG" | head -4
-echo "=== home emitter OK + blend probes ==="
-grep -cF "renderemitter-home] engine emitter Ok" "$LOG"
-grep -E "renderemitter-home] (backdrop|panel-blend|button|title-bar)" "$LOG" | tail -8
-echo "=== walker (should still present) ==="
-grep -cF "present walker Ok(ret=0x1)" "$LOG"
-echo "=== crash/json-overflow (must be 0) ==="
-grep -icE "SIGSEGV|SIGABRT|string length overflow" "$LOG"
+echo "=== sprite loads (expect FPSBackground 1024x1024 + logo_white_1x) ==="
+grep -E "renderemitter-multi] loaded real sprite" "$LOG" | head -10
+grep -cF "renderemitter-multi] WARN: failed" "$LOG" | sed 's/^/WARN-failures: /'
+echo "=== FPSBackground decode ==="
+grep -E "FPSBackground" "$LOG" | head -4
+echo "=== probes ==="
+grep -E "renderemitter-multi] probe" "$LOG" | head -12
+echo "present=true count:"; grep -cF "present=true" "$LOG"
+echo "=== engine emitter OK + swap + walker ==="
+grep -E "renderemitter-multi] engine emitter Ok" "$LOG" | head -4
+grep -cF "present walker Ok(ret=0x1)" "$LOG" | sed 's/^/walker-OK: /'
+echo "=== stability ==="
+grep -icE "SIGSEGV|SIGABRT|panic|string length overflow" "$LOG" | sed 's/^/crash-marker-count: /'

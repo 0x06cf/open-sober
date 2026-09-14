@@ -4268,11 +4268,28 @@ fn login_ui_textures() -> Vec<RealSprite> {
         let auth = "/home/hermes-worker/.cache/open-sober/android-env/assets/ExtraContent/textures/ui/LuaApp/graphic/Auth";
         let graphic = "/home/hermes-worker/.cache/open-sober/android-env/assets/ExtraContent/textures/ui/LuaApp/graphic";
         let mut out = Vec::new();
-        for (name, dir, rel) in [
-            ("reversevignette.png", auth, "reversevignette.png"),
-            ("logo_white_1x.png", auth, "logo_white_1x.png"),
-            ("noconnection.png", graphic, "noconnection.png"),
-        ] {
+        // SH150 — RENDEREMITTER_HOME reorders the sprite vec so FPSBackground
+        // (the opaque launcher backdrop) is sprite index 0 = drawn FIRST by the
+        // painter's-order loop (index ascending). The LOGIN mode keeps
+        // reversevignette first (its dark backdrop). reversevignette is still
+        // loaded in HOME mode so the vec stays 4 long (placements are
+        // positional), but gets a zero-size box so it draws nothing.
+        let home = std::env::var_os("RENDEREMITTER_HOME").is_some();
+        let order: &[(&str, &str, &str)] = if home {
+            &[
+                ("FPSBackground.png", auth, "FPSBackground.png"),
+                ("logo_white_1x.png", auth, "logo_white_1x.png"),
+                ("noconnection.png", graphic, "noconnection.png"),
+                ("reversevignette.png", auth, "reversevignette.png"),
+            ]
+        } else {
+            &[
+                ("reversevignette.png", auth, "reversevignette.png"),
+                ("logo_white_1x.png", auth, "logo_white_1x.png"),
+                ("noconnection.png", graphic, "noconnection.png"),
+            ]
+        };
+        for (name, dir, rel) in order {
             let path = format!("{dir}/{rel}");
             match std::fs::read(&path).ok().and_then(|d| decode_png_rgba(&d)) {
                 Some((w, h, rgba)) => {
@@ -4386,7 +4403,9 @@ fn login_ui_textures() -> Vec<RealSprite> {
 fn real_ui_textures() -> Vec<RealSprite> {
     static MT: std::sync::OnceLock<Vec<RealSprite>> = std::sync::OnceLock::new();
     MT.get_or_init(|| {
-        if std::env::var_os("RENDEREMITTER_LOGIN").is_some() {
+        if std::env::var_os("RENDEREMITTER_LOGIN").is_some()
+            || std::env::var_os("RENDEREMITTER_HOME").is_some()
+        {
             return login_ui_textures();
         }
         let root = "/home/hermes-worker/.cache/open-sober/android-env/assets/content/textures/ui";
@@ -4463,11 +4482,37 @@ pub fn render_engine_emitter_multi(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) 
     const VW: f32 = 1280.0;
     const VH: f32 = 720.0;
     let login = std::env::var_os("RENDEREMITTER_LOGIN").is_some();
+    // SH150 — RENDEREMITTER_HOME=1: render the 'home' half of the auth surface —
+    // the real FPSBackground.png (opaque 1024x1024 launcher backdrop) as the
+    // full-viewport backing instead of the login's dark reversevignette, with the
+    // real RO-BLOX wordmark + a spotlight strip. Same emitter machinery, real-APK
+    // pixels. (login stays the dark login form; either may run with MULTI.)
     // (name, cx_ndc, cy_ndc, hh, probe_ix, probe_iy, tol). Login mode (SH73):
     // the real auth backdrop (reversevignette, nearly-clear where the logo
     // sits) + the Roblox wordmark. Vignette probe over the solid dark row-0;
     // logo glyph is alpha=255 white so its probe is byte-exact over ANY dst.
-    let placements: &[(&str, f32, f32, f32, u32, u32, u32)] = if login {
+    let placements: &[(&str, f32, f32, f32, u32, u32, u32)] = if std::env::var_os("RENDEREMITTER_HOME").is_some() {
+        // SH150 — Home/launcher surface: the REAL FPSBackground.png (index 0,
+        // drawn first) fills the viewport as the opaque launcher backdrop, with
+        // the RO-BLOX wordmark (index 1) centered above — the operator's 'home'
+        // half of 'login/home'. All remaining sprites (reversevignette, the
+        // login form prims, and the text labels) get a ZERO-SIZE box so they
+        // draw nothing; placement INDEX is positional (matches the sprite vec).
+        &[
+            ("FPSBackground.png", 0.0, 0.0, 1.78, 512, 512, 8),
+            ("logo_white_1x.png", 0.0, 0.42, 0.22, 193, 44, 2),
+            ("noconnection.png", 0.0, 0.0, 0.0, 0, 0, 0),
+            ("reversevignette.png", 0.0, 0.0, 0.0, 0, 0, 0),
+            ("field.png", 0.0, 0.0, 0.0, 0, 0, 0),
+            ("loginbtn.png", 0.0, 0.0, 0.0, 0, 0, 0),
+            ("field2.png", 0.0, 0.0, 0.0, 0, 0, 0),
+            (".", 0.0, 0.0, 0.0, 0, 0, 0),
+            (".", 0.0, 0.0, 0.0, 0, 0, 0),
+            (".", 0.0, 0.0, 0.0, 0, 0, 0),
+            (".", 0.0, 0.0, 0.0, 0, 0, 0),
+            (".", 0.0, 0.0, 0.0, 0, 0, 0),
+        ]
+    } else if login {
         &[
             ("reversevignette.png", 0.0, 0.0, 1.78, 512, 512, 6),
             ("logo_white_1x.png", 0.0, 0.35, 0.22, 193, 44, 2),
