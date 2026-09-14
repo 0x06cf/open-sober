@@ -62,3 +62,39 @@ the ladder, printing once-guard / DM-root[0x106a68818] / once-slot[0x106a68408]
   0x4000 instead of a live DataModel (the ONE-NEXT-UNSYNTHESIZED-OBJECT after
   __call_once now runs) so DM-root [0x106a68818] populates and the match path
   takes the app-shell ctor branch.
+
+## 4. RECON-CORRECTION (deleg_d8c3d2b2, authoritative, disassembly-backed)
+A follow-up deep recon (141 tool calls) corrected section 1's NEXT premise —
+the do-init construct chain is NOT a DataModel builder:
+
+- `0x2173b3c` is a thin dispatcher (`strcmp(x0*,"GPU")` vs literals
+  x0="App",x1="Execute" -> `b 0x61e30bc`) = the **RTApp registry GetOrCreate**.
+- `0x61e3aa4` returns `(0x4000<<app_id)|(count & 0x3fff)` — so the observed
+  once-slot `[0x106a68408]=0x4000` is the **CORRECT RTApp app-task-id return**,
+  NOT a broken/malformed DataModel pointer. The once-lambda registers the app
+  task; it does not construct the DataModel.
+- **DM-root `[0x106a68818]` (appbridge obj `0x106a687f8` +0x20) is a distinct
+  .bss global with NO static/once writer in the entire binary** (verified:
+  zero `str` instructions land on guest 0x6a68818 from any adrp base). It is
+  populated ONLY by a live heap store during the real AppBridge V2 app-launch,
+  which the headless ladder never reaches. There is NO transfer from the
+  once-slot [0x106a68408] to DM-root [0x106a68818] and no static initializer
+  writes it.
+- The match dispatch (0x2206db8) reads `[x19,#0x20]` = [0x106a68818]; if 0 it
+  takes the benign Ok(0x3e8). A non-zero would `ldr x8,[x0]; ldr x1,[x8,#0x30];
+  br x1` into the app-shell ctor with the DataModel as `this` — i.e. DM-root
+  must hold a live vtable'd DataModel/app-shell object.
+- The register-region "keep clearing one-next-unsynthesized-object until the
+  do-init owns a live DM" is therefore well-defined: the ONE-NEXT seed IS a
+  live DataModel/AppShell object whose pointer lands in guest 0x106a68818,
+  with a real [vt+0x30] = the app-shell ctor. That single store turns the
+  do-init from "handled" into "constructing an app-shell session node".
+- CoreScripts loader 0x1f1d8ac runs AFTER a live DM (no 6a68000 reference),
+  confirming SH131d is downstream of owning the DM, not a blocker to it.
+
+Honest status after SH155: the GATE-FIX + probes are committed and the ladder
+is measurably deeper (guest __call_once fully executes and self-latches the
+once-guard for the first time; app-data-model counter advances). The next
+concrete seed is a real DataModel object at [0x106a68818] whose vt+0x30 is the
+app-shell ctor (find that ctor address / reuse an existing DataModel vtable in
+.data.rel.ro, then host-store the object pointer).
