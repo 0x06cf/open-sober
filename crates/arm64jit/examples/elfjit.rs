@@ -6408,6 +6408,52 @@ fn main() {
                                     // startAppWithParams call on the seeded main thread
                                     // (see docs/recon-sh156-startluaappdm-postdoinit.md).
                                     *(0x106a70880u64 as *mut u8) = 1;
+                                    // SH159 (recon deleg_0eff24ca): the AppBridgeV2
+                                    // union-init 0x2366694's FIRST sub-constructor
+                                    // 0x2366848 guards on globals G=[0x6a63da0] and
+                                    // W=[0x6a63d70]. Empirically (probe) both hold
+                                    // non-NULL HOST-heap pointers at runtime (NOT real
+                                    // live objects), so the guard is taken and the
+                                    // sub-constructor treats that pointer as `this`,
+                                    // garbage-virtual-dispatches, and never returns to
+                                    // the body's governor dispatch (0x2366848's blr
+                                    // chain: 2175068 -> vt[+48] -> never ret). Zero both
+                                    // so every one of the 11 union-init sub-constructors
+                                    // collapses at its `cbz` guard and 0x2366694 returns
+                                    // at 0x2366810, letting the body blr at 0x23effbc
+                                    // reach the governor 0x102e9fa84.
+                                    *(0x106a63da0u64 as *mut u64) = 0;
+                                    *(0x106a63d70u64 as *mut u64) = 0;
+                                    // SH159b (recon deleg_0eff24ca): the governor
+                                    // (0x102e9fa84) reads x19=[x0+0x20] at 0x2e9fac0
+                                    // (x0=wrapper @ [0x106a705e8]... actually GetOrCreate
+                                    // returns the wrapper so gov x0 = &[0x106a705e8];
+                                    // x19 = impl = [wrapper+0x20] = [0x106a70608]).
+                                    // Runtime dump at the governor fault showed
+                                    // x19=0x7fa1... (host-garbage impl) -> the MODERN
+                                    // appendix derefs it -> SIGSEGV. Seed a real guest
+                                    // impl buffer at [0x106a70608] + its +0x408 DISPATCH
+                                    // object + DISPATCH vt[+0x18]=benign leaf so the
+                                    // governor's MODERN path has coherent sub-objects.
+                                    let gov_leaf = *ROUTEB_LEAF_ADDR.get_or_init(|| {
+                                        let a = arm64jit::jit::register_host_call_auto(routeb_singleton_leaf);
+                                        eprintln!("[elfjit:v2boot] SH159 gov dispatch leaf registered at {a:#x}");
+                                        a
+                                    });
+                                    // impl is a ~0x500-byte guest buffer (governor reads
+                                    // up to +0x408/0x448). DISPATCH at impl+0x408.
+                                    let impl_buf = Box::leak(vec![0u8; 0x500usize].into_boxed_slice()).as_mut_ptr() as u64;
+                                    let disptch_buf = Box::leak(vec![0u8; 0x20usize].into_boxed_slice()).as_mut_ptr() as u64;
+                                    let disptch_vt = Box::leak(vec![0u8; 0x20usize].into_boxed_slice()).as_mut_ptr() as u64;
+                                    unsafe {
+                                        for s in 0..(0x20 / 8) {
+                                            *(disptch_vt.wrapping_add(s * 8) as *mut u64) = gov_leaf; // DISPATCH vt all slots benign
+                                        }
+                                        *(disptch_buf as *mut u64) = disptch_vt; // DISPATCH[+0] = vt
+                                        *(impl_buf.wrapping_add(0x408) as *mut u64) = disptch_buf; // impl[+0x408] = DISPATCH
+                                        *(0x106a70608u64 as *mut u64) = impl_buf; // wrapper[+0x20] = impl (governor x19)
+                                    }
+                                    eprintln!("[elfjit:v2boot] SH159b seeded gov impl@[0x106a70608]=0x{impl_buf:x} impl[+0x408]=DISPATCH@0x{disptch_buf:x} DISPATCH.vt[+0x18]=benign leaf 0x{gov_leaf:x}");
                                 }
                                 // SH156 NEXT GATE: the ctor 0x102207b50's body reads
                                 // globals whose pages are LEFT UNMAPPED by the engine's
@@ -6487,6 +6533,43 @@ fn main() {
                         };
                         eprintln!(
                             "[elfjit:v2boot] SH155 post-StartLuaAppDM: once-guard[0x6a68410]={og_now:#x} DM-root[0x106a68818]=0x{dm_now:x} liveDM-image={ok} once-slot[0x106a68408]=0x{once_slot:x} once-live={once_ok} ctor-guard[0x6a64d70]={ctor_guard:?} ctor-flags[0x7285fb0]={ctor_flags:?}"
+                        );
+                        // SH158: probe the AppBridgeV2 governor dispatch state. The
+                        // do-init body 0x1023eff4c (region-watch confirmed reached)
+                        // builds the AppBridgeV2 singleton via GetOrCreate 0x2367270
+                        // and `blr [obj->vt + 0x18]` at 0x23effbc — which should land on
+                        // the governor 0x102e9fa84. It does NOT (region-watch empty).
+                        // Recon deleg_dbe26a3a claimed .rela.dyn has zero data relocs
+                        // so [0x1063a3428]=0 always; but .rela.dyn is 2MB ANDROID_RELA
+                        // packed relocs (readelf cannot decode that format), so this
+                        // probe reads the ACTUAL runtime values to test both claims:
+                        //  - [0x1063a3428] (vtable 0x1063a3410 slot +0x18) == 0x2e9fa84?
+                        //  - [0x106a705e8] AppBridgeV2 singleton obj slot
+                        //  - [0x106a70618] once-guard (0=run builder, 1=skip)
+                        let abv_guard = if guest_page_mapped(0x106a70618u64) {
+                            Some(unsafe { *(0x106a70618u64 as *const u8) })
+                        } else {
+                            None
+                        };
+                        let abv_slot = unsafe { *(0x106a705e8u64 as *const u64) };
+                        let vt18 = unsafe { *(0x1063a3428u64 as *const u64) };
+                        let vt00 = unsafe { *(0x1063a3410u64 as *const u64) };
+                        let vt18_is_gov = vt18 == 0x102e9fa84;
+                        // SH159 (recon deleg_0eff24ca, union-init gate): the
+                        // AppBridgeV2 union-init 0x2366694's first sub-constructor
+                        // 0x2366848 guards on globals G=[0x6a63da0] and W=[0x6a63d70]
+                        // which (per recon) hold FEATURE-FLAG NAME STRING addresses
+                        // ("EnableTextChat..."/"EnableUniverseChatChannelMonitor"), not
+                        // a live object. When non-zero it treats the string as `this`,
+                        // garbage-dispatches, and never returns to the body's governor
+                        // dispatch. Probe the ACTUAL runtime values here.
+                        let guard_g = unsafe { *(0x106a63da0u64 as *const u64) };
+                        let guard_w = unsafe { *(0x106a63d70u64 as *const u64) };
+                        eprintln!(
+                            "[elfjit:v2boot] SH159 union-init guard probe: G[0x106a63da0]=0x{guard_g:x} W[0x106a63d70]=0x{guard_w:x} (recon: G should be 0x499fe5 string, W 0x2617d4)"
+                        );
+                        eprintln!(
+                            "[elfjit:v2boot] SH158 AppBridgeV2 dispatch probe: once-guard[0x106a70618]={abv_guard:?} singleton[0x106a705e8]=0x{abv_slot:x} vt[0x1063a3410]=0x{vt00:x} vt[+0x18]@0x1063a3428=0x{vt18:x} gov_expected=0x102e9fa84 vt18_is_gov={vt18_is_gov}"
                         );
                     }
                     if *guest == 0x102206404 || *guest == 0x1023efe2c {
