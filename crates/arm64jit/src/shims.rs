@@ -136,6 +136,43 @@ extern "C" fn bionic_strcpy_chk(
     unsafe { libc::strcpy(dst as *mut libc::c_char, src as *const libc::c_char) as u64 }
 }
 
+// guarted memcmp (length-bounded compare, SH135 class): unsafe ptr / zero len -> 0
+// (equal/empty path); both valid -> real compare. The deep do-init map/flag walk
+// hands unseeded pointers to C++ string/map compares which land here.
+extern "C" fn bionic_memcmp(
+    a: u64, b: u64, n: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(a) || !ptr_ok(b) || n == 0 {
+        return 0;
+    }
+    unsafe { libc::memcmp(a as *const libc::c_void, b as *const libc::c_void, n as usize) as u64 }
+}
+
+// guarded strcasecmp / strncasecmp (case-insensitive pointer walks, pure SH97 class).
+extern "C" fn bionic_strcasecmp(
+    a: u64, b: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(a) || !ptr_ok(b) {
+        return 0;
+    }
+    unsafe { libc::strcasecmp(a as *const libc::c_char, b as *const libc::c_char) as u64 }
+}
+
+extern "C" fn bionic_strncasecmp(
+    a: u64, b: u64, n: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if n == 0 {
+        return 0;
+    }
+    if !ptr_ok(a) || !ptr_ok(b) {
+        return 0;
+    }
+    unsafe {
+        libc::strncasecmp(a as *const libc::c_char, b as *const libc::c_char, n as usize)
+            as u64
+    }
+}
+
 // ---- bionic `__errno` (returns `int*`, the *address* of the host errno) ----
 extern "C" fn bionic_errno(
     _a0: u64,
@@ -1332,6 +1369,12 @@ pub fn register_shims() -> usize {
         (b"strspn\0", bionic_strspn),
         (b"strcspn\0", bionic_strcspn),
         (b"memchr\0", bionic_memchr),
+        // SH135-harden: memcmp is the length-bounded compare the do-init map/flag
+        // walk lands on with unseeded pointers (same garbage class); strcasecmp/
+        // strncasecmp are pure pointer walks. Guard all -> 0 on unsafe ptr / n==0.
+        (b"memcmp\0", bionic_memcmp),
+        (b"strcasecmp\0", bionic_strcasecmp),
+        (b"strncasecmp\0", bionic_strncasecmp),
         (b"__strncpy_chk2\0", bionic_strncpy_chk2),
         (b"__android_log_print\0", bionic_android_log),
         // SH98: marshal stat/fstat/lstat into the bionic-aarch64 struct stat
@@ -1485,6 +1528,10 @@ mod tests {
         assert_eq!(crate::shims::bionic_strspn(g, g, 0, 0, 0, 0, 0, 0), 0);
         assert_eq!(crate::shims::bionic_strcspn(g, g, 0, 0, 0, 0, 0, 0), 0);
         assert_eq!(crate::shims::bionic_memchr(g, 0u64, 4, 0, 0, 0, 0, 0), 0);
+        assert_eq!(crate::shims::bionic_memcmp(g, g, 4, 0, 0, 0, 0, 0), 0, "memcmp garbage");
+        assert_eq!(crate::shims::bionic_strcasecmp(g, g, 0, 0, 0, 0, 0, 0), 0);
+        assert_eq!(crate::shims::bionic_strncasecmp(g, g, 4, 0, 0, 0, 0, 0), 0);
+        assert_eq!(crate::shims::bionic_memcmp(0x1800064, 0x1800064, 4, 0, 0, 0, 0, 0), 0, "sub-image");
         // strcpy with garbage src returns dst untouched (no copy, NUL-harmless).
         let dst = [0x41u8; 8];
         let dptr = dst.as_ptr() as u64;
@@ -1518,6 +1565,20 @@ mod tests {
             crate::shims::bionic_memchr(ha, b'h' as u64, 5, 0, 0, 0, 0, 0),
             ha
         );
+        // memcmp compares valid memory, case-insensitive walks behave, zero len -> 0.
+        assert_eq!(crate::shims::bionic_memcmp(ha, hb, 5, 0, 0, 0, 0, 0), 0, "memcmp equal");
+        assert_ne!(crate::shims::bionic_memcmp(ha, hc, 5, 0, 0, 0, 0, 0), 0, "memcmp differ");
+        assert_eq!(crate::shims::bionic_strcasecmp(ha, hb, 0, 0, 0, 0, 0, 0), 0, "eq case");
+        assert_eq!(crate::shims::bionic_strncasecmp(ha, hb, 5, 0, 0, 0, 0, 0), 0);
+        // A case-differing pair differs only case-insensitively via strcasecmp==0.
+        let upper = std::ffi::CString::new("HELLO").unwrap();
+        assert_eq!(
+            crate::shims::bionic_strcasecmp(ha, upper.as_ptr() as u64, 0, 0, 0, 0, 0, 0),
+            0,
+            "case-insensitive equal"
+        );
+        assert_eq!(crate::shims::bionic_strncasecmp(ha, upper.as_ptr() as u64, 5, 0, 0, 0, 0, 0), 0);
+        assert_eq!(crate::shims::bionic_memcmp(ha, hb, 0, 0, 0, 0, 0, 0), 0, "zero len -> 0");
     }
 
     /// Asset shims serialize the process-wide open-asset table, so they are
