@@ -11044,6 +11044,35 @@ fn main() {
         });
     }
 
+    // SH162 (recon deleg_f177139a task-2): the MAIN thread's start_app top-level
+    // jit_run (V2StartAppWithParams) genuinely runs CONCURRENTLY with the detached
+    // --v2boot ladder thread, sharing the single global block cache AND the same
+    // boot guest stack (s2.x[31]=st.x[31]) — the deterministic source of the
+    // run-variable SH55/64 flake (crashes land at different guestpc each run).
+    // Mirror the proven renderinit gate (8410-8437): when JIT_SERIALIZE_RENDER=1
+    // + --v2boot, wait for LADDER_DONE (bounded) BEFORE start_app so only ONE
+    // top-level jit_run exists at a time. Ladder runs first, signals LADDER_DONE
+    // (7006), then start_app runs alone — no dual-top-level overlap at all.
+    // (Use the same gating condition as the WORKER_ADMISSION_GATE: the env var
+    // must be present; --v2boot is required for this main path anyway.)
+    if std::env::var("JIT_SERIALIZE_RENDER").ok().as_deref() == Some("1")
+        && std::env::args().any(|a| a == "--v2boot")
+        && !LADDER_DONE.load(core::sync::atomic::Ordering::Relaxed)
+    {
+        eprintln!(
+            "[elfjit:progbin] SH162 JIT_SERIALIZE_RENDER=1: waiting for --v2boot ladder LADDER_DONE before main start_app jit_run (deterministic serialization, no SH55/64 overlap)"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        while !LADDER_DONE.load(core::sync::atomic::Ordering::Relaxed) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if LADDER_DONE.load(core::sync::atomic::Ordering::Relaxed) {
+            eprintln!("[elfjit:progbin] SH162 LADDER_DONE received — driving start_app after ladder");
+        } else {
+            eprintln!("[elfjit:progbin] WARN SH162 LADDER_DONE not reached in 300s (ladder parked?) — proceeding to start_app anyway");
+        }
+    }
+
     match arm64jit::jit::jit_run(image, base, start_app, &mut s2 as *mut CpuState) {
             Err(e) => eprintln!("[elfjit] StartApp stopped: {e}"),
             Ok(r) => eprintln!("[elfjit] StartApp returned Ok({r:#x})"),
