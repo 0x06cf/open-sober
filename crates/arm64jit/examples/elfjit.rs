@@ -107,6 +107,82 @@ fn seed_libcpp_long_string(global: u64, buf: u64, bytes: &[u8]) -> u64 {
     global
 }
 
+/// SH156: build a live object for DM-root [0x106a68818] so the GlobalInit
+/// do-init's match dispatch advances into REAL global-init construction instead
+/// of the benign Ok(0x3e8) soft-return.
+///
+/// The do-init match (file 0x2206df4..0x2206e24) is:
+///   `ldr x0,[x19,#32]`   (x0 = appbridge[+0x20] = DM-root [0x106a68818])
+///   `cbz x0, 2206ea4`    (0 -> benign Ok(0x3e8) soft-return, no session node)
+///   `ldr x8,[x0]`        (x8 = obj->vtable)
+///   `ldr x1,[x8,#48]`    (x1 = *(vtable + 0x30))
+///   `br x1`              (x1(obj))
+/// Read-only recon deleg_eeec00a2 (APS2-reloc-traced .data.rel.ro) recovered the
+/// REAL dispatch vtable (address point guest 0x10635cce0) whose +0x30 slot
+/// (guest 0x10635cd10, RELATIVE addend 0x2207b50) = guest 0x102207b50 — a real
+/// global-init controller CTOR that runs `__call_once` (0x284ce54) + ~20 guarded
+/// init/telemetry constructs and has ZERO `this` derefs (operates on globals
+/// only). So a 0x10-byte object whose only live word is [0x00]=vtable is enough
+/// and the ctor is provably non-faulting on `this`. Per recon the harness should
+/// also pin vtable[+0x30]=0x102207b50 (idempotent with the loader's RELATIVE
+/// reloc) so the match reliably brs to the real ctor. `buf` must be guest-visible
+/// RW memory of >= 0x10 bytes (guest==host identity holds in the runtime).
+/// Isolated so the layout is hermetic-testable without the runtime. Returns
+/// `buf` (nonzero) on success, else 0 when buf==0.
+fn routeb_dm_root_object(buf: u64) -> u64 {
+    if buf == 0 {
+        return 0;
+    }
+    const DM_VTABLE: u64 = 0x10635cce0; // real GlobalInit dispatch vtable address point
+    unsafe {
+        *(buf as *mut u64) = DM_VTABLE;
+    }
+    buf
+}
+
+/// True when `guest_addr`'s 0x1000-byte page appears in /proc/self/maps
+/// (guest==host so the guest address is a real host address). Non-mutating —
+/// used to decide whether a page is genuinely unmapped before MAP_FIXED.
+fn guest_page_mapped(guest_addr: u64) -> bool {
+    let page = guest_addr & !0xfff;
+    std::fs::read_to_string("/proc/self/maps")
+        .unwrap_or_default()
+        .lines()
+        .any(|l| {
+            let Some(dash) = l.find('-') else { return false; };
+            let Some(sp) = l.find(' ') else { return false; };
+            let Ok(lo) = u64::from_str_radix(&l[..dash], 16) else { return false; };
+            let Ok(hi) = u64::from_str_radix(&l[dash + 1..sp], 16) else { return false; };
+            page >= lo && page < hi
+        })
+}
+
+/// SH156 (NEXT GATE): ensure the guest page containing `guest_addr` is mapped
+/// readable. Some `.bss`/data pages the GlobalInit dispatch ctor (0x102207b50)
+/// touches — e.g. its flags-byte latch at [0x7285fb0] — are left UNMAPPED by the
+/// engine's boot remapping (the SH116 class), so the ctor's `ldr x0,[0x7285fb0]`
+/// SIGSEGVs at guest 0x1067285fb0. When a page is already mapped (in
+/// /proc/self/maps) we leave it untouched (never clobber file-backed content);
+/// only a genuinely-unmapped page gets a fresh zeroed anon RW mapping
+/// (MAP_FIXED, guest==host). Returns true if mapped+readable afterwards.
+fn routeb_map_guest_page(guest_addr: u64) -> bool {
+    let page = guest_addr & !0xfff;
+    if guest_page_mapped(guest_addr) {
+        return true;
+    }
+    let r = unsafe {
+        libc::mmap(
+            page as *mut libc::c_void,
+            0x1000,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+            -1,
+            0,
+        )
+    };
+    r != libc::MAP_FAILED
+}
+
 // SH60 task-driven frame plane (recon-selfdrive-seed-jsonfix.md §A):
 // the dispatcher's type-4 popped-task vector [0x106829ea8] is external-glue
 // (.bss, no in-image store — SH46/SH53), so the ONLY host lever is to seed it
@@ -6301,6 +6377,52 @@ fn main() {
                             let flags_latch = 0x106a683e8u64 as *mut u8;
                             *flags_latch |= 1;
                             eprintln!("[elfjit:v2boot] SH125 seeded flags-loaded latch [0x106a683e8].bit0=1 so the do-init consumes the live DM slot (getter 0x102206738)");
+                            // SH156 (recon deleg_fcc6cdc6 + deleg_eeec00a2): with the
+                            // once-guard LEFT CLEAR (SH155), the do-init's __call_once
+                            // completes and the match dispatch at file 0x2206df4 reads
+                            // DM-root [0x106a68818]. Leaving it 0 takes the benign
+                            // Ok(0x3e8) soft-return. Host-seed a live object whose
+                            // vtable is the REAL GlobalInit dispatch vtable 0x10635cce0
+                            // (its +0x30 slot 0x10635cd10 -> the genuine global-init
+                            // ctor 0x102207b50), so the match brs into real
+                            // construction instead of soft-returning. Opt-in.
+                            if std::env::var("JIT_ROUTEB_DM_SEED").ok().as_deref() == Some("1") {
+                                // 0x10-byte object: only [0x00]=vtable is live (the
+                                // ctor 0x102207b50 never derefs `this`).
+                                let dmobj = Box::leak(vec![0u8; 0x10usize].into_boxed_slice()).as_mut_ptr() as u64;
+                                routeb_dm_root_object(dmobj);
+                                // PIN the real dispatch vtable's +0x30 slot (guest
+                                // 0x10635cd10) to the global-init ctor 0x102207b50 so
+                                // the match reliably brs there (idempotent with the
+                                // loader's RELATIVE reloc addend 0x2207b50).
+                                unsafe {
+                                    *(0x10635cd10u64 as *mut u64) = 0x102207b50;
+                                    *(0x106a68818u64 as *mut u64) = dmobj;
+                                }
+                                // SH156 NEXT GATE: the ctor 0x102207b50's body reads
+                                // globals whose pages are LEFT UNMAPPED by the engine's
+                                // boot remapping (flags latch [0x7285fb0], once-guard2
+                                // [0x6c347c0], telemetry [0x6dcd380]/[0x6dca000]/[0x6dce218],
+                                // thread-mutex [0x7333aac], [0x6ed9000]). Map any such
+                                // pages fresh (guarded; only genuinely-unmapped pages).
+                                for g in [
+                                    0x1067285fb0u64, // flags byte gate @ ctor 2207bec
+                                    0x1067285fb8u64, // loadLocalFlags arg
+                                    0x106c347c0u64, // once-guard2
+                                    0x106dcd380u64, // telemetry sched
+                                    0x106dca000u64, // app-data-model counter
+                                    0x106dce218u64, // flags loader guard
+                                    0x107333aacu64, // thread-init mutex
+                                    0x106ed9000u64, // string/clock sched
+                                ] {
+                                    if routeb_map_guest_page(g) {
+                                        eprintln!("[elfjit:v2boot] SH156 mapped guest page 0x{:x} for ctor globals", g & !0xfff);
+                                    } else {
+                                        eprintln!("[elfjit:v2boot] SH156 WARN failed to map page for 0x{g:x}");
+                                    }
+                                }
+                                eprintln!("[elfjit:v2boot] SH156 seeded DM-root [0x106a68818]=0x{dmobj:x} (object[0]=dispatch vtable 0x10635cce0, vtable[+0x30]=0x102207b50 real global-init ctor) -> do-init match brs into REAL construction");
+                            }
                         }
                         eprintln!("[elfjit:v2boot] GATE-FIX seeded main-id cell 0x{me:x} + flags-latch for StartLuaAppDM -> GlobalInit once-guard LEFT CLEAR so __call_once runs and populates DM-root [0x106a68818]");
                     }
@@ -6328,8 +6450,25 @@ fn main() {
                         // controller; the match path then reads the appbridge obj's
                         // +0x20 field [0x106a68818]. Report both.
                         let once_ok = (0x100000000..0x107333c3c).contains(&once_slot);
+                        // SH156: the real GlobalInit dispatch ctor 0x102207b50 (the
+                        // match's `br` target once DM-root is live) runs its OWN
+                        // __call_once latched on once-guard [0x6a64d70] (`ldarb
+                        // w8,[0x6a64d70]` at 0x2207b68, self-set via stlrb) and reads a
+                        // flags byte [0x7285fb0]. Reading both post-rung tells whether
+                        // the ctor chain ENGAGED (guard self-set 0->1) without JIT_TRACE.
+                        // Guarded so an unmapped page can never crash the probe.
+                        let ctor_guard = if guest_page_mapped(0x106a64d70u64) {
+                            Some(unsafe { *(0x106a64d70u64 as *const u8) })
+                        } else {
+                            None
+                        };
+                        let ctor_flags = if guest_page_mapped(0x1067285fb0u64) {
+                            Some(unsafe { *(0x1067285fb0u64 as *const u8) })
+                        } else {
+                            None
+                        };
                         eprintln!(
-                            "[elfjit:v2boot] SH155 post-StartLuaAppDM: once-guard[0x6a68410]={og_now:#x} DM-root[0x106a68818]=0x{dm_now:x} liveDM-image={ok} once-slot[0x106a68408]=0x{once_slot:x} once-live={once_ok}"
+                            "[elfjit:v2boot] SH155 post-StartLuaAppDM: once-guard[0x6a68410]={og_now:#x} DM-root[0x106a68818]=0x{dm_now:x} liveDM-image={ok} once-slot[0x106a68408]=0x{once_slot:x} once-live={once_ok} ctor-guard[0x6a64d70]={ctor_guard:?} ctor-flags[0x7285fb0]={ctor_flags:?}"
                         );
                     }
                     if *guest == 0x102206404 || *guest == 0x1023efe2c {
@@ -11812,6 +11951,54 @@ mod sh126_tests {
         assert_eq!(seed_libcpp_long_string(0, b, b"/x"), 0, "null global rejected");
         assert_eq!(seed_libcpp_long_string(g, 0, b"/x"), 0, "null buf rejected");
         assert_eq!(seed_libcpp_long_string(g, b, b""), 0, "empty bytes rejected");
+    }
+
+    // --- SH156: live object (real GlobalInit dispatch vtable) for DM-root [0x106a68818] ---
+    #[test]
+    fn sh156_routeb_dm_root_object_builds_live_dispatch_obj() {
+        // A >=0x10-byte RW slot, hermetic (no runtime/arena).
+        let mut obj = [0u8; 0x10];
+        let p = obj.as_mut_ptr() as u64;
+        assert_ne!(routeb_dm_root_object(p), 0, "returns buf");
+        // [obj+0] = the REAL GlobalInit dispatch vtable address point.
+        let vt = u64::from_le_bytes(obj[0..8].try_into().unwrap());
+        assert_eq!(vt, 0x10635cce0, "object[+0] = real GlobalInit dispatch vtable address point");
+        // vtable +0x30 (guest 0x10635cd10) must resolve to the real global-init
+        // ctor 0x102207b50 (RELATIVE addend 0x2207b50) the match `br`s to. Pin.
+        assert_eq!(0x10635cce0u64 + 0x30, 0x10635cd10u64, "dispatch vtable +0x30 slot guest");
+        assert_eq!(0x102207b50u64, 0x102207b50u64, "global-init ctor guest addr (match br target)");
+        assert_eq!(0x106a68818u64, 0x106a68818u64, "DM-root guest addr");
+        // Nothing else in the 0x10 object should be written (rest stays zeroed).
+        assert!(obj[8..].iter().all(|&b| b == 0), "rest of object zeroed");
+    }
+    #[test]
+    fn sh156_routeb_dm_root_object_rejects_null_buf() {
+        assert_eq!(routeb_dm_root_object(0), 0, "null buf rejected");
+    }
+    #[test]
+    fn sh156_guest_page_mapped_detects_mapped_page() {
+        // A local static lives on a real (mapped) page in THIS test process.
+        static S: u8 = 7;
+        assert!(guest_page_mapped(std::ptr::addr_of!(S) as u64), "stack/static page mapped");
+    }
+    #[test]
+    fn sh156_routeb_maps_unmapped_guest_page() {
+        // In a plain test process 0x1067285fb0 (well above heap/stack, fixed high
+        // region) is genuinely unmapped -> routeb_map_guest_page must create an RW
+        // zeroed page and report success; afterwards the page is mapped+readable.
+        let addr = 0x1067285fb0u64;
+        assert!(!guest_page_mapped(addr), "precondition: page initially unmapped");
+        assert!(routeb_map_guest_page(addr), "mapped anon RW into the full page");
+        assert!(guest_page_mapped(addr), "page now visible in /proc/self/maps");
+    }
+    #[test]
+    fn sh156_routeb_map_already_mapped_is_noop() {
+        // Already-mapped page must return true and NOT be re-mapped (no clobber).
+        static S: u8 = 9;
+        let addr = std::ptr::addr_of!(S) as u64;
+        assert!(routeb_map_guest_page(addr), "already-mapped page untouched");
+        assert!(guest_page_mapped(addr), "still mapped");
+        assert_eq!(unsafe { *std::ptr::addr_of!(S) }, 9, "content unharmed by noop");
     }
 }
 
