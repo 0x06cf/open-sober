@@ -5101,15 +5101,21 @@ fn render_engine_emitter_mesh(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) -> u6
         mesa_fn::<extern "C" fn(u32)>(h, b"glReadBuffer\0"),
         mesa_fn::<extern "C" fn()>(h, b"glFinish\0"),
     ) else { return 0; };
-    let (Some(bb), Some(_av)) = (
+    let (Some(bb), Some(bt)) = (
         mesa_fn::<extern "C" fn(u32, u32)>(h, b"glBindBuffer\0"),
         mesa_fn::<extern "C" fn(u32, u32)>(h, b"glBindTexture\0"),
     ) else { return 0; };
+    let at: Option<extern "C" fn(u32)> = mesa_fn(h, b"glActiveTexture\0");
     vp(0, 0, 1280, 720);
     ds(0x0B71); ds(0x0B44); ds(0x0BE2); ds(0x0C11);
     bf(0x8D40, 0);
     let back = 0x0405u32; dbs(1, &back); rbuf(0x0405);
     up(m.program);
+    // SH154: re-bind the studs texture to unit 0 (the HOME/multi emitter
+    // re-binds TEXTURE0 to its own atlas each frame, so without this the mesh
+    // frame would sample the previous surface's texture — a cross-frame bleed).
+    if let Some(at) = at { at(0x84C0); }
+    bt(0x0DE1, m.tex);
     // identity model-rot (yaw orbits per frame would go here); tex unit 0.
     let ident: [f32; 16] = [1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0, 0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0];
     let mvp = m.mvp; // cached perspective MVP (no per-frame mesh file re-read)
@@ -5178,6 +5184,39 @@ fn present_one_task_frame(ctx: u64, n: u64, iimg: &[u8], ibase: u64, isp: u64) -
     let vt = unsafe { *(ctx as *const u64) };
     if !(vt >= 0x100000000 && vt >> 56 == 0) {
         return 0;
+    }
+    // SH154 (RENDER_TASKFRAME_SEQUENCE=1): present a real task-driven FILM —
+    // alternate distinct real-content surfaces across frames by n % k (default
+    // k=2 => Mesh,Home,Mesh,Home; k=3 adds a palette slot). Reuses the proven
+    // emitters unchanged. Takes precedence over the single-content gates.
+    if std::env::var_os("RENDER_TASKFRAME_SEQUENCE").is_some() {
+        let k: u64 = std::env::var("TASKFRAME_SEQUENCE_K").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+        let step = n % k;
+        let r = match step {
+            0 if taskframe_mesh().is_some() => render_engine_emitter_mesh(ctx, iimg, ibase, isp),
+            1 => {
+                if std::env::var_os("RENDEREMITTER_HOME").is_some() {
+                    render_engine_emitter_multi(ctx, iimg, ibase, isp)
+                } else {
+                    render_engine_emitter_home(ctx, iimg, ibase, isp, 5)
+                }
+            }
+            _ => {
+                // palette slot (k>=3)
+                seed_task_frame_gles_slots();
+                let tp2 = arm64jit::jit::current_guest_tp();
+                let _ = arm64jit::jit::run_guest_callback(
+                    unsafe { *(vt.wrapping_add(16) as *const u64) },
+                    [ctx, 0, 0, 0, 0, 0, 0, 0],
+                    tp2,
+                );
+                1
+            }
+        };
+        eprintln!(
+            "[elfjit:taskv4-frame] seq frame #{n} step {step}/{k} ret={r:#x} — task-driven real-content film frame"
+        );
+        return if r == 0 { 1 } else { r };
     }
     // SH153 (RENDER_TASKFRAME_MESH=1): present the cached real smooth_sphere +
     // studs through the engine's OWN geometry wrapper. Takes precedence over
