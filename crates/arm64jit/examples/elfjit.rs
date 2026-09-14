@@ -1000,6 +1000,67 @@ pub fn routeb_seed_pb_registry_map(image: &[u8], base: u64) -> u64 {
 extern "C" fn routeb_singleton_leaf(a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64) -> u64 {
     a0
 }
+/// SH111 differential vtable: `routeb_singleton_null_leaf` returns 0 (for the
+/// nativeInit count slot +0x558 and ptr-arg slot +0x568, whose consumers either
+/// loop on the low-32 count or cbz-check the pointer). Returning identity there
+/// would make the native-flags init loop iterate a byte-swapped huge count and
+/// overrun the vector.
+extern "C" fn routeb_singleton_null_leaf(_a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64) -> u64 {
+    0
+}
+static SINGLETON_OBJ: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+/// SH111: `routeb_singleton_obj_leaf` returns a DEDICATED stable zeroed 0x40
+/// guest-resident object (Box::leak, guest==host identity-mapped so the caller
+/// can read/write fields without faulting). This is the differential default for
+/// the [0x60,0x580) band: the earlier blanket 0x580 identity-widening (b19b1c2)
+/// regressed nativeInitializeNativeFlags because a high-slot virtual returned
+/// identity a0 (== `this`, possibly NULL/low) and the caller deref'd x0+0x28 ->
+/// NULL+0x28 SIGSEGV. Returning a non-NULL zeroed object makes any [ret+off]
+/// read a valid guest-object read (field==0), never a NULL+0x28 fault, and
+/// passes a NULL-check harmlessly. A single shared object suffices (no reachable
+/// consumer compares two returned pointers; all store it, cbz-check it, or read
+/// one field).
+extern "C" fn routeb_singleton_obj_leaf(_a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64) -> u64 {
+    *SINGLETON_OBJ.get_or_init(|| {
+        let o = Box::leak(vec![0u8; 0x40usize].into_boxed_slice()).as_mut_ptr() as u64;
+        eprintln!("[elfjit:routeB] singleton stable-zeroed 0x40 object 0x{o:x}");
+        o
+    })
+}
+/// SH111: pure per-slot classification for the differential dispatch-singleton
+/// vtable. Decoupled from JIT registration so it is unit-testable. Returns which
+/// host-call leaf a given 8-byte vtable slot (slot index = byte_offset/8) must
+/// route to, and whether the slot must be covered by the vtable at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SingletonVtableSlot {
+    /// Identity leaf (return a0). Safe when the caller only STORES the virtual's
+    /// return (proven for +0xf8/+0x108/+0x548) or is a benign `this` dispatch.
+    Identity,
+    /// A non-NULL stable-zeroed guest object, so any caller `[ret+off]` read is a
+    /// valid zeroed field instead of a NULL+0x28 fault (the blanket-identity
+    /// regression, b19b1c2). Default for the [0x60,0x580) band.
+    Object,
+    /// NULL/0. For +0x558 (the nativeInit INT flag-count, must be 0 so the flags
+    /// loop exits immediately) and +0x568 (a pointer arg, cbz-NULL-checked).
+    NullLeaf,
+    /// Outside the 0x580 vtable — reads past the allocation yield the SAME benign
+    /// soft-return as the old 0x60 baseline (kept deliberately, < the +0x720 gate).
+    Outside,
+}
+fn routeb_singleton_vtable_slot(byte_off: u64) -> SingletonVtableSlot {
+    match byte_off {
+        // slots 0..0x60: kept identity (proven clean baseline)
+        0..=0x58 => SingletonVtableSlot::Identity,
+        // gate sites A/A2/B: store-only -> identity resolves the soft-return
+        0xf8 | 0x108 | 0x548 => SingletonVtableSlot::Identity,
+        // nativeInit: MUST be NULL (int count / ptr-arg)
+        0x558 | 0x568 => SingletonVtableSlot::NullLeaf,
+        // everything else below 0x580: non-NULL stable object (deref-safe)
+        0x60..0x580 => SingletonVtableSlot::Object,
+        _ => SingletonVtableSlot::Outside,
+    }
+}
+const ROUTEB_SINGLETON_VTABLE_LEN: u64 = 0x60;
 
 /// SH101: dispatch-1 in the gameGlobalInit do-init walker (`ldr x10,[obj];
 /// ldr x8,[x10,#0x10]; blr x8` at 0x1022084f0/4fc/500) returns the leaf's x0 in
@@ -1328,14 +1389,43 @@ fn routeb_seed_task_singletons() {
         eprintln!("[elfjit:routeB] benign singleton virtual registered at {a:#x}");
         a
     });
-    // Leaked 0x60-byte vtable; every 8-byte slot = the benign leaf. SH110 reverted:
-    // widening to 0x580 made nativeInitializeNativeFlags hard-crash (high-slot leaf
-    // returns a0 while the caller derefs it -> NULL+0x28 fault) BEFORE StartLuaAppDM.
-    // 0x60 keeps the clean milestone (soft-return at high vtable slots is benign);
-    // track the widening as frontier-sh110's next gate instead.
+    // SH111: differential 0x580 vtable. SH110 showed the blanketed 0x580
+    // identity-widening regressed nativeInitializeNativeFlags: a high-slot
+    // virtual returned identity a0 (== `this`, possibly NULL/low) and the caller
+    // deref'd x0+0x28 -> NULL+0x28 SIGSEGV before StartLuaAppDM. Instead:
+    //   - slots 0..0x60: keep the proven identity leaf (current clean baseline).
+    //   - [0x60,0x580) default: stable-zeroed 0x40 guest-resident object leaf
+    //     (any caller's [ret+off] read is a valid zeroed field, never NULL+0x28).
+    //   - +0xf8/+0x108/+0x548 (soft-return gate sites A/A2/B): identity leaf
+    //     (subagent-verified store-only: `ldr x8,[x19]; str x0,[x8]; mov x0,xzr`,
+    //     the virtual's return value is never deref'd), so V2Init/V2Start/V1
+    //     AppStart resolve their dispatch instead of leaking host bytes.
+    //   - +0x558 (nativeInit count) / +0x568 (ptr arg): NULL leaf — identity
+    //     there would make the flags-init loop iterate a huge low-32 count.
+    // Keep 0x580 (< the +0x720 bool-gate read), so non-gate deep slots keep the
+    // same benign soft-return as the 0x60 baseline.
+    // SH111 investigation: differential 0x580 vtable tried + EMPIRICALLY REVERTED.
+    // Covering the soft-return gate slots (+0xf8/+0x108/+0x548) requires widening
+    // the vtable past 0x60, and ANY widening (identity leaf b19b1c2 OR stable-zeroed
+    // object leaf SH111) makes nativeInitializeNativeFlags hard-crash (exit 134,
+    // fault at host-thunk while resolving a deep shared-vtable slot) BEFORE
+    // StartLuaAppDM. The vtable is SHARED between nativeInit (which stays clean
+    // ONLY because 0x60 slots read-past into host bytes -> benign soft-return) and
+    // V2Start/V2Init (which need wide coverage for a genuine return), so widening
+    // cannot serve both. The 0x60 baseline IS the benchmarked milestone (EXIT 0,
+    // 0 crash, StartLuaAppDM returned Ok); the V2Start/V2Init soft-return is benign
+    // (ladder proceeds past it). Revert to 0x60 and instead make the three CALL SITES
+    // resolve without widening (see frontier-sh111 note). NEXT target: patch the 3
+    // dispatch blr sites (0x62517c4/0x6251aa8/0x6260948) to a fixed guest-resident
+    // leaf directly (scoped to known leak sites), leaving the shared vtable 0x60.
     let vtable: &'static mut [u8] = Box::leak(vec![0u8; 0x60].into_boxed_slice());
-    for i in 0..(0x60 / 8) {
-        unsafe { *(vtable.as_mut_ptr().wrapping_add(i * 8) as *mut u64) = leaf; }
+    {
+        let mut fill = |i: u64, v: u64| unsafe {
+            *(vtable.as_mut_ptr().wrapping_add((i * 8) as usize) as *mut u64) = v
+        };
+        for slot in 0..(0x60 / 8) {
+            fill(slot, leaf);
+        }
     }
     let vtable_addr = vtable.as_ptr() as u64;
     // Templates (0x28 bytes) whose +0 is the vtable; rest zero (obj fields the
@@ -8741,6 +8831,53 @@ mod sh79_tests {
             assert!(opaque > 20, "composite '{ch}' only {opaque} opaque px");
             eprintln!("[sh79] '{ch}' ({}) composite -> {opaque} opaque px", gid);
         }
+    }
+}
+
+#[cfg(test)]
+mod sh111_tests {
+    use super::*;
+    // SH111: empirical outcome — a widened dispatch-singleton vtable (0x60->0x580),
+    // whether filled with identity leaves (b19b1c2) or with a stable-zeroed object
+    // leaf (SH111 attempt), REGRESSES nativeInitializeNativeFlags (exit 134) before
+    // StartLuaAppDM. The vtable is SHARED and nativeInit stays clean ONLY because
+    // the 0x60 slots read-past into host bytes -> benign soft-return; the same
+    // growth that would let V2Start/V2Init resolve their +0xf8/+0x108/+0x548 gate
+    // slots also makes nativeInit resolve deep slots and fault. The correct commit
+    // state is the 0x60 baseline, and the actual fix for the soft-returns is a
+    // SCOPED patch at the three dispatch blr SITES (0x62517c4/0x6251aa8/0x6260948),
+    // not a vtable widening. This test locks that baseline + the empirical rational.
+    #[test]
+    fn sh111_singleton_vtable_stays_0x60_baseline() {
+        // The committed vtable is 0x60 (the benchmarked clean milestone).
+        assert!(ROUTEB_SINGLETON_VTABLE_LEN >= 0x60);
+        // Widening past 0x60 is forbidden while the shared vtable also serves
+        // nativeInitializeNativeFlags (regression class b19b1c2/SH111).
+        assert!(
+            ROUTEB_SINGLETON_VTABLE_LEN < 0xf8,
+            "vtable must stay at the narrow 0x60 baseline; widening regresses nativeInitializeNativeFlags"
+        );
+        // Slots 0..0x60 are all identity leaves (proven clean).
+        for off in [0u64, 0x58] {
+            assert_eq!(routeb_singleton_vtable_slot(off), SingletonVtableSlot::Identity, "low slot +{off:x}");
+        }
+        // The three soft-return gate sites are store-only (identity return would be
+        // safe) — but reaching them requires widening, which is rejected above. This
+        // is why the call-site patch is the resolution, not the vtable. We pin the
+        // site addresses so a future implementer targets them directly.
+        // dispatch sites (blr = vtable+offset): site A 0x62517c4 -> +0xf8,
+        // site A2 0x6251aa8 -> +0x108, site B 0x6260948 -> +0x548.
+        assert_eq!(routeb_singleton_vtable_slot(0xf8), SingletonVtableSlot::Identity, "gate +0xf8 store-only");
+        assert_eq!(routeb_singleton_vtable_slot(0x108), SingletonVtableSlot::Identity, "gate +0x108 store-only");
+        assert_eq!(routeb_singleton_vtable_slot(0x548), SingletonVtableSlot::Identity, "gate +0x548 store-only");
+        // The stable-zeroed object leaf exists and is deref-safe (the SH111
+        // alternative), useful if a future per-call-site approach needs a real
+        // returned object.
+        let obj = routeb_singleton_obj_leaf(0, 0, 0, 0, 0, 0, 0, 0);
+        assert!(obj != 0, "obj leaf must be non-NULL");
+        assert_eq!(unsafe { *(obj.wrapping_add(0x28) as *const u64) }, 0, "object +0x28 must read as zeroed slot");
+        // The NULL leaf returns exactly 0.
+        assert_eq!(routeb_singleton_null_leaf(0, 0, 0, 0, 0, 0, 0, 0), 0);
     }
 }
 

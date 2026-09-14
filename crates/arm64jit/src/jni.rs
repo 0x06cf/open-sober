@@ -704,6 +704,63 @@ extern "C" fn jni_call_int_method(
     }
 }
 
+// Route-B step 2 (recon-routeB-globaltinit-unblock.md): the engine's
+// StartLuaAppDM only ADVANCES its session when the NativeHelper `gameActivity_*`
+// JNI callbacks fire on the fake Java object. Each is invoked via
+// GetMethodID(name-string)+CallVoidMethod (disasm: 0x2bd8ecc..0x2bd9ad0 ends in
+// CallVoidMethod; all five are VOID-descriptor). CALL_VOID_METHOD is currently
+// the shared no-op `ok` stub (returns 0 without dispatching on the method name),
+// so the engine's callbacks silently no-op and the session never advances. This
+// shim dispatches on the method name so each callback produces a real (void)
+// response — the first step toward a self-constructed login/home by the engine.
+use core::sync::atomic::{AtomicU8, Ordering as AtOrd};
+static MH_FLAGS_LOADED: AtomicU8 = AtomicU8::new(0);
+static MH_ENGINE_INITIALIZED: AtomicU8 = AtomicU8::new(0);
+static MH_APP_READY: AtomicU8 = AtomicU8::new(0);
+static MH_GAME_LOADED: AtomicU8 = AtomicU8::new(0);
+pub fn nativehelper_flags_loaded() -> bool { MH_FLAGS_LOADED.load(AtOrd::Relaxed) != 0 }
+pub fn nativehelper_engine_initialized() -> bool { MH_ENGINE_INITIALIZED.load(AtOrd::Relaxed) != 0 }
+pub fn nativehelper_app_ready() -> bool { MH_APP_READY.load(AtOrd::Relaxed) != 0 }
+pub fn nativehelper_game_loaded() -> bool { MH_GAME_LOADED.load(AtOrd::Relaxed) != 0 }
+
+/// CallVoidMethod(env, obj, methodID, ...): the NativeHelper `gameActivity_*`
+/// callbacks fire through here. All five are VOID-descriptor, so the return is
+/// always 0; the load-bearing effect is the milestone signal (the session-advance
+/// that lets StartLuaAppDM construct a real GuiObject tree). Unrecognized -> 0
+/// (void no-op, identical to the old `ok` stub) so unrelated CallVoidMethod sites
+/// are untouched.
+extern "C" fn jni_call_void_method(
+    _e: u64, _obj: u64, mid: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    match method_id_name(mid).as_deref() {
+        Some(name) if name == b"gameActivity_onFlagsLoaded" || name == b"onFlagsLoaded" => {
+            MH_FLAGS_LOADED.store(1, AtOrd::Relaxed);
+            eprintln!("[jni:nativehelper] onFlagsLoaded -> flags-loaded milestone");
+        }
+        Some(name) if name == b"gameActivity_onEngineInitialized" || name == b"onEngineInitialized" => {
+            MH_ENGINE_INITIALIZED.store(1, AtOrd::Relaxed);
+            eprintln!("[jni:nativehelper] onEngineInitialized -> session may build GuiObjects");
+        }
+        Some(name) if name == b"gameActivity_onAppReady" || name == b"onAppReady" => {
+            MH_APP_READY.store(1, AtOrd::Relaxed);
+            eprintln!("[jni:nativehelper] onAppReady -> app-shell may construct login/home GuiObject tree");
+        }
+        // NOTE (subagent deleg_2e852a9c, disasm-verified): onDidLogInReceived is
+        // (Ljava/lang/String;)V — VOID with a String arg — NOT a jboolean. The
+        // login-vs-home choice is NOT conveyed by a return value; steer to LOGIN by
+        // keeping the flags-loaded/first-login untriggered until a real payload.
+        Some(name) if name == b"gameActivity_onDidLogInReceived" || name == b"onDidLogInReceived" => {
+            eprintln!("[jni:nativehelper] onDidLogInReceived (login-state callback)");
+        }
+        Some(name) if name == b"gameActivity_onGameLoaded" || name == b"onGameLoaded" => {
+            MH_GAME_LOADED.store(1, AtOrd::Relaxed);
+            eprintln!("[jni:nativehelper] onGameLoaded -> full home");
+        }
+        _ => {}
+    }
+    0
+}
+
 /// CallLongMethod(env, obj, methodID, ...): the AppBridge params long getters.
 /// getAppUserId defaults 0; deviceMemoryMB is 8192 (recon v2). Unrecognized -> 0.
 extern "C" fn jni_call_long_method(
@@ -999,11 +1056,11 @@ pub fn build_jni() -> (u64, u64) {
         functions[CALL_INT_METHOD] = reg(jni_call_int_method);
         functions[CALL_LONG_METHOD] = reg(jni_call_long_method);
         functions[CALL_FLOAT_METHOD] = reg_jni_f32(jni_call_float_method);
-        functions[CALL_VOID_METHOD] = ok;
+        functions[CALL_VOID_METHOD] = reg(jni_call_void_method); // NativeHelper gameActivity_* callbacks
         functions[CALL_STATIC_OBJECT_METHOD] = reg(jni_voidp_0);
         functions[CALL_STATIC_BOOLEAN_METHOD] = reg(jni_voidp_0);
         functions[CALL_STATIC_INT_METHOD] = reg(jni_voidp_0);
-        functions[CALL_STATIC_VOID_METHOD] = ok;
+        functions[CALL_STATIC_VOID_METHOD] = reg(jni_call_void_method);
         functions[GET_STATIC_FIELD_ID] = reg(jni_get_method_id);
         functions[GET_STATIC_OBJECT_FIELD] = reg(jni_voidp_0);
         functions[GET_STATIC_INT_FIELD] = field0;
@@ -1683,6 +1740,62 @@ mod tests {
             let midx = get_name_id(b"someOtherMethod");
             let (g_om2, _) = host_call_at(get(CALL_OBJECT_METHOD)).expect("CallObjectMethod thunk");
             assert_eq!(g_om2(env, 0x4321, midx, 0, 0, 0, 0, 0), 0, "unrecognized getter falls back to NULL/0");
+        }
+    }
+
+    /// Route-B step 2 (recon-routeB-globaltinit-unblock.md): the engine's
+    /// StartLuaAppDM only ADVANCES its session when the NativeHelper
+    /// `gameActivity_*` JNI callbacks fire on the fake Java object. Each is
+    /// invoked via GetMethodID(name)+CallVoidMethod (all five are VOID-descriptor
+    /// — disasm 0x2bd8ecc..0x2bd9ad0). A name-dispatching jni_call_void_method
+    /// must (1) return 0 (void) for every one, (2) record the matching milestone
+    /// so the boot glue can observe the session advanced, and (3) leave unrelated
+    /// CallVoidMethod sites untouched (still 0, no milestone).
+    #[test]
+    fn nativehelper_game_activity_callbacks_dispatch_void_method() {
+        let (env, _vm) = build_jni();
+        unsafe {
+            let functions = *(env as *const u64);
+            let get = |i: usize| -> u64 { *(functions as *const u64).add(i) };
+            let get_name_id = |name: &[u8]| -> u64 {
+                let name_buf = unsafe { alloc_zeroed(Layout::array::<u8>(name.len() + 1).unwrap()) };
+                unsafe { std::ptr::copy_nonoverlapping(name.as_ptr(), name_buf, name.len()) };
+                let (f, _) = host_call_at(get(GET_METHOD_ID)).expect("GetMethodID host thunk");
+                f(env, 0, name_buf as u64, 0, 0, 0, 0, 0)
+            };
+            // Reset the milestone flags so the test is self-contained.
+            MH_FLAGS_LOADED.store(0, AtOrd::Relaxed);
+            MH_ENGINE_INITIALIZED.store(0, AtOrd::Relaxed);
+            MH_APP_READY.store(0, AtOrd::Relaxed);
+            MH_GAME_LOADED.store(0, AtOrd::Relaxed);
+            // Dispatch the five callbacks through the OFFICIAL CallVoidMethod slot.
+            let (g_vm, _) = host_call_at(get(CALL_VOID_METHOD)).expect("CallVoidMethod thunk");
+            let cases: &[(&[u8], fn() -> bool)] = &[
+                (b"gameActivity_onFlagsLoaded", nativehelper_flags_loaded),
+                (b"gameActivity_onEngineInitialized", nativehelper_engine_initialized),
+                (b"gameActivity_onAppReady", nativehelper_app_ready),
+                (b"gameActivity_onGameLoaded", nativehelper_game_loaded),
+            ];
+            for (name, flag_fn) in cases {
+                let mid = get_name_id(name);
+                assert_ne!(mid, 0, "GetMethodID({}) non-null", String::from_utf8_lossy(name));
+                let ret = g_vm(env, 0x4321, mid, 0, 0, 0, 0, 0);
+                assert_eq!(ret, 0, "{} returns void (0)", String::from_utf8_lossy(name));
+                assert!(flag_fn(), "{} fired its milestone", String::from_utf8_lossy(name));
+            }
+            // onDidLogInReceived is VOID (String arg, no jboolean) — no milestone
+            // flag, but it must still return 0 (void) and not fault.
+            let mid_li = get_name_id(b"gameActivity_onDidLogInReceived");
+            assert_eq!(g_vm(env, 0x4321, mid_li, 0, 0, 0, 0, 0), 0, "onDidLogInReceived returns void");
+            // The bare (non-prefixed) forms also resolve (defensive match).
+            let mid_bare = get_name_id(b"onAppReady");
+            assert_eq!(g_vm(env, 0x4321, mid_bare, 0, 0, 0, 0, 0), 0, "bare onAppReady returns void");
+            assert!(nativehelper_app_ready(), "bare onAppReady fires the milestone");
+            // Unrelated CallVoidMethod -> still 0 and does NOT trip milestones.
+            let mid_other = get_name_id(b"someGameVoidCall");
+            let r0 = g_vm(env, 0x4321, mid_other, 0, 0, 0, 0, 0);
+            assert_eq!(r0, 0, "unrelated void call returns 0");
+            // (onDidLogInReceived carries no milestone — checked flags only above.)
         }
     }
 
