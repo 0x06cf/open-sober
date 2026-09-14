@@ -59,6 +59,15 @@ the whole process first; now it surfaces on that minority of runs. Both SH124
 changes are env-gated; the crash is at rung 0 before any do-init/exit. This is
 the real remaining blocker to flipping the opt-in chain default-ON (STATUS gate b).
 
+## Characterization (after SH124, real libroblox.so)
+WITHOUT the render pipeline (`--renderinit`/`--renderthunk`/`--renderframe`), the
+full SH115-125 opt-in `--v2boot` ladder completes clean 3/3 (EXIT 0 / "ladder
+done" / joined) — /tmp/norender-{1,2,3}.txt. The run-variable crash appears ONLY
+when the render threads are ALSO driven concurrently with the ladder — i.e. it is
+the render-thread-vs-ladder jit_run desync (the SH55/64 class), NOT the
+session-construction path. The clean session-construction (ladder alone) is
+stable; the concurrent render path is what remains run-variable.
+
 ## Regressions
 +2 resolver tests: `sh124_exit_intercept_gated_on_drive_lifecycle` (exit family
 intercepted only under JIT_DRIVE_LIFECYCLE; non-exit names never) and
