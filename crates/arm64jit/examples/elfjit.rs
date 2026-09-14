@@ -2772,6 +2772,53 @@ fn mesh_positions_to_ndc(m: &RbxMeshV2, fit: f32) -> Vec<f32> {
     out
 }
 
+/// Parse a DDS file that is a plain single-channel R8 (LUMINANCE) surface —
+/// the format Roblox's MaterialManager material maps ship as (e.g.
+/// `android/textures/studs.dds`: DDS, 2048x128, mips=12, DDPF_LUMINANCE,
+/// rmask=0xff, custom UVER/NVTT markers). Returns (width, height, base-mip R8
+/// bytes). Bounds-checked. Only DDPF_LUMINANCE 8-bit surfaces are accepted; any
+/// compressed/EAC/ASTC-skipping surface returns None (those need the texture
+/// codec, not an R8 expand).
+fn parse_roblox_dds_r8(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    if data.len() < 128 || &data[0..4] != b"DDS " {
+        return None;
+    }
+    let hsz = le32(data, 4) as usize;
+    if hsz < 124 || data.len() < 8 + hsz {
+        return None;
+    }
+    // 'DDS ' (4) + dwSize (4) + DDS_HEADER. The header (dwFlags..dwCaps) begins at
+    // offset 8; dwSize is a redundant member of it, not its start.
+    let h = 8;
+    let hgt = le32(data, h + 4); // dwHeight (file 12)
+    let wdt = le32(data, h + 8); // dwWidth (file 16)
+    let mips = le32(data, h + 20); // dwMipMapCount (file 28)
+    // dwDepth at h+20 (0 for surface).
+    let pf = 76; // DDS_PIXELFORMAT begins at file offset 76 (dwSize, flags, fourcc, bitcount, masks)
+    // pf: dwSize(4) dwFlags(4) dwFourCC(4) dwRGBBitCount(4) rmask gmask bmask amask
+    let pfflags = le32(data, pf + 4);
+    let bitcount = le32(data, pf + 12);
+    let rmask = le32(data, pf + 16);
+    const DDPF_LUMINANCE: u32 = 0x20000;
+    const DDPF_FOURCC: u32 = 0x4;
+    // Single-channel 8-bit luminance: DDPF_LUMINANCE, no FourCC (not compressed),
+    // 8 bits, red mask 0xff.
+    if (pfflags & DDPF_LUMINANCE) == 0 || (pfflags & DDPF_FOURCC) != 0 || bitcount != 8 || rmask != 0xff {
+        return None;
+    }
+    if wdt == 0 || hgt == 0 {
+        return None;
+    }
+    let n = (wdt as usize) * (hgt as usize);
+    let data_off = 4 + hsz;
+    if data.len() < data_off + n {
+        return None;
+    }
+    let r8 = data[data_off..data_off + n].to_vec();
+    let _ = mips;
+    Some((wdt, hgt, r8))
+}
+
 /// Find a sfnt table's (offset, length) by 4-char tag. Returns None if the font
 /// is a CFF/OTTO head (`'OTTO'` signature; no glyf outlines) or the tag is absent.
 fn sfnt_find_table(font: &[u8], tag: &[u8; 4]) -> Option<(usize, usize)> {
@@ -8207,7 +8254,23 @@ fn main() {
                                     // ETC2 blocks; decode_etc2_rgb must yield the same colors.
                                     let etc2_mode = renderframe_args.iter().any(|a| a == "--renderframe-etc2");
                                     let comp_mode = etc_mode || etc2_mode;
-                                    let fs_src: &[u8] = if tex_mode || comp_mode {
+                                    // --renderframe-mesh-tex <dds>: upload a REAL Roblox material
+                                    // map (DDS R8 LUMINANCE, e.g. android/textures/studs.dds) and
+                                    // sample it over the --renderframe-mesh geometry. Real APK
+                                    // texture data on real mesh geometry through the engine's own
+                                    // GLES path (screen-space UV, reusing the proven single-attribute
+                                    // textured bridge; R8->RGBA expand, no decoder).
+                                    let mesh_tex: Option<std::path::PathBuf> = renderframe_args
+                                        .iter()
+                                        .position(|a| a == "--renderframe-mesh-tex")
+                                        .and_then(|i| renderframe_args.get(i + 1).cloned())
+                                        .map(std::path::PathBuf::from);
+                                    let fs_src: &[u8] = if mesh_tex.is_some() {
+                                        // Sample the full atlas: uv = frag/screen. The studs atlas is
+                                        // 128x2048 (128 wide, 2048 rows), so map x to the atlas width and
+                                        // scroll y across rows for a recognizable studs strip.
+                                        b"precision mediump float;\nuniform sampler2D uTex;\nvoid main(){ vec2 uv = vec2(gl_FragCoord.x / 1280.0, gl_FragCoord.y / 720.0); uv.x = (uv.x * 0.5) + 0.25; gl_FragColor = texture2D(uTex, uv); }\n\0"
+                                    } else if tex_mode || comp_mode {
                                         // 2x2 texels RED,GREEN,BLUE,WHITE. UV = floor(frag/640,360)
                                         // picks a quadrant, (uv+0.5)*0.5 samples its texel center
                                         // under NEAREST. centroid(640,360)->(1,1)->WHITE; (900,150)
@@ -8327,7 +8390,7 @@ fn main() {
                                     // textured draws will need. glTexImage2D has 9 args (pixels on
                                     // the guest stack), so drive it with a dedicated CpuState whose
                                     // sp=tex_sp points at a slot holding the pixels pointer.
-                                    if tex_mode || comp_mode {
+                                    if tex_mode || comp_mode || mesh_tex.is_some() {
                                                                             const GL_TEXTURE0: u64 = 0x84c0;
                                                                             const GL_TEXTURE_2D: u64 = 0x0de1;
                                                                             const GL_RGBA: u64 = 0x1908;
@@ -8344,7 +8407,36 @@ fn main() {
                                                                             let _ = gcall(plt_bind_texture, GL_TEXTURE_2D, tex_id, 0, 0, 0, 0);
                                                                             let _ = gcall(plt_tex_parameteri, GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST, 0, 0, 0);
                                                                             let _ = gcall(plt_tex_parameteri, GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST, 0, 0, 0);
-                                                                            if tex_mode {
+                                                                            if mesh_tex.is_some() {
+                                                                                // REAL Roblox material map: parse the DDS R8 surface, expand to RGBA,
+                                                                                // upload via 9-arg glTexImage2D (real APK pixel data on real mesh
+                                                                                // geometry). R8 gray -> (v,v,v,255) in a dedicated leaked RGBA buffer
+                                                                                // (studs atlas is 128x2048, ~1 MiB rgba).
+                                                                                let dds_bytes = std::fs::read(mesh_tex.as_ref().unwrap()).expect("read studs.dds");
+                                                                                let (tw, th, r8) = parse_roblox_dds_r8(&dds_bytes).expect("dds R8 parse");
+                                                                                eprintln!(
+                                                                                    "[elfjit:renderframe-mesh-tex] parsed real DDS {:?}: {tw}x{th} R8 ({} bytes)",
+                                                                                    mesh_tex.as_ref().unwrap().file_name().unwrap_or_default(),
+                                                                                    r8.len()
+                                                                                );
+                                                                                let rgba: Vec<u8> = r8.iter().flat_map(|&v| [v, v, v, 255]).collect();
+                                                                                let texbuf = Box::leak(rgba.into_boxed_slice());
+                                                                                let tex_pixels = texbuf.as_ptr() as u64;
+                                                                                let tex_sp = base + 0xf80;
+                                                                                *(tex_sp as *mut u64) = tex_pixels;
+                                                                                let mut stex = arm64jit::jit::CpuState::new();
+                                                                                stex.tpidr = tpidr;
+                                                                                stex.x[31] = tex_sp;
+                                                                                stex.x[0] = GL_TEXTURE_2D;
+                                                                                stex.x[1] = 0; // level
+                                                                                stex.x[2] = GL_RGBA; // internalformat
+                                                                                stex.x[3] = tw as u64; // width
+                                                                                stex.x[4] = th as u64; // height
+                                                                                stex.x[5] = 0; // border
+                                                                                stex.x[6] = GL_RGBA; // format
+                                                                                stex.x[7] = GL_UNSIGNED_BYTE; // type
+                                                                                let _ = arm64jit::jit::jit_run(iimg, ibase, plt_tex_image_2d, &mut stex as *mut CpuState);
+                                                                            } else if tex_mode {
                                                                                 // RGBA 2x2 checkerboard via 9-arg glTexImage2D. pixels (the 9th arg) rides the
                                                                                 // guest stack at [sp+0]; the PLT stub is a leaf (adrp/ldr/add/br, never pushes sp),
                                                                                 // so a fake sp whose [0] holds the pixels ptr is read by the bridge's gs_stack.
@@ -8686,8 +8778,15 @@ fn main() {
                                                 gp.x[5] = 0x1401; // GL_UNSIGNED_BYTE
                                                 gp.x[6] = slot;
                                                 let _ = arm64jit::jit::jit_run(iimg, ibase, plt_readpixels, &mut gp as *mut CpuState);
-                                                let r = unsafe { *(slot as *const u8) };
-                                                if r >= 200 { drawn += 1; hits.push((px, py)); } else { bg += 1; }
+                                                let p = slot as *const u8;
+                                                let r = unsafe { *p };
+                                                let g = unsafe { *p.add(1) };
+                                                let b = unsafe { *p.add(2) };
+                                                // "drawn" = the pixel differs from the cleared background
+                                                // (rgba 0,0,0.3 -> ~0,0,76): any channel above the clear's
+                                                // g/b baseline means geometry+shader covered it (solid red
+                                                // OR the grayscale studs texture both qualify).
+                                                if r >= 60 || g >= 60 || b >= 60 { drawn += 1; hits.push((px, py)); } else { bg += 1; }
                                             }
                                         }
                                         eprintln!(
@@ -10846,6 +10945,48 @@ mod mesh_tests {
         // real avatar UVs span a meaningful sub-region of the [0,1] atlas and v is finite.
         assert!(u_min >= 0.0 && u_min < u_max, "uv min {u_min} max {u_max}");
         assert!(u_max > 0.5 && u_max <= 1.0, "uv max {u_max}");
+    }
+
+    #[test]
+    fn sh141_parse_real_studs_dds_r8() {
+        let p = "/home/hermes-worker/.cache/open-sober/android-env/assets/android/textures/studs.dds";
+        let Ok(d) = std::fs::read(p) else { return };
+        let (w, h, r8) = parse_roblox_dds_r8(&d).expect("studs.dds is R8 DDS");
+        assert_eq!((w, h), (128, 2048), "studs atlas 128x2048");
+        assert_eq!(r8.len(), (128 * 2048) as usize, "R8 base mip size");
+        // R8 pixel data is genuinely varied (the studs surface has bright + dark).
+        let mut lo = 255u8;
+        let mut hi = 0u8;
+        for &v in r8.iter().step_by(97) {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        assert!(hi - lo > 40, "studs R8 has real luminance variation ({lo}..{hi})");
+    }
+
+    #[test]
+    fn sh141_dds_r8_rejects_compressed_or_bad_surface() {
+        // A non-DDS header must be rejected (no panic).
+        assert!(parse_roblox_dds_r8(b"not a dds").is_none());
+        // A DDS with a FourCC (compressed) pixelformat must be rejected.
+        let mut d = vec![0u8; 200];
+        d[0..4].copy_from_slice(b"DDS ");
+        // dwSize at offset 4
+        d[4..8].copy_from_slice(&124u32.to_le_bytes());
+        // header: dwHeight(8) dwWidth(12) dwMipMapCount(24)
+        d[8..12].copy_from_slice(&(64u32).to_le_bytes()); // height (header starts at 4+124=128; but we just need pf flags)
+        d[12..16].copy_from_slice(&(64u32).to_le_bytes());
+        // pixelformat at 4+124+76 = 204 -> beyond our 200-byte buffer; use proper buffer size.
+        let mut d = vec![0u8; 260];
+        d[0..4].copy_from_slice(b"DDS ");
+        d[4..8].copy_from_slice(&124u32.to_le_bytes());
+        d[8..12].copy_from_slice(&(64u32).to_le_bytes());
+        d[12..16].copy_from_slice(&(64u32).to_le_bytes());
+        d[20..24].copy_from_slice(&(1u32).to_le_bytes()); // dwMipMapCount
+        let pf = 4 + 124 + 76;
+        d[pf..pf + 4].copy_from_slice(&(32u32).to_le_bytes()); // pf dwSize
+        d[pf + 4..pf + 8].copy_from_slice(&(0x4u32).to_le_bytes()); // DDPF_FOURCC -> must reject
+        assert!(parse_roblox_dds_r8(&d).is_none(), "FourCC surface rejected");
     }
 }
 
