@@ -6303,6 +6303,34 @@ fn main() {
                 eprintln!(
                     "[elfjit:deque-node-live] inject into LIVE drainer's deque (vtable 0x{vt:x}); draining when pc in [0x{DRAIN_LO:x},0x{DRAIN_HI:x})"
                 );
+                // SH126-serial (recon deleg_a5c26351 + sh126-serial-s1.txt): under
+                // JIT_SERIALIZE_RENDER + --v2boot, the ladder holds guest_tid0 in its
+                // rung jit_runs, so the engine's live drain pop-loop NEVER lands its pc
+                // in the body [DRAIN_LO, DRAIN_HI) during the ladder — the 400-tick x
+                // 50ms capture budget below burns entirely in the pre-recovery window
+                // and the injector gives up ("gave up after 400 ticks") before
+                // RENDERCTX publishes, so 0 nodes dispatch and the presenter drains
+                // nothing (combined run presents 0 real task frames). Do not start the
+                // capture budget at t=0 under the serialized ladder: wait for the
+                // ladder to signal LADDER_DONE, THEN for the renderinit thread to
+                // recover/publish RENDERCTX (same 300s bound as the renderinit gate)
+                // so the injected nodes dispatch into a READY presenter -> real frames.
+                let serialize = std::env::var("JIT_SERIALIZE_RENDER").ok().as_deref() == Some("1")
+                    && std::env::args().any(|a| a == "--v2boot");
+                if serialize {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+                    while !LADDER_DONE.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    while RENDERCTX.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    eprintln!(
+                        "[elfjit:deque-node-live] serialized gate passed: LADDER_DONE={} RENDERCTX={:#x} — starting live-drain capture (injected nodes now dispatch post-recovery)",
+                        LADDER_DONE.load(Ordering::Relaxed),
+                        RENDERCTX.load(Ordering::Relaxed)
+                    );
+                }
                 for it in 0..400 {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                     let is_ptr = |p: u64| p >= 0x100000000 && p >> 56 == 0 && p & 7 == 0;
