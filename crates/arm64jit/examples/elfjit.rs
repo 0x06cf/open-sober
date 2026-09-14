@@ -2924,6 +2924,46 @@ fn mesh_orbit_mvp(center: &[f32; 3], ext: f32, fit_fov: f32, aspect: f32, yaw_ra
     mat4_mul(p, mat4_mul(v, m))
 }
 
+/// Compose MVP: same bbox-framed perspective camera + per-object model
+/// transform. `origin` is an offset (in model cm) added after centering (so each
+/// object in a composed scene sits at its own world position); `scale` shrinks
+/// the object about its center; `yaw_rad` rotates it about its +Y. M = T(origin)
+/// * S(scale) * Ry(yaw) * T(-center).
+fn mesh_compose_mvp(center: &[f32; 3], ext: f32, origin: [f32; 3], scale: f32, yaw_rad: f32, fit_fov: f32, aspect: f32) -> [f32; 16] {
+    let d = if ext > 1e-9 { (ext * 0.5) / (fit_fov * 0.5).tan() * 1.6 } else { 4.0 };
+    let near = ext.max(1e-3) * 0.05;
+    let far = (ext.max(1e-3) * 10.0).max(d + ext);
+    let p = mat4_perspective(fit_fov, aspect, near, far);
+    let v = mat4_translate(0.0, 0.0, -d);
+    let mut s = [0f32; 16];
+    s[0] = scale; s[5] = scale; s[10] = scale; s[15] = 1.0;
+    let m = mat4_mul(
+        mat4_translate(origin[0], origin[1], origin[2]),
+        mat4_mul(s, mat4_mul(mat4_rotate_y(yaw_rad), mat4_translate(-center[0], -center[1], -center[2]))),
+    );
+    mat4_mul(p, mat4_mul(v, m))
+}
+
+/// Compose MVP with a SHARED scene camera: `scene_ext` is the max bbox extent
+/// across ALL composed objects, so every object is viewed from the SAME distance
+/// and the world-space origins in `origin` (cm) correctly spread them across one
+/// coherent composed frame. M = T(origin) * S(scale) * Ry(yaw) * T(-center).
+fn mesh_compose_mvp_shared(center: &[f32; 3], scene_ext: f32, origin: [f32; 3], scale: f32, yaw_rad: f32, fit_fov: f32, aspect: f32) -> [f32; 16] {
+    let ext = scene_ext.max(1e-3);
+    let d = (ext * 0.5) / (fit_fov * 0.5).tan() * 1.6;
+    let near = ext * 0.05;
+    let far = (ext * 10.0).max(d + ext);
+    let p = mat4_perspective(fit_fov, aspect, near, far);
+    let v = mat4_translate(0.0, 0.0, -d);
+    let mut s = [0f32; 16];
+    s[0] = scale; s[5] = scale; s[10] = scale; s[15] = 1.0;
+    let m = mat4_mul(
+        mat4_translate(origin[0], origin[1], origin[2]),
+        mat4_mul(s, mat4_mul(mat4_rotate_y(yaw_rad), mat4_translate(-center[0], -center[1], -center[2]))),
+    );
+    mat4_mul(p, mat4_mul(v, m))
+}
+
 /// Parse a DDS file that is a plain single-channel R8 (LUMINANCE) surface —
 /// the format Roblox's MaterialManager material maps ship as (e.g.
 /// `android/textures/studs.dds`: DDS, 2048x128, mips=12, DDPF_LUMINANCE,
@@ -8441,7 +8481,7 @@ fn main() {
                                         // SH145: diffuse lighting. vN is the world-space normal (varying
                                         // from the VS's mat3(uModelRot)*aNormal); a fixed world-space
                                         // light dir. color = tex * (ambient + diffuse*dot(N,L)).
-                                        b"precision mediump float;\nuniform sampler2D uTex;\nvarying vec2 vUV;\nvarying vec3 vN;\nvoid main(){ vec3 L = normalize(vec3(0.4, 0.7, 0.6)); vec3 n = normalize(vN); float d = max(dot(n, L), 0.0); vec4 t = texture2D(uTex, vUV); gl_FragColor = vec4(t.rgb * (0.30 + 0.70*d), 1.0); }\n\0"
+                                        b"precision mediump float;\nuniform sampler2D uTex;\nvarying vec2 vUV;\nvarying vec3 vN;\nvoid main(){ vec3 L = normalize(vec3(0.4, 0.7, 0.6)); vec3 n = normalize(vN); float d = max(dot(n, L), 0.0); vec4 t = texture2D(uTex, vUV); gl_FragColor = vec4(t.rgb * (0.55 + 0.45*d) + vec3(0.03), 1.0); }\n\0"
                                     } else if mesh_tex.is_some() {
                                         // Sample the full atlas: uv = frag/screen. The studs atlas is
                                         // 128x2048 (128 wide, 2048 rows), so map x to the atlas width and
@@ -9323,6 +9363,175 @@ fn main() {
                                             );
                                             std::thread::sleep(std::time::Duration::from_millis(220));
                                         }
+                                    }
+                                    // --renderframe-mesh-compose <p1>,<p2>,...: SH146 — render N DISTINCT
+                                    // real Roblox .mesh objects (e.g. avatar torso/limbs/head) in ONE
+                                    // frame, each with its OWN VBO/EBO, per-object compose-MVP
+                                    // (translate+scale+yaw via mesh_compose_mvp) and SH145 diffuse
+                                    // lighting, ALL driven sequentially through the engine's own
+                                    // geometry wrapper 0x105b35288 — a composed real-avatar scene.
+                                    // Objects are laid in a row across the world X axis and each is
+                                    // lit by the same world light; one clear, N draws, one swap.
+                                    let compose_str: Option<std::path::PathBuf> = None;
+                                    let compose_objs: Vec<String> = renderframe_args
+                                        .iter()
+                                        .position(|a| a == "--renderframe-mesh-compose")
+                                        .and_then(|i| renderframe_args.get(i + 1))
+                                        .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+                                        .unwrap_or_default();
+                                    if !compose_objs.is_empty() {
+                                        const GL_ARRAY_BUFFER: u64 = 0x8892;
+                                        const GL_ELEMENT_ARRAY_BUFFER: u64 = 0x8893;
+                                        const GL_STATIC_DRAW: u64 = 0x88e4;
+                                        // Clear first so the composed scene is the only content (the
+                                        // --renderframe-triangle reference draws before this block).
+                                        {
+                                            let mut scn = arm64jit::jit::CpuState::new();
+                                            scn.tpidr = tpidr; scn.x[31] = isp;
+                                            scn.v[0] = (0.02f32).to_bits() as u64;
+                                            scn.v[2] = (0.02f32).to_bits() as u64;
+                                            scn.v[4] = (0.14f32).to_bits() as u64;
+                                            scn.v[6] = (1.0f32).to_bits() as u64;
+                                            let _ = arm64jit::jit::jit_run(iimg, ibase, plt_clearcolor, &mut scn as *mut CpuState);
+                                            let _ = gcall(plt_clear, GL_COLOR_BUFFER_BIT, 0, 0, 0, 0, 0);
+                                        }
+                                        let n = compose_objs.len();
+                                        let mat4fv = arm64jit::resolver::resolve_gles_int(b"glUniformMatrix4fv\0")
+                                            .expect("glUniformMatrix4fv resolves");
+                                        let mut ok_objs = 0usize;
+                                        let mut silhouettes: Vec<String> = Vec::new();
+                                        // Pre-scan: find the max scene extent so ONE shared camera frames
+                                        // every object (coherent composed scene, not per-object framing).
+                                        let mut scene_ext = 0.0f32;
+                                        for obj in &compose_objs {
+                                            if let Ok(odata) = std::fs::read(obj) {
+                                                if let Some(m) = parse_roblox_mesh_v2(&odata) {
+                                                    let (_, ext) = mesh_bbox(&m);
+                                                    scene_ext = scene_ext.max(ext);
+                                                }
+                                            }
+                                        }
+                                        let scene_ext = scene_ext.max(1e-3);
+                                        for (oi, obj) in compose_objs.iter().enumerate() {
+                                            // Parse + interleave with real normals (stride-36).
+                                            let Ok(odata) = std::fs::read(obj) else {
+                                                eprintln!("[elfjit:renderframe-mesh-compose] obj {oi}: cannot read {obj}");
+                                                continue;
+                                            };
+                                            let Some(m) = parse_roblox_mesh_v2(&odata) else {
+                                                eprintln!("[elfjit:renderframe-mesh-compose] obj {oi}: {obj} not v2 mesh");
+                                                continue;
+                                            };
+                                            let (mc, mext) = mesh_bbox(&m);
+                                            let mut mvp = [0f32; 16];
+                                            let verts = mesh_interleave_model_uv(&m, 60.0f32.to_radians(), 1280.0 / 720.0, 0.0, &mut mvp);
+                                            let idx = m.indices.clone();
+                                            let n_elems = idx.len();
+                                            // Per-object geo region (leaked).
+                                            let vert_bytes = verts.len() * 4;
+                                            let idx_bytes = idx.len() * 4;
+                                            let geo = Box::leak(vec![0u8; vert_bytes + idx_bytes + 64].into_boxed_slice());
+                                            let vbo_data = geo.as_ptr() as u64;
+                                            let ebo_data = vbo_data + (vert_bytes as u64) + 32;
+                                            std::ptr::copy_nonoverlapping(verts.as_ptr() as *const u8, vbo_data as *mut u8, vert_bytes);
+                                            std::ptr::copy_nonoverlapping(idx.as_ptr() as *const u8, ebo_data as *mut u8, idx_bytes);
+                                            // Reuse the already-linked mesh program + uMVP/uModelRot locs.
+                                            let _ = gcall(plt_useprogram, mesh_uv_program as u64, 0, 0, 0, 0, 0);
+                                            let _ = gcall(plt_bindbuffer, GL_ARRAY_BUFFER, 0, 0, 0, 0, 0);
+                                            // Per-object VBO + EBO.
+                                            let vbo_slot = objs.as_ptr() as u64 + 0xf10;
+                                            let ebo_slot = objs.as_ptr() as u64 + 0xf18;
+                                            let _ = gcall(plt_genbuffers, 1, vbo_slot, 0, 0, 0, 0);
+                                            let vbo = *(vbo_slot as *const u32) as u64;
+                                            let _ = gcall(plt_bindbuffer, GL_ARRAY_BUFFER, vbo, 0, 0, 0, 0);
+                                            let _ = gcall(plt_buffdata, GL_ARRAY_BUFFER, vert_bytes as u64, vbo_data, GL_STATIC_DRAW, 0, 0);
+                                            let _ = gcall(plt_genbuffers, 1, ebo_slot, 0, 0, 0, 0);
+                                            let ebo = *(ebo_slot as *const u32) as u64;
+                                            let _ = gcall(plt_bindbuffer, GL_ELEMENT_ARRAY_BUFFER, ebo, 0, 0, 0, 0);
+                                            let _ = gcall(plt_buffdata, GL_ELEMENT_ARRAY_BUFFER, idx_bytes as u64, ebo_data, GL_STATIC_DRAW, 0, 0);
+                                            // Per-object coherent renderer (re-fabricate the descriptor).
+                                            let renderer = base; // reuse renderer at base; rebuild desc/ibo per object
+                                            let container = base + 0x100;
+                                            let desc = base + 0x200;
+                                            let stride_tbl = base + 0x300;
+                                            let prim = base + 0x400;
+                                            let prim2 = base + 0x418;
+                                            let prim3 = base + 0x430;
+                                            let ibo = base + 0x500;
+                                            *(desc.wrapping_add(72) as *mut u32) = vbo as u32;
+                                            *(stride_tbl as *mut u64) = 36;
+                                            *(renderer.wrapping_add(56) as *mut u64) = container;
+                                            *(container.wrapping_add(72) as *mut u64) = prim;
+                                            *(container.wrapping_add(80) as *mut u64) = prim3 + 0x18;
+                                            *(container.wrapping_add(96) as *mut u64) = stride_tbl;
+                                            *(renderer.wrapping_add(0x48) as *mut u64) = desc;
+                                            *(prim as *mut u32) = 0; *(prim.wrapping_add(4) as *mut u32) = 0; *(prim.wrapping_add(8) as *mut u32) = 3; *(prim.wrapping_add(12) as *mut u32) = 0; *(prim.wrapping_add(16) as *mut u32) = 0;
+                                            *(prim2 as *mut u32) = 0; *(prim2.wrapping_add(4) as *mut u32) = 16; *(prim2.wrapping_add(8) as *mut u32) = 1; *(prim2.wrapping_add(12) as *mut u32) = 1; *(prim2.wrapping_add(16) as *mut u32) = 0;
+                                            *(prim3 as *mut u32) = 0; *(prim3.wrapping_add(4) as *mut u32) = 24; *(prim3.wrapping_add(8) as *mut u32) = 2; *(prim3.wrapping_add(12) as *mut u32) = 2; *(prim3.wrapping_add(16) as *mut u32) = 0;
+                                            *(renderer.wrapping_add(120) as *mut u64) = ibo;
+                                            *(ibo.wrapping_add(72) as *mut u32) = ebo as u32;
+                                            *(renderer.wrapping_add(142) as *mut u16) = n_elems as u16;
+                                            // Per-object compose MVP: row across X (fitted within the visible viewport,
+                                            // whose half-width is ~0.8*scene_ext at the scene camera distance),
+                                            // yawed. spacing ~ 0.6*scene_ext keeps 3 objects on-screen.
+                                            let x = ((oi as f32) - (n as f32 - 1.0) / 2.0) * (scene_ext * 0.6);
+                                            let scale = 0.45f32;
+                                            let omvp = mesh_compose_mvp_shared(&mc, scene_ext, [x, 0.0, 0.0], scale, 0.6f32, 60.0f32.to_radians(), 1280.0 / 720.0);
+                                            let mvp_buf = Box::leak(omvp.to_vec().into_boxed_slice());
+                                            let mut sm = arm64jit::jit::CpuState::new();
+                                            sm.tpidr = tpidr; sm.x[31] = isp;
+                                            sm.x[0] = mesh_uv_mvp_loc; sm.x[1] = 1; sm.x[2] = 0; sm.x[3] = mvp_buf.as_ptr() as u64;
+                                            let _ = arm64jit::jit::jit_run(iimg, ibase, mat4fv, &mut sm as *mut CpuState);
+                                            // uModelRot = yaw rotation (world-aligned normals).
+                                            if mesh_uv_modelrot_loc != 0 {
+                                                let mrot = mat4_rotate_y(0.0);
+                                                let mrb = Box::leak(mrot.to_vec().into_boxed_slice());
+                                                let mut smr = arm64jit::jit::CpuState::new();
+                                                smr.tpidr = tpidr; smr.x[31] = isp;
+                                                smr.x[0] = mesh_uv_modelrot_loc; smr.x[1] = 1; smr.x[2] = 0; smr.x[3] = mrb.as_ptr() as u64;
+                                                let _ = arm64jit::jit::jit_run(iimg, ibase, mat4fv, &mut smr as *mut CpuState);
+                                            }
+                                            // Drive the engine's own geometry wrapper for this object.
+                                            let mut swn = arm64jit::jit::CpuState::new();
+                                            swn.tpidr = tpidr; swn.x[31] = isp;
+                                            swn.x[0] = renderer; swn.x[1] = 0; swn.x[2] = 0; swn.x[3] = 0;
+                                            swn.x[4] = n_elems as u64; swn.x[5] = n_elems.max(1) as u64;
+                                            let wr = arm64jit::jit::jit_run(iimg, ibase, 0x105b35288, &mut swn as *mut CpuState);
+                                            // Per-object silhouette probe: a 3x3 grid counts drawn points on a
+                                            // small window around the object's expected screen position.
+                                            let mut drawn = 0u32;
+                                            for gy in 0..3 {
+                                                for gx in 0..3 {
+                                                    // Approx screen center for this X (1280 wide / N columns).
+                                                    let sx = (1280u32 as f32 * ((oi as f32 + 0.5) / n as f32)) as u32;
+                                                    let sy = 240 + gy * 120;
+                                                    let slot = objs.as_ptr() as u64 + 0xfb0;
+                                                    let mut gp = arm64jit::jit::CpuState::new();
+                                                    gp.tpidr = tpidr; gp.x[31] = isp;
+                                                    gp.x[0] = sx as u64; gp.x[1] = sy as u64; gp.x[2] = 1; gp.x[3] = 1;
+                                                    gp.x[4] = 0x1908; gp.x[5] = 0x1401; gp.x[6] = slot;
+                                                    let _ = arm64jit::jit::jit_run(iimg, ibase, plt_readpixels, &mut gp as *mut CpuState);
+                                                    let p = slot as *const u8;
+                                                    let r = unsafe { *p }; let g = unsafe { *p.add(1) }; let b = unsafe { *p.add(2) };
+                                                    if r >= 24 || g >= 24 || b >= 24 { drawn += 1; }
+                                                }
+                                            }
+                                            silhouettes.push(format!("{drawn}/9"));
+                                            eprintln!(
+                                                "[elfjit:renderframe-mesh-compose] obj {oi} {} : {}v/{}f wrapper={wr:?} silhouette={drawn}/9",
+                                                obj, m.positions.len(), m.indices.len() / 3
+                                            );
+                                            ok_objs += 1;
+                                        }
+                                        // One swap presents the full composed frame.
+                                        let mut sen = arm64jit::jit::CpuState::new();
+                                        sen.tpidr = tpidr; sen.x[31] = isp; sen.x[0] = real_ctx;
+                                        let sr = arm64jit::jit::jit_run(iimg, ibase, swap_thunk, &mut sen as *mut CpuState);
+                                        eprintln!(
+                                            "[elfjit:renderframe-mesh-compose] {ok_objs}/{} real objects composed in one frame, silhouettes={silhouettes:?}, swap={sr:?}",
+                                            n
+                                        );
+                                        let _ = compose_str;
                                     }
                                 }
                                 // Present the drawn frame.
@@ -11463,5 +11672,39 @@ mod sh143_mvp_tests {
         assert_eq!(&v[0..9], &[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
         // v1: [1,0,0,1, 1,0, 0,0,1]
         assert_eq!(&v[9..18], &[1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn sh146_compose_places_objects_at_distinct_origins() {
+        // Compose MVP must translate a centered object to its world origin: two
+        // objects at different x must map their (centered) origins to finite,
+        // in-front clip points with SEPARABLE ndc x (left vs right).
+        let mesh = RbxMeshV2 {
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: vec![[0.0, 1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+            uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+            indices: vec![0, 1, 2],
+        };
+        let (c, ext) = mesh_bbox(&mesh);
+        let fwd = |m: &[f32; 16], p: [f32; 3]| -> [f32; 4] {
+            [
+                m[0]*p[0] + m[4]*p[1] + m[8]*p[2] + m[12],
+                m[1]*p[0] + m[5]*p[1] + m[9]*p[2] + m[13],
+                m[2]*p[0] + m[6]*p[1] + m[10]*p[2] + m[14],
+                m[3]*p[0] + m[7]*p[1] + m[11]*p[2] + m[15],
+            ]
+        };
+        let m_left = mesh_compose_mvp(&c, ext, [-3.0, 0.0, 0.0], 0.3, 0.0, 60.0f32.to_radians(), 1280.0 / 720.0);
+        let m_right = mesh_compose_mvp(&c, ext, [3.0, 0.0, 0.0], 0.3, 0.0, 60.0f32.to_radians(), 1280.0 / 720.0);
+        for m in [&m_left, &m_right] {
+            let o = fwd(m, c);
+            assert!(o[0].is_finite() && o[1].is_finite() && o[2].is_finite() && o[3] > 0.0, "compose center in front: {o:?}");
+        }
+        let (xl, xr) = {
+            let ol = fwd(&m_left, c); let or_ = fwd(&m_right, c);
+            (ol[0] / ol[3], or_[0] / or_[3])
+        };
+        assert!(xl < xr, "left object must be left of right: ndc x {xl} vs {xr}");
+        assert!(xl.abs() > 0.05 && xr.abs() > 0.05, "objects offset from center: {xl},{xr}");
     }
 }

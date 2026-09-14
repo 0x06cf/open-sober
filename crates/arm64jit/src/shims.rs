@@ -316,6 +316,103 @@ extern "C" fn bionic_memset(
     unsafe { libc::memset(dst as *mut libc::c_void, c as i32, n as usize) as u64 }
 }
 
+// SH147-harden: raw memmove is the highest-value reachable hole — the boot path
+// dispatches memmove@plt ~192x (sh126-workers hostcall, same SH97/SH139 class as
+// guarded memcpy/memset). Unsafe/overlap-prone ptr or n==0 -> dst (no copy);
+// valid ptrs pass through to glibc bit-identical.
+extern "C" fn bionic_memmove(
+    dst: u64, src: u64, n: u64,
+    _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(dst) || !ptr_ok(src) || n == 0 {
+        return dst;
+    }
+    unsafe { libc::memmove(dst as *mut libc::c_void, src as *const libc::c_void, n as usize) as u64 }
+}
+
+// guarded strrchr — reverse strchr; unsafe s -> NULL (0).
+extern "C" fn bionic_strrchr(
+    s: u64, c: u64,
+    _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(s) {
+        return 0;
+    }
+    unsafe { libc::strrchr(s as *const libc::c_char, c as i32) as u64 }
+}
+
+// guarded strdup — unsafe s -> NULL (no host alloc, no strlen).
+extern "C" fn bionic_strdup(
+    s: u64,
+    _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(s) {
+        return 0;
+    }
+    unsafe { libc::strdup(s as *const libc::c_char) as u64 }
+}
+
+// guarded strndup — unsafe s or n==0 -> NULL.
+extern "C" fn bionic_strndup(
+    s: u64, n: u64,
+    _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(s) || n == 0 {
+        return 0;
+    }
+    unsafe { libc::strndup(s as *const libc::c_char, n as usize) as u64 }
+}
+
+// guarded atoi/atol — unsafe s -> 0 without touching host atoi's strlen.
+extern "C" fn bionic_atoi(
+    s: u64,
+    _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(s) {
+        return 0;
+    }
+    unsafe { libc::atoi(s as *const libc::c_char) as u64 }
+}
+extern "C" fn bionic_atol(
+    s: u64,
+    _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(s) {
+        return 0;
+    }
+    unsafe { libc::atol(s as *const libc::c_char) as u64 }
+}
+extern "C" fn bionic_atoll(
+    s: u64,
+    _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(s) {
+        return 0;
+    }
+    unsafe { libc::atoll(s as *const libc::c_char) as u64 }
+}
+
+// guarded strtol — unsafe s -> 0; valid s passes through (endptr is a plain
+// output pointer arg, and glibc writes it only when s is valid).
+extern "C" fn bionic_strtol(
+    s: u64, endptr: u64, base: u64,
+    _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(s) {
+        return 0;
+    }
+    unsafe { libc::strtol(s as *const libc::c_char, endptr as *mut *mut libc::c_char, base as i32) as u64 }
+}
+extern "C" fn bionic_strtoul(
+    s: u64, endptr: u64, base: u64,
+    _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(s) {
+        return 0;
+    }
+    unsafe { libc::strtoul(s as *const libc::c_char, endptr as *mut *mut libc::c_char, base as i32) as u64 }
+}
+
 // ---- Android AssetManager/AAsset shims (real, image-backed) ----
 //
 // Recon-v2 (docs/recon-framework-boot-order.md) names the AssetManager the
@@ -1506,6 +1603,19 @@ pub fn register_shims() -> usize {
         // state slot; garbage src SIGSEGVs glibc. Valid ptrs pass through unchanged.
         (b"memcpy\0", bionic_memcpy),
         (b"memset\0", bionic_memset),
+        // SH147-harden: raw memmove is PROVEN reachable at boot (~192x dispatch);
+        // strrchr/strdup/strndup/atoi/atol/atoll/strtol/strtoul are the same raw
+        // pointer-deref SH97/SH135 class (garbage str -> glibc strlen SIGSEGV).
+        // strtod deferred (needs a d0-return GlesCall path, no reachability proof).
+        (b"memmove\0", bionic_memmove),
+        (b"strrchr\0", bionic_strrchr),
+        (b"strdup\0", bionic_strdup),
+        (b"strndup\0", bionic_strndup),
+        (b"atoi\0", bionic_atoi),
+        (b"atol\0", bionic_atol),
+        (b"atoll\0", bionic_atoll),
+        (b"strtol\0", bionic_strtol),
+        (b"strtoul\0", bionic_strtoul),
         (b"__android_log_print\0", bionic_android_log),
         // SH98: marshal stat/fstat/lstat into the bionic-aarch64 struct stat
         // (128 B). Raw glibc's x86-64 struct is 144 B and overruns stack-local
@@ -1685,6 +1795,18 @@ mod tests {
         assert_eq!(crate::shims::bionic_strcpy_chk(dptr, g, 8, 0, 0, 0, 0, 0), dptr);
         // Sub-image small-int argument class is also rejected (no deref).
         assert_eq!(crate::shims::bionic_strcmp(0x1800064, 0x1800064, 0, 0, 0, 0, 0, 0), 0);
+        // SH147: the newly-guarded raw pointer-deref imports must also reject the
+        // garbage class without faulting.
+        assert_eq!(crate::shims::bionic_memmove(g, g, 4, 0, 0, 0, 0, 0), g, "memmove garbage returns dst");
+        assert_eq!(crate::shims::bionic_strrchr(g, b'l' as u64, 0, 0, 0, 0, 0, 0), 0, "strrchr garbage");
+        assert_eq!(crate::shims::bionic_strdup(g, 0, 0, 0, 0, 0, 0, 0), 0, "strdup garbage");
+        assert_eq!(crate::shims::bionic_strndup(g, 4, 0, 0, 0, 0, 0, 0), 0, "strndup garbage");
+        assert_eq!(crate::shims::bionic_atoi(g, 0, 0, 0, 0, 0, 0, 0), 0, "atoi garbage");
+        assert_eq!(crate::shims::bionic_atol(g, 0, 0, 0, 0, 0, 0, 0), 0, "atol garbage");
+        assert_eq!(crate::shims::bionic_atoll(g, 0, 0, 0, 0, 0, 0, 0), 0, "atoll garbage");
+        assert_eq!(crate::shims::bionic_strtol(g, g, 10, 0, 0, 0, 0, 0), 0, "strtol garbage");
+        assert_eq!(crate::shims::bionic_strtoul(g, g, 10, 0, 0, 0, 0, 0), 0, "strtoul garbage");
+        assert_eq!(crate::shims::bionic_memmove(0x1800064, 0x1800064, 4, 0, 0, 0, 0, 0), 0x1800064, "memmove sub-image");
 
         // Valid canonical strings still reach real glibc and behave normally.
         let a = std::ffi::CString::new("hello").unwrap();
@@ -1725,6 +1847,38 @@ mod tests {
         );
         assert_eq!(crate::shims::bionic_strncasecmp(ha, upper.as_ptr() as u64, 5, 0, 0, 0, 0, 0), 0);
         assert_eq!(crate::shims::bionic_memcmp(ha, hb, 0, 0, 0, 0, 0, 0), 0, "zero len -> 0");
+        // SH147 valid path: real canonical pointers reach glibc bit-identically.
+        assert_eq!(crate::shims::bionic_atoi(a.as_ptr() as u64, 0, 0, 0, 0, 0, 0, 0), 0, "atoi('hello')->0");
+        assert_eq!(crate::shims::bionic_atol(a.as_ptr() as u64, 0, 0, 0, 0, 0, 0, 0), 0, "atol('hello')->0");
+        let num = std::ffi::CString::new("12345").unwrap();
+        assert_eq!(crate::shims::bionic_atoi(num.as_ptr() as u64, 0, 0, 0, 0, 0, 0, 0), 12345, "atoi('12345')");
+        assert_eq!(crate::shims::bionic_atol(num.as_ptr() as u64, 0, 0, 0, 0, 0, 0, 0), 12345, "atol('12345')");
+        assert_eq!(crate::shims::bionic_atoll(num.as_ptr() as u64, 0, 0, 0, 0, 0, 0, 0), 12345, "atoll('12345')");
+        assert_eq!(crate::shims::bionic_strtol(num.as_ptr() as u64, 0, 10, 0, 0, 0, 0, 0), 12345, "strtol('12345',base10)");
+        assert_eq!(crate::shims::bionic_strtoul(num.as_ptr() as u64, 0, 10, 0, 0, 0, 0, 0), 12345, "strtoul('12345',base10)");
+        // strrchr finds the LAST 'l' in "hello" (= offset 3).
+        assert_eq!(
+            crate::shims::bionic_strrchr(ha, b'l' as u64, 0, 0, 0, 0, 0, 0),
+            ha + 3,
+            "strrchr('hello','l')->offset3"
+        );
+        // strdup/strndup return a non-null equal copy (caller frees; test leaks OK).
+        let d1 = crate::shims::bionic_strdup(ha, 0, 0, 0, 0, 0, 0, 0);
+        assert_ne!(d1, 0);
+        let d1s = unsafe { std::ffi::CStr::from_ptr(d1 as *const libc::c_char) };
+        assert_eq!(d1s.to_bytes(), b"hello");
+        let d2 = crate::shims::bionic_strndup(ha, 3, 0, 0, 0, 0, 0, 0);
+        assert_ne!(d2, 0);
+        let d2s = unsafe { std::ffi::CStr::from_ptr(d2 as *const libc::c_char) };
+        assert_eq!(d2s.to_bytes(), b"hel");
+        // memmove copies bytes (dst identity returned) — overlap-safe vs memcpy.
+        let mut buf = [0u8; 8];
+        let mut src_a = [0x66u8, 0xde, 0xad, 0xbe];
+        let dst = buf.as_mut_ptr() as u64;
+        let src = src_a.as_mut_ptr() as u64;
+        let r = crate::shims::bionic_memmove(dst, src, 4, 0, 0, 0, 0, 0);
+        assert_eq!(r, dst);
+        assert_eq!(&buf[0..4], &[0x66, 0xde, 0xad, 0xbe], "memmove copied bytes");
     }
 
     /// Asset shims serialize the process-wide open-asset table, so they are
