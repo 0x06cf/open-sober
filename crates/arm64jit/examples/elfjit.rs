@@ -83,6 +83,30 @@ fn guest_arena_alloc(size: usize) -> u64 {
     addr
 }
 
+/// SH131: write `bytes` (+ NUL) into `buf` and lay out a libc++ `std::string`
+/// in LONG form at `global` (a 24-byte slot): `[0..8]=__data_` (buf ptr),
+/// `[8..16]=__size_`, `[16..24]=__cap_` (bit0 clear => long, the discriminator
+/// libc++ tests via `__cap_ & 1`). Used to seed the engine's files-dir global
+/// (guest 0x10726d600) that its nativeSetFilesDirectory would otherwise fill,
+/// de-gating the datastore base path from the Lua app-shell wall. `buf` must be
+/// guest-visible RW memory (guest==host identity holds in the runtime). Returns
+/// `global` (nonzero) on success, else 0 if buf or global is 0. Isolated so the
+/// layout is hermetic-testable without the runtime.
+fn seed_libcpp_long_string(global: u64, buf: u64, bytes: &[u8]) -> u64 {
+    if global == 0 || buf == 0 || bytes.is_empty() || bytes.len() >= 4096 {
+        return 0;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, bytes.len());
+        *(buf as *mut u8).add(bytes.len()) = 0;
+        let gp = global as *mut u64;
+        gp.add(0).write_volatile(buf);
+        gp.add(1).write_volatile(bytes.len() as u64); // __size_
+        gp.add(2).write_volatile(bytes.len() as u64); // __cap_ (bit0=0 => long)
+    }
+    global
+}
+
 // SH60 task-driven frame plane (recon-selfdrive-seed-jsonfix.md §A):
 // the dispatcher's type-4 popped-task vector [0x106829ea8] is external-glue
 // (.bss, no in-image store — SH46/SH53), so the ONLY host lever is to seed it
@@ -5667,6 +5691,54 @@ fn main() {
                     );
                     dump("SendAppEventOnAppReady");
                 }
+                // SH131 (deleg_fbb8faf7, disasm 21f7654): seed the engine's OWN
+                // data-path global before it ever builds an app-data-model. The
+                // real client stores its files dir via nativeSetFilesDirectory
+                // (guest 0x1021f7654) into the 24-byte libc++ std::string at
+                // guest 0x10726d600 (file 0x726d600; disasm `adrp 726d000; add
+                // x8,x8,#0x600` = file 0x726d600 + 0x100000000 — NOT the
+                // 0x1026d600 the earlier SH114 comment mis-set, which is the
+                // read-only code segment). Without it the engine's own SQLite
+                // datastore (rbx-storage.db) never gets a base path and nothing
+                // reaches the fsmap store. The JNI shim (SH114) only supplies
+                // getFilesDir when the engine CALLS that getter (gated behind
+                // the Lua app-shell wall). Driving the native's STORE body
+                // directly is a dead-end: its GetStringUTFChars helper reads a
+                // REAL Java-arena jstring, not our fabricated handle, so the
+                // materialized string came back empty. Instead seed the same
+                // 24-byte libc++ std::string slot the engine's consumers read,
+                // in LONG form (36-byte path exceeds the 22-byte SSO): [0..7]=
+                // __data_ ptr (guest-arena bytes), [8..15]=__size_,
+                // [16..23]=__cap_ (bit0=0 => long). Opt-in --v2boot-set-filesdir.
+                if std::env::args().any(|a| a == "--v2boot-set-filesdir") {
+                    const FILES_DIR_GLOBAL: u64 = 0x10726d600;
+                    const DIR: &[u8] = b"/data/user/0/com.roblox.client/files";
+                    // Guest-arena buffer holding the path + NUL (guest==host).
+                    let buf = guest_arena_alloc(DIR.len() + 1);
+                    if buf != 0 && seed_libcpp_long_string(FILES_DIR_GLOBAL, buf, DIR) != 0 {
+                        eprintln!(
+                            "[elfjit:v2boot-setfilesdir] seeded libc++ string @ [0x{FILES_DIR_GLOBAL:x}] = \"{}\" (ptr={buf:#x} size={})",
+                            String::from_utf8_lossy(DIR),
+                            DIR.len()
+                        );
+                        // Verify: read back + render the pointed-to bytes.
+                        let ptr = unsafe { *(FILES_DIR_GLOBAL as *const u64) };
+                        let size = unsafe { *((FILES_DIR_GLOBAL as *const u64).add(1)) };
+                        let mut s = String::new();
+                        for i in 0..size.min(4096) as usize {
+                            let c = unsafe { *(ptr as *const u8).add(i) };
+                            if c == 0 { break; }
+                            s.push(c as char);
+                        }
+                        eprintln!(
+                            "[elfjit:v2boot-setfilesdir] verify read-back [0x{FILES_DIR_GLOBAL:x}] ptr={ptr:#x} size={size} = \"{s}\" {}",
+                            if s == String::from_utf8_lossy(DIR) { "SEEDED" } else { "MISMATCH" }
+                        );
+                    } else {
+                        eprintln!("[elfjit:v2boot-setfilesdir] WARN guest arena not set — cannot seed files-dir global");
+                    }
+                    dump("nativeSetFilesDirectory (host-seeded)");
+                }
                 eprintln!("[elfjit:v2boot] ladder done; final [0x106829ea8] = {:#x}", dw(BSS_TASKV4));
                     // SH126-gate: signal the render pipeline it may start now
                     // (JIT_SERIALIZE_RENDER=1 makes --renderinit wait for this so
@@ -10350,6 +10422,41 @@ mod sh126_tests {
         for i in 0..4 {
             assert_eq!(w[i] & 0x1f, 8, "slot {i} targets x0");
         }
+    }
+
+    // --- SH131: files-dir long-string seed (persistence base path) ---
+    #[test]
+    fn sh131_seed_libcpp_long_string_places_path_and_sizes() {
+        // A 24-byte slot + a separate buffer, hermetic (no runtime/arena).
+        let mut slot = [0u8; 24];
+        let mut buf = [0u8; 64];
+        let g = slot.as_mut_ptr() as u64;
+        let b = buf.as_mut_ptr() as u64;
+        let dir = b"/data/user/0/com.roblox.client/files";
+        assert_ne!(seed_libcpp_long_string(g, b, dir), 0, "seed returns global");
+        // [0..8] = __data_ ptr == buf
+        let ptr = u64::from_le_bytes(slot[0..8].try_into().unwrap());
+        assert_eq!(ptr, b, "__data_ points at buf");
+        // [8..16] = __size_
+        let size = u64::from_le_bytes(slot[8..16].try_into().unwrap());
+        assert_eq!(size, dir.len() as u64, "__size_");
+        // [16..24] = __cap_ with bit0 clear => libc++ LONG discriminator.
+        let cap = u64::from_le_bytes(slot[16..24].try_into().unwrap());
+        assert_eq!(cap & 1, 0, "__cap_ bit0 clear => libc++ long form");
+        // The pointed-to buffer holds the path, NUL-terminated.
+        let got: Vec<u8> = (0..dir.len()).map(|i| unsafe { *(b as *const u8).add(i) }).collect();
+        assert_eq!(got, dir, "buffer holds the exact dir bytes");
+        assert_eq!(unsafe { *(b as *const u8).add(dir.len()) }, 0, "NUL terminator");
+    }
+    #[test]
+    fn sh131_seed_libcpp_long_string_rejects_bad_args() {
+        let mut slot = [0u8; 24];
+        let mut buf = [0u8; 64];
+        let g = slot.as_mut_ptr() as u64;
+        let b = buf.as_mut_ptr() as u64;
+        assert_eq!(seed_libcpp_long_string(0, b, b"/x"), 0, "null global rejected");
+        assert_eq!(seed_libcpp_long_string(g, 0, b"/x"), 0, "null buf rejected");
+        assert_eq!(seed_libcpp_long_string(g, b, b""), 0, "empty bytes rejected");
     }
 }
 
