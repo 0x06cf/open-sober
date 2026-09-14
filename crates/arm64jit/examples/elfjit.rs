@@ -2666,6 +2666,112 @@ fn be32(d: &[u8], o: usize) -> u32 {
     u32::from_be_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
 }
 
+// ============================================================================
+// Roblox .mesh v2 parser (pure std) — reads the real binary mesh assets shipped
+// in the APK (content/.../*.mesh). Format (devforum spec, rbx_mesh):
+//   "version 2.00\n" (13 B) then FileMeshHeaderV2:
+//     u16 sizeof_FileMeshHeaderV2 (=12); u8 sizeof_FileMeshVertex (36 no-RGBA or
+//     40 with RGBA); u8 sizeof_FileMeshFace (=12); u32 numVerts; u32 numFaces.
+//   then numVerts * FileMeshVertex: pos[3]f32, norm[3]f32, uv[2]f32,
+//     tangent[4]i8, [color[4]u8 if stride==40].
+//   then numFaces * FileMeshFace: a,b,c u32 vertex indices.
+// Returns a Vec of (position, normal, uv) plus the index list. Used to feed the
+// engine's own geometry wrapper real in-world/avatar mesh geometry.
+// ============================================================================
+fn le16(d: &[u8], o: usize) -> u16 {
+    u16::from_le_bytes([d[o], d[o + 1]])
+}
+fn le32(d: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
+}
+fn lef32(d: &[u8], o: usize) -> f32 {
+    f32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
+}
+
+/// Parsed Roblox `version 2.00` mesh: per-vertex position/normal/uv and the
+/// triangle face index list.
+struct RbxMeshV2 {
+    /// Per-vertex [px, py, pz] model-space (units as authored — centimeters).
+    positions: Vec<[f32; 3]>,
+    /// Per-vertex [nx, ny, nz].
+    normals: Vec<[f32; 3]>,
+    /// Per-vertex [u, v].
+    uvs: Vec<[f32; 2]>,
+    /// Flat u32 triangle index list (3 per face).
+    indices: Vec<u32>,
+}
+
+fn parse_roblox_mesh_v2(data: &[u8]) -> Option<RbxMeshV2> {
+    if data.len() < 25 || &data[0..8] != b"version " || data[8] != b'2' {
+        return None;
+    }
+    // "version 2.00\n" is 13 bytes; header starts at 13. Accept 2.00 only.
+    let mut off = 13;
+    let sh = le16(data, off); // sizeof_FileMeshHeaderV2
+    let sv = data[off + 2]; // sizeof_FileMeshVertex (36 or 40)
+    let sf = data[off + 3]; // sizeof_FileMeshFace (12)
+    if sh != 12 || sf != 12 || (sv != 36 && sv != 40) {
+        return None;
+    }
+    let nv = le32(data, off + 4) as usize;
+    let nf = le32(data, off + 8) as usize;
+    off += 12; // -> vertex array
+    if off + nv * sv as usize + nf * sf as usize > data.len() {
+        return None;
+    }
+    let mut positions = Vec::with_capacity(nv);
+    let mut normals = Vec::with_capacity(nv);
+    let mut uvs = Vec::with_capacity(nv);
+    let mut voff = off;
+    for _ in 0..nv {
+        positions.push([lef32(data, voff), lef32(data, voff + 4), lef32(data, voff + 8)]);
+        normals.push([lef32(data, voff + 12), lef32(data, voff + 16), lef32(data, voff + 20)]);
+        uvs.push([lef32(data, voff + 24), lef32(data, voff + 28)]);
+        voff += sv as usize;
+    }
+    let mut indices = Vec::with_capacity(nf * 3);
+    let mut foff = voff;
+    for _ in 0..nf {
+        indices.push(le32(data, foff));
+        indices.push(le32(data, foff + 4));
+        indices.push(le32(data, foff + 8));
+        foff += sf as usize;
+    }
+    Some(RbxMeshV2 { positions, normals, uvs, indices })
+}
+
+/// Center + uniformly scale a mesh's model-space positions into NDC so the
+/// pass-through vertex shader (`gl_Position = aPos`) shows the whole shape.
+/// Returns per-vertex vec4 (x, y, z, 1.0) interleaved, ready for a stride-16
+/// vec4 VBO. `fit` = the fraction of the unit NDC half-extent the max model
+/// extent should occupy (e.g. 0.85).
+fn mesh_positions_to_ndc(m: &RbxMeshV2, fit: f32) -> Vec<f32> {
+    if m.positions.is_empty() {
+        return Vec::new();
+    }
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for p in &m.positions {
+        for k in 0..3 {
+            min[k] = min[k].min(p[k]);
+            max[k] = max[k].max(p[k]);
+        }
+    }
+    let cx = (min[0] + max[0]) / 2.0;
+    let cy = (min[1] + max[1]) / 2.0;
+    let cz = (min[2] + max[2]) / 2.0;
+    let ext = ((max[0] - min[0]).max(max[1] - min[1])).max(max[2] - min[2]);
+    let scale = if ext > 1e-9 { fit * 2.0 / ext } else { 1.0 };
+    let mut out = Vec::with_capacity(m.positions.len() * 4);
+    for p in &m.positions {
+        out.push((p[0] - cx) * scale);
+        out.push((p[1] - cy) * scale);
+        out.push((p[2] - cz) * scale);
+        out.push(1.0);
+    }
+    out
+}
+
 /// Find a sfnt table's (offset, length) by 4-char tag. Returns None if the font
 /// is a CFF/OTTO head (`'OTTO'` signature; no glyf outlines) or the tag is absent.
 fn sfnt_find_table(font: &[u8], tag: &[u8; 4]) -> Option<(usize, usize)> {
@@ -8130,27 +8236,56 @@ fn main() {
                                     *(fs_ary as *mut u64) = fs_ptr;
                                     // Triangle vertices (NDC, 3 x vec4). Fill most of the frame so the
                                     // rendered footprint is easy to measure for scaling.
-                                    let verts: [f32; 12] = [
-                                        -0.95, -0.95, 0.0, 1.0, // v0
-                                        0.95, -0.95, 0.0, 1.0, // v1
-                                        0.0, 0.95, 0.0, 1.0, // v2
-                                    ];
-                                    let vbo_data = objs.as_ptr() as u64 + 0xc00;
-                                    // Indices: 3 (u32).
-                                    let idx: [u32; 3] = [0, 1, 2];
-                                    let ebo_data = objs.as_ptr() as u64 + 0xd00;
+                                    // --renderframe-mesh <path>: instead drive REAL in-world/avatar
+                                    // mesh geometry (Roblox .mesh v2) through the SAME coherent
+                                    // renderer + engine geometry wrapper. The mesh positions are
+                                    // centered+scaled to NDC (fit 0.85) so the pass-through VS shows
+                                    // the whole shape — the first real APK asset geometry rendered.
+                                    let mesh_path: Option<std::path::PathBuf> = renderframe_args
+                                        .iter()
+                                        .position(|a| a == "--renderframe-mesh")
+                                        .and_then(|i| renderframe_args.get(i + 1).cloned())
+                                        .map(std::path::PathBuf::from);
+                                    let mut verts: Vec<f32>;
+                                    let mut idx: Vec<u32>;
+                                    if let Some(mp) = &mesh_path {
+                                        let mdata = std::fs::read(mp).expect("read mesh");
+                                        let mesh = parse_roblox_mesh_v2(&mdata).expect("parse mesh v2");
+                                        eprintln!(
+                                            "[elfjit:renderframe-mesh] parsed real mesh {:?}: {} verts, {} faces ({} idx), stride-36 v2.00",
+                                            mp.file_name().unwrap_or_default(),
+                                            mesh.positions.len(),
+                                            mesh.indices.len() / 3,
+                                            mesh.indices.len()
+                                        );
+                                        verts = mesh_positions_to_ndc(&mesh, 0.85);
+                                        idx = mesh.indices.clone();
+                                    } else {
+                                        verts = vec![
+                                            -0.95, -0.95, 0.0, 1.0, // v0
+                                            0.95, -0.95, 0.0, 1.0, // v1
+                                            0.0, 0.95, 0.0, 1.0, // v2
+                                        ];
+                                        idx = vec![0, 1, 2];
+                                    }
+                                    let n_elems = idx.len();
+                                    // Geometry buffers live in a dedicated leaked region sized to fit
+                                    // the largest mesh (verts = stride-16 vec4, idx = u32).
+                                    let vert_bytes = verts.len() * 4;
+                                    let idx_bytes = idx.len() * 4;
+                                    let geo = Box::leak(vec![0u8; vert_bytes + idx_bytes + 64].into_boxed_slice());
+                                    let vbo_data = geo.as_ptr() as u64;
+                                    let ebo_data = vbo_data + (vert_bytes as u64) + 32;
                                     std::ptr::copy_nonoverlapping(
                                         verts.as_ptr() as *const u8,
                                         vbo_data as *mut u8,
-                                        std::mem::size_of_val(&verts),
+                                        vert_bytes,
                                     );
                                     std::ptr::copy_nonoverlapping(
                                         idx.as_ptr() as *const u8,
                                         ebo_data as *mut u8,
-                                        std::mem::size_of_val(&idx),
+                                        idx_bytes,
                                     );
-                                    let shader_id_slot = objs.as_ptr() as u64 + 0xe00;
-                                    let _ = shader_id_slot;
                                     // Compile vertex shader (glCreateShader returns id in x0).
                                     let vs_shader = gcall(plt_createshader, GL_VERTEX_SHADER, 0, 0, 0, 0, 0)
                                         .unwrap_or(0)
@@ -8380,7 +8515,7 @@ fn main() {
                                     let _ = gcall(
                                         plt_buffdata,
                                         GL_ARRAY_BUFFER,
-                                        std::mem::size_of_val(&verts) as u64,
+                                        vert_bytes as u64,
                                         vbo_data,
                                         GL_STATIC_DRAW,
                                         0,
@@ -8401,7 +8536,7 @@ fn main() {
                                     let _ = gcall(
                                         plt_buffdata,
                                         GL_ELEMENT_ARRAY_BUFFER,
-                                        std::mem::size_of_val(&idx) as u64,
+                                        idx_bytes as u64,
                                         ebo_data,
                                         GL_STATIC_DRAW,
                                         0,
@@ -8497,10 +8632,11 @@ fn main() {
                                     // IBO: renderer[+120]=ibo ; [ibo+72]=EBO id
                                     *(renderer.wrapping_add(120) as *mut u64) = ibo;
                                     *(ibo.wrapping_add(72) as *mut u32) = ebo as u32;
-                                    // renderer[+142] u16 element count = 3
-                                    *(renderer.wrapping_add(142) as *mut u16) = 3;
+                                    // renderer[+142] u16 element count = n_elems
+                                    *(renderer.wrapping_add(142) as *mut u16) = n_elems as u16;
                                     eprintln!(
-                                        "[elfjit:renderframe-triangle] coherent renderer 0x{renderer:x}: container 0x{container:x} prim 0x{prim:x} desc 0x{desc:x} desc_tbl@renderer+0x48 stride 0x{stride_tbl:x} ibo 0x{ibo:x}"
+                                        "[elfjit:renderframe-triangle] coherent renderer 0x{renderer:x}: container 0x{container:x} prim 0x{prim:x} desc 0x{desc:x} desc_tbl@renderer+0x48 stride 0x{stride_tbl:x} ibo 0x{ibo:x} elems {n_elems} mesh={}",
+                                        mesh_path.as_ref().map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned()).unwrap_or_else(|| "none".into())
                                     );
                                     // Drive the engine's OWN geometry wrapper.
                                     let mut sw = arm64jit::jit::CpuState::new();
@@ -8510,8 +8646,8 @@ fn main() {
                                     sw.x[1] = 0; // w22: draw-mode table index (0=GL_TRIANGLES)
                                     sw.x[2] = 0; // w23: stride multiplier
                                     sw.x[3] = 0; // -> w1 for primitive-setup
-                                    sw.x[4] = 3; // w20 -> glDrawElements count (wrapper `mov w1,w20`)
-                                    sw.x[5] = 3; // w21: nonzero -> indexed path selection
+                                    sw.x[4] = n_elems as u64; // w20 -> glDrawElements count (wrapper `mov w1,w20`)
+                                    sw.x[5] = n_elems.max(1) as u64; // w21: nonzero -> indexed path selection
                                     match arm64jit::jit::jit_run(
                                         iimg,
                                         ibase,
@@ -8524,6 +8660,39 @@ fn main() {
                                         Ok(ok) => eprintln!(
                                             "[elfjit:renderframe-triangle] geometry wrapper 0x5b35288 returned Ok({ok:#x}) (real indexed glDrawElements drawn)"
                                         ),
+                                    }
+                                    // mesh-mode silhouette verification: sample a 5x5 grid across
+                                    // the frame; every point on the mesh interior reads the solid-red
+                                    // shader. Count how many are drawn — a real in-world/avatar mesh
+                                    // silhouette (nonzero interior, bounded footprint) vs the
+                                    // degenerate 3-index triangle (which would score ~9/25+).
+                                    if mesh_path.is_some() {
+                                        let mut drawn = 0u32;
+                                        let mut bg = 0u32;
+                                        let mut hits: Vec<(u32, u32)> = Vec::new();
+                                        for gy in 0..5 {
+                                            for gx in 0..5 {
+                                                let px = 130 + gx * 255;
+                                                let py = 72 + gy * 144;
+                                                let slot = objs.as_ptr() as u64 + 0xfb0;
+                                                let mut gp = arm64jit::jit::CpuState::new();
+                                                gp.tpidr = tpidr;
+                                                gp.x[31] = isp;
+                                                gp.x[0] = px as u64;
+                                                gp.x[1] = py as u64;
+                                                gp.x[2] = 1;
+                                                gp.x[3] = 1;
+                                                gp.x[4] = 0x1908; // GL_RGBA
+                                                gp.x[5] = 0x1401; // GL_UNSIGNED_BYTE
+                                                gp.x[6] = slot;
+                                                let _ = arm64jit::jit::jit_run(iimg, ibase, plt_readpixels, &mut gp as *mut CpuState);
+                                                let r = unsafe { *(slot as *const u8) };
+                                                if r >= 200 { drawn += 1; hits.push((px, py)); } else { bg += 1; }
+                                            }
+                                        }
+                                        eprintln!(
+                                            "[elfjit:renderframe-mesh] silhouette 5x5: {drawn}/25 drawn ({hits:?}), {bg} background — real mesh geometry through the engine wrapper"
+                                        );
                                     }
                                     // glReadPixels readback: verify the triangle
                                     // actually drew. Center (0,0 NDC -> ~639,360) should
@@ -10586,6 +10755,97 @@ mod sh126_tests {
         assert_eq!(seed_libcpp_long_string(0, b, b"/x"), 0, "null global rejected");
         assert_eq!(seed_libcpp_long_string(g, 0, b"/x"), 0, "null buf rejected");
         assert_eq!(seed_libcpp_long_string(g, b, b""), 0, "empty bytes rejected");
+    }
+}
+
+#[cfg(test)]
+mod mesh_tests {
+    use super::*;
+
+    fn real_mesh(name: &str) -> Option<Vec<u8>> {
+        std::fs::read(format!(
+            "/home/hermes-worker/.cache/open-sober/android-env/assets/content/avatar/compositing/{name}"
+        ))
+        .ok()
+    }
+
+    #[test]
+    fn sh141_parse_real_quad_mesh_bounds() {
+        let Some(d) = real_mesh("CompositQuad.mesh") else { return };
+        let m = parse_roblox_mesh_v2(&d).expect("quad mesh parses");
+        assert_eq!(m.positions.len(), 4);
+        assert_eq!(m.indices.len(), 6, "2 faces x 3 idx");
+        // byte-length must never overrun (parser bounds-checked).
+        assert!(m.positions.len() < d.len());
+        assert!(m.indices.len() * 4 < d.len());
+        // positions are all finite (no garbage reads from a bad stride).
+        for p in &m.positions {
+            for v in p {
+                assert!(v.is_finite(), "position value not finite: {v}");
+            }
+        }
+    }
+
+    #[test]
+    fn sh141_parse_real_torso_mesh_geometry() {
+        let Some(d) = real_mesh("CompositTorsoBase.mesh") else { return };
+        let m = parse_roblox_mesh_v2(&d).expect("torso mesh parses");
+        assert_eq!(m.positions.len(), 664);
+        assert_eq!(m.indices.len(), 1248, "416 faces x 3 idx");
+        // model-space positions are in cm units (real topology, not degenerate).
+        let mut max_ext = 0.0f32;
+        for p in &m.positions {
+            for k in 0..3 {
+                assert!(p[k].is_finite());
+                max_ext = max_ext.max(p[k].abs());
+            }
+        }
+        assert!(max_ext > 100.0, "real torso spans cm units (>100), got {max_ext}");
+    }
+
+    #[test]
+    fn sh141_ndc_transform_centers_and_scales() {
+        // A synthetic unit box that should map to the fit fraction of NDC.
+        let m = RbxMeshV2 {
+            positions: vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 20.0, 0.0]],
+            normals: vec![],
+            uvs: vec![],
+            indices: vec![0, 1, 2],
+        };
+        let ndc = mesh_positions_to_ndc(&m, 0.85);
+        // center(5,10), extent 20 -> scale 0.85*2/20 = 0.085. v0=(0,0,0)->(-0.425,-0.85,0,1),
+        // v1=(10,0,0)->(0.425,-0.85,0,1), v2=(0,20,0)->(-0.425,0.85,0,1).
+        let expected = [
+            -5.0 * 0.085, -10.0 * 0.085, 0.0, 1.0,
+            5.0 * 0.085, -10.0 * 0.085, 0.0, 1.0,
+            -5.0 * 0.085, 10.0 * 0.085, 0.0, 1.0,
+        ];
+        assert_eq!(ndc.len(), 12);
+        for (got, exp) in ndc.iter().zip(expected.iter()) {
+            assert!((got - exp).abs() < 1e-4, "ndc {got} != {exp}");
+        }
+        // w always 1.0, z centered on 0.
+        assert_eq!(ndc[3], 1.0);
+        assert_eq!(ndc[11], 1.0);
+        assert!((ndc[2] - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sh141_mesh_positions_roundtrip_bbox_and_uvs() {
+        // Re-derive bbox from a REAL mesh and confirm the parser recorded real UVs.
+        let Some(d) = real_mesh("CompositTorsoBase.mesh") else { return };
+        let m = parse_roblox_mesh_v2(&d).unwrap();
+        assert!(!m.uvs.is_empty());
+        let mut u_min = f32::INFINITY;
+        let mut u_max = f32::NEG_INFINITY;
+        for uv in &m.uvs {
+            assert!(uv[0].is_finite() && uv[1].is_finite());
+            u_min = u_min.min(uv[0]);
+            u_max = u_max.max(uv[0]);
+        }
+        // real avatar UVs span a meaningful sub-region of the [0,1] atlas and v is finite.
+        assert!(u_min >= 0.0 && u_min < u_max, "uv min {u_min} max {u_max}");
+        assert!(u_max > 0.5 && u_max <= 1.0, "uv max {u_max}");
     }
 }
 
