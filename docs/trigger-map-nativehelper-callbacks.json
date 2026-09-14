@@ -1,0 +1,37 @@
+{
+  "callback_trigger_map": [
+    {
+      "callback": "gameActivity_onFlagsLoaded",
+      "engine_trigger": "Not fired by nativeInitializeNativeFlags itself (that only applies flags via GetFlagsCount/GetStringAt and sets latch [0x72739d4] then returns). Fired by the app-bridge's flag-load completion path: once flag-apply finishes, the engine's RBX::NativeHelper_JNI::gameActivity_onFlagsLoaded fires CallVoidMethod(env, nativeHelperObj, GetMethodID('gameActivity_onFlagsLoaded')). Engine-side dispatch citizens: flag-apply chain 0x102320cec->0x102320f2c and the flags-loaded latch setter; method-name string rodata 0x40a2a0.",
+      "harness_step": "Rung 0 is already nativeInitializeNativeFlags (0x10232048c). To fire onFlagsLoaded headlessly: (a) make nativeInitializeNativeFlags RETURN cleanly instead of soft-returning at pc 0xffffffffffffffff outside image (clear the indirect-blr garbage pc, SH108/SH111 class), so flag-apply completes; (b) then the next app-bridge session advance reaches NativeHelper_JNI::gameActivity_onFlagsLoaded. Fastest forced path: the wired jni_call_void_method shim already fires MH_FLAGS_LOADED if jni drives CallVoidMethod('gameActivity_onFlagsLoaded') directly.",
+      "reachable_today": false
+    },
+    {
+      "callback": "gameActivity_onEngineInitialized",
+      "engine_trigger": "Fired by RBX::NativeHelper_JNI::gameActivity_onEngineInitialized (method-name 0x499825) after the engine's init/GlobalInit completes; the engine dispatches CallVoidMethod('gameActivity_onEngineInitialized') once TaskScheduler/device init finishes and the session is allowed to create GuiObjects.",
+      "harness_step": "Seeds [0x72739d4].bit0 flags-loaded latch + clear remaining boot gates (SH82 main-thread-id cell [0x106863a68], SH86 CRT allocator hooks, SH88 pb_defaults registry, dispatch singletons) so nativeGameGlobalInit RETURNS and its subsequent rungs reach the engine-init dispatch. Not headlessly reachable while nativeInitializeNativeFlags/GlobalInit park or soft-return.",
+      "reachable_today": false
+    },
+    {
+      "callback": "gameActivity_onAppReady",
+      "engine_trigger": "Surface-attached app-ready. Fired by RBX::NativeHelper_JNI::gameActivity_onAppReady (method-name 0x595971, mangled fn RBX::NativeHelper_JNI::gameActivity_onAppReady(P12GameActivity RKNSt6__ndk112basic_string...) 0x696c25) -> CallVoidMethod('gameActivity_onAppReady'); reached once a real surface (ANativeWindow) is attached via nativeAppBridgeV2UpdateSurfaceAppWithPlatformParams/V2StartApp and the app-shell is ready to build its first login/home GuiObject tree.",
+      "harness_step": "Surface handoff (TASK 2): drive nativeAppBridgeV2UpdateSurfaceAppWithPlatformParams (guest 0x1025f5fec) with a real surface XID -> it calls V2StartApp helper 0x10258b374 which runs ANativeWindow_fromSurface (real XID) and stores the window at [0x10683d348]; then nativeAppBridgeV2SendAppEventOnAppReady (0x102bb463c) parses the app-ready event and the engine dispatches onAppReady. Need ANativeWindow XID plugin present (runlog: 'could not open an X11 window (Xvfb absent) — keeping sentinel').",
+      "reachable_today": false
+    },
+    {
+      "callback": "gameActivity_onDidLogInReceived",
+      "engine_trigger": "Fired by NativeHelper_JNI after a login/session state arrives from the platform (method-name 0x50a545; VOID, LString arg — NOT jboolean, per deleg_2e852a9c disasm). Gates login vs home screen.",
+      "harness_step": "After onEngineInitialized/onAppReady, the session/network login callback must deliver an isLoggedIn=false payload. Not reachable before the earlier milestones; shim returns 0 with no milestone by design (login-payload gate).",
+      "reachable_today": false
+    },
+    {
+      "callback": "gameActivity_onGameLoaded",
+      "engine_trigger": "Fired by NativeHelper_JNI::gameActivity_onGameLoaded (method-name 0x461a65, mangled fn 0x696d97) -> CallVoidMethod('gameActivity_onGameLoaded') once the session/game fully loads; the last callback, full home.",
+      "harness_step": "Depends on the full login->session->game-load chain. Farthest from headless reach; only after all preceding callbacks and a real place/session load.",
+      "reachable_today": false
+    }
+  ],
+  "onAppReady_surface_handoff_fns": "nativeAppBridgeV2UpdateSurfaceAppWithPlatformParams (guest 0x1025f5fec) -> its V2StartApp helper sub 0x10258b374 (executes ANativeWindow_fromSurface on the Surface jobject/XID, stores the ANativeWindow* at [0x10683d348] with refcount [0x10683d344], releases old) + 0x10258b4c4; then the app-ready JNI event is dispatched via nativeAppBridgeV2SendAppEventOnAppReady (guest 0x102bb463c, which string-enum-parses and fires the ready event). The onAppReady JNI callback itself is the engine-side RBX::NativeHelper_JNI::gameActivity_onAppReady -> CallVoidMethod('gameActivity_onAppReady').",
+  "first_reachable_callback": "gameActivity_onFlagsLoaded",
+  "notes": "Mechanism: all five gameActivity_* callbacks are engine->Java JNI CallVoidMethod dispatches from the C++ RBX::NativeHelper_JNI class onto the fake NativeHelper jobject (option b/c: engine C++ side after session/network/init events), confirmed by mangled __func__ strings at rodata 0x696c25/0x696d97 and the method-name strings adjacent to 'JNINativeHelper'. The Rust shims (jni.rs jni_call_void_method, MH_FLAGS_LOADED/MH_ENGINE_INITIALIZED/MH_APP_READY/MH_GAME_LOADED atoms) are wired and hermetic-verified, but the ENGINE-side dispatch sites are NOT reached headlessly today: SH111 confirms 'the call sites are not yet reached' and the ladder parks (nativeInitializeNativeFlags soft-returns at pc 0xffffffffffffffff outside image per runs/sh112 combined runlog line 54; combined render ladder hits pre-existing renderinit std::runtime_error (bad-ptr)). nativeInitializeNativeFlags does NOT itself fire onFlagsLoaded — it only applies flags and sets the [0x72739d4] latch; onFlagsLoaded is a separate mill of the app-bridge once flag-apply completes. First reachable in ladder order is onFlagsLoaded (rung 0 = nativeInitializeNativeFlags); the remaining blocker is making the truncated rungs actually RETURN and driving the app-bridge session past them. The milestone atoms are currently set-only, not polled into a session-advance gate, so even a fired callback does not yet advance StartLuaAppDM's session (route-B step-2 tail). See docs/recon-routeB-globaltinit-unblock.md, docs/frontier-sh111-vtable-nativehelper.md. Addresses are guest = file vaddr + 0x100000000."
+}
