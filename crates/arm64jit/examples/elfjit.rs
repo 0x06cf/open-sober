@@ -1680,6 +1680,85 @@ fn routeb_reassert_canary_guard() {
         *(0x10631aa30u64 as *mut u64) = unit; // JNI_OnLoad guard slot, kept in sync (SH106)
     }
 }
+static ROUTEB_SENDAPP_PATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// SH119: SendAppEventOnAppReady (guest 0x102bb463c) STILL for-returns through
+/// two UNGATED singleton lambdas the SH115 3-site patch + gate-force can't reach
+/// (they are on the gate-backed CLEAN path's own registered callbacks, dispatching
+/// direct off the too-short 0x60 vtable):
+///   - lambda 0x6251610: `ldr x8,[x8,#0xf0]; blr x8` @ file 0x6251670/0x6251674,
+///     window 0x6251670..0x6251684 (ldr/blr/ldr/str/mov-x0-xzr) -> materialize OBJ
+///     into x0 (movz+3 movk) + nop; repoint b.eq@0x6251628 + cbz@0x6251634 (both ->
+///     0x6251680) to epilogue 0x6251684.
+///   - lambda 0x6260a68: `ldr x8,[x8,#0x550]; blr x8` @ file 0x6260abc/0x6260ac0,
+///     window 0x6260abc..0x6260ac8 (ldr/blr/mov-x0-xzr) -> materialize OBJ into x0
+///     (movz + movk hw1 + movk hw2); repoint b.eq@0x6260a7c + cbz@0x6260a88 (both
+///     -> 0x6260ac4) to epilogue 0x6260ac8.
+/// Both return OBJ (non-NULL stable) so the enclosing SendAppEventOnAppReady body
+/// completes towards building the app-data-model / GuiObjects.
+fn routeb_patch_sendapp_singleton_lambdas() {
+    if ROUTEB_SENDAPP_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let obj = routeb_singleton_obj_addr();
+    // materialize OBJ into x0: movz x0,#lo; movk x0,#16/32/48
+    let mut word_at = |hw: u32, imm: u16| -> u32 {
+        if hw == 0 {
+            0xD280_0000u32 | ((imm as u32) << 5) // movz x0,#imm (hw0)
+        } else {
+            (0xF280_0000u32 + (hw << 21)) | ((imm as u32) << 5) // movk x0 hwN
+        }
+    };
+    let helper = |obj: u64| (word_at(0, (obj & 0xffff) as u16), word_at(1, ((obj >> 16) & 0xffff) as u16), word_at(2, ((obj >> 32) & 0xffff) as u16), word_at(3, ((obj >> 48) & 0xffff) as u16));
+    let (w0, w1, w2, w3) = helper(obj);
+
+    // Site 1: lambda 0x6251610, 5-slot window (movz, movk hw1, movk hw2, movk hw3, nop)
+    let g1 = 0x106251670_u64; // guest = file(0x6251670) + 0x100000000
+    {
+        let page = (g1 & !0xfff) as *mut libc::c_void;
+        unsafe {
+            if libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_WRITE) == 0
+                && *(g1 as *const u32) == 0xf940_7908u32
+            {
+                *((g1 + 0) as *mut u32) = w0;
+                *((g1 + 4) as *mut u32) = w1;
+                *((g1 + 8) as *mut u32) = w2;
+                *((g1 + 12) as *mut u32) = w3;
+                *((g1 + 16) as *mut u32) = 0xd503_201fu32; // nop (kill mov x0,xzr)
+                libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+                arm64jit::jit::block_cache_drop_region(g1, g1 + 20);
+                eprintln!("[elfjit:routeB] SH119 patched SendAppEvent lambda 0x6251610 @0x{g1:x} 20B -> materialize obj 0x{obj:x} into x0 (returns OBJ)");
+                let _ = repoint_early_branch(0x106251628, 0x106251680, 0x106251684, "L610 b.eq");
+                let _ = repoint_early_branch(0x106251634, 0x106251680, 0x106251684, "L610 cbz x19");
+            } else {
+                libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+                eprintln!("[elfjit:routeB] WARN SH119 lambda A @0x{g1:x} guard/mprotect failed, not patched");
+            }
+        }
+    }
+    // Site 2: lambda 0x6260a68, 3-slot window (movz, movk hw1, movk hw2)
+    let g2 = 0x106260abc_u64; // guest = file(0x6260abc) + 0x100000000
+    {
+        let page = (g2 & !0xfff) as *mut libc::c_void;
+        unsafe {
+            if libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_WRITE) == 0
+                && *(g2 as *const u32) == 0xf942_a908u32
+            {
+                *((g2 + 0) as *mut u32) = w0;
+                *((g2 + 4) as *mut u32) = w1;
+                *((g2 + 8) as *mut u32) = w2; // overwrites mov x0,xzr
+                libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+                arm64jit::jit::block_cache_drop_region(g2, g2 + 12);
+                eprintln!("[elfjit:routeB] SH119 patched SendAppEvent lambda 0x6260a68 @0x{g2:x} 12B -> materialize obj 0x{obj:x} into x0 (returns OBJ)");
+                let _ = repoint_early_branch(0x106260a7c, 0x106260ac4, 0x106260ac8, "L60a68 b.eq");
+                let _ = repoint_early_branch(0x106260a88, 0x106260ac4, 0x106260ac8, "L60a68 cbz x19");
+            } else {
+                libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+                eprintln!("[elfjit:routeB] WARN SH119 lambda B @0x{g2:x} guard/mprotect failed, not patched");
+            }
+        }
+    }
+    ROUTEB_SENDAPP_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
 /// Apply the SH115 scoped patch to the three singleton-dispatch accessor sites.
 /// (file vaddr -> expected original slot0 word + the two early-return branches
 /// that jump onto the patched store-slot and their file vaddrs)
@@ -4941,6 +5020,11 @@ fn main() {
                 // bucket-array; leaf-rewrite it to `ret` so the caller takes the
                 // 'found' path and the flag-registration loop advances.
                 routeb_patch_nativeinit_flagmap_helper();
+                // SH119: SendAppEventOnAppReady's two ungated singleton lambdas
+                // (0x6251610 off 0xf0, 0x6260a68 off 0x550) still soft-return;
+                // materialize the stable object into x0 at both so the body
+                // completes towards the app-data-model / GuiObjects.
+                routeb_patch_sendapp_singleton_lambdas();
             }
             // SH87: the map-family generic dispatch can blr through the garbage +0x18
             // hash2 of a rehash-copied map (0x1800064) — force blr x1 (primary hash).
@@ -9420,6 +9504,34 @@ mod sh115_tests {
         let unit: u64 = 0x2f_2a_1a_0a_0e_0f_10_11;
         assert_ne!(unit, 0, "canary constant must be non-zero");
         assert_ne!(unit as usize & 0xf, 0, "canary low bits non-zero");
+    }
+    #[test]
+    fn sh119_sendapp_ungated_lambdas_materialized_into_x0() {
+        // SH119: SendAppEventOnAppReady still soft-returns via two UNGATED
+        // singleton lambdas dispatching off the 0x60 vtable. Patch each to
+        // materialize OBJ into x0 (movz+movk; rd=0) + repoint early branches.
+        let obj: u64 = 0x7f_0123_4567_8abc;
+        let movz0 = |imm: u16| 0xD280_0000u32 | ((imm as u32) << 5);
+        let movk0 = |hw: u32, imm: u16| (0xF280_0000u32 + (hw << 21)) | ((imm as u32) << 5);
+        // lambda 0x6251610 (guest window 0x106251670), materialize into x0:
+        let w = [
+            movz0((obj & 0xffff) as u16),
+            movk0(1, ((obj >> 16) & 0xffff) as u16),
+            movk0(2, ((obj >> 32) & 0xffff) as u16),
+            movk0(3, ((obj >> 48) & 0xffff) as u16),
+            0xd503_201fu32, // nop (kill mov x0,xzr)
+        ];
+        let rebuild = |w: &[u32]| -> u64 {
+            (0..4).fold(0u64, |acc, i| acc | (((w[i] >> 5) & 0xffff) as u64) << (16 * i as u64))
+        };
+        assert_eq!(rebuild(&w), obj, "window reassembles OBJ");
+        assert_eq!(w[4], 0xd503_201fu32, "final slot is a nop");
+        // addresses: guest = file + 0x100000000
+        assert_eq!(0x6251670u64 + 0x1_0000_0000, 0x106251670u64, "L610 window start");
+        assert_eq!(0x6260abcu64 + 0x1_0000_0000, 0x106260abcu64, "L0a68 window start");
+        // the two early-return branch addresses to repoint (file + base)
+        assert_eq!(0x6251628u64 + 0x1_0000_0000, 0x106251628u64, "L610 b.eq");
+        assert_eq!(0x6260a7cu64 + 0x1_0000_0000, 0x106260a7cu64, "L0a68 b.eq");
     }
     #[test]
     fn sh115_repoints_early_return_branches_off_the_store_slot() {
