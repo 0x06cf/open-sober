@@ -908,6 +908,13 @@ fn sh124_exit_is_intercepted(name: &str) -> bool {
         && matches!(name, "exit" | "_exit" | "_Exit" | "abort" | "exit_group")
 }
 
+/// SH131: the guest's libc `raise` import is intercepted for unwind ONLY under
+/// JIT_DRIVE_LIFECYCLE (the same gate as SH124's exit family). Out of that
+/// env the binding stays the historical host-glibc `raise` (default unchanged).
+fn sh131_raise_is_intercepted() -> bool {
+    std::env::var_os("JIT_DRIVE_LIFECYCLE").is_some()
+}
+
 /// The process's own main thread has gettid() == getpid(); a spawned host
 /// thread (the --v2boot ladder / render threads) has a distinct tid.
 fn sh124_running_on_main_thread() -> bool {
@@ -953,6 +960,22 @@ pub fn resolve(name: &[u8]) -> Option<u64> {
         eprintln!(
             "[resolver] SH124 intercepting guest {} (@ {key:?}) -> host_guest_exit (spawned-thread exit unwinds, main-thread exit stays real) under JIT_DRIVE_LIFECYCLE",
             name_str(name)
+        );
+        return alloc_slot(&mut r, &key, hostf);
+    }
+    // SH131: intercept the guest's libc `raise` under JIT_DRIVE_LIFECYCLE. The
+    // engine's fatal path calls raise(SIGTRAP) (the same class SH121 NOP'ed at
+    // the TaskScheduler ctor, but at OTHER sites reached by a released clone
+    // worker after CAPTURE — the post-frame dispatch-flood exit-133). Bound to
+    // host glibc `raise`, that raises a REAL host SIGTRAP that terminates the
+    // WHOLE process (128+5=133) without ever entering our guest signal dispatch
+    // (so it is invisible to signals.rs). Mirror host_guest_exit: on a SPAWNED
+    // thread, log + unwind just that jit_run (zero x30 -> pc 0 -> returns); a
+    // MAIN-thread raise stays real. Inert without the env == historical binding.
+    if sh131_raise_is_intercepted() && name_str(name) == "raise" {
+        let hostf: HostCall = host_guest_raise;
+        eprintln!(
+            "[resolver] SH131 intercepting guest raise -> host_guest_raise (SIGTRAP on a spawned thread unwinds, main-thread raise stays real) under JIT_DRIVE_LIFECYCLE"
         );
         return alloc_slot(&mut r, &key, hostf);
     }
@@ -1121,6 +1144,39 @@ extern "C" fn host_guest_exit(
         eprintln!("[resolver] SH124 spawned-thread guest exit({a0:#x}) tid {my_tid} (no guest state) — ignored");
     }
     a0
+}
+
+/// SH131: the guest's libc `raise(sig)` import (see the resolver branch above).
+/// The engine's fatal raises SIGTRAP (5); bound to host glibc `raise` it would
+/// deliver a REAL host SIGTRAP that terminates the whole process (128+5=133)
+/// from any thread — invisible to guest signal dispatch. On a SPAWNED thread
+/// we log + unwind just that jit_run (mirrors host_guest_exit); the process
+/// survives and settles to a clean finish. A MAIN-thread raise stays a real
+/// raise (genuine fatal preserved).
+extern "C" fn host_guest_raise(
+    a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    let sig = a0 as i32;
+    if sig == libc::SIGTRAP && !sh124_running_on_main_thread() {
+        eprintln!(
+            "[resolver] SH131 spawned-thread guest raise(SIGTRAP={sig}) — unwinding this jit_run (process survives; the post-frame capture flood fatal)"
+        );
+        let my_tid = unsafe { libc::gettid() as u64 };
+        let st = crate::jit::guest_state_of_host(my_tid as i64);
+        if st != 0 {
+            unsafe {
+                (*(st as *mut CpuState)).x[0] = a0; // surface the signal number
+                (*(st as *mut CpuState)).x[30] = 0; // pc=0 -> run_loop unwinds
+            }
+        } else {
+            eprintln!("[resolver] SH131 spawned-thread guest raise(SIGTRAP) tid {my_tid} (no guest state) — ignored");
+        }
+        return 0;
+    }
+    // Real raise (main thread, or any genuinely-delivered signal).
+    let real: unsafe extern "C" fn(i32) -> i32 =
+        unsafe { std::mem::transmute(libc::dlsym(libc::RTLD_DEFAULT, b"raise\0".as_ptr() as *const libc::c_char)) };
+    unsafe { real(sig) as u64 }
 }
 
 /// Reverse-lookup an import slot address back to its symbol name (the first
@@ -1783,6 +1839,10 @@ mod tests {
     /// must be INTERCEPTED ONLY under JIT_DRIVE_LIFECYCLE. Population of
     /// JIT_DRIVE_LIFECYCLE is what flips interception on; out of that env the
     /// binding stays the historical host-glibc-exit (UNCHANGED default).
+    /// ALSO SH131: the guest's `raise` import is intercepted for unwind under
+    /// the SAME env gate (the released-worker SIGTRAP fatal -> exit 133 fix).
+    /// Folded into ONE test so the two env-mutating probes never race on the
+    /// process-global JIT_DRIVE_LIFECYCLE in parallel.
     #[test]
     fn sh124_exit_intercept_gated_on_drive_lifecycle() {
         // Out of the env: nothing intercepted (default unchanged).
@@ -1794,6 +1854,7 @@ mod tests {
                 "{name} must NOT be intercepted with JIT_DRIVE_LIFECYCLE unset (default unchanged)"
             );
         }
+        assert!(!sh131_raise_is_intercepted(), "raise must not be intercepted out of the env");
         // With the env set: the exit family intercepted, non-exit names not.
         unsafe { std::env::set_var("JIT_DRIVE_LIFECYCLE", "1") };
         for name in ["exit", "_exit", "_Exit", "abort", "exit_group"] {
@@ -1802,6 +1863,7 @@ mod tests {
                 "exit-family {name} must be intercepted under JIT_DRIVE_LIFECYCLE"
             );
         }
+        assert!(sh131_raise_is_intercepted(), "raise must be intercepted under JIT_DRIVE_LIFECYCLE");
         assert!(!sh124_exit_is_intercepted("strlen"));
         assert!(!sh124_exit_is_intercepted("memcpy"));
         assert!(!sh124_exit_is_intercepted("pthread_mutex_lock"));

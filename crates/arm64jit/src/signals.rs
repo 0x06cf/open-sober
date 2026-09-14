@@ -239,6 +239,18 @@ pub fn dispatch_current_thread(st: &mut CpuState, sig: u32, resume: u64) {
     if act.handler == 0 {
         // Default disposition.
         if default_terminates(sig as u64) {
+            // SH131 diag: before terminating on a SIGTRAP (which the engine
+            // uses as its fatal — exit 133, the SH121 class at a NEW site on a
+            // released clone worker), dump the current guest pc so the exact
+            // raise()/brk site can be patched rather than blamed on the flood.
+            if sig == 5 {
+                eprintln!(
+                    "[signals] SIGTRAP default-terminate on tid {} gettid={}: pc={:#x} x30={:#x} x0={:#x} (128{}={}, the fatal exit 133) — pin the guest raise site (SH121-class)",
+                    std::thread::current().name().unwrap_or("?"),
+                    unsafe { libc::gettid() },
+                    st.pc, st.x[30], st.x[0], sig, 128 + sig
+                );
+            }
             // SAFETY: a SIG_DFL-terminating signal ends the whole process, as
             // on Linux (no guest settable handlers get to run for it).
             unsafe {

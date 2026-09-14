@@ -237,6 +237,32 @@ fn reseed_task_frame_color(base: u64, cc: [f32; 4]) {
 /// currency-owning thread is the fix).
 static PENDING_PRESENTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// SH131 combined-run flood bound: after the serialized-capture presenter has
+/// presented its frame budget, the type-4 vector [0x106829ea8] is nulled back
+/// to its boot-idle no-op state (the dispatcher's `ldr x3,[x8,#3752]; br x3`
+/// returns doing nothing when the slot is 0 — exactly the pre-SH60 idle), and
+/// this gate tells the --deque-node-live injector to stop placing fresh foreign
+/// nodes. Without this, the injector's 400-tick (20s) re-injection loop keeps
+/// the drain dispatching through our frame thunk long after the presenter
+/// stopped (PENDING_PRESENTS grows unbounded — 6659 at dispatch #15000 in the
+/// SH130 combined log), and a released engine clone worker then hits an
+/// untrapped guest fatal raise(SIGTRAP) = exit 133. Halting the flood lets the
+/// run settle to the clean boot-idle finish. Combined-capture mode only.
+static TASKFRAME_HALT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// True in the SH130/129 combined serialized-capture mode (JIT_SERIALIZE_RENDER
+/// + --v2boot + --taskv4-seed frame): the case whose post-frame dispatch flood
+/// must be bounded for a clean exit. Standalone single-plane mode (no serialize)
+/// stays unchanged.
+fn combined_frame_capture() -> bool {
+    let serialize = std::env::var("JIT_SERIALIZE_RENDER").ok().as_deref() == Some("1")
+        && std::env::args().any(|a| a == "--v2boot")
+        && std::env::args().position(|a| a == "--taskv4-seed")
+            .map(|i| std::env::args().nth(i + 1).as_deref() == Some("frame"))
+            .unwrap_or(false);
+    serialize
+}
+
 /// The type-4 task-consumer vector seed: a registered non-recursive leaf host
 /// thunk. ABI per recon §A: (node=x0, [node+32]&~1=x1, consumer=x2); return
 /// discarded. Must never re-enter the dispatcher/drain/vector (would recurse).
@@ -6395,6 +6421,14 @@ fn main() {
                     }
                 }
                 for it in 0..400 {
+                    // SH131: stop re-injecting once the combined-capture frame
+                    // budget is met (vector nulled + halt signaled) so the drain
+                    // settles to boot-idle and no released worker hits a flood
+                    // fatal (exit 133). Mirrors the presenter's bound.
+                    if TASKFRAME_HALT.load(core::sync::atomic::Ordering::Acquire) {
+                        eprintln!("[elfjit:deque-node-live] SH131 flood bound: TASKFRAME_HALT=1 — injector stopped after {it} ticks (post-frame budget)");
+                        break;
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(50));
                     let is_ptr = |p: u64| p >= 0x100000000 && p >> 56 == 0 && p & 7 == 0;
                     // Already placed a node?
@@ -7258,6 +7292,20 @@ fn main() {
                         "[elfjit:taskv4-frame] presenter drained: {presented} real task-driven frames presented (all on the currency-owning thread); pending={}",
                         PENDING_PRESENTS.load(core::sync::atomic::Ordering::Relaxed)
                     );
+                    // SH131: in the combined serialized-capture run, the frame
+                    // budget is the only artifact we want — the injector's
+                    // 400-tick re-injection has been flooding the drain through
+                    // the frame thunk past this point, ending in a released
+                    // clone worker's guest raise(SIGTRAP) (exit 133). Null the
+                    // type-4 vector back to its boot-idle no-op state and tell
+                    // the injector to stop, so the run settles cleanly instead.
+                    if combined_frame_capture() {
+                        TASKFRAME_HALT.store(true, core::sync::atomic::Ordering::Release);
+                        unsafe { *(0x106829ea8u64 as *mut u64) = 0; }
+                        eprintln!(
+                            "[elfjit:taskv4-frame] SH131 flood bound: TASKFRAME_HALT=1, nulled type-4 vector [0x106829ea8]=0 — drain returns to boot-idle no-op, injector stops"
+                        );
+                    }
                 } else {
                     // Non-frame seed value: still fire one deterministic present
                     // (SH60 marker) on this currency-owning thread.
