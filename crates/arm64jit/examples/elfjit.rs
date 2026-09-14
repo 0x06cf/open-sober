@@ -1516,6 +1516,57 @@ fn routeb_seed_dispatcher_node() {
     ROUTEB_DISPATCHER_NODE_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
+// ---- SH121: TaskScheduler ctor "flags-loaded" gate -> raise(SIGTRAP) ----
+//
+// setTaskSchedulerBackgroundMode (guest 0x102bb2380 -> internal 0x10258aff0)
+// lazily constructs the TaskScheduler via once-guard [0x10726a488]. Its ctor
+// (file 0x224f810, guest 0x10224f810) starts with the flags gate at guest
+// 0x10224fa20: `ldrb w8,[x8,#2516]` reads the flags-loaded byte [0x72739d4]
+// (0xe8 0x12 0x00 0x36 = tbz w8,#0,0x224fc80). BSS leaves bit0==0, so the ctor
+// takes the fatal path (0x224fc80 -> bl 0x626d1d0 -> raise(SIGTRAP)=exit 133).
+// The recon (deleg_b67653e9) proved the SIGTRAP is the guest's own raise(5),
+// not a JIT-emitted trap. Because nativeGameGlobalInit now RETURNS via the
+// SH82 thread-id trick (never loading flags), this ctor is the FIRST flags gate
+// the ladder hits -> exit 133 right after "driving setTaskSchedulerBM". Fix:
+// NOP the `tbz` so the ctor proceeds regardless of flags-loaded (mirrors SH116's
+// code-site approach; [0x72730xx].bss is unmapped -> a data seed may not land).
+static ROUTEB_TASKSCHED_FLAGSGATE_PATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+fn routeb_patch_taskscheduler_flags_gate() {
+    if ROUTEB_TASKSCHED_FLAGSGATE_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    // guest addr = file vaddr 0x224fa24 + 0x100000000 (identity-mapped .text).
+    let addr = 0x10224fa24u64;
+    let want = 0xd503_201fu32; // nop
+    let page = addr & !0xfff;
+    unsafe {
+        if libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_WRITE) == 0 {
+            let before = *(addr as *const u32);
+            // e8 12 00 36 (LE u32 0x360012e8) = TBZ W8,#0,#0x5c (to the fatal raise)
+            if before == 0x3600_12e8u32 {
+                *(addr as *mut u32) = want;
+                eprintln!(
+                    "[elfjit:routeB] SH121 patched TaskScheduler ctor flags-gate `tbz w8,#0,<fatal>` 0x{addr:x} ({before:08x}) -> `nop` ({want:08x}) — ctor proceeds regardless of [0x72739d4].bit0 (kills the guest raise(SIGTRAP)=exit 133)"
+                );
+            } else if before == want {
+                eprintln!("[elfjit:routeB] SH121 TaskScheduler flags-gate 0x{addr:x} already nop");
+            } else {
+                eprintln!(
+                    "[elfjit:routeB] WARN SH121 TaskScheduler flags-gate 0x{addr:x} unexpected bytes {before:08x}, not patched"
+                );
+            }
+            libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_EXEC);
+        } else {
+            eprintln!(
+                "[elfjit:routeB] WARN mprotect RW failed for SH121 TaskScheduler flags-gate 0x{addr:x} errno={}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    arm64jit::jit::block_cache_drop_region(0x10224f9e0, 0x10224fca0);
+    ROUTEB_TASKSCHED_FLAGSGATE_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
 // ---- SH115: scoped singleton-dispatch patch (make V2Init/V2Start/V1AppStart/  ----
 // ---- SendAppEventOnAppReady bodies complete instead of soft-returning)     ----
 //
@@ -5050,6 +5101,17 @@ fn main() {
                 // node .bss global (0x10683a460) with an unseeded self-link; seed
                 // the DATA (NOT the generic shared leaf) to the benign empty state.
                 routeb_seed_dispatcher_node();
+                // SH121: setTaskSchedulerBM lazily constructs the TaskScheduler whose
+                // ctor asserts [0x72739d4].bit0 ("flags loaded") -> raise(SIGTRAP)
+                // (exit 133) — the current next gate. NOP the tbz. Also seed the
+                // REAL setTaskSchedulerBM version-gate [0x10683cff8] (adrp 0x683c000
+                // +0xff8, low>=6 && byte1>=3) so it keeps the AppBridge V2 main path
+                // (SH109's [0x10683d350] seed belongs to V2Init/V2Start only, and its
+                // comment even mis-attributes it to setTaskSchedulerBM).
+                routeb_patch_taskscheduler_flags_gate();
+                unsafe {
+                    *(0x10683cff8u64 as *mut u64) = 0x0306u64; // low byte 6, byte1 3
+                }
             }
             // SH87: the map-family generic dispatch can blr through the garbage +0x18
             // hash2 of a rehash-copied map (0x1800064) — force blr x1 (primary hash).
@@ -9591,6 +9653,34 @@ mod sh115_tests {
             assert_eq!(neww & 0xff00_0000, word & 0xff00_0000, "opcode byte changed");
             assert_eq!(neww & 0x1f, word & 0x1f, "Rt/cond bits changed");
         }
+    }
+    #[test]
+    fn sh121_taskscheduler_flags_gate_tbz_nop() {
+        // SH121: the TaskScheduler ctor's "flags loaded" gate (guest 0x10224fa20
+        // `ldrb w8,[x8,#2516]`; 0x10224fa24 `tbz w8,#0,0x224fc80` fatal -> guest
+        // raise(SIGTRAP)=exit 133) fired the moment setTaskSchedulerBM lazily
+        // constructs the scheduler — the FIRST flags gate the [SH115] opt-in
+        // ladder hits (gameGlobalInit returns via the SH82 thread-id trick, never
+        // loading flags, so [0x72739d4].bit0 stays 0). NOP the tbz so the ctor
+        // proceeds. Verify the exact encodings + guest/file address transform +
+        // imm14 target math (0x97 words -> +0x25c -> guest 0x10224fc80).
+        // bytes at file 0x224fa24: e8 12 00 36 = LE u32 0x360012e8 = TBZ W8,#0
+        assert_eq!(0x3600_12e8u32, 0x3600_12e8u32, "guest tbz word");
+        // NOP is 0xd503201f (d5 03 20 1f).
+        assert_eq!(0xd503_201fu32, 0xd503_201fu32, "nop encoding");
+        // guest = file vaddr + 0x100000000 (identity transform the patcher uses)
+        assert_eq!(0x224fa24u64 + 0x1_0000_0000, 0x10224fa24u64, "flags-gate tbz start");
+        // imm14 math: (0x360012e8 >> 5) & 0x3fff = 0x97 words forward -> +0x25c
+        let imm14 = (0x3600_12e8u32 >> 5) & 0x3fff;
+        assert_eq!(imm14, 0x97, "tbz imm14 targets the fatal raise");
+        let target = 0x10224fa24u64.wrapping_add((imm14 as u64) * 4);
+        assert_eq!(target, 0x10224fc80u64, "tbz resolves to the fatal raise site");
+        // the gate reads [0x7273000 + 0x9d4] = [0x72739d4] (flags-loaded latch)
+        assert_eq!(0x7273000u64 + 0x9d4, 0x72739d4u64, "flags-loaded latch");
+        // setTaskSchedulerBM's own version-gate is [adrp 0x683c000 + 0xff8] =
+        // [0x10683cff8] (NOT the misattributed SH109 [0x10683d350]).
+        assert_eq!(0x683c000u64 + 0xff8, 0x683cff8u64, "setTaskSchedulerBM version-gate file addr");
+        assert_eq!(0x683cff8u64 + 0x1_0000_0000, 0x10683cff8u64, "version-gate guest addr");
     }
 }
 
