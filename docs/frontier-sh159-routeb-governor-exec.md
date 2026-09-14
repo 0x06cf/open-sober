@@ -54,8 +54,19 @@ dispatch `ldr x9,[x0]; ldr x9,[x9,#32]; blr x9`).
 
 ## Hermetic tests (elfjit.rs, +0 this commit — probes only; no behavior change to code paths gated by the fix)
 The SH159 regression surface is the runtime governor-reach region-watch, not a
-unit test; the two guard-global writes are plain opt-in data seeds. Elfjit example
+unit test; the guard-global writes + .text patches are opt-in data seed/site
+patches (guarded, idempotent, exact-match-on-original-bytes). Elfjit example
 61/0 still green.
+
+## SH160 (chained, verified): NOP the init3 dispatch-gate calls (see commit)
+After the governor completes and startAppWithParams returns, fn 0x23f00f8 calls
+nativePostClientSettingsLoadedInitialization3's dispatch gate 0x2256510 with
+x0=appData[+0x28]==NULL (structural live-heap 'init3 provider') — `ldr [x0]`
+faults. SH160 patches both call sites (guest 0x1023f013c/0x1023f01b0, `bl
+0x2256510`) -> `stp xzr,xzr,[x8]` (zero the 16-byte out-buffer, benign no-op).
+VERIFIED: boot continues past init3 into the governor post-startApp continuation
+(fault moved 0x102256510 -> 0x102e9fcc4). Repro runs/sh160.txt (EXIT 134, deeper
+app-boot), sh160-default.txt (EXIT 0 / 24 frames / 0 faults).
 
 ## Repro
 ```
