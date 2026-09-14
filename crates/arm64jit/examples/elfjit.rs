@@ -6502,6 +6502,7 @@ fn main() {
                                         *(0x106a70608u64 as *mut u64) = impl_buf; // wrapper[+0x20] = impl (governor x19)
                                     }
                                     eprintln!("[elfjit:v2boot] SH159b seeded gov impl@[0x106a70608]=0x{impl_buf:x} impl[+0x408]=DISPATCH@0x{disptch_buf:x} DISPATCH.vt[+0x18]=benign leaf 0x{gov_leaf:x}");
+                                    }
                                 }
                                 // SH156 NEXT GATE: the ctor 0x102207b50's body reads
                                 // globals whose pages are LEFT UNMAPPED by the engine's
