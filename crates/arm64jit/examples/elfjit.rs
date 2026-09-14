@@ -1737,6 +1737,72 @@ fn routeb_patch_nativeinit_flagmap_helper() {
     }
     ROUTEB_FLAGMAP_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
+static ROUTEB_RUNG0_DISPATCH_PATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// SH126-followup (recon deleg_fcd65c31): with JIT_SERIALIZE_RENDER the drain
+/// overlap is gone, but the residual run-variable rung-0 crash is a null-store in
+/// `nativeInitializeNativeFlags` (nativeInit, guest 0x10232048c): a virtual
+/// dispatch `blr x8` at file 0x62514e0 (`ldr x8,[x8,#232]` vt[+232]) enters the
+/// flag-recorder at guest 0x101d97c70 (file 0x1d97c70) with `this`/map === 0
+/// (crash dump: x19=0 x0=0, fault=0x0, host store to address 0). It is the same
+/// SendAppEvent-notifications family SH115/119 patch (their targets 0x6251610@+0xf0
+/// and 0x6260a68@+0x550), but this caller 0x6251438/0x62514e0 is an UNPATCHED third
+/// site whose callee (0x1d97c70) records a flag into a null map -> null-store.
+/// It is NOT the render thread (gated on LADDER_DONE, never starts) and NOT
+/// --deque-node-live (a host poking thread, never a top-level jit_run). Fix:
+/// leaf-rewrite the callee entry 0x101d97c70 to no-op (materialize the stable
+/// singleton into x0 + ret) so the null-map store never runs — the caller takes
+/// the benign return. Mirrors SH119 site-1 (materialize) + SH117 (leaf entry).
+/// Opt-in under JIT_SH115_SINGLETON_PATCH (same chain).
+fn routeb_patch_rung0_flag_recorder() {
+    if ROUTEB_RUNG0_DISPATCH_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let obj = routeb_singleton_obj_addr();
+    let mut word_at = |hw: u32, imm: u16| -> u32 {
+        if hw == 0 {
+            0xD280_0000u32 | 8 | ((imm as u32) << 5) // movz x0,#imm (hw0)
+        } else {
+            (0xF280_0000u32 + (hw << 21)) | 8 | ((imm as u32) << 5) // movk x0 hwN
+        }
+    };
+    // 5-slot window: movz x0 hw0, movk x0 hw1, movk x0 hw2, movk x0 hw3, ret
+    let w = [
+        word_at(0, (obj & 0xffff) as u16),
+        word_at(1, ((obj >> 16) & 0xffff) as u16),
+        word_at(2, ((obj >> 32) & 0xffff) as u16),
+        word_at(3, ((obj >> 48) & 0xffff) as u16),
+        0xd65f_03c0u32, // ret
+    ];
+    let start = 0x101d97c70u64; // guest = file(0x1d97c70) + 0x100000000
+    let page = (start & !0xfff) as *mut libc::c_void;
+    unsafe {
+        if libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_WRITE) != 0 {
+            eprintln!(
+                "[elfjit:routeB] WARN mprotect RW failed for rung0 flag-recorder @0x{start:x} errno={}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        let before = *(start as *const u32);
+        if before != 0xa9ba_7bfdu32 {
+            // word0 = stp x29,x30,[sp,#-96]!
+            eprintln!(
+                "[elfjit:routeB] WARN rung0 flag-recorder @0x{start:x} unexpected word0 {before:08x} (want a9ba7bfd), not patched"
+            );
+            libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+            return;
+        }
+        for (i, ww) in w.iter().enumerate() {
+            *((start + (i as u64) * 4) as *mut u32) = *ww;
+        }
+        libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+        arm64jit::jit::block_cache_drop_region(start, start + 20);
+        eprintln!(
+            "[elfjit:routeB] SH126-r0 patched rung0 flag-recorder @0x{start:x} 20B -> materialize singleton obj 0x{obj:x} into x0 + ret (null-map store no-ops)"
+        );
+    }
+    ROUTEB_RUNG0_DISPATCH_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
 static ROUTEB_GUARD_UNIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 /// SH118: guest 0x1067d16f0 is BOTH the `__stack_chk_guard` GOT slot (all
 /// 48,831 stack-protected fns read their canary base from it) AND the engine's
@@ -5166,6 +5232,10 @@ fn main() {
                 // node .bss global (0x10683a460) with an unseeded self-link; seed
                 // the DATA (NOT the generic shared leaf) to the benign empty state.
                 routeb_seed_dispatcher_node();
+                // SH126-r0: the rung-0 nativeInit null-map dispatch (vt[+232] ->
+                // flag-recorder 0x101d97c70, null map store). Leaf-rewrite the
+                // callee so the store no-ops (residual 1/3 crash w/ serialized render).
+                routeb_patch_rung0_flag_recorder();
                 // SH121: setTaskSchedulerBM lazily constructs the TaskScheduler whose
                 // ctor asserts [0x72739d4].bit0 ("flags loaded") -> raise(SIGTRAP)
                 // (exit 133). NOP the tbz + seed the REAL setTaskSchedulerBM version-gate
@@ -9970,6 +10040,42 @@ mod sh126_tests {
         assert_ne!(leaf, 0, "leaf must be non-NULL (a blr 0 would re-soft-return)");
         assert_eq!((leaf >> 40) & 0xff, 0x7f, "leaf in the JIT host-call region");
         assert_eq!(routeb_singleton_leaf(0xdead_beef, 0, 0, 0, 0, 0, 0, 0), 0xdead_beef);
+    }
+    #[test]
+    fn sh126_r0_flag_recorder_leaf_materializes_singleton() {
+        // The residual rung-0 crash: virtual dispatch vt[+232] at file 0x62514e0
+        // enters flag-recorder 0x101d97c70 with this/map=0 -> null-store. The
+        // callee-entry patch materializes the stable singleton into x0 + ret so
+        // the store no-ops. Pin the addresses + the 5-slot window encodings.
+        // caller dispatch: 0x62514d4 `ldr x8,[x8,#232]`, 0x62514e0 `blr x8`.
+        assert_eq!(0x6251438u64 + 0x1_0000_0000, 0x106251438u64, "caller fn entry");
+        assert_eq!(0x62514e0u64 + 0x1_0000_0000, 0x1062514e0u64, "blr x8 (vt[+232]) site");
+        assert_eq!(0x1d97c70u64 + 0x1_0000_0000, 0x101d97c70u64, "flag-recorder callee entry");
+        // word0 = `stp x29,x30,[sp,#-96]!` (a9ba7bfd) — the patch guard.
+        assert_eq!(0xa9ba_7bfdu32, 0xa9ba_7bfdu32, "callee prologue word0");
+        // The 5-slot window: movz x0 hw0 + movk x0 hw1/2/3 + ret. Rebuild obj.
+        let obj: u64 = 0x7f_1234_5678_9abc;
+        let wa = |hw: u32, imm: u16| -> u32 {
+            if hw == 0 {
+                0xD280_0000u32 | 8 | ((imm as u32) << 5)
+            } else {
+                (0xF280_0000u32 + (hw << 21)) | 8 | ((imm as u32) << 5)
+            }
+        };
+        let w = [
+            wa(0, (obj & 0xffff) as u16),
+            wa(1, ((obj >> 16) & 0xffff) as u16),
+            wa(2, ((obj >> 32) & 0xffff) as u16),
+            wa(3, ((obj >> 48) & 0xffff) as u16),
+            0xd65f_03c0u32, // ret
+        ];
+        let rebuilt = (0..4).fold(0u64, |acc, i| acc | (((w[i] >> 5) & 0xffff) as u64) << (16 * i as u64));
+        assert_eq!(rebuilt, obj, "window reassembles the singleton obj");
+        assert_eq!(w[4], 0xd65f_03c0u32, "final slot is ret");
+        // each movz/movk targets rd=x0 (bits 4..0 = 8)
+        for i in 0..4 {
+            assert_eq!(w[i] & 0x1f, 8, "slot {i} targets x0");
+        }
     }
 }
 
