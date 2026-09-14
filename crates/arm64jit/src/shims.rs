@@ -19,6 +19,123 @@ unsafe extern "C" {
     fn __errno_location() -> *mut std::ffi::c_int;
 }
 
+// ---- SH97 harden: guarded pointer-domain check for string ops -----------------
+// The deep gameGlobalInit / do-init walk hands unseeded map-field pointers to libc
+// string ops (same crash class as SH97's strlen: 0xffffff80ffffffc8 garbage, 0, or
+// a sub-image small-int/tag). Raw glibc strcmp/strncmp/strstr/... deref them and
+// SIGSEGV. Mirror safe_cstr_len: refuse a pointer whose top 16 bits are 0xffff
+// (sign-extended garbage) or that is < 0x100000000 (never a mapped pointer). A
+// valid empty string still has a canonical pointer, so this is a pure domain check,
+// distinct from returning a length.
+#[inline]
+fn ptr_ok(p: u64) -> bool {
+    p != 0 && p >= 0x100000000 && (p >> 48) as u16 != 0xffff
+}
+
+// guarded strcmp: garbage arg -> 0 (caller's equal/empty path, same ethos as
+// strlen returning 0); both valid -> real compare.
+extern "C" fn bionic_strcmp(
+    a: u64, b: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(a) || !ptr_ok(b) {
+        return 0;
+    }
+    unsafe {
+        libc::strcmp(a as *const libc::c_char, b as *const libc::c_char) as u64
+    }
+}
+
+extern "C" fn bionic_strncmp(
+    a: u64, b: u64, n: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if n == 0 {
+        return 0;
+    }
+    if !ptr_ok(a) || !ptr_ok(b) {
+        return 0;
+    }
+    unsafe {
+        libc::strncmp(a as *const libc::c_char, b as *const libc::c_char, n as usize)
+            as u64
+    }
+}
+
+extern "C" fn bionic_strstr(
+    h: u64, n: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(h) || !ptr_ok(n) {
+        return 0;
+    }
+    unsafe { libc::strstr(h as *const libc::c_char, n as *const libc::c_char) as u64 }
+}
+
+extern "C" fn bionic_strchr(
+    s: u64, c: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(s) {
+        return 0;
+    }
+    unsafe { libc::strchr(s as *const libc::c_char, c as i32) as u64 }
+}
+
+extern "C" fn bionic_strcpy(
+    dst: u64, src: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    // src garbage/unsafe -> return dst untouched (no copy, NUL-terminated output
+    // stays harmless); both valid -> real copy.
+    if !ptr_ok(dst) || !ptr_ok(src) {
+        return dst;
+    }
+    unsafe { libc::strcpy(dst as *mut libc::c_char, src as *const libc::c_char) as u64 }
+}
+
+extern "C" fn bionic_strspn(
+    s: u64, accept: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(s) || !ptr_ok(accept) {
+        return 0;
+    }
+    unsafe { libc::strspn(s as *const libc::c_char, accept as *const libc::c_char) as u64 }
+}
+
+extern "C" fn bionic_strcspn(
+    s: u64, reject: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(s) || !ptr_ok(reject) {
+        return 0;
+    }
+    unsafe { libc::strcspn(s as *const libc::c_char, reject as *const libc::c_char) as u64 }
+}
+
+extern "C" fn bionic_memchr(
+    s: u64, c: u64, n: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(s) || n == 0 {
+        return 0;
+    }
+    unsafe { libc::memchr(s as *const libc::c_void, c as i32, n as usize) as u64 }
+}
+
+// fortified __strchr_chk(s,c,slen): guard s like strchr.
+extern "C" fn bionic_strchr_chk(
+    s: u64, c: u64, _slen: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(s) {
+        return 0;
+    }
+    unsafe { libc::strchr(s as *const libc::c_char, c as i32) as u64 }
+}
+
+// fortified __strcpy_chk(dst,src,dstlen): guard src like strcpy.
+extern "C" fn bionic_strcpy_chk(
+    dst: u64, src: u64, _dstlen: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(dst) || !ptr_ok(src) {
+        return dst;
+    }
+    unsafe { libc::strcpy(dst as *mut libc::c_char, src as *const libc::c_char) as u64 }
+}
+
 // ---- bionic `__errno` (returns `int*`, the *address* of the host errno) ----
 extern "C" fn bionic_errno(
     _a0: u64,
@@ -1199,6 +1316,22 @@ pub fn register_shims() -> usize {
         // pointer from an unseeded map field returns length 0 instead of SIGSEGV'ing in
         // raw glibc strlen.
         (b"strlen\0", bionic_strlen),
+        // SH97-harden: the deep do-init walk hands unseeded map-field pointers to
+        // string ops (garbage class 0xffffff80ffffffc8 / 0 / sub-image tag), and raw
+        // glibc strcmp/strncmp/strstr/strchr/memchr/strcpy/strspn/strcspn deref them
+        // -> SIGSEGV. route through ptr_ok-guarded shims (register_named takes
+        // precedence over the generic dlsym binding; valid pointers pass through to
+        // the real glibc call unchanged).
+        (b"strcmp\0", bionic_strcmp),
+        (b"strncmp\0", bionic_strncmp),
+        (b"strstr\0", bionic_strstr),
+        (b"strchr\0", bionic_strchr),
+        (b"__strchr_chk\0", bionic_strchr_chk),
+        (b"strcpy\0", bionic_strcpy),
+        (b"__strcpy_chk\0", bionic_strcpy_chk),
+        (b"strspn\0", bionic_strspn),
+        (b"strcspn\0", bionic_strcspn),
+        (b"memchr\0", bionic_memchr),
         (b"__strncpy_chk2\0", bionic_strncpy_chk2),
         (b"__android_log_print\0", bionic_android_log),
         // SH98: marshal stat/fstat/lstat into the bionic-aarch64 struct stat
@@ -1330,6 +1463,61 @@ mod tests {
     #[test]
     fn bionic_errno_returns_valid_pointer() {
         assert!(crate::shims::bionic_errno(0, 0, 0, 0, 0, 0, 0, 0) != 0);
+    }
+
+    /// SH97-harden: the guarded string-op shims must NOT deref a garbage pointer
+    /// class (0xffffff80ffffffc8 sign-extended tag, 0, or sub-image small-int —
+    /// the exact class the deep gameGlobalInit/do-init walk hands to libc string
+    /// fns from unseeded map fields) — returning a deterministic non-faulting
+    /// default instead of SIGSEGV'ing in raw glibc. Valid canonical pointers must
+    /// still pass through to the real glibc call.
+    #[test]
+    fn sh97_harden_guarded_string_ops_reject_garbage_no_segfault() {
+        let g: u64 = 0xffffff80ffffffc8; // the observed crash-class pointer
+        assert!((g >> 48) as u16 == 0xffff);
+        // Each shim, fed the garbage class, must return a determinable default
+        // (0 / dst) without touching memory.
+        assert_eq!(crate::shims::bionic_strcmp(g, g, 0, 0, 0, 0, 0, 0), 0);
+        assert_eq!(crate::shims::bionic_strncmp(g, g, 4, 0, 0, 0, 0, 0), 0);
+        assert_eq!(crate::shims::bionic_strstr(g, g, 0, 0, 0, 0, 0, 0), 0);
+        assert_eq!(crate::shims::bionic_strchr(g, 0u64, 0, 0, 0, 0, 0, 0), 0);
+        assert_eq!(crate::shims::bionic_strchr_chk(g, 0u64, 0, 0, 0, 0, 0, 0), 0);
+        assert_eq!(crate::shims::bionic_strspn(g, g, 0, 0, 0, 0, 0, 0), 0);
+        assert_eq!(crate::shims::bionic_strcspn(g, g, 0, 0, 0, 0, 0, 0), 0);
+        assert_eq!(crate::shims::bionic_memchr(g, 0u64, 4, 0, 0, 0, 0, 0), 0);
+        // strcpy with garbage src returns dst untouched (no copy, NUL-harmless).
+        let dst = [0x41u8; 8];
+        let dptr = dst.as_ptr() as u64;
+        assert_eq!(crate::shims::bionic_strcpy(dptr, g, 0, 0, 0, 0, 0, 0), dptr);
+        assert_eq!(crate::shims::bionic_strcpy_chk(dptr, g, 8, 0, 0, 0, 0, 0), dptr);
+        // Sub-image small-int argument class is also rejected (no deref).
+        assert_eq!(crate::shims::bionic_strcmp(0x1800064, 0x1800064, 0, 0, 0, 0, 0, 0), 0);
+
+        // Valid canonical strings still reach real glibc and behave normally.
+        let a = std::ffi::CString::new("hello").unwrap();
+        let b = std::ffi::CString::new("hello").unwrap();
+        let c = std::ffi::CString::new("world").unwrap();
+        let ha = a.as_ptr() as u64;
+        let hb = b.as_ptr() as u64;
+        let hc = c.as_ptr() as u64;
+        assert!(ha >= 0x100000000 && (ha >> 48) as u16 != 0xffff);
+        assert_eq!(crate::shims::bionic_strcmp(ha, hb, 0, 0, 0, 0, 0, 0), 0, "equal");
+        assert_ne!(crate::shims::bionic_strcmp(ha, hc, 0, 0, 0, 0, 0, 0), 0, "differ");
+        assert_eq!(crate::shims::bionic_strncmp(ha, hb, 5, 0, 0, 0, 0, 0), 0);
+        // strstr finds the needle in a real haystack.
+        let hay = std::ffi::CString::new("the-roblox-session").unwrap();
+        let needle = std::ffi::CString::new("roblox").unwrap();
+        let found = crate::shims::bionic_strstr(
+            hay.as_ptr() as u64, needle.as_ptr() as u64, 0, 0, 0, 0, 0, 0,
+        );
+        assert_eq!(found, hay.as_ptr() as u64 + 4, "needle at offset 4");
+        // strspn/strcspn on valid strings behave like the real libc.
+        assert_ne!(crate::shims::bionic_strspn(ha, hb, 0, 0, 0, 0, 0, 0), 0); // "hello" in "hello"
+        // memchr finds the byte.
+        assert_eq!(
+            crate::shims::bionic_memchr(ha, b'h' as u64, 5, 0, 0, 0, 0, 0),
+            ha
+        );
     }
 
     /// Asset shims serialize the process-wide open-asset table, so they are
