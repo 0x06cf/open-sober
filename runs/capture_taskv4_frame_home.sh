@@ -12,6 +12,7 @@ LOG=/home/hermes-worker/runs/sh152-taskframe-home.txt
 rm -f "$LOG"
 timeout 55 env JIT_DRIVE_LIFECYCLE=1 RENDERINIT_WARMUP_MS=1000 \
   RENDER_TASKFRAME_HOME=1 RENDEREMITTER_HOME=1 \
+  TASKFRAME_WINDOW_MS=20000 TASKFRAME_MAX_FRAMES=8 \
   ./target/debug/examples/elfjit ~/.cache/open-sober/robbox/libroblox.so 0x2173ff4 \
   --jni --startapp 0x258b144 \
   --renderinit 0x105b3a280 --renderthunk --renderframe \

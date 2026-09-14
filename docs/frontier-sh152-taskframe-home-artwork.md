@@ -51,3 +51,9 @@ its own sanctioned design.
 
 ## Repro
 `runs/capture_taskv4_frame_home.sh` (log `runs/sh152-taskframe-home.txt`).
+Full 1280x720 RGBA artifact: `runs/sh152-home-frame.png` (1,042,891 B, on disk);
+downscaled sub-1MB in-repo capture `runs/sh152-home-frame-640.png`. Vision
+confirms the real Roblox launcher screen — black backdrop, white RO-BLOX
+wordmark, tilted game-tile collage (FPSBackground.png). The capture is a
+REAL type-4 task-driven frame of real Roblox artwork through the engine's own
+GLES path.
