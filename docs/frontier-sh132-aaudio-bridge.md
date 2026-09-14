@@ -57,6 +57,11 @@ reached.
   HostCall-shape sanity.
 - Fixed a WAV test bug: block-align field is at byte offset 32 (bits-per-sample
   at 34); the original test read the wrong offset.
+- **Empirical symbol-match (Sep 14):** `strings` on the real libroblox.so shows
+  exactly 26 `AAudio*` symbols and a `libaaudio.so` dlopen string, and the
+  bridge's `AAUDIO_SYMBOLS` table is a byte-exact set-match against those 26
+  symbols (no missing, no extra). The latent capability is founded on the real
+  binary's actual ABI, not an assumption.
 
 ## Next (audio direction)
 - When the session advances and FMOD's AAudio output device is actually opened,
