@@ -8481,7 +8481,7 @@ fn main() {
                                         // SH145: diffuse lighting. vN is the world-space normal (varying
                                         // from the VS's mat3(uModelRot)*aNormal); a fixed world-space
                                         // light dir. color = tex * (ambient + diffuse*dot(N,L)).
-                                        b"precision mediump float;\nuniform sampler2D uTex;\nvarying vec2 vUV;\nvarying vec3 vN;\nvoid main(){ vec3 L = normalize(vec3(0.4, 0.7, 0.6)); vec3 n = normalize(vN); float d = max(dot(n, L), 0.0); vec4 t = texture2D(uTex, vUV); gl_FragColor = vec4(t.rgb * (0.55 + 0.45*d) + vec3(0.03), 1.0); }\n\0"
+                                        b"precision highp float;\nuniform sampler2D uTex;\nvarying vec2 vUV;\nvarying vec3 vN;\nvoid main(){ vec3 L = normalize(vec3(0.4, 0.7, 0.6)); vec3 n = normalize(vN); float d = max(dot(n, L), 0.0); vec3 V = vec3(0.0, 0.0, 1.0); vec3 H = normalize(L + V); float spec = pow(max(dot(n, H), 0.0), 32.0); vec4 t = texture2D(uTex, vUV); gl_FragColor = vec4(t.rgb * (0.45 + 0.45*d) + vec3(0.90*spec) + vec3(0.03), 1.0); }\n\0"
                                     } else if mesh_tex.is_some() {
                                         // Sample the full atlas: uv = frag/screen. The studs atlas is
                                         // 128x2048 (128 wide, 2048 rows), so map x to the atlas width and
