@@ -250,14 +250,14 @@ extern "C" fn bionic_android_log(
     _a6: u64,
     _a7: u64,
 ) -> u64 {
-    let t = if tag != 0 {
+    let t = if ptr_ok(tag) {
         unsafe { std::ffi::CStr::from_ptr(tag as *const std::ffi::c_char) }
             .to_string_lossy()
             .into_owned()
     } else {
         String::new()
     };
-    let m = if fmt != 0 {
+    let m = if ptr_ok(fmt) {
         unsafe { std::ffi::CStr::from_ptr(fmt as *const std::ffi::c_char) }
             .to_string_lossy()
             .into_owned()
@@ -266,6 +266,54 @@ extern "C" fn bionic_android_log(
     };
     eprintln!("[roblox:{t}] {m}");
     1
+}
+
+// SH136-harden: guarded __memcpy_chk (length-bounded copy, the SH135 mem class).
+// unsafe dst/src ptr or n==0 -> 0 (nothing copied); both valid -> real copy. The
+// deep do-init walk can hand an unseeded map pointer here like it does to memcmp.
+extern "C" fn bionic_memcpy_chk(
+    dst: u64, src: u64, n: u64, _dstlen: u64,
+    _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(dst) || !ptr_ok(src) || n == 0 {
+        return dst;
+    }
+    unsafe { libc::memcpy(dst as *mut libc::c_void, src as *const libc::c_void, n as usize) as u64 }
+}
+
+// guarded __strncpy_chk (bounded strncpy, mirror bionic_strncpy_chk2's guard).
+extern "C" fn bionic_strncpy_chk(
+    dst: u64, src: u64, n: u64, _dstlen: u64,
+    _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(dst) || !ptr_ok(src) {
+        return dst;
+    }
+    unsafe { libc::strncpy(dst as *mut libc::c_char, src as *const libc::c_char, n as usize) as u64 }
+}
+
+// SH136-harden: RAW `memcpy` (not just __memcpy_chk) — the GameActivity init calls
+// memcpy@plt (file 0x2b9e084) with a source from an unseeded state slot; a garbage
+// src ptr SIGSEGVs raw glibc memcpy. Guard: unsafe ptr or n==0 -> dst (no copy).
+extern "C" fn bionic_memcpy(
+    dst: u64, src: u64, n: u64,
+    _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(dst) || !ptr_ok(src) || n == 0 {
+        return dst;
+    }
+    unsafe { libc::memcpy(dst as *mut libc::c_void, src as *const libc::c_void, n as usize) as u64 }
+}
+
+// guarded memset — unsafe dst or n==0 -> dst (no write).
+extern "C" fn bionic_memset(
+    dst: u64, c: u64, n: u64,
+    _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    if !ptr_ok(dst) || n == 0 {
+        return dst;
+    }
+    unsafe { libc::memset(dst as *mut libc::c_void, c as i32, n as usize) as u64 }
 }
 
 // ---- Android AssetManager/AAsset shims (real, image-backed) ----
@@ -1448,6 +1496,16 @@ pub fn register_shims() -> usize {
         (b"strcasecmp\0", bionic_strcasecmp),
         (b"strncasecmp\0", bionic_strncasecmp),
         (b"__strncpy_chk2\0", bionic_strncpy_chk2),
+        // SH136-harden: __memcpy_chk (169 sites) is the length-bounded copy the
+        // do-init mem walk can hand an unseeded pointer (SH135 mem class);
+        // __strncpy_chk is the sibling of the already-guarded __strncpy_chk2.
+        (b"__memcpy_chk\0", bionic_memcpy_chk),
+        (b"__strncpy_chk\0", bionic_strncpy_chk),
+        // SH136-harden: RAW memcpy/memset/memmove (not just the _chk variants) —
+        // the GameActivity init calls memcpy@plt (file 0x2b9e084) from an unseeded
+        // state slot; garbage src SIGSEGVs glibc. Valid ptrs pass through unchanged.
+        (b"memcpy\0", bionic_memcpy),
+        (b"memset\0", bionic_memset),
         (b"__android_log_print\0", bionic_android_log),
         // SH98: marshal stat/fstat/lstat into the bionic-aarch64 struct stat
         // (128 B). Raw glibc's x86-64 struct is 144 B and overruns stack-local
@@ -1610,6 +1668,13 @@ mod tests {
         assert_eq!(crate::shims::bionic_strcspn(g, g, 0, 0, 0, 0, 0, 0), 0);
         assert_eq!(crate::shims::bionic_memchr(g, 0u64, 4, 0, 0, 0, 0, 0), 0);
         assert_eq!(crate::shims::bionic_memcmp(g, g, 4, 0, 0, 0, 0, 0), 0, "memcmp garbage");
+        assert_eq!(crate::shims::bionic_memcpy_chk(g, g, 4, 0, 0, 0, 0, 0), g, "memcpy_chk garbage returns dst");
+        assert_eq!(crate::shims::bionic_strncpy_chk(g, g, 4, 0, 0, 0, 0, 0), g, "strncpy_chk garbage returns dst");
+        assert_eq!(crate::shims::bionic_memcpy(g, g, 4, 0, 0, 0, 0, 0), g, "raw memcpy garbage returns dst");
+        assert_eq!(crate::shims::bionic_memset(g, 0, 4, 0, 0, 0, 0, 0), g, "raw memset garbage returns dst");
+        assert_eq!(crate::shims::bionic_memcpy(0x1800064, 0x1800064, 4, 0, 0, 0, 0, 0), 0x1800064, "raw memcpy sub-image");
+        // __android_log_print with a garbage tag/fmt renders empty (no CStr::from_ptr fault).
+        assert_eq!(crate::shims::bionic_android_log(0, g, g, 0, 0, 0, 0, 0), 1, "log garbage no fault");
         assert_eq!(crate::shims::bionic_strcasecmp(g, g, 0, 0, 0, 0, 0, 0), 0);
         assert_eq!(crate::shims::bionic_strncasecmp(g, g, 4, 0, 0, 0, 0, 0), 0);
         assert_eq!(crate::shims::bionic_memcmp(0x1800064, 0x1800064, 4, 0, 0, 0, 0, 0), 0, "sub-image");
