@@ -4951,6 +4951,7 @@ struct TaskFrameMesh {
     tex: u32,
     n_elems: u32,
     renderer: u64, // leaked coherent geometry-ctx (guest-addressable)
+    mvp: [f32; 16], // cached perspective MVP (built once, no per-frame file read)
 }
 
 fn taskframe_mesh() -> Option<&'static TaskFrameMesh> {
@@ -5064,7 +5065,7 @@ fn taskframe_mesh() -> Option<&'static TaskFrameMesh> {
         eprintln!(
             "[elfjit:taskframe-mesh] built cached mesh program prog={prog:#x} vbo={vbo} ebo={ebo} tex={tex} ({dw}x{dh} studs) elems={n_elems} renderer={base:#x} mvp_loc={mvp_loc} modelrot={modelrot_loc} tex_loc={tex_loc}"
         );
-        Some(TaskFrameMesh { program: prog, mvp_loc, modelrot_loc, tex_loc, vbo, ebo, tex, n_elems, renderer: base })
+        Some(TaskFrameMesh { program: prog, mvp_loc, modelrot_loc, tex_loc, vbo, ebo, tex, n_elems, renderer: base, mvp })
     })
     .as_ref()
 }
@@ -5111,13 +5112,7 @@ fn render_engine_emitter_mesh(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) -> u6
     up(m.program);
     // identity model-rot (yaw orbits per frame would go here); tex unit 0.
     let ident: [f32; 16] = [1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0, 0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0];
-    let mut mvp = [0f32; 16];
-    // regenerate the MVP from the cached? we did not store it; rebuild cheaply.
-    if let Some(_mesh) = std::fs::read("/home/hermes-worker/.cache/open-sober/android-env/assets/content/models/MaterialManager/smooth_sphere.mesh")
-        .ok().and_then(|d| parse_roblox_mesh_v2(&d))
-    {
-        let _ = mesh_interleave_model_uv(&_mesh, 60.0f32.to_radians(), 1280.0 / 720.0, 0.0, &mut mvp);
-    }
+    let mvp = m.mvp; // cached perspective MVP (no per-frame mesh file re-read)
     um4(m.mvp_loc, 1, 0, mvp.as_ptr());
     um4(m.modelrot_loc, 1, 0, ident.as_ptr());
     ui(m.tex_loc, 0);
