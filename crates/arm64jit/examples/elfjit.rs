@@ -1380,6 +1380,22 @@ static ROUTEB_ADAPTER_REC_ADDR: std::sync::OnceLock<u64> = std::sync::OnceLock::
 /// (the null-vtable stub). Seeding src = a host template whose +0 is a leaked
 /// vtable (every slot = `routeb_singleton_leaf`) makes every objA/objB accessor
 /// result a real polymorphic object whose virtuals are benign leaves.
+///
+/// SH114 (deleg_83e74525, disasm-verified): the three V2Init/V2Start/V1AppStart/
+/// SendAppEventOnAppReady soft-return sites are lazy-singleton virtual dispatches
+/// `ldr x8,[x8,#N]; blr x8` (site A file 0x62517c4 [+0xf8], A2 0x6251aa8
+/// [+0x108], B 0x6260948 [+0x548]). The 0x60 vtable (SH110/111 baseline, locked
+/// by sh111_singleton_vtable_stays_0x60_baseline) is too short, so each index
+/// reads past into host bytes and `blr x8` jumps outside image -> benign
+/// soft-return (the enclosing fn body never completes). Widening to 0x580
+/// regresses nativeInit (returned a0 deref'd x0+0x28). A differential SCOPED
+/// patch of the blr->mov x0,xzr was TRIED this cycle and EMPIRICALLY REJECTED:
+/// returning 0 makes the POST-blr caller deref [out]+0x28 -> NULL+0x28 SIGSEGV
+/// in nativeInitializeNativeFlags (fault=0x28) — the same crash class as the
+/// vtable widening. Root cause per SH111: the virtual's return IS deref'd by
+/// SOME caller (nativeInit), so a scoped leaf must return a STABLE zeroed guest
+/// object (routeb_singleton_obj_leaf), NOT 0/xzr — left as the next gate. The
+/// baseline 0x60 soft-return remains benign (ladder completes EXIT 0).
 fn routeb_seed_task_singletons() {
     if ROUTEB_SINGLETON_SEEDED.load(core::sync::atomic::Ordering::Relaxed) {
         return;
@@ -4878,6 +4894,53 @@ fn main() {
                         "[elfjit:v2boot] surface-handoff: wired_xid=0x{win:x} [0x10683d348]=0x{stored:x} MH_FLAGS_LOADED={nf} MH_APP_READY={ar}"
                     );
                     dump("V2UpdateSurfaceAppWithPlatformParams");
+                }
+                // SH114 (deleg_0d4e5597, disasm): the NativeHelper milestones
+                // (MH_* atoms) are SET-ONLY — nothing in guest memory polls them,
+                // so StartLuaAppDM's session never advances and no in-image
+                // GuiObject->scene-list writer runs. The missing Java->engine
+                // response is nativeAppBridgeV2SendAppEventOnAppReady
+                // (0x102bb463c): it parses the first 4 bytes of the event-name
+                // jstring (x2) against magics ("Home" LE 0x656d6f48 -> w19=4),
+                // builds a 0x50 app-event struct, dispatches it through the
+                // shared app-bridge pipe 0x102baeeec into the
+                // LuaAppExperienceController -> NativeHelper/AppShell -> DataModel
+                // path that constructs the shell UI. Driving it as a SEQUENTIAL
+                // ladder rung (same thread, after surface-handoff) fixtures the
+                // milestone contract without the SH44/49 block-cache SIGSEGV of a
+                // shim-internal nested jit_run. Event-name ABI (6-arg JNI):
+                // x0=env x1=thiz x2=event jstring, x3/x4/x5=extra jstrings (must
+                // be readable non-null for GetStringUTFChars).
+                if std::env::args().any(|a| a == "--v2boot-send-appevent") {
+                    let ev = arm64jit::jni::new_string_utf_handle(b"Home");
+                    let n3 = arm64jit::jni::new_string_utf_handle(b"");
+                    let n4 = arm64jit::jni::new_string_utf_handle(b"");
+                    let n5 = arm64jit::jni::new_string_utf_handle(b"");
+                    eprintln!(
+                        "[elfjit:v2boot] driving SendAppEventOnAppReady @ guest 0x102bb463c (event=\"Home\" jstr={ev:#x})"
+                    );
+                    let mut se = arm64jit::jit::CpuState::new();
+                    se.tpidr = tpidr;
+                    se.x[31] = boot_sp;
+                    se.x[0] = env_ptr;
+                    se.x[1] = thiz;
+                    se.x[2] = ev;
+                    se.x[3] = n3;
+                    se.x[4] = n4;
+                    se.x[5] = n5;
+                    match arm64jit::jit::jit_run(iimg, ib, 0x102bb463c, &mut se as *mut CpuState) {
+                        Err(e) => eprintln!("[elfjit:v2boot] SendAppEventOnAppReady stopped: {e}"),
+                        Ok(r) => eprintln!(
+                            "[elfjit:v2boot] SendAppEventOnAppReady returned Ok({r:#x}) w19-event={:#x}",
+                            se.x[19]
+                        ),
+                    }
+                    let nf2 = arm64jit::jni::nativehelper_flags_loaded();
+                    let ar2 = arm64jit::jni::nativehelper_app_ready();
+                    eprintln!(
+                        "[elfjit:v2boot] app-event post: MH_FLAGS_LOADED={nf2} MH_APP_READY={ar2}"
+                    );
+                    dump("SendAppEventOnAppReady");
                 }
                 eprintln!("[elfjit:v2boot] ladder done; final [0x106829ea8] = {:#x}", dw(BSS_TASKV4));
             });

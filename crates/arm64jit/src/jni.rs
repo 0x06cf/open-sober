@@ -637,6 +637,21 @@ fn auto_value_string_getter(name: &[u8]) -> Option<&'static [u8]> {
         // its actual UI/texture/font files by direct FS open, not just via the
         // AAssetManager.
         b"getAssetFolderPath" => assets_root_cstr(),
+        // SH114 (deleg_f84d9f90, disasm): the REAL client never hardcodes its
+        // data dir — it obtains it via Java Context.getFilesDir()/getCacheDir()/
+        // getDatabasePath() (method-name rodata 0x244d48) and stores it via
+        // nativeSetFilesDirectory into the global std::string at guest 0x1026d600.
+        // Previously these returned 0, so the engine never built a base path and
+        // its OWN SQLite datastore (rbx-storage.db / settings.dat) never opened
+        // under the fsmap root — no real persistence reached the store. Returning
+        // the guest-absolute dir strings lets the engine's own .db opens route
+        // through fsmap onto persistent host disk (a real remembered session, not
+        // the harness-side --persist-roundtrip self-test).
+        b"getFilesDir" => Some(b"/data/user/0/com.roblox.client/files"),
+        b"getCacheDir" => Some(b"/data/user/0/com.roblox.client/cache"),
+        b"getFilesDirectory" => Some(b"/data/user/0/com.roblox.client/files"),
+        b"getCacheDirectory" => Some(b"/data/user/0/com.roblox.client/cache"),
+        b"getDatabasePath" => Some(b"/data/user/0/com.roblox.client/databases"),
         _ => None,
     }
 }
@@ -1740,6 +1755,50 @@ mod tests {
             let midx = get_name_id(b"someOtherMethod");
             let (g_om2, _) = host_call_at(get(CALL_OBJECT_METHOD)).expect("CallObjectMethod thunk");
             assert_eq!(g_om2(env, 0x4321, midx, 0, 0, 0, 0, 0), 0, "unrecognized getter falls back to NULL/0");
+        }
+    }
+
+    /// SH114 (deleg_f84d9f90, disasm: Context dir getters rodata 0x244d48 ->
+    /// nativeSetFilesDirectory global 0x1026d600): the REAL client obtains its
+    /// base data dir via getFilesDir()/getCacheDir()/getDatabasePath() JNI
+    /// getters. These previously returned 0, so the engine never built a path
+    /// and its OWN SQLite datastore (rbx-storage.db) never opened under the
+    /// fsmap root — no real persistence reached the store (objective 2b). Now
+    /// they resolve to guest-absolute dir jstrings (readable, correct length)
+    /// through the official table so the engine's own .db opens land on
+    /// persistent host disk.
+    #[test]
+    fn sh114_context_data_dir_getters_resolve_via_fn_table() {
+        let (env, _vm) = build_jni();
+        let functions = unsafe { *(env as *const u64) };
+        let get = |i: usize| -> u64 { unsafe { *(functions as *const u64).add(i) } };
+        let get_name_id = |name: &[u8]| -> u64 {
+            let layout = Layout::array::<u8>(name.len() + 1).unwrap();
+            let name_buf = unsafe { alloc_zeroed(layout) };
+            unsafe { std::ptr::copy_nonoverlapping(name.as_ptr(), name_buf, name.len()) };
+            let (f, _) = host_call_at(get(GET_METHOD_ID)).expect("GetMethodID thunk");
+            f(env, 0, name_buf as u64, 0, 0, 0, 0, 0)
+        };
+        let (g_om, _) = host_call_at(get(CALL_OBJECT_METHOD)).expect("CallObjectMethod thunk");
+        let (g_sl, _) = host_call_at(get(GET_STRING_UTF_LEN)).expect("GetStringUTFLength thunk");
+        for (name, expect_len) in [
+            (&b"getFilesDir"[..], "/data/user/0/com.roblox.client/files".len()),
+            (&b"getCacheDir"[..], "/data/user/0/com.roblox.client/cache".len()),
+            (&b"getFilesDirectory"[..], "/data/user/0/com.roblox.client/files".len()),
+            (&b"getCacheDirectory"[..], "/data/user/0/com.roblox.client/cache".len()),
+            (&b"getDatabasePath"[..], "/data/user/0/com.roblox.client/databases".len()),
+        ] {
+            let mid = get_name_id(name);
+            assert_ne!(mid, 0, "GetMethodID({}) non-null", String::from_utf8_lossy(name));
+            let h = g_om(env, 0x4321, mid, 0, 0, 0, 0, 0);
+            assert_ne!(h, 0, "CallObjectMethod({}) returns a readable jstring", String::from_utf8_lossy(name));
+            let len = g_sl(env, h, 0, 0, 0, 0, 0, 0);
+            assert_eq!(
+                len as usize,
+                expect_len,
+                "{} jstring length matches the guest-absolute dir path",
+                String::from_utf8_lossy(name)
+            );
         }
     }
 
