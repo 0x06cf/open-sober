@@ -1492,6 +1492,43 @@ fn routeb_patch_gov_dispatch() {
     arm64jit::jit::block_cache_drop_region(0x102e9fb40, 0x102e9fb90);
 }
 
+/// SH160 (recon deleg_3302c320): after the governor's MODERN/startAppWithParams path
+/// completes, fn 0x23f00f8 (guest 0x1023f00f8, reached from gov 0x2e9fbd8 with x1=x19=
+/// [arg0+32]=appData) calls nativePostClientSettingsLoadedInitialization3's dispatch
+/// gate 0x2256510 with x0=[x1+40]=appData[+0x28]==NULL under partial init -> `ldr
+/// x9,[x0]` faults (read 0). 0x2256510 post-processes the result (0x222a9fc map lookup
+/// + destroy path), so a benign leaf is impractical. The+0x28 'init3 provider' is a
+/// live-app-launch heap object (structural). Cleanest: NOP the two call sites so the
+/// gate never runs — the out-buffer [x8] gets zeroed (stp xzr,xzr) so downstream
+/// csel/cbz skip the params copies (benign no-op). site1 x8=sp+0x20, site2 x8=sp+0x8.
+fn routeb_patch_startapp_init3_gates() {
+    // (call_site, orig_bl_bytes) both `bl 0x2256510`
+    let sites: [(u64, u32); 2] = [
+        (0x1023f013c, 0x97f9_98f5), // bl 0x2256510 (site1)
+        (0x1023f01b0, 0x97f9_98d8), // bl 0x2256510 (site2)
+    ];
+    for (addr, orig) in sites {
+        let page = addr & !0xfff;
+        unsafe {
+            if libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_WRITE) != 0 {
+                eprintln!("[elfjit:routeB] WARN SH160 mprotect RW failed @0x{addr:x} errno={}", std::io::Error::last_os_error());
+                continue;
+            }
+            let before = *(addr as *const u32);
+            if before == orig {
+                *(addr as *mut u32) = 0xa900_7d1f; // stp xzr,xzr,[x8]
+                eprintln!("[elfjit:routeB] SH160 patched init3 dispatch-gate call @0x{addr:x} ({before:08x}) -> stp xzr,xzr,[x8] (zero out-buffer; gate never runs, benign no-op)");
+            } else if before == 0xa900_7d1f {
+                eprintln!("[elfjit:routeB] SH160 init3 gate @0x{addr:x} already patched");
+            } else {
+                eprintln!("[elfjit:routeB] WARN SH160 init3 gate @0x{addr:x} unexpected {before:08x}, not patched");
+            }
+            libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_EXEC);
+        }
+    }
+    arm64jit::jit::block_cache_drop_region(0x1023f00f0, 0x1023f01c0);
+}
+
 /// SH159e (recon deleg_9ea3f752): nativeAppBridgeV2StartAppWithParams (0x24258c6e4)
 /// reads the param union: x22=[x0+8]=capacity, count=[x19+24], float=[x19+32].
 /// The governor passes x0=sp+0x198 whose union we never initialized (we skip the
@@ -6567,6 +6604,11 @@ fn main() {
                                     // SH159e: make startAppWithParams' param inputs
                                     // deterministic (skipped appendix didn't fill union).
                                     routeb_patch_startapp_params();
+                                    // SH160: NOP the two nativePostClientSettings
+                                    // LoadedInitialization3 dispatch-gate calls (the
+                                    // appData[+0x28] 'init3 provider' is a structural
+                                    // live-heap object); zero the out-buffer instead.
+                                    routeb_patch_startapp_init3_gates();
                                     // SH159b (recon deleg_0eff24ca): the governor
                                     // (0x102e9fa84) reads x19=[x0+0x20] at 0x2e9fac0
                                     // (x0=wrapper @ [0x106a705e8]... actually GetOrCreate
