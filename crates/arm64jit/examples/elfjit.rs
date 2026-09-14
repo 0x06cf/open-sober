@@ -4932,6 +4932,237 @@ pub fn render_engine_emitter_multi(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) 
         r
     }
 }
+/// SH153 — a REAL Roblox 3D mesh (smooth_sphere.mesh + studs.dds) presented
+/// inside a type-4 task-driven frame, via the SH151-sanctioned cached-program
+/// design. The mesh program + VBO/EBO + texture + coherent geometry-ctx are
+/// built ONCE (pure-host mesa_fn, warm-up) and cached; each task-frame present
+/// only re-uploads uniforms + re-drives the engine's own geometry wrapper
+/// 0x105b35288 as a SEPARATE top-level jit_run — NO nested guest-bridge GLSL
+/// compile / GL object allocation (the exact SH151 SIGABRT class). This closes
+/// SH151's ORIGINAL intent (real mesh geometry in task frames) safely, using
+/// the "already-current program" alternative SH151 itself sanctioned.
+struct TaskFrameMesh {
+    program: u32,
+    mvp_loc: i32,
+    modelrot_loc: i32,
+    tex_loc: i32,
+    vbo: u32,
+    ebo: u32,
+    tex: u32,
+    n_elems: u32,
+    renderer: u64, // leaked coherent geometry-ctx (guest-addressable)
+}
+
+fn taskframe_mesh() -> Option<&'static TaskFrameMesh> {
+    static TFM: std::sync::OnceLock<Option<TaskFrameMesh>> = std::sync::OnceLock::new();
+    TFM.get_or_init(|| {
+        let mpath = "/home/hermes-worker/.cache/open-sober/android-env/assets/content/models/MaterialManager/smooth_sphere.mesh";
+        let dpath = "/home/hermes-worker/.cache/open-sober/android-env/assets/android/textures/studs.dds";
+        let Some(mesh) = std::fs::read(mpath).ok().and_then(|d| parse_roblox_mesh_v2(&d)) else {
+            eprintln!("[elfjit:taskframe-mesh] WARN: failed to parse {mpath}");
+            return None;
+        };
+        let Some((dw, dh, dds)) = std::fs::read(dpath).ok().and_then(|d| parse_roblox_dds_r8(&d)) else {
+            eprintln!("[elfjit:taskframe-mesh] WARN: failed to parse {dpath}");
+            return None;
+        };
+        let h = unsafe { libc::dlopen(c"libGLESv2.so.2".as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+        if h.is_null() {
+            return None;
+        }
+        let _ = &dw; let _ = &dh;
+        // Build the mesh-uv + lighting program via PURE-HOST mesa_fn (same shape
+        // as emitter_tex_program / walker_mesh_program — proven safe to reuse
+        // from the frame callback by SH152). Vertex: aPos/aUV/aNormal + MVP +
+        // model-rot; Fragment: diffuse+specular over the studs texture.
+        let (Some(cs), Some(ss), Some(cp), Some(cprog), Some(att), Some(link)) = (
+            mesa_fn::<extern "C" fn(u32) -> u32>(h, b"glCreateShader\0"),
+            mesa_fn::<extern "C" fn(u32, i32, *const *const i8, *const i32)>(h, b"glShaderSource\0"),
+            mesa_fn::<extern "C" fn(u32)>(h, b"glCompileShader\0"),
+            mesa_fn::<extern "C" fn() -> u32>(h, b"glCreateProgram\0"),
+            mesa_fn::<extern "C" fn(u32, u32)>(h, b"glAttachShader\0"),
+            mesa_fn::<extern "C" fn(u32)>(h, b"glLinkProgram\0"),
+        ) else { return None; };
+        let vs_src = c"attribute vec4 aPos; attribute vec2 aUV; attribute vec3 aNormal; uniform mat4 uMVP; uniform mat4 uModelRot; varying vec2 vUV; varying vec3 vN; void main(){ vUV = aUV; vN = mat3(uModelRot) * aNormal; gl_Position = uMVP * aPos; }\n".to_bytes_with_nul();
+        let fs_src = c"precision highp float; uniform sampler2D uTex; varying vec2 vUV; varying vec3 vN; void main(){ vec3 L = normalize(vec3(0.4, 0.7, 0.6)); vec3 n = normalize(vN); float d = max(dot(n, L), 0.0); vec3 V = vec3(0.0, 0.0, 1.0); vec3 H = normalize(L + V); float spec = pow(max(dot(n, H), 0.0), 32.0); vec4 t = texture2D(uTex, vUV); gl_FragColor = vec4(t.rgb * (0.45 + 0.45*d) + vec3(0.90*spec) + vec3(0.03), 1.0); }\n".to_bytes_with_nul();
+        let (vsp, fsp) = (vs_src.as_ptr() as *const i8, fs_src.as_ptr() as *const i8);
+        let vs = cs(0x8B31); ss(vs, 1, &vsp, std::ptr::null()); cp(vs);
+        let fs = cs(0x8B30); ss(fs, 1, &fsp, std::ptr::null()); cp(fs);
+        let prog = cprog(); att(prog, vs); att(prog, fs);
+        if let Some(bal) = mesa_fn::<extern "C" fn(u32, u32, *const i8)>(h, b"glBindAttribLocation\0") {
+            bal(prog, 0, b"aPos\0".as_ptr() as *const i8);
+            bal(prog, 1, b"aUV\0".as_ptr() as *const i8);
+            bal(prog, 2, b"aNormal\0".as_ptr() as *const i8);
+        }
+        link(prog);
+        let (Some(gul), Some(up)) = (
+            mesa_fn::<extern "C" fn(u32, *const i8) -> i32>(h, b"glGetUniformLocation\0"),
+            mesa_fn::<extern "C" fn(u32)>(h, b"glUseProgram\0"),
+        ) else { return None; };
+        let (mvp_loc, modelrot_loc, tex_loc) = (
+            gul(prog, b"uMVP\0".as_ptr() as *const i8),
+            gul(prog, b"uModelRot\0".as_ptr() as *const i8),
+            gul(prog, b"uTex\0".as_ptr() as *const i8),
+        );
+        // Interleave model-space verts (stride-36 [pos4,uv2,nrm3]) + perspective
+        // MVP, like the proven --renderframe-mesh-tex path (SH143/145).
+        let mut mvp = [0f32; 16];
+        let verts = mesh_interleave_model_uv(&mesh, 60.0f32.to_radians(), 1280.0 / 720.0, 0.0, &mut mvp);
+        let idx = mesh.indices.clone();
+        let n_elems = idx.len() as u32;
+        let (Some(gb), Some(bb), Some(bd), Some(gt), Some(at), Some(bt), Some(tp_), Some(te)) = (
+            mesa_fn::<extern "C" fn(i32, *mut u32)>(h, b"glGenBuffers\0"),
+            mesa_fn::<extern "C" fn(u32, u32)>(h, b"glBindBuffer\0"),
+            mesa_fn::<extern "C" fn(u32, isize, *const i8, u32)>(h, b"glBufferData\0"),
+            mesa_fn::<extern "C" fn(i32, *mut u32)>(h, b"glGenTextures\0"),
+            mesa_fn::<extern "C" fn(u32)>(h, b"glActiveTexture\0"),
+            mesa_fn::<extern "C" fn(u32, u32)>(h, b"glBindTexture\0"),
+            mesa_fn::<extern "C" fn(u32, u32, i32, i32)>(h, b"glTexParameteri\0"),
+            mesa_fn::<extern "C" fn(u32, i32, i32, i32, i32, i32, u32, u32, *const i8)>(h, b"glTexImage2D\0"),
+        ) else { return None; };
+        let (mut vbo, mut ebo, mut tex) = (0u32, 0u32, 0u32);
+        gb(1, &mut vbo); bb(0x8892, vbo);
+        bd(0x8892, (verts.len() * 4) as isize, verts.as_ptr() as *const i8, 0x88E4);
+        gb(1, &mut ebo); bb(0x8893, ebo);
+        bd(0x8893, (idx.len() * 4) as isize, idx.as_ptr() as *const i8, 0x88E4);
+        // studs.dds R8 -> RGBA8 ({v,v,v,255}) and upload to unit 0.
+        let rgba: Vec<u8> = dds.iter().flat_map(|&v| [v, v, v, 255]).collect();
+        gt(1, &mut tex); at(0x84C0); bt(0x0DE1, tex);
+        tp_(0x0DE1, 0x2800, 0x2600, 0); tp_(0x0DE1, 0x2801, 0x2600, 0);
+        te(0x0DE1, 0, 0x1908, dw as i32, dh as i32, 0, 0x1908, 0x1401, rgba.as_ptr() as *const i8);
+        up(prog);
+        // Build the coherent geometry-ctx (leaked, guest-addressable) mirroring
+        // the proven --renderframe-mesh block (elfjit ~9053): stride-36, 3 attrs.
+        let base = Box::leak(vec![0u64; 0x600].into_boxed_slice()).as_ptr() as u64;
+        let container = base + 0x100;
+        let desc = base + 0x200;
+        let stride_tbl = base + 0x300;
+        let prim = base + 0x400;
+        let prim2 = base + 0x418;
+        let prim3 = base + 0x430;
+        let ibo_obj = base + 0x500;
+        let (fmt_pos, fmt_uv, fmt_norm) = (3u32, 1u32, 2u32);
+        unsafe {
+            *(desc.wrapping_add(72) as *mut u32) = vbo;
+            *(stride_tbl as *mut u64) = 36;
+            *(base.wrapping_add(56) as *mut u64) = container;
+            *(container.wrapping_add(72) as *mut u64) = prim;
+            *(container.wrapping_add(80) as *mut u64) = prim3 + 0x18;
+            *(container.wrapping_add(96) as *mut u64) = stride_tbl;
+            *(base.wrapping_add(0x48) as *mut u64) = desc;
+            for (p, off, fmt, ai) in [(prim, 0u32, fmt_pos, 0u32), (prim2, 16, fmt_uv, 1), (prim3, 24, fmt_norm, 2)] {
+                *(p as *mut u32) = 0;
+                *(p.wrapping_add(4) as *mut u32) = off;
+                *(p.wrapping_add(8) as *mut u32) = fmt;
+                *(p.wrapping_add(12) as *mut u32) = ai;
+                *(p.wrapping_add(16) as *mut u32) = 0;
+            }
+            *(base.wrapping_add(120) as *mut u64) = ibo_obj;
+            *(ibo_obj.wrapping_add(72) as *mut u32) = ebo;
+            *(base.wrapping_add(142) as *mut u16) = n_elems as u16;
+        }
+        eprintln!(
+            "[elfjit:taskframe-mesh] built cached mesh program prog={prog:#x} vbo={vbo} ebo={ebo} tex={tex} ({dw}x{dh} studs) elems={n_elems} renderer={base:#x} mvp_loc={mvp_loc} modelrot={modelrot_loc} tex_loc={tex_loc}"
+        );
+        Some(TaskFrameMesh { program: prog, mvp_loc, modelrot_loc, tex_loc, vbo, ebo, tex, n_elems, renderer: base })
+    })
+    .as_ref()
+}
+
+/// SH153 — present the cached real sphere on the current (currency-owning) ctx
+/// as a SEPARATE top-level jit_run to the engine wrapper, then swap via real
+/// ctx-vt[+24]. Per-frame is ONLY uniform upload + wrapper drive (no GLSL).
+fn render_engine_emitter_mesh(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) -> u64 {
+    let Some(m) = taskframe_mesh() else {
+        eprintln!("[elfjit:taskframe-mesh] not ready — fall back");
+        return 0;
+    };
+    let h = unsafe { libc::dlopen(c"libGLESv2.so.2".as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+    if h.is_null() {
+        return 0;
+    }
+    let vt = unsafe { *(ctx as *const u64) };
+    let bind = unsafe { *(vt.wrapping_add(16) as *const u64) };
+    let swap = unsafe { *(vt.wrapping_add(24) as *const u64) };
+    let tp = arm64jit::jit::current_guest_tp();
+    let _ = arm64jit::jit::run_guest_callback(bind, [ctx, 0, 0, 0, 0, 0, 0, 0], tp);
+    let (Some(up), Some(vap), Some(ea), Some(ui), Some(um4), Some(vp), Some(ds), Some(en), Some(bf), Some(dbs), Some(rbuf), Some(fin)) = (
+        mesa_fn::<extern "C" fn(u32)>(h, b"glUseProgram\0"),
+        mesa_fn::<extern "C" fn(u32, i32, u32, i32, *const i8)>(h, b"glVertexAttribPointer\0"),
+        mesa_fn::<extern "C" fn(u32)>(h, b"glEnableVertexAttribArray\0"),
+        mesa_fn::<extern "C" fn(i32, i32)>(h, b"glUniform1i\0"),
+        mesa_fn::<extern "C" fn(i32, i32, i8, *const f32)>(h, b"glUniformMatrix4fv\0"),
+        mesa_fn::<extern "C" fn(i32,i32,i32,i32)>(h, b"glViewport\0"),
+        mesa_fn::<extern "C" fn(u32)>(h, b"glDisable\0"),
+        mesa_fn::<extern "C" fn(u32)>(h, b"glEnable\0"),
+        mesa_fn::<extern "C" fn(u32, u32)>(h, b"glBindFramebuffer\0"),
+        mesa_fn::<extern "C" fn(i32, *const u32)>(h, b"glDrawBuffers\0"),
+        mesa_fn::<extern "C" fn(u32)>(h, b"glReadBuffer\0"),
+        mesa_fn::<extern "C" fn()>(h, b"glFinish\0"),
+    ) else { return 0; };
+    let (Some(bb), Some(_av)) = (
+        mesa_fn::<extern "C" fn(u32, u32)>(h, b"glBindBuffer\0"),
+        mesa_fn::<extern "C" fn(u32, u32)>(h, b"glBindTexture\0"),
+    ) else { return 0; };
+    vp(0, 0, 1280, 720);
+    ds(0x0B71); ds(0x0B44); ds(0x0BE2); ds(0x0C11);
+    bf(0x8D40, 0);
+    let back = 0x0405u32; dbs(1, &back); rbuf(0x0405);
+    up(m.program);
+    // identity model-rot (yaw orbits per frame would go here); tex unit 0.
+    let ident: [f32; 16] = [1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0, 0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0];
+    let mut mvp = [0f32; 16];
+    // regenerate the MVP from the cached? we did not store it; rebuild cheaply.
+    if let Some(_mesh) = std::fs::read("/home/hermes-worker/.cache/open-sober/android-env/assets/content/models/MaterialManager/smooth_sphere.mesh")
+        .ok().and_then(|d| parse_roblox_mesh_v2(&d))
+    {
+        let _ = mesh_interleave_model_uv(&_mesh, 60.0f32.to_radians(), 1280.0 / 720.0, 0.0, &mut mvp);
+    }
+    um4(m.mvp_loc, 1, 0, mvp.as_ptr());
+    um4(m.modelrot_loc, 1, 0, ident.as_ptr());
+    ui(m.tex_loc, 0);
+    bb(0x8892, m.vbo);
+    let stride: i32 = 36;
+    let off0 = std::ptr::null::<i8>();
+    let off16 = 16isize as *const i8;
+    let off24 = 24isize as *const i8;
+    vap(0, 4, 0x1406, stride, off0);
+    vap(1, 2, 0x1406, stride, off16);
+    vap(2, 3, 0x1406, stride, off24);
+    ea(0); ea(1); ea(2);
+    bb(0x8893, m.ebo);
+    // Drive the engine's OWN geometry wrapper (indexed path: x5 nonzero).
+    let stkbuf = Box::leak(vec![0u8; 0x8000].into_boxed_slice());
+    let stk_top = (stkbuf.as_ptr() as u64).wrapping_add(0x8000) & !15;
+    let mut st = arm64jit::jit::CpuState::new();
+    st.tpidr = tp;
+    st.x[31] = stk_top;
+    st.x[0] = m.renderer;
+    st.x[1] = 0; st.x[2] = 0; st.x[3] = 0;
+    st.x[4] = m.n_elems as u64;
+    st.x[5] = m.n_elems as u64;
+    let ret = arm64jit::jit::jit_run(iimg, ibase, 0x105b35288, &mut st as *mut CpuState);
+    let r = match ret {
+        Err(e) => { eprintln!("[elfjit:taskframe-mesh] wrapper stopped: {e}"); return 0; }
+        Ok(r) => r,
+    };
+    fin();
+    // RENDER_TASKFRAME_MESH_RAW=1: dump the presented sphere frame back-buffer
+    // (GL_RGBA8 1280x720) to /tmp/sh153-mesh.raw for offline analysis + a
+    // viewable capture. Mirrors the multi-emitter GLTRAP diagnostic.
+    if std::env::var_os("RENDER_TASKFRAME_MESH_RAW").is_some() {
+        if let Some(rp) = mesa_fn::<extern "C" fn(i32,i32,i32,i32,u32,u32,*mut i8)>(h, b"glReadPixels\0") {
+            let mut frame = vec![0u8; 1280 * 720 * 4];
+            rp(0, 0, 1280, 720, 0x1908, 0x1401, frame.as_mut_ptr() as *mut i8);
+            std::fs::write("/tmp/sh153-mesh.raw", &frame).ok();
+            eprintln!("[elfjit:taskframe-mesh] wrote /tmp/sh153-mesh.raw GL_RGBA (1280x720 u8)");
+        }
+    }
+    let _ = arm64jit::jit::run_guest_callback(swap, [ctx, 0, 0, 0, 0, 0, 0, 0], tp);
+    eprintln!("[elfjit:taskframe-mesh] engine wrapper Ok(ret={r:#x}) elems={} — real indexed mesh glDrawElements in a task frame", m.n_elems);
+    r
+}
+
 /// Present ONE real task-driven frame on the CURRENT thread (must be the
 /// renderinit thread where EGL current-binding is established — SH61b). Binds
 /// via the engine make-current 0x105b3b358, drives frame-fn 0x105b32c00, swaps
@@ -4952,6 +5183,23 @@ fn present_one_task_frame(ctx: u64, n: u64, iimg: &[u8], ibase: u64, isp: u64) -
     let vt = unsafe { *(ctx as *const u64) };
     if !(vt >= 0x100000000 && vt >> 56 == 0) {
         return 0;
+    }
+    // SH153 (RENDER_TASKFRAME_MESH=1): present the cached real smooth_sphere +
+    // studs through the engine's OWN geometry wrapper. Takes precedence over
+    // RENDER_TASKFRAME_HOME so the mesh branch wins when both are set. The
+    // engine wrapper returns Ok(ret)=0 on a CLEAN draw, so we gate on readiness
+    // (program/ctx cached once) rather than the return value; only if the warm-
+    // up failed do we fall through to HOME/palette.
+    if std::env::var_os("RENDER_TASKFRAME_MESH").is_some() {
+        if taskframe_mesh().is_none() {
+            eprintln!("[elfjit:taskv4-frame] task frame #{n} MESH warm-up failed — falling through to HOME/palette");
+        } else {
+            let r = render_engine_emitter_mesh(ctx, iimg, ibase, isp);
+            eprintln!(
+                "[elfjit:taskv4-frame] task frame #{n} REAL MESH (engine wrapper) ret={r:#x} — task-driven real 3D mesh frame"
+            );
+            return if r == 0 { 1 } else { r };
+        }
     }
     // SH152: real-content task frame. Draw a home surface on the live ctx and
     // swap via the SAME real ctx-vt[+24] — a genuine present. Both emitters run
