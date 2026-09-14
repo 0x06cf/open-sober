@@ -1658,6 +1658,28 @@ fn routeb_patch_nativeinit_flagmap_helper() {
     }
     ROUTEB_FLAGMAP_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
+static ROUTEB_GUARD_UNIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+/// SH118: guest 0x1067d16f0 is BOTH the `__stack_chk_guard` GOT slot (all
+/// 48,831 stack-protected fns read their canary base from it) AND the engine's
+/// render-ctx/singleton global (SH14/SH106 dual-use). SH106 seeded it to a
+/// stable canary VALUE, but StartApp/renderinit RE-PUBLISH it to the live ctx,
+/// so a canary fn whose body re-publishes the slot mid-execution (V2UpdateSurface
+/// does) reads a mutated canary at epilogue vs prologue -> false
+/// `*** stack smashing detected ***` SIGABRT. Fix: seed the slot to the ADDRESS
+/// of a leaked stable u64 (the canary fn caches that pointer at prologue and the
+/// epilogue derefs the cached pointer, so *guard is constant regardless of a
+/// mid-body slot re-publication). Idempotent; must run right before each rung's
+/// jit_run whose body can re-publish the slot.
+fn routeb_reassert_canary_guard() {
+    let unit = *ROUTEB_GUARD_UNIT.get_or_init(|| {
+        let b: &'static mut u64 = Box::leak(Box::new(0x2f_2a_1a_0a_0e_0f_10_11u64));
+        b as *mut u64 as u64
+    });
+    unsafe {
+        *(0x1067d16f0u64 as *mut u64) = unit; // pervasive canary-guard GOT slot (== renderer-ctx alias)
+        *(0x10631aa30u64 as *mut u64) = unit; // JNI_OnLoad guard slot, kept in sync (SH106)
+    }
+}
 /// Apply the SH115 scoped patch to the three singleton-dispatch accessor sites.
 /// (file vaddr -> expected original slot0 word + the two early-return branches
 /// that jump onto the patched store-slot and their file vaddrs)
@@ -5138,6 +5160,12 @@ fn main() {
                     eprintln!(
                         "[elfjit:v2boot] driving V2UpdateSurfaceAppWithPlatformParams @ guest 0x1025f5fec (surface_token={surf_token:#x} params={params:#x})"
                     );
+                    // SH118: the surface-body canary fn re-publishes the dual-use
+                    // guard/ctx GOT slot mid-execution -> false stack-smash. Reassert
+                    // a stable guard pointer right before this rung.
+                    if std::env::var("JIT_SH115_SINGLETON_PATCH").ok().as_deref() == Some("1") {
+                        routeb_reassert_canary_guard();
+                    }
                     let mut su = arm64jit::jit::CpuState::new();
                     su.tpidr = tpidr;
                     su.x[31] = boot_sp;
@@ -9379,6 +9407,19 @@ mod sh115_tests {
         assert_eq!(0xd65f_03c0u32, 0xd65f_03c0u32, "patch word0 = ret");
         assert_eq!(0xd503_201fu32, 0xd503_201fu32, "patch word1 = nop");
         assert_eq!(0x10232090cu64 & 3, 0, "helper start 4-aligned");
+    }
+    #[test]
+    fn sh118_canary_guard_slots_reasserted_to_stable_pointer() {
+        // SH118: guest 0x1067d16f0 is BOTH the __stack_chk_guard GOT slot AND the
+        // render-ctx singleton (SH14/SH106 dual-use). A canary fn whose body
+        // re-publishes the slot mid-execution false-fails. Fix: seed both guard
+        // slots to a stable leaked pointer whose deref is constant. Pin the slots
+        // + the guard constant.
+        assert_eq!(0x67d16f0u64 + 0x1_0000_0000, 0x1067d16f0u64, "pervasive guard GOT slot");
+        assert_eq!(0x631aa30u64 + 0x1_0000_0000, 0x10631aa30u64, "JNI_OnLoad guard slot");
+        let unit: u64 = 0x2f_2a_1a_0a_0e_0f_10_11;
+        assert_ne!(unit, 0, "canary constant must be non-zero");
+        assert_ne!(unit as usize & 0xf, 0, "canary low bits non-zero");
     }
     #[test]
     fn sh115_repoints_early_return_branches_off_the_store_slot() {
