@@ -5060,6 +5060,10 @@ fn main() {
         // start_app jit_run below (which parks the main thread forever and
         // never returns), on a detached thread that sleeps its own warmup so
         // the rungs execute concurrently while StartApp idles. Opt-in.
+        // SH124: the ladder handle is JOINED after the StartApp jit_run returns
+        // so main() no longer tears down the detached ladder mid-do-init (the
+        // pre-SH124 exit-232 race). No-op while StartApp parks (exit 124).
+        let mut v2boot_join: Option<std::thread::JoinHandle<()>> = None;
         if std::env::args().any(|a| a == "--v2boot") {
             const BSS_TASKV4: u64 = 0x106829ea8;
             // Route-B SH81: force the engine's dispatch-accessor low-bit gate so
@@ -5140,7 +5144,7 @@ fn main() {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(4500);
-            std::thread::spawn(move || {
+            v2boot_join = Some(std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(warmup_ms));
                 let (env_ptr, _vm) = arm64jit::jni::build_jni();
                 let thiz = arm64jit::jni::new_fake_object(); // Activity jobject
@@ -5298,6 +5302,19 @@ fn main() {
                             // so the GlobalInit do-init falls through its once-guard.
                             let og = 0x106a68410u64 as *mut u8;
                             *og |= 1;
+                            // SH125 (recon deleg_5e2c8480 of do-init 0x102206c40): the
+                            // do-init's flags-loaded GETTER (guest 0x10220671c) reads
+                            // `ldrb w0,[0x106a683e8]` (file 0x2206738) before the
+                            // thread-dispatch worker. When bit0==0 it selects the
+                            // "fallback" dispatch-object slot [x21+0] instead of the
+                            // "live DM" slot [x21+8] — still host-garbage / unseeded.
+                            // Seed bit0=1 so the do-init consistently consumes the real
+                            // DM/app-config slot. Mirrors the SH82/122 data-seed pattern
+                            // (host byte-store, idempotent, NO .text patch — a NOP on the
+                            // getter's tbz would force the guard-init path instead).
+                            let flags_latch = 0x106a683e8u64 as *mut u8;
+                            *flags_latch |= 1;
+                            eprintln!("[elfjit:v2boot] SH125 seeded flags-loaded latch [0x106a683e8].bit0=1 so the do-init consumes the live DM slot (getter 0x102206738)");
                         }
                         eprintln!("[elfjit:v2boot] SH122 seeded main-id cell 0x{me:x} + once-guard [0x6a68410].bit0=1 for StartLuaAppDM -> GlobalInit do-init takes the DM-construction match path");
                     }
@@ -5437,7 +5454,7 @@ fn main() {
                     eprintln!(
                         "[elfjit:v2boot] SH122 session-advance probe: MH_FLAGS_LOADED={nf} MH_ENGINE_INITIALIZED={ni} MH_APP_READY={ar} once-guard[0x6a68410]={og:#x}"
                     );
-            });
+            }));
         }
         // --v2boot-r246: the sequential --v2boot driver STALLS at rung 1 because
         // nativeGameGlobalInit parks without returning (SH54/SH55), so rungs 2-6
@@ -8927,6 +8944,30 @@ fn main() {
             {
                 eprintln!("[elfjit] guest idle; exiting");
                 break;
+            }
+        }
+        // SH124: once StartApp's jit_run HAS RETURNED (the post-SH123 clean
+        // exit-232 state), main() was previously running off the end and
+        // tearing down the detached --v2boot ladder thread mid-do-init before
+        // it printed "ladder done" + the session-advance probe. Join the ladder
+        // (bounded) so its deep DM/app-shell construction completes and its
+        // probe is observable end-to-end. No-op here when StartApp parks (that
+        // path never reaches this block; the process is held by the settle loop
+        // or a timeout instead).
+        if let Some(handle) = v2boot_join.take() {
+            eprintln!("[elfjit] StartApp returned — joining detached --v2boot ladder thread so its do-init construction completes");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            let mut stepped = false;
+            while !handle.is_finished() && std::time::Instant::now() < deadline {
+                if !stepped {
+                    eprintln!("[elfjit:v2boot-join] waiting for ladder (ladder done + session-advance probe)");
+                    stepped = true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            match handle.join() {
+                Ok(()) => eprintln!("[elfjit:v2boot-join] ladder thread joined cleanly"),
+                Err(_) => eprintln!("[elfjit:v2boot-join] ladder thread panicked"),
             }
         }
     }

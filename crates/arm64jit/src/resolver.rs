@@ -896,6 +896,24 @@ pub fn resolve_gles_mixed(name: &[u8]) -> Option<u64> {
 /// `dlsym`, register it and return the thunk's *guest address*; if the name
 /// can't be resolved on the host, return `None` (caller must decide how to
 /// handle a missing import).
+/// SH124 decision predicate: should the guest's `name` be routed through
+/// `host_guest_exit` (intercepted) instead of host glibc `exit`?
+///
+/// True ONLY under JIT_DRIVE_LIFECYCLE (the session-drive mode whose --v2boot
+/// ladder the exit-232 self-termination was aborting) AND for the libc exit
+/// family. Out of both conditions it is the historical inert binding (host
+/// glibc exit) — the default path is UNCHANGED unless the drive env is set.
+fn sh124_exit_is_intercepted(name: &str) -> bool {
+    std::env::var_os("JIT_DRIVE_LIFECYCLE").is_some()
+        && matches!(name, "exit" | "_exit" | "_Exit" | "abort" | "exit_group")
+}
+
+/// The process's own main thread has gettid() == getpid(); a spawned host
+/// thread (the --v2boot ladder / render threads) has a distinct tid.
+fn sh124_running_on_main_thread() -> bool {
+    unsafe { libc::gettid() as u64 == libc::getpid() as u64 }
+}
+
 pub fn resolve(name: &[u8]) -> Option<u64> {
     let mut r = resolver().lock().unwrap();
     let key = CString::new(name).ok()?;
@@ -913,6 +931,29 @@ pub fn resolve(name: &[u8]) -> Option<u64> {
     // number->host mapping is exact (same code path as a guest `svc #0`).
     if name_str(name) == "syscall" {
         let hostf: HostCall = host_syscall_intercept;
+        return alloc_slot(&mut r, &key, hostf);
+    }
+    // SH124: intercept the guest's libc `exit`/`_exit`/`abort`/`exit_group`
+    // imports. Without this the guest calling its imported `exit(232)` deep in
+    // the --v2boot ladder's do-init (StartLuaAppDM session construction) binds
+    // to HOST glibc exit, which terminates the WHOLE process from the ladder
+    // thread — killing main()'s post-StartApp join before it can observe the
+    // ladder completing (the pre-SH124 exit-232 self-termination race: the log
+    // cut after json-fix clamps fired, before "ladder done" + the session-
+    // advance probe printed). Under JIT_DRIVE_LIFECYCLE (the session-drive
+    // mode that runs this ladder), bind them to a shim that, when invoked on a
+    // SPAWNED thread, logs the exit and unwinds just that guest thread
+    // (halting its jit_run) instead of terminating the process, so the ladder
+    // continues and its probe is observable. A MAIN-thread exit stays real
+    // (genuine process termination is preserved). Inert (no env) == the
+    // historical binding to host glibc exit, i.e. the default path is
+    // UNCHANGED unless JIT_DRIVE_LIFECYCLE is set.
+    if sh124_exit_is_intercepted(name_str(name)) {
+        let hostf: HostCall = host_guest_exit;
+        eprintln!(
+            "[resolver] SH124 intercepting guest {} (@ {key:?}) -> host_guest_exit (spawned-thread exit unwinds, main-thread exit stays real) under JIT_DRIVE_LIFECYCLE",
+            name_str(name)
+        );
         return alloc_slot(&mut r, &key, hostf);
     }
     // `eglGetProcAddress` is the guest's dynamic GLES loader (Roblox resolves
@@ -1032,6 +1073,54 @@ extern "C" fn host_syscall_intercept(
     st.x[5] = a6;
     st.x[8] = a0; // the AArch64 syscall number
     unsafe { crate::jit::guest_svc(&mut st as *mut CpuState) }
+}
+
+/// SH124: the guest's imported libc `exit`/`_exit`/`abort`/`exit_group` under
+/// JIT_DRIVE_LIFECYCLE (see the resolve() intercept above). A SPAWNED
+/// (non-main) thread's guest exit used to terminate the WHOLE process via host
+/// glibc exit — aborting the --v2boot ladder mid-do-init before "ladder done"
+/// + the session-advance probe printed (the pre-SH124 exit-232 race). When this
+/// shim runs on a non-main thread, log the exit and unwind just that guest
+/// thread by zeroing its saved x30 (LR): the run_loop's hostcall return path
+/// does `s.pc = s.x[30]`, so pc becomes 0 -> "outside image" -> jit_run returns
+/// Err and the caller (the ladder's rung loop) continues to its next rung /
+/// completion print. A MAIN-thread exit must remain a REAL process exit
+/// (genuine termination preserved) — route it to host glibc `exit`.
+extern "C" fn host_guest_exit(
+    a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    // The process's own main thread has gettid() == getpid(); a spawned host
+    // thread (the --v2boot ladder / render threads) has a distinct tid.
+    if sh124_running_on_main_thread() {
+        // Main-thread exit: a genuine termination. Call the real glibc exit.
+        eprintln!("[resolver] SH124 main-thread guest exit({a0:#x}) — terminating (real)");
+        let real: unsafe extern "C" fn(i32) -> ! =
+            unsafe { std::mem::transmute(libc::dlsym(libc::RTLD_DEFAULT, c"exit".as_ptr())) };
+        unsafe { real(a0 as i32) };
+    }
+    // Spawned-thread exit: record + unwind this guest thread's jit_run so the
+    // ladder (or a render thread) continues on the caller side and its
+    // completion is observable, instead of killing the whole process.
+    if std::env::var_os("JIT_TRACE_SVC").is_some() {
+        eprintln!("[resolver] SH124 spawned-thread guest exit({a0:#x}) — unwinding this jit_run (process survives)");
+    }
+    let my_tid = unsafe { libc::gettid() as u64 };
+    let st = crate::jit::guest_state_of_host(my_tid as i64);
+    if st != 0 {
+        unsafe {
+            // Save the exit code where the unwound caller can read it: real
+            // glibc exit_group returns nothing, but we synthesize w0=the code.
+            (*(st as *mut CpuState)).x[0] = a0;
+            // Zero LR so the run_loop's `s.pc = s.x[30]` lands pc at 0 -> JIT
+            // run_loop returns Err("outside image") -> this thread's jit_run
+            // unwinds, letting the caller (ladder loop / next rung) proceed.
+            (*(st as *mut CpuState)).x[30] = 0;
+        }
+    } else {
+        // No registered guest state (defensive): still do not kill the process.
+        eprintln!("[resolver] SH124 spawned-thread guest exit({a0:#x}) tid {my_tid} (no guest state) — ignored");
+    }
+    a0
 }
 
 /// Reverse-lookup an import slot address back to its symbol name (the first
@@ -1689,6 +1778,53 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    /// SH124: the exit-232 self-termination fix. The guest's libc exit family
+    /// must be INTERCEPTED ONLY under JIT_DRIVE_LIFECYCLE. Population of
+    /// JIT_DRIVE_LIFECYCLE is what flips interception on; out of that env the
+    /// binding stays the historical host-glibc-exit (UNCHANGED default).
+    #[test]
+    fn sh124_exit_intercept_gated_on_drive_lifecycle() {
+        // Out of the env: nothing intercepted (default unchanged).
+        let drive_was_set = std::env::var_os("JIT_DRIVE_LIFECYCLE").is_some();
+        unsafe { std::env::remove_var("JIT_DRIVE_LIFECYCLE") };
+        for name in ["exit", "_exit", "_Exit", "abort", "exit_group", "strlen", "memcpy"] {
+            assert!(
+                !sh124_exit_is_intercepted(name),
+                "{name} must NOT be intercepted with JIT_DRIVE_LIFECYCLE unset (default unchanged)"
+            );
+        }
+        // With the env set: the exit family intercepted, non-exit names not.
+        unsafe { std::env::set_var("JIT_DRIVE_LIFECYCLE", "1") };
+        for name in ["exit", "_exit", "_Exit", "abort", "exit_group"] {
+            assert!(
+                sh124_exit_is_intercepted(name),
+                "exit-family {name} must be intercepted under JIT_DRIVE_LIFECYCLE"
+            );
+        }
+        assert!(!sh124_exit_is_intercepted("strlen"));
+        assert!(!sh124_exit_is_intercepted("memcpy"));
+        assert!(!sh124_exit_is_intercepted("pthread_mutex_lock"));
+        if !drive_was_set {
+            unsafe { std::env::remove_var("JIT_DRIVE_LIFECYCLE") };
+        }
+    }
+
+    /// SH124: a spawned (non-main) host thread must NOT report itself as the
+    /// main thread — the check that keeps a SPAWNED-thread guest exit from
+    /// terminating the whole process (letting it unwind its jit_run instead)
+    /// while a genuine MAIN-thread exit stays real. The process's main thread
+    /// is the one whose gettid() == getpid(); any spawned thread differs.
+    #[test]
+    fn sh124_spawned_thread_is_not_main_thread() {
+        let spawned = std::thread::spawn(|| sh124_running_on_main_thread());
+        assert!(!spawned.join().unwrap());
+        // The test harness main-ish thread: this can equal getpid() when the
+        // test runs on the process main thread, so only assert the spawned
+        // case (a spawned thread is always non-main). The discriminator's
+        // inverse is validated implicitly by the real run (main-thread exit
+        // still terminates, ladder thread unwind is observed to survive).
+    }
 
     /// Two REAL host threads rendezvous through the bionic NORMAL mutex bridge
     /// operating on a byte-exact bionic-layout `pthread_mutex_t` (16-bit state
