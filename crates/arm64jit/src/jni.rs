@@ -610,7 +610,15 @@ fn method_id_name(mid: u64) -> Option<Vec<u8>> {
 /// uninitialized stack slot.
 fn auto_value_string_getter(name: &[u8]) -> Option<&'static [u8]> {
     match name {
-        b"getBaseURL" => Some(b""),
+        // SH134 (recon deleg_a26ee3a7): the client transports login/auth over
+        // RAW native sockets + bundled OpenSSL — NOT JNI HTTP. Its AppBridge
+        // base URL is web-request root the engine prefixes onto its API/TLS
+        // calls. The binary itself carries `https://www.roblox.com` as its
+        // canonical base (strings). Returning the real production base instead
+        // of "" lets the transport-complete TLS channel (sockets/DNS/clock/
+        // getrandom all already forward to host) target a real endpoint on the
+        // reachable path; "" gave the writer a valid 0-length but no host.
+        b"getBaseURL" => Some(b"https://www.roblox.com"),
         b"getBuildVariant" => Some(b""),
         b"getUserAgent" => Some(b""),
         b"getAppStarterPlace" => Some(b""),
@@ -1692,6 +1700,8 @@ mod tests {
                 let (g_sl, _) = host_call_at(get(GET_STRING_UTF_LEN)).expect("GetStringUTFLength thunk");
                 let len = g_sl(env, h, 0, 0, 0, 0, 0, 0);
                 match name {
+                    b"getBaseURL" => assert_eq!(len, "https://www.roblox.com".len() as u64,
+                        "getBaseURL defaults to the real production web root (SH134)"),
                     b"getSelectedTheme" => assert_eq!(len, 4, "selectedTheme defaults to \"Dark\""),
                     b"getOsVersion" => assert_eq!(len, 2, "osVersion defaults to \"33\""),
                     b"getDeviceName" => assert_eq!(len, 7, "getDeviceName \"Cordial\""),
@@ -1802,6 +1812,48 @@ mod tests {
         }
     }
 
+    /// SH134 (recon deleg_a26ee3a7): the client does login/auth HTTP over raw
+    /// native sockets + bundled OpenSSL, so the AppBridge `getBaseURL` must be
+    /// the REAL production web root (the engine prefixes it onto its API calls)
+    /// — not "" — so the transport-complete host TLS channel targets a real
+    /// endpoint. Similarly the remaining string params must still resolve to
+    /// readable zero-length jstrings (not NULL).
+    #[test]
+    fn sh134_base_url_and_appbridge_string_getters_resolve_to_readable_jstring() {
+        let (env, _vm) = build_jni();
+        let functions = unsafe { *(env as *const u64) };
+        let get = |i: usize| -> u64 { unsafe { *(functions as *const u64).add(i) } };
+        let get_name_id = |name: &[u8]| -> u64 {
+            let layout = Layout::array::<u8>(name.len() + 1).unwrap();
+            let name_buf = unsafe { alloc_zeroed(layout) };
+            unsafe { std::ptr::copy_nonoverlapping(name.as_ptr(), name_buf, name.len()) };
+            let (f, _) = host_call_at(get(GET_METHOD_ID)).expect("GetMethodID thunk");
+            f(env, 0, name_buf as u64, 0, 0, 0, 0, 0)
+        };
+        let (g_om, _) = host_call_at(get(CALL_OBJECT_METHOD)).expect("CallObjectMethod thunk");
+        let (g_sl, _) = host_call_at(get(GET_STRING_UTF_LEN)).expect("GetStringUTFLength thunk");
+        // getBaseURL -> the real production base, byte length = URL length.
+        let base = auto_value_string_getter(b"getBaseURL").expect("getBaseURL mapped");
+        assert_eq!(base, b"https://www.roblox.com");
+        let mid = get_name_id(b"getBaseURL");
+        let h = g_om(env, 0x4321, mid, 0, 0, 0, 0, 0);
+        assert_ne!(h, 0, "getBaseURL returns a readable jstring");
+        assert_eq!(g_sl(env, h, 0, 0, 0, 0, 0, 0) as usize, base.len());
+        // The rest of the string params resolve to readable empty jstrings.
+        for name in [
+            &b"getBuildVariant"[..],
+            &b"getUserAgent"[..],
+            &b"getAppStarterPlace"[..],
+            &b"getAppStarterScript"[..],
+            &b"getUsername"[..],
+        ] {
+            let mid = get_name_id(name);
+            assert_ne!(mid, 0, "GetMethodID({}) non-null", String::from_utf8_lossy(name));
+            let h = g_om(env, 0x4321, mid, 0, 0, 0, 0, 0);
+            assert_ne!(h, 0, "CallObjectMethod({}) returns a readable jstring", String::from_utf8_lossy(name));
+            assert_eq!(g_sl(env, h, 0, 0, 0, 0, 0, 0), 0, "{} is a 0-length string", String::from_utf8_lossy(name));
+        }
+    }
     /// Route-B step 2 (recon-routeB-globaltinit-unblock.md): the engine's
     /// StartLuaAppDM only ADVANCES its session when the NativeHelper
     /// `gameActivity_*` JNI callbacks fire on the fake Java object. Each is
