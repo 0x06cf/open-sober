@@ -1406,6 +1406,39 @@ pub fn routeb_seed_game_global_vector() -> u64 {
 /// 0x2206df4) returns to 0x2206e74 AFTER the barrier, never reaching 0x2206e70, so the
 /// product path is untouched. Append-only bl->nop (d503201f). The TaskScheduler is fully
 /// constructed at 0x2206e68; the barrier is a pure handshake. Gate like SH87.
+/// SH159c: AppBridgeV2 governor 0x102e9fa84's version gate reads [0x6a70700] and
+/// takes a MODERN APPENDIX (0x2e9faf0..0x2e9fb1c) that re-reads the
+/// nativeAppBridgeV2InitWithParams params (bl 0x23c1504) — under the JIT this
+/// faults (mis-translated block / uninitialized union at 0x102e9fb10). We want
+/// the ROUTER path 0x2e9fb20 (router flag [0x6a70880]=1 -> MODERN -> bl
+/// 0x258c6e4 startAppWithParams). Patch `b.cc 0x2e9fb20` -> unconditional
+/// `b 0x2e9fb20` (skip the appendix regardless of the version word). Imm26 from
+/// 0x2e9fad8 to 0x2e9fb20 = +0x48 = 0x12.
+fn routeb_patch_gov_router() {
+    const ADDR: u64 = 0x102e9fad8; // `b.cc 0x2e9fb20` (0x54000243)
+    let want = 0x1400_0012u32; // `b 0x2e9fb20` (unconditional, imm26=0x12)
+    let page = ADDR & !0xfff;
+    unsafe {
+        if libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_WRITE) == 0 {
+            let before = *(ADDR as *const u32);
+            if before == 0x5400_0243u32 {
+                *(ADDR as *mut u32) = want;
+                eprintln!(
+                    "[elfjit:routeB] SH159c patched governor version-gate 0x{ADDR:x} ({before:08x}) -> unconditional `b 0x2e9fb20` — governor always takes the ROUTER path (router flag -> MODERN -> bl 0x258c6e4), skipping the faulting InitWithParams appendix"
+                );
+            } else if before == want {
+                eprintln!("[elfjit:routeB] SH159c governor version-gate 0x{ADDR:x} already patched");
+            } else {
+                eprintln!("[elfjit:routeB] WARN SH159c governor version-gate 0x{ADDR:x} unexpected {before:08x}, not patched");
+            }
+            libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_EXEC);
+        } else {
+            eprintln!("[elfjit:routeB] WARN SH159c mprotect RW failed for governor gate 0x{ADDR:x} errno={}", std::io::Error::last_os_error());
+        }
+    }
+    arm64jit::jit::block_cache_drop_region(0x102e9fa80, 0x102e9fb30);
+}
+
 fn routeb_patch_globalinit_cevent_barrier() {
     const ADDR: u64 = 0x102206e70; // file 0x2206e70: `bl 2207578` = CEvent::wait (futex park)
     let want = 0xd503_201fu32; // nop
@@ -6424,6 +6457,21 @@ fn main() {
                                     // reach the governor 0x102e9fa84.
                                     *(0x106a63da0u64 as *mut u64) = 0;
                                     *(0x106a63d70u64 as *mut u64) = 0;
+                                    // SH159c: the governor 0x102e9fa84 gates on the
+                                    // version word [0x6a70700] at 0x2e9fac4-0x2e9fb20
+                                    // (low byte >=6 && byte1 >=3 -> takes the MODERN
+                                    // APPENDIX = a nativeAppBridgeV2InitWithParams
+                                    // param re-read at 0x2e9faf0..0x2e9fb1c that faults
+                                    // on an uninitialized x5 stack union). We want the
+                                    // ROUTER path 0x2e9fb20 (router flag [0x6a70880]=1
+                                    // -> MODERN -> bl 0x258c6e4 startAppWithParams).
+                                    // Force version=0 so `b.cc 0x2e9fb20` skips the
+                                    // appendix entirely.
+                                    *(0x106a70700u64 as *mut u64) = 0;
+                                    // SH159c .text patch: force the governor's
+                                    // version-gate to always take the ROUTER path
+                                    // (skips the faulting InitWithParams appendix).
+                                    routeb_patch_gov_router();
                                     // SH159b (recon deleg_0eff24ca): the governor
                                     // (0x102e9fa84) reads x19=[x0+0x20] at 0x2e9fac0
                                     // (x0=wrapper @ [0x106a705e8]... actually GetOrCreate
@@ -6565,6 +6613,14 @@ fn main() {
                         // dispatch. Probe the ACTUAL runtime values here.
                         let guard_g = unsafe { *(0x106a63da0u64 as *const u64) };
                         let guard_w = unsafe { *(0x106a63d70u64 as *const u64) };
+                        // SH159c: read the governor version-word [0x6a70700] that
+                        // selects the MODERN appendix (needs byte0>=6 && byte1>=3).
+                        // If it's still >=0x306, the appendix path runs even after
+                        // our seed=0 (engine re-writes it) => route around it.
+                        let gov_version = unsafe { *(0x106a70700u64 as *const u64) };
+                        eprintln!(
+                            "[elfjit:v2boot] SH159c governor version word [0x106a70700]=0x{gov_version:x} (>=0x306 -> appendix) seed_log_value_check"
+                        );
                         eprintln!(
                             "[elfjit:v2boot] SH159 union-init guard probe: G[0x106a63da0]=0x{guard_g:x} W[0x106a63d70]=0x{guard_w:x} (recon: G should be 0x499fe5 string, W 0x2617d4)"
                         );
