@@ -5103,11 +5103,12 @@ fn main() {
                 routeb_seed_dispatcher_node();
                 // SH121: setTaskSchedulerBM lazily constructs the TaskScheduler whose
                 // ctor asserts [0x72739d4].bit0 ("flags loaded") -> raise(SIGTRAP)
-                // (exit 133) — the current next gate. NOP the tbz. Also seed the
-                // REAL setTaskSchedulerBM version-gate [0x10683cff8] (adrp 0x683c000
-                // +0xff8, low>=6 && byte1>=3) so it keeps the AppBridge V2 main path
-                // (SH109's [0x10683d350] seed belongs to V2Init/V2Start only, and its
-                // comment even mis-attributes it to setTaskSchedulerBM).
+                // (exit 133). NOP the tbz + seed the REAL setTaskSchedulerBM version-gate
+                // [0x10683cff8] (SH109's [0x10683d350] belongs to V2Init/V2Start). KEEP
+                // OPT-IN like the rest of the SH115-121 chain: defaulting it ON makes the
+                // default ladder proceed deeper into setTaskSchedulerBM and fault at the
+                // NEXT unseeded gate (guestpc 0x106241c70) instead of the safe pre-existing
+                // run-variable exit — a default-path regression. Inert without the flag.
                 routeb_patch_taskscheduler_flags_gate();
                 unsafe {
                     *(0x10683cff8u64 as *mut u64) = 0x0306u64; // low byte 6, byte1 3
@@ -5279,6 +5280,27 @@ fn main() {
                         unsafe { *(main_id_cell as *mut u64) = me as u64 };
                         eprintln!("[elfjit:v2boot] seeded main-thread-id [0x106863a68]=0x{me:x} for GlobalInit thread-dispatch (this thread == stored == self -> takes the vt[+48] match path, no park)");
                     }
+                    // SH122: StartLuaAppDM fans into the SAME GlobalInit do-init
+                    // (via 0x2baeeec -> 0x2206c40) that is once-latched on
+                    // [0x6a68410].bit0 and thread-gated on [0x106863a68]
+                    // (deleg_65301a28). On this (non-main) ladder thread the
+                    // thread-dispatch b.ne parks/soft-returns and the once-guard
+                    // stays unlatched, so the DM/app-shell is never built. Mirror
+                    // the SH82 trick: seed the main-id cell to self + set the
+                    // once-guard bit0 so the do-init takes the match/DM-construction
+                    // path. Restore the cell after the rung.
+                    if *guest == 0x1023efe2c && std::env::var("JIT_SH115_SINGLETON_PATCH").ok().as_deref() == Some("1") {
+                        let me = unsafe { libc::pthread_self() };
+                        unsafe {
+                            *(main_id_cell as *mut u64) = me as u64;
+                            // once-guard [FILE 0x6a68410] = guest 0x106a68410 (in the
+                            // mapped rw- segment [0x1067d67c0,0x107333c3c)). Set bit0
+                            // so the GlobalInit do-init falls through its once-guard.
+                            let og = 0x106a68410u64 as *mut u8;
+                            *og |= 1;
+                        }
+                        eprintln!("[elfjit:v2boot] SH122 seeded main-id cell 0x{me:x} + once-guard [0x6a68410].bit0=1 for StartLuaAppDM -> GlobalInit do-init takes the DM-construction match path");
+                    }
                     let mut s = arm64jit::jit::CpuState::new();
                     s.tpidr = tpidr;
                     s.x[31] = boot_sp;
@@ -5288,7 +5310,7 @@ fn main() {
                         Ok(r) => eprintln!("[elfjit:v2boot] {name} returned Ok({r:#x})"),
                     }
                     dump(name);
-                    if *guest == 0x102206404 {
+                    if *guest == 0x102206404 || *guest == 0x1023efe2c {
                         unsafe { *(main_id_cell as *mut u64) = orig_main_id };
                     }
                 }
@@ -5405,6 +5427,16 @@ fn main() {
                     dump("SendAppEventOnAppReady");
                 }
                 eprintln!("[elfjit:v2boot] ladder done; final [0x106829ea8] = {:#x}", dw(BSS_TASKV4));
+                    // SH122 session-advance probe: after the ladder, read the
+                    // NativeHelper milestones + data-dir path state to confirm
+                    // whether StartLuaAppDM's do-init actually advanced the session.
+                    let nf = arm64jit::jni::nativehelper_flags_loaded();
+                    let ni = arm64jit::jni::nativehelper_engine_initialized();
+                    let ar = arm64jit::jni::nativehelper_app_ready();
+                    let og = unsafe { *(0x106a68410u64 as *const u8) };
+                    eprintln!(
+                        "[elfjit:v2boot] SH122 session-advance probe: MH_FLAGS_LOADED={nf} MH_ENGINE_INITIALIZED={ni} MH_APP_READY={ar} once-guard[0x6a68410]={og:#x}"
+                    );
             });
         }
         // --v2boot-r246: the sequential --v2boot driver STALLS at rung 1 because
@@ -9681,6 +9713,28 @@ mod sh115_tests {
         // [0x10683cff8] (NOT the misattributed SH109 [0x10683d350]).
         assert_eq!(0x683c000u64 + 0xff8, 0x683cff8u64, "setTaskSchedulerBM version-gate file addr");
         assert_eq!(0x683cff8u64 + 0x1_0000_0000, 0x10683cff8u64, "version-gate guest addr");
+    }
+    #[test]
+    fn sh122_startluaappdm_doinit_seed_addresses() {
+        // SH122: StartLuaAppDM (guest 0x1023efe2c) fans into the SAME GlobalInit
+        // do-init (0x2baeeec -> 0x2206c40) that built nothing because it is
+        // once-latched on [0x6a68410].bit0 AND thread-gated on [0x106863a68]
+        // (deleg_65301a28). To make the session's DM/app-shell actually construct
+        // we seed the once-guard bit0 + mirror the SH82 thread-id trick. Pin the
+        // addresses + the once-guard guest-vs-file transform (this caught a real
+        // bug: host-store used the FILE offset 0x6a68410 -> unmapped -> SIGSEGV;
+        // the guest address is 0x106a68410 in the rw- segment [0x1067d67c0,
+        // 0x107333c3c)).
+        // once-guard load in the do-init: adrp x8 + add x8,#0x410 (guest
+        // 0x102206c80/84); ldarb w9,[x8] reads [0x106a68000+0x410].
+        assert_eq!(0x6a68000u64 + 0x410, 0x6a68410u64, "once-guard FILE vaddr");
+        assert_eq!(0x6a68410u64 + 0x1_0000_0000, 0x106a68410u64, "once-guard GUEST vaddr (the one a host store / probe must use)");
+        assert_eq!(0x2206c80u64 + 0x1_0000_0000, 0x102206c80u64, "once-guard adrp guest addr");
+        // the thread-id cell the do-init compares against (same as rung-1 SH82).
+        assert_eq!(0x6863a68u64 + 0x1_0000_0000, 0x106863a68u64, "main-id cell guest addr");
+        // StartLuaAppDM guest entry + its fan-in chain.
+        assert_eq!(0x23efe2cu64 + 0x1_0000_0000, 0x1023efe2cu64, "StartLuaAppDM guest entry");
+        assert_eq!(0x2206c40u64 + 0x1_0000_0000, 0x102206c40u64, "GlobalInit do-init (fan-in target)");
     }
 }
 
