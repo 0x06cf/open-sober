@@ -95,6 +95,28 @@ source; empty headlessly.**
   executes (region-watch), 0 crashes, OUT empty (env/class value-source, honest).
 - `/tmp` cleaned.
 
+## Addendum — JIT_LADDER_SERIALIZE gate (also landed in SH177): benign, verified non-regression
+
+The `JIT_LADDER_SERIALIZE=1` opt-in (elfjit.rs:11140-11159) extends SH162's
+main-start_app serialization to a bare --v2boot ladder WITHOUT arming WORKER_ADMISSION_GATE
+(so it avoids the SH170 EXIT-139 pitfall that combining the bare ladder with
+JIT_SERIALIZE_RENDER causes). Empirically confirmed this cycle:
+- Cone (deleg_a21155ee task-0) verified statically: the gate only waits (bounded 300s) for
+  LADDER_DONE before the main start_app jit_run; it does NOT park the ladder thread, so it
+  cannot deadlock; no new untested ladder-determinism seed is exposed.
+- Real-binary bare-ladder runs (5x with the gate + 3x control without): the rung-0
+  `nativeInitializeNativeFlags: run_loop pc 0x21 outside image` crash occurs in BOTH,
+  at identical frequency — it is the PRE-EXISTING SH55/64 ladder-thread-vs-clone-worker
+  race (host x86-pointer leak through unseeded singleton vtables, SH103/SH109 class,
+  documented in SH176/HANDOFF), NOT a regression from this gate. The gate serializes only
+  the MAIN thread's start_app; it cannot fix the ladder thread's own concurrent-thread
+  flake. Confirmed: the canonical SH130 combined run (which uses JIT_SERIALIZE_RENDER +
+  WORKER_ADMISSION_GATE via the SH130 recipe) still EXITS 0 with 24 real task frames and 0
+  crashes at HEAD — the product path is unregressed.
+- The DM-capture migration latch (capture_sh167_dm_alloc_capture.sh) also reconfirmed at
+  HEAD: EXIT clean, 0 captures (latent-correct — no live make_shared<DataModel> headlessly),
+  ladder done, SendAppEventOnAppReady Ok(0x3e8), 0 crashes. Migration-readiness intact.
+
 ## Files
 
 - `crates/arm64jit/examples/elfjit.rs` — `--cookie-readback` driver + `routeb_patch_cookie_readback` (+ `--cookie-ingress`).
