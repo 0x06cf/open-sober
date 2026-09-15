@@ -6209,6 +6209,22 @@ fn main() {
     if std::env::var("JIT_SERIALIZE_RENDER").ok().as_deref() == Some("1")
         && std::env::args().any(|a| a == "--v2boot")
     {
+        // SH170 pitfall: JIT_SERIALIZE_RENDER's WORKER_ADMISSION_GATE is only
+        // correct for the COMBINED render chain (gate + --renderinit +
+        // --taskv4-seed frame, capture_sh130.sh). Bolting it onto the DM-seed
+        // chain (JIT_ROUTEB_DM_SEED=1 / JIT_ROUTEB_DMFORCE=1) parks the clone
+        // worker that nativeGameGlobalInit's do-init depends on, so the do-init
+        // throws an unhandled guest C++ exception ('libc++abi: terminating',
+        // EXIT 139) EVERY run. Warn on that known-bad combo instead of silently
+        // mis-running. Diagnostic only — no behavior change on valid paths.
+        let dm_seed = std::env::var("JIT_ROUTEB_DM_SEED").ok().as_deref() == Some("1")
+            || std::env::var("JIT_ROUTEB_DMFORCE").ok().as_deref() == Some("1");
+        if dm_seed {
+            eprintln!("[elfjit:worker-gate] WARNING (SH170): JIT_SERIALIZE_RENDER + DM-seed chain \
+                       (JIT_ROUTEB_DM_SEED/DMFORCE) is a KNOWN-ABORT combo — the gate parks the do-init's \
+                       clone worker and nativeGameGlobalInit throws an unhandled C++ exception. Use the gate \
+                       only with the combined render chain (capture_sh130.sh) or drop JIT_SERIALIZE_RENDER.");
+        }
         arm64jit::jit::WORKER_ADMISSION_GATE.store(true, core::sync::atomic::Ordering::Release);
         eprintln!("[elfjit:worker-gate] SH130 admission gate SET — engine clone workers parked until LADDER_DONE (kills the SH55/64 combined race)");
     }
