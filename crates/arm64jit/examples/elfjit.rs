@@ -11089,6 +11089,107 @@ fn main() {
         }
     }
 
+    // SH175 follow-on (--cookie-ingress): drive the pure-native cookie worker
+    // 0x102203148 (native body under nativeSetMultipleCookies 0x102202ff8) as a
+    // STANDALONE top-level jit_run on this (main) thread, BEFORE StartApp, with
+    // JIT_ROUTEB_COOKIE=1 so routeb_cookie_jar_guard fires at the worker's entry
+    // pc and seeds the cookie-jar container [0x106ed7a20] + clears the two boot
+    // gates ([0x106dcfc30]/[0x1072739d4] bit0) — clearing the SH129/174
+    // "jar-CONSTRUCTION NULL" fault at 0x220331c. Recon (deleg_13d959ca): the
+    // worker is pure-native (no thread/JNI/guest->host re-entry); drive it as its
+    // own top-level jit_run for a clean one-shot. ABI is 6 args (x0 cookies,
+    // x1 clen, x2 url, x3 ulen, x4 w4, x5 w5); w4(arg4)&1==1 is REQUIRED to reach
+    // the classifier/commit accumulator (arg4=0 early-bails at 0x2203b20). The
+    // jar is READ-ONLY here (only a local accumulator is built), so the seeded
+    // jar is preserved. First headless exercise of the worker deep-path past the
+    // jar-init deref; if a further unexercised singleton faults, that pc is the
+    // NEXT gate. Standalone mode (no --v2boot): this is the first/only top-level
+    // jit_run on the main thread, so no jit_run concurrency (SH55/64-safe single
+    // top-level discipline).
+    if std::env::args().any(|a| a == "--cookie-ingress") {
+        const COOKIE_WORKER: u64 = 0x102203148;
+        const COOKIE: &[u8] = b".ROBLESECURITY\t0xdeadbeef_0123456789abcdef";
+        const URL: &[u8] = b"https://www.roblox.com/";
+        let cbuf = guest_arena_alloc(COOKIE.len() + 1);
+        let ubuf = guest_arena_alloc(URL.len() + 1);
+        if cbuf == 0 || ubuf == 0 {
+            eprintln!("[elfjit:cookie-ingress] WARN guest arena not set — cannot drive cookie worker");
+        } else {
+            unsafe {
+                std::ptr::copy_nonoverlapping(COOKIE.as_ptr(), cbuf as *mut u8, COOKIE.len());
+                *((cbuf + COOKIE.len() as u64) as *mut u8) = 0;
+                std::ptr::copy_nonoverlapping(URL.as_ptr(), ubuf as *mut u8, URL.len());
+                *((ubuf + URL.len() as u64) as *mut u8) = 0;
+            }
+            unsafe { std::env::set_var("JIT_ROUTEB_COOKIE", "1") };
+            eprintln!(
+                "[elfjit:cookie-ingress] driving cookie worker 0x{COOKIE_WORKER:x} (cbuf={cbuf:#x} len={} url={ubuf:#x} len={}, w4=1) with JIT_ROUTEB_COOKIE=1 (jar+gate guard armed)",
+                COOKIE.len(),
+                URL.len()
+            );
+            let jar_before = unsafe { *(0x106ed7a20u64 as *const u64) };
+            eprintln!("[elfjit:cookie-ingress] jar[0x106ed7a20] before = {jar_before:#x}");
+            let mut cs = arm64jit::jit::CpuState::new();
+            cs.tpidr = arm64jit::jit::current_guest_tp();
+            cs.x[31] = st.x[31];
+            cs.x[0] = cbuf;
+            cs.x[1] = COOKIE.len() as u64;
+            cs.x[2] = ubuf;
+            cs.x[3] = URL.len() as u64;
+            cs.x[4] = 1; // w4=1 -> reach classifier/commit accumulator
+            cs.x[5] = 0;
+            match arm64jit::jit::jit_run(image, base, COOKIE_WORKER, &mut cs as *mut CpuState) {
+                Err(e) => eprintln!("[elfjit:cookie-ingress] cookie worker stopped: {e}"),
+                Ok(r) => {
+                    eprintln!("[elfjit:cookie-ingress] cookie worker returned Ok({r:#x}) — jar-init cleared, deep path exercised (next gate if faulted)");
+                    let jar_after = unsafe { *(0x106ed7a20u64 as *const u64) };
+                    let gate1 = unsafe { *(0x106dcfc30u64 as *const u8) } & 1;
+                    let gate2 = unsafe { *(0x1072739d4u64 as *const u8) } & 1;
+                    eprintln!(
+                        "[elfjit:cookie-ingress] jar[0x106ed7a20] after = {jar_after:#x} (was {jar_before:#x}, engine-constructed={}) gates[0x6dcfc30].0={gate1} [0x72739d4].0={gate2}",
+                        jar_before == 0 && jar_after != 0
+                    );
+                    // Decode the libc++ std::string the engine's jar-init built:
+                    // bit0 of word0 = 0 short (SSO, data at +1, size = word0>>1),
+                    // bit0 = 1 long (cap at +0, size at +8, data-ptr at +16). If a
+                    // coherent readable string is present, the jar container is
+                    // genuinely constructed (not just a seeded inert SSO).
+                    if jar_after != 0 && (jar_after >= 0x100000000) {
+                        let w0 = unsafe { *(jar_after as *const u64) };
+                        if w0 & 1 == 0 {
+                            let size = (w0 >> 1) as usize;
+                            let data = jar_after + 1;
+                            let mut s = String::new();
+                            for i in 0..(size.min(64) as u64) {
+                                let c = unsafe { *((data + i) as *const u8) };
+                                s.push(if c == 0 { '\0' } else { c as char });
+                            }
+                            eprintln!(
+                                "[elfjit:cookie-ingress] jar is SHORT/SSO libc++ string: size={size} data@0x{data:x} = {:?}",
+                                s
+                            );
+                        } else {
+                            let cap = w0 >> 1;
+                            let size = unsafe { *((jar_after + 8) as *const u64) } as usize;
+                            let data = unsafe { *((jar_after + 16) as *const u64) };
+                            let mut s = String::new();
+                            if (data >= 0x100000000) {
+                                for i in 0..(size.min(64) as u64) {
+                                    let c = unsafe { *((data + i) as *const u8) };
+                                    s.push(if c == 0 { '\0' } else { c as char });
+                                }
+                            }
+                            eprintln!(
+                                "[elfjit:cookie-ingress] jar is LONG libc++ string: cap={cap} size={size} data@0x{data:x} = {:?}",
+                                s
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     match arm64jit::jit::jit_run(image, base, start_app, &mut s2 as *mut CpuState) {
             Err(e) => eprintln!("[elfjit] StartApp stopped: {e}"),
             Ok(r) => eprintln!("[elfjit] StartApp returned Ok({r:#x})"),
