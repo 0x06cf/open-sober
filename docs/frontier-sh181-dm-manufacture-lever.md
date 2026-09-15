@@ -73,6 +73,19 @@ timeout after ladder done), **0 SIGSEGV/SIGABRT/stack-smash**, full ladder compl
   DataModel remains the migration gate, now with the one headless manufacture seed installed and
   verified live-correct (not inert).
 
+## Consumer-level closure (recon deleg_54f48787, READ-ONLY, decisive)
+Follow-up recon exhausted the one remaining lever: **NO seedable/JIT-drivable headless path
+exercises the manufactured DM end-to-end.** The current-DM holder *0x106391908 has EXACTLY
+ONE static reference in the whole binary — the getter 0x2dbcc10 (`adrp x0,6391000/add #0x908/ret`,
+0 direct bl callers) — and the DataModelServices fan-out consumers (0x2dbcba0..0x2dbcd18) fire
+only on a NULL→real transition that `ExperienceController::join → submitStartGameTask`
+(inlined make_shared<DataModel>) makes at a REAL app-launch; createDataModelForTeleport
+(0x2e1dc38, a DM consumer not a factory) has 0 static callers. The governor-tail vt+0x30 blr
+(SH164) dispatches the NativeDataModelManager impl shell, a DIFFERENT object from the
+current-DM-holder DM. So the manufacture lever fires only when a real session writes a live DM
+to the holder — session-gated, matching the SH181 empirical 0 'entered region'. The lever stays
+installed as default-inert, harmless, correct: it is the migration-ready genuine-vptr DM seed.
+
 ## Standing (unchanged)
 The end-goal real Roblox session remains behind the live DataModel; SH181 re-opens the ONE
 headless lever (manufacture with a live genuine vtable) that SH178 closed prematurely, and the
