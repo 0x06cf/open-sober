@@ -1545,6 +1545,67 @@ fn routeb_patch_startapp_init3_gates() {
 /// (`mov x0,x19` at 0x2e9fe00 right after), so NOPing the 3-instruction window
 /// (ldr/mov/bl) is a benign no-op — mirrors SH160's init3-gate NOP. Verified
 /// encodings: `ldr x0,[x19,#1088]`=0xf9422260, `mov x1,x20`=0xaa1403e1, `bl`=0x97d88e5b.
+///
+/// SH177 (objective 2b, recon deleg_8c9de1e2 both tasks, authoritative): the cookie
+/// READ-BACK getter 0x1021ff6b0 selects its emission route on probe F()=0x21ff828,
+/// which returns 0 unconditionally because helper `1dc7428` hardcodes `mov w0,wzr; ret`
+/// (17 call sites, incl. GL-unsupported-message semantics — do NOT patch it globally).
+/// w2==0 + features[+73].bit0==0 + F()==0 -> getter takes the MAIN path 0x21ff744
+/// (reads the WebLogin store, never the jar) -> out stays empty. To reach the
+/// jar-driven Route B (0x5fee984, which re-emits the jar value into x8 via the
+/// `#HttpOnly_` format constant at .rodata 0x304d0e, ZERO WebLogin-store dependency),
+/// NOP the two read-back-local branch gates, gated by a dedicated env
+/// JIT_ROUTEB_COOKIE_READBACK so the bare ladder path is byte-identical:
+///   A) getter 0x1021ff72c `tbnz w8,#0, 21ff744` (Main-to-return elided elsewhere;
+///      encoding 0x370000c8) -> nop, so F()==0 falls THROUGH to Route B.
+///   B) Route-B gate 0x105fee9c4 `tbz w0,#0, 5feec00` (its per-entry re-check of the
+///      `1dc7428` stub via `bl 1dc7428` at 0x105fee9c0; encoding 0x360011e0) -> nop,
+///      so Route B does not bail to empty-out at the stub. Both read-back-local;
+///      the 17-caller stub 1dc7428 itself is never touched (GL-message semantics).
+fn routeb_patch_cookie_readback() {
+    if std::env::var_os("JIT_ROUTEB_COOKIE_READBACK").is_none() {
+        return;
+    }
+    // Gate A: getter 0x1021ff72c `tbnz w8,#0, 0x21ff744` -> nop (fall through to Route B).
+    let a = 0x1021ff72cu64;
+    let want = 0xd503_201fu32; // nop
+    let page = a & !0xfff;
+    unsafe {
+        if libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_WRITE) == 0 {
+            let before = *(a as *const u32);
+            if before == 0x3700_00c8u32 {
+                *(a as *mut u32) = want;
+                eprintln!("[elfjit:cookie-rb] SH177 gate A patched getter 0x{a:x} (tbnz->Main {before:08x}) -> nop (force jar-driven Route B)");
+            } else if before == want {
+                eprintln!("[elfjit:cookie-rb] SH177 gate A 0x{a:x} already patched");
+            } else {
+                eprintln!("[elfjit:cookie-rb] WARN gate A 0x{a:x} unexpected {before:08x}, not patched");
+            }
+            let _ = libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_EXEC);
+        }
+    }
+    // Gate B: Route-B entry `tbz w0,#0, 0x21ff844`... actually 0x105fee9c4 `tbz w0,#0,5feec00`
+    // after `bl 1dc7428` @ 0x105fee9c0 -> nop so the stub's 0 doesn't bail Route B.
+    let b = 0x105fee9c4u64;
+    let page = b & !0xfff;
+    unsafe {
+        if libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_WRITE) == 0 {
+            let before = *(b as *const u32);
+            if before == 0x3600_11e0u32 {
+                *(b as *mut u32) = want;
+                eprintln!("[elfjit:cookie-rb] SH177 gate B patched Route-B @0x{b:x} (tbz-stub-bail {before:08x}) -> nop (proceed to jar read-back)");
+            } else if before == want {
+                eprintln!("[elfjit:cookie-rb] SH177 gate B 0x{b:x} already patched");
+            } else {
+                eprintln!("[elfjit:cookie-rb] WARN gate B 0x{b:x} unexpected {before:08x}, not patched");
+            }
+            let _ = libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_EXEC);
+        }
+    }
+    arm64jit::jit::block_cache_drop_region(0x1021ff6a0, 0x1021ff860);
+    arm64jit::jit::block_cache_drop_region(0x105fee980, 0x105feebd0);
+}
+
 fn routeb_patch_gov_tail_cont() {
     let addr = 0x102e9fdf4u64;
     let orig: [u32; 3] = [0xf942_2260, 0xaa14_03e1, 0x97d8_8e5b];
@@ -11071,12 +11132,20 @@ fn main() {
     // (7006), then start_app runs alone — no dual-top-level overlap at all.
     // (Use the same gating condition as the WORKER_ADMISSION_GATE: the env var
     // must be present; --v2boot is required for this main path anyway.)
-    if std::env::var("JIT_SERIALIZE_RENDER").ok().as_deref() == Some("1")
+    // SH177 (recon deleg_26cb3b36 task-1, authoritative): also fire on a new
+    // standalone JIT_LADDER_SERIALIZE=1 (without JIT_SERIALIZE_RENDER, which would
+    // re-arm the WORKER_ADMISSION_GATE block and abort nativeGameGlobalInit EXIT
+    // 139 per SH170). This closes the SH55/64 dual-top-level-jit_run race for the
+    // deterministic-Ok(0x3e8) --v2boot ladder headlessly.
+    let ladder_serialize = std::env::var("JIT_LADDER_SERIALIZE").ok().as_deref() == Some("1");
+    let render_serialize = std::env::var("JIT_SERIALIZE_RENDER").ok().as_deref() == Some("1");
+    if (ladder_serialize || render_serialize)
         && std::env::args().any(|a| a == "--v2boot")
         && !LADDER_DONE.load(core::sync::atomic::Ordering::Relaxed)
     {
         eprintln!(
-            "[elfjit:progbin] SH162 JIT_SERIALIZE_RENDER=1: waiting for --v2boot ladder LADDER_DONE before main start_app jit_run (deterministic serialization, no SH55/64 overlap)"
+            "[elfjit:progbin] SH162/SH177 {}: waiting for --v2boot ladder LADDER_DONE before main start_app jit_run (deterministic serialization, no SH55/64 overlap)",
+            if ladder_serialize { "JIT_LADDER_SERIALIZE=1" } else { "JIT_SERIALIZE_RENDER=1" }
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
         while !LADDER_DONE.load(core::sync::atomic::Ordering::Relaxed) && std::time::Instant::now() < deadline {
@@ -11187,6 +11256,144 @@ fn main() {
                     }
                 }
             }
+        }
+    }
+
+    // SH177 (objective 2b, recon deleg_48e16777 task-0+task-1): cookie READ-BACK —
+    // after --cookie-ingress self-constructs the jar, write a classified value into
+    // it and drive nativeGetCookiesInNetscapeFormat (0x1021ff6b0) so the ENGINE
+    // re-emits the value as an RFC6265 line via its jar-driven Route B. This is the
+    // deterministic engine-side read of the persisted login cookie, headlessly.
+    // Preconditions pinned from disasm: accessor 0x21e1668 (config singleton
+    // [0x10683d7e8] + gate [0x10683d810]), features obj [S+24] with byte +73 bit0=0
+    // (Route B, jar-driven — bit0=1 reads the WebLogin store instead), w2=0, probe
+    // 0x21ff828 permitting. Out string goes to x8. Equity: if a further unexercised
+    // singleton faults, that pc is the honest NEXT gate (documented, not a claim).
+    if std::env::args().any(|a| a == "--cookie-readback") {
+        const GETTER: u64 = 0x1021ff6b0;
+        const CFG: u64 = 0x10683d7e8; // config singleton
+        const CFG_GATE: u64 = 0x10683d810; // gate byte
+        const GATE_FLAGS: u64 = 0x1072739d4;
+        // SH177 recon (deleg_66d4cead + deleg_b11c2a89 + classifier 0x22035c0 disasm):
+        // the Route-B emit is gated by the keep/domain CLASSIFIER 0x22035c0,
+        // which validates a DOTTED HOST string (checks byte[pos-1]=='.' 0x2e,
+        // then a second '.'/':', returns 1=keep only on a valid dotted host).
+        // Route B reads the jar STRING (getter 0x21fce24) then lowercases it
+        // (21ff8fc) and feeds it to the classifier — so the jar must hold a
+        // pure DOTTED DOMAIN like ".roblox.com" (NO '=', NO full cookie line:
+        // the '=' name=value syntax breaks the host-shape gate -> classifier
+        // returns 0 -> empty OUT, as empirically observed). The RFC6265
+        // '#HttpOnly_.%s\tTRUE\t/\t%s\t0\t%s\t%s' line (rodata 0x100304d0e) is
+        // then formatted from the domain + env/class-JNI name/value backing
+        // (5feee7c/21ff8fc — the Java CookieManager on a real device).
+        let TOK: &[u8] = b".roblox.com";
+        // Route B requires probe F()==0 -> the getter's `tbnz w8,#0` takes Main
+        // (reads the WebLogin store, empty headlessly). Patching read-back-local
+        // branch gates (SH177 routeb_patch_cookie_readback) forces the jar-driven
+        // Route B. Gated by JIT_ROUTEB_COOKIE_READBACK (set here).
+        unsafe { std::env::set_var("JIT_ROUTEB_COOKIE_READBACK", "1") };
+        routeb_patch_cookie_readback();
+        let jar = unsafe { *(0x106ed7a20u64 as *const u64) };
+        eprintln!("[elfjit:cookie-readback] jar[0x106ed7a20] = {jar:#x} (write {}-byte classified value into it)", TOK.len());
+        if jar != 0 && jar >= 0x100000000 && !std::env::args().any(|a| a == "--cookie-readback-nojar") {
+            let dbuf = guest_arena_alloc(TOK.len() + 1);
+            if dbuf == 0 {
+                eprintln!("[elfjit:cookie-readback] WARN guest arena unset — cannot write jar value");
+            } else {
+                let wr = arm64jit::jit::cookie_jar_write_value(jar, dbuf, TOK);
+                eprintln!("[elfjit:cookie-readback] cookie_jar_write_value -> {wr:#x} (jar now holds {}-byte classified token)", TOK.len());
+                // Ensure config singleton + features obj are seeded for Route B.
+                // The config singleton is statically placed AT [0x10683d7e8] (its
+                // first 8B = vtable), NOT a pointer stored there. The accessor
+                // 0x1021e1668 constructs it (writes vtable 0x10635fa30 at +0 and
+                // zeroes +8..+0x28, so [S+24]=features must be seeded by us).
+                unsafe {
+                    for a in [CFG, CFG_GATE, GATE_FLAGS, 0x106dcfc30] {
+                        let _ = arm64jit::jit::routeb_ensure_writable(a);
+                    }
+                    let vt = *(CFG as *const u64);
+                    if vt == 0 || vt >> 56 != 0 {
+                        // Drive the accessor to construct the singleton at CFG.
+                        let mut ac = arm64jit::jit::CpuState::new();
+                        ac.tpidr = arm64jit::jit::current_guest_tp();
+                        ac.x[31] = st.x[31];
+                        let slot = guest_arena_alloc(8);
+                        ac.x[8] = slot;
+                        let _ = arm64jit::jit::jit_run(image, base, 0x1021e1668, &mut ac as *mut CpuState);
+                        eprintln!("[elfjit:cookie-readback] config accessor ran, config@0x{CFG:x} vtable = {:#x}", *(CFG as *const u64));
+                    }
+                    let vt = *(CFG as *const u64);
+                    if vt != 0 && (vt >> 56 == 0) {
+                        // S = CFG (the object lives at the global; [S+24]=features).
+                        let s = CFG;
+                        // Seed features obj [S+24] with byte +73 bit0=0 => jar-driven Route B.
+                        let feats = unsafe { *((s + 24) as *const u64) };
+                        let fbuf = if feats == 0 || (feats >> 56 != 0) {
+                            let b = guest_arena_alloc(96);
+                            unsafe { *((s + 24) as *mut u64) = b };
+                            eprintln!("[elfjit:cookie-readback] seeded [config+24] features = {b:#x}");
+                            b
+                        } else {
+                            feats
+                        };
+                        // [fbuf+73].bit0 = 0 (Route B), +1 => Main/WebLogin store path.
+                        unsafe { *((fbuf + 73) as *mut u8) &= !1 };
+                        unsafe { *((CFG_GATE as *mut u8)) |= 1 };
+                        unsafe { *(GATE_FLAGS as *mut u32) |= 1 };
+                        unsafe { *(0x106dcfc30u64 as *mut u32) |= 1 };
+                        eprintln!("[elfjit:cookie-readback] Route B armed (features[+73].0=0, gates set)");
+                    }
+                }
+                // Drive the getter: x0=url, x1=ulen, x2=0, x8=&out(0x20 SSO). Use a BARE host
+                // (dotted-domain form) — the classifier 0x22035c0 validates the
+                // request URL as a dotted host (rejects scheme ':'/trailing '/').
+                let url = guest_arena_alloc(32);
+                let ulen = b".roblox.com".len() as u64;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(b".roblox.com".as_ptr(), url as *mut u8, ulen as usize);
+                    *((url + ulen) as *mut u8) = 0;
+                }
+                let out = guest_arena_alloc(0x20);
+                let mut gs = arm64jit::jit::CpuState::new();
+                gs.tpidr = arm64jit::jit::current_guest_tp();
+                gs.x[31] = st.x[31];
+                gs.x[0] = url;
+                gs.x[1] = ulen;
+                gs.x[2] = 0;
+                gs.x[8] = out;
+                match arm64jit::jit::jit_run(image, base, GETTER, &mut gs as *mut CpuState) {
+                    Err(e) => eprintln!("[elfjit:cookie-readback] getter stopped: {e}"),
+                    Ok(r) => {
+                        eprintln!("[elfjit:cookie-readback] nativeGetCookiesInNetscapeFormat returned Ok({r:#x})");
+                        // Decode the out string (x8) as libc++ SSO/long. Use
+                        // read_unaligned: the arena bump allocator does not 8-align.
+                        let w0 = unsafe { core::ptr::read_unaligned(out as *const u64) };
+                        if w0 & 1 == 0 {
+                            let size = (w0 >> 1) as usize;
+                            let data = out + 1;
+                            let mut s = String::new();
+                            for i in 0..size.min(96) {
+                                let c = unsafe { *((data + i as u64) as *const u8) };
+                                s.push(if c == 0 { ' ' } else { c as char });
+                            }
+                            eprintln!("[elfjit:cookie-readback] OUT SSO size={size}: {s:?}");
+                        } else {
+                            let size = unsafe { core::ptr::read_unaligned((out + 8) as *const u64) } as usize;
+                            let data = unsafe { core::ptr::read_unaligned((out + 16) as *const u64) };
+                            let mut s = String::new();
+                            if data >= 0x100000000 {
+                                for i in 0..size.min(128) {
+                                    let c = unsafe { *((data + i as u64) as *const u8) };
+                                    s.push(if c == 0 { ' ' } else { c as char });
+                                }
+                            }
+                            eprintln!("[elfjit:cookie-readback] OUT LONG size={size}: {s:?}");
+                        }
+                    }
+                }
+            }
+        } else {
+            eprintln!("[elfjit:cookie-readback] jar not constructed (or --cookie-readback-nojar) — run with --cookie-ingress first");
         }
     }
 

@@ -703,6 +703,36 @@ fn routeb_cookie_jar_guard(_state: *mut CpuState, pc: u64) {
     }
 }
 
+/// SH177 (objective 2b / recon deleg_48e16777 task-0+task-1): write a classified
+/// value into the engine's cookie-jar container as a valid libc++ `std::string`.
+///
+/// `nativeGetCookiesInNetscapeFormat` (guest 0x1021ff6b0) reads the jar via getter
+/// 0x21fce24 (`ldr [0x106ed7a20]`); on the jar-driven Route B (feature byte
+/// `[features+73].bit0==0`) it re-formats the jar contents into an RFC6265 line.
+/// Recon (task-1, authoritative): "getter CAN emit a cookie headlessly ONLY through
+/// Route B (jar-driven) — yields a real value only if the jar string holds it."
+/// This is the deterministic write-side. The engine's libc++ LONG decode (verbatim
+/// in the Route-B getter 0x5fee9e0..): `ldrb w8,[x0]; ldp x10,x9,[x0,#8];
+/// lsr x11,w8,#1; tst w8,#1; csel x0,x9,x0,ne; csel x1,x11,x10,eq` => LONG when
+/// byte0 bit0==1 (tst crosses to the __cap_ word at [x0+0]), then data=x9=[x0+16],
+/// size=x10=[x0+8]. So the LONG layout is: __cap_@[0] (bit0=1 => long), __size_@[8],
+/// __data_@[16]. `data_buf` must be >= len+1 bytes (NUL). Pure layout,
+/// hermetic-testable, no runtime. Returns `jar_buf` on success, 0 on NULL/invalid.
+pub fn cookie_jar_write_value(jar_buf: u64, data_buf: u64, bytes: &[u8]) -> u64 {
+    if jar_buf == 0 || data_buf == 0 || bytes.is_empty() || bytes.len() >= 4096 {
+        return 0;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), data_buf as *mut u8, bytes.len());
+        *((data_buf + bytes.len() as u64) as *mut u8) = 0;
+        let gp = jar_buf as *mut u64;
+        gp.add(0).write_volatile(bytes.len() as u64 | 1); // __cap_ (bit0=1 => long)
+        gp.add(1).write_volatile(bytes.len() as u64); // __size_
+        gp.add(2).write_volatile(data_buf); // __data_
+    }
+    jar_buf
+}
+
 /// SH164 (recon deleg_94aac9d7): block-entry probe for the governor-tail dispatch.
 /// The tail (pc 0x102e9fcc4..0x102e9fdc8) loads x0=impl[+0x408], `ldr x8,[x0]; ldr
 /// x8,[x8,#48]; blr x8` dispatches vt[+0x30]. On a real session the slot holds a live
@@ -976,7 +1006,7 @@ fn page_is_writable(addr: u64) -> bool {
 /// -> map anon RW (routeb_map_guest_page, the SH156 pattern); mapped-but-read-only (a real
 /// file-backed .data page, like the NativeDataModelManager singleton holder) -> mprotect RW
 /// (private file mapping COWs safely). Returns true when writable afterwards.
-fn routeb_ensure_writable(addr: u64) -> bool {
+pub fn routeb_ensure_writable(addr: u64) -> bool {
     if page_is_writable(addr) {
         return true;
     }
@@ -4862,6 +4892,38 @@ mod tests {
             0x102bd1d68u64,
             "default all-leaf manager keeps +0x1f0 as a leaf (SH165-fwd benign unchanged)"
         );
+    }
+
+    #[test]
+    fn sh177_cookie_jar_write_value_layouts_long_string() {
+        // SH177 (objective 2b): cookie_jar_write_value lays a LONG-form libc++
+        // std::string into the jar's 0x20-byte buffer (__data_/__size_/__cap_,
+        // cap bit0=0 => long) so nativeGetCookiesInNetscapeFormat's Route B
+        // (jar-driven) can re-emit it as an RFC6265 line. Pure layout, no runtime.
+        let jar = Box::leak(vec![0xabu8; 0x20].into_boxed_slice()).as_mut_ptr() as u64;
+        let data = Box::leak(vec![0u8; 64].into_boxed_slice()).as_mut_ptr() as u64;
+        let val: &[u8] = b"#HttpOnly_.roblox.com\t.ROBLESECURITY\t0xdeadbeef012345";
+        let r = cookie_jar_write_value(jar, data, val);
+        assert_eq!(r, jar);
+        unsafe {
+            let gp = jar as *const u64;
+            assert_eq!(gp.add(0).read_volatile(), val.len() as u64 | 1); // __cap_ (bit0=1 => long)
+            assert_eq!(gp.add(1).read_volatile(), val.len() as u64); // __size_
+            assert_eq!(gp.add(2).read_volatile(), data); // __data_
+            // bytes + NUL landed in data_buf
+            let mut ok = true;
+            for i in 0..val.len() {
+                if *((data + i as u64) as *const u8) != val[i] {
+                    ok = false;
+                }
+            }
+            assert!(ok);
+            assert_eq!(*((data + val.len() as u64) as *const u8), 0);
+        }
+        // Null / empty inputs rejected.
+        assert_eq!(cookie_jar_write_value(0, data, val), 0);
+        assert_eq!(cookie_jar_write_value(jar, 0, val), 0);
+        assert_eq!(cookie_jar_write_value(jar, data, &[]), 0);
     }
 
     #[test]
