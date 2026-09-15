@@ -4581,6 +4581,15 @@ pub fn compile_image_bounded(
 mod tests {
     use super::*;
 
+    /// SH179: the DM-allocation-capture hermetic tests (sh167 guard + sh169 trail) mutate
+    /// process-global state that is shared across test threads — the PREV_DM_ALLOC_HOOK
+    /// static and the JIT_DM_ALLOC_CAPTURE[_DELEGATE] process env — and the Rust test
+    /// harness runs them on parallel threads, so sh167 could read a PREV or DELEGATE state
+    /// mid-mutation by sh169 and fail at a run-variable assert line (observed 550/0 ->
+    /// 371/1 flake at jit.rs:5068/5085). Serializing the two shared-state tests makes the
+    /// suite deterministic; production (single jit_run thread per run) is untouched.
+    static DM_CAPTURE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn worker_gate_park_bounded_wait_unparks_promptly() {
         // (a) Gate clear (default) -> park returns immediately, no spin/hang.
@@ -5014,6 +5023,8 @@ mod tests {
 
     #[test]
     fn sh167_dm_alloc_capture_is_env_gated_and_never_clobbers_live_hook() {
+        // SH179: serialize against sh169 (shared PREV_DM_ALLOC_HOOK static + process env).
+        let _dm_capture_lock = DM_CAPTURE_TEST_LOCK.lock().unwrap();
         // SH167 (recon cone deleg_35857472 task-2): the CRT operator-new capture hook. The
         // guard must (a) be inert without JIT_DM_ALLOC_CAPTURE, (b) fire ONLY at the wrapper
         // block-entry pc 0x102a0d9b8, (c) seed the ACTIVE allocator-hook global 0x1067daaf0
@@ -5104,6 +5115,8 @@ mod tests {
 
     #[test]
     fn sh169_delegating_trail_falls_back_safely_when_no_guest_image() {
+        // SH179: serialize against sh167 (shared PREV_DM_ALLOC_HOOK static + process env).
+        let _dm_capture_lock = DM_CAPTURE_TEST_LOCK.lock().unwrap();
         // SH169 delegation: with a saved engine hook (delegate mode), the capture trail routes
         // the real allocation through the JIT to the engine's own hook. In a hermetic test there
         // is no active guest image, so run_guest_callback must Err and the trail must fall back to
