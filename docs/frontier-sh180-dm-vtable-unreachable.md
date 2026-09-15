@@ -1,7 +1,7 @@
 # SH180 — Route-B static-construction hunt CLOSED at the vtable level + migration-capture harness verified consistent (2-agent fresh cone)
 
 Date: Sep 15, 2026, hermes-worker. Workspace green (550/0 at HEAD 485ee20 SH179).
-Docs only — no production code change warranted. Commit <SH180COMMIT>.
+Docs only — no production code change warranted. Commit 26609cc.
 
 ## Why this session ran a fresh cone
 
