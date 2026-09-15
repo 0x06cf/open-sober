@@ -110,3 +110,55 @@ manufacture lever remains the one real headless Route-B artifact.
 - NEXT (honest): live-DM session = migration (GPU-host/real-input), SH174 capture latch =
   validated observer. Any new Route-B push MUST first locate a live-DM-construction event
   OUTSIDE the five closed gates, else strictly migration work. Cone kept armed per discipline.
+
+## SH186b — FRESH-SECTOR DO-INIT RE-ATTACK (2-agent follow-on cone, both READ-ONLY, authoritative)
+The operator SEP-15 're-attack via do-init/do-build completion or a dynamic DM-ctor trace'
+directive, answered at the strongest level. Two independent agents (deleg_5ba893c8 x2):
+
+### (1) Do-init wall is CROSSABLE as a code change — but the endpoint is empty (deleg task-0)
+do-init 0x2206c40 (guest 0x102206c40) main-thread branch IF all preconditions plant:
+- flag [guest 0x106a68410].bit0 = 1 (clear once-guard fast path; else 0x284ce54 re-inits)
+- scheduler runnable [0x106a68408] = 0 lets 0x6201bd4 use the ENGINE default runner (no
+  fabricated-runner needed for the first test)
+- descriptor vt[+0x30] (guest 0x10635ce10, StartLuaAppDM variant 0x10635dd98) = app-shell ctor
+  = 0x1057d6ef4 — runtime-known (SH182 empirically executes it)
+- main-thread-id [0x106863a68] = caller's live pthread_self() (written in-process, NOT a boot
+  constant) so 0x2206db8 takes the `br x1`->ctor branch instead of scheduler-construction
+Call 0x102206c40 on-main-thread (x1=&desc{x0=[0x10683d008]-binder, x2=0}), hook 0x2206e24 (br x1).
+FEASIBILITY: passing the do-init GATE headlessly ~80/100 (real code change, not migration).
+Reaching a live DM MAKE ~35/100 — the ctor target + thread-id equality are in-process-runtime
+writes, and (critically) the DM it yields has NO consumer holder (gate 2) and NO GuiObject-
+producer vtable (gate 3). => Crossing the wall is implementable but produces NO self-constructed
+screens; a do-init-driver code edit would be feature-flag cruft against a known-empty endpoint.
+Do NOT build it.
+
+### (2) INDEPENDENT EXHAUSTIVE HUNT — no live-DM-construction event outside the 5 gates (deleg task-1, decisive)
+Full APS2/ANDROID_RELA decode (568,272 relocs, corrected byte-offset):
+- Genuine DM typeinfo 0x6714e18 (.data.rel.ro), name slot 0x6714e20 reloc-addend 0xcaca6b =
+  the ONLY referenced N3RBX9DataModelE (179 rodata copies, 1 used). Exactly 3 sub-vtables via
+  RTTI relocs: 0x67162f0 / 0x67163a8 / 0x6716400, all RELATIVE-reloc-populated (16/15/16 slots;
+  [V1+0x30]=0x57d6ef4 app-shell ctor; [V1+0]=0x57ce740; [V1+0x38]=0x1db2cf0) — CONFIRMS the SH186
+  reconciliation (relocate-populated zeros by design, NOT fabricated).
+- **The DM vptr VALUES 0x67162f0/0x67163a8/0x6716400 have ZERO static materialization sites**:
+  0 adrp+add, 0 movz/movk, 0 GOT/.data reloc addend, 0 literal-pool dword, and absent as raw
+  bytes from the ENTIRE 109MB image. No code anywhere computes a DataModel vptr base.
+- op-new sites sized 0x1108 (0x2b37b6c..0x2b37d24) = malloc+memcpy clone factories, never write
+  offset-0 (vptr). DM ctor slots (0x57d6ef4/0x57ce740/0x57d19bc/0x57d07d0) = 0 direct bl callers
+  (vtable-dispatched only). Single typeinfo ref = __dynamic_cast consumer 0x2b83ab4 (type-check,
+  not construction). .init_array ctor-region entries = trivial static-data initializers.
+- onDataModelLoaded/dataModelOnCreated: string ABSENT. createDataModel family = forTeleport
+  (dead, gate 5) + ContentAsync (AssetService, downstream of live DM). 
+VERDICT: **no boot-reachable RBX::DataModel-construction event exists outside the 5 gates** —
+stronger than any prior negative: the vptr value itself has no static materialization, so a live
+DM can only come from a runtime make_shared that computes the vptr base, and no code path
+references it. A Route-B push cannot 'first locate an outside-the-gates construction event'; none
+exists. Strictly migration (GPU-host/real app-launch), SH174 the observer.
+
+## SH186 STANDING (final)
+Route-B live-DM, after a fresh 5-way re-attack (3 SH186 + 2 SH186b agents), is MIGRATION-GATE
+with the wall now characterized at the reference level (vptr zero-materialization). All
+headless avenues are closed: no static seed, no dynamic trace, no do-init completion that
+yields screens (crossable gate, empty endpoint), no manufacture consumer. The SH181/182
+manufacture lever remains the only headless handle (fires into a no-consumer holder, reaches
+no GuiObject-producer vtable). Do NOT build further Route-B levers that re-tread the 5 gates.
+Next real unlock = migration/GPU-host with SH174 capture-latch observer. Cone kept armed.
