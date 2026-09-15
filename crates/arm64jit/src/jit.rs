@@ -1042,6 +1042,29 @@ fn routeb_dm_ctor_arg(full: bool) -> u64 {
     }
 }
 
+/// Reconstruct the PATH-B-missing DM pointer members the init chain derefs as
+/// object bases, so PATH B's real init body doesn't fault. Recon deleg_623cac1f:
+/// the ctor's own body reads only DM+0x38c (scalar, safe 0), but the transitive
+/// init chain (Mutex::lock wrapper 0x2b53a68) locks a NULL pointer member's
+/// embedded +0x28 pthread_mutex_t -> fault 0x28. The fault frame derives two live
+/// sub-object bases at DM+0x610 and DM+0x648 (0x38 apart). Seeding each to a valid
+/// zeroed buffer makes the embedded +0x28 mutex an all-zero PTHREAD_MUTEX_INITIALIZER
+/// -> lock succeeds. Idempotent / default-inert (only called by the PATH B driver).
+fn routeb_seed_dm_pathb_members(dm: u64) {
+    use std::sync::OnceLock;
+    static SUB0: OnceLock<u64> = OnceLock::new();
+    static SUB1: OnceLock<u64> = OnceLock::new();
+    let s0 = *SUB0.get_or_init(|| Box::leak(vec![0x0u8; 0x40].into_boxed_slice()).as_mut_ptr() as u64);
+    let s1 = *SUB1.get_or_init(|| Box::leak(vec![0x0u8; 0x40].into_boxed_slice()).as_mut_ptr() as u64);
+    for (off, ptr) in [(0x610u64, s0), (0x648u64, s1)] {
+        let cur = unsafe { std::ptr::read_unaligned((dm + off) as *const u64) };
+        if cur != ptr {
+            unsafe { std::ptr::write_unaligned((dm + off) as *mut u64, ptr) };
+            eprintln!("[routeb-dmctor] SH182 PATH B: seeded DM+{off:#x} = {ptr:#x} (was {cur:#x})");
+        }
+    }
+}
+
 /// SH182: at the StartLuaAppDM entry (where the manufacture plant already ran,
 /// so the current-DM holder is the genuine-vptr DM), host-DRIVE the DM's real
 /// app-shell ctor 0x1057d6ef4 with x0=manufactured DM. default-inert (env
@@ -1082,6 +1105,9 @@ fn routeb_dm_ctor_driver_guard(_state: *mut CpuState, pc: u64) {
         //     (component ctor + AppBridgeV2Init + placeVersion vector append).
         let dm = routeb_manufactured_dm();
         let full = std::env::var_os("JIT_DM_CTOR_FULL").is_some();
+        if full {
+            routeb_seed_dm_pathb_members(dm); // un-NULL DM+0x610/+0x648 so Mutex::lock succeeds
+        }
         let arg = routeb_dm_ctor_arg(full);
         let tp = crate::jit::current_guest_tp();
         match crate::jit::run_guest_callback(APPSHELL_CTOR, [dm, arg, 0, 0, 0, 0, 0, 0], tp) {
@@ -5162,6 +5188,26 @@ mod tests {
             0,
             "SSO byte23 = 0"
         );
+        // PATH B member seed: un-NULLs DM+0x610/+0x648 to valid zeroed buffers.
+        let mut dm_buf = vec![0x0u8; 0x700];
+        let dm_b = dm_buf.as_mut_ptr() as u64;
+        let offs = [0x610u64, 0x648u64];
+        routeb_seed_dm_pathb_members(dm_b);
+        for off in offs {
+            let p = unsafe { std::ptr::read_unaligned((dm_b + off) as *const u64) };
+            assert_ne!(p, 0, "PATH B must un-NULL DM+{off:#x}");
+            assert!(
+                unsafe { std::ptr::read_unaligned((p + 0x28) as *const u64) } == 0,
+                "PATH B sub-object +0x28 must be zeroed (PTHREAD_MUTEX_INITIALIZER) at +{off:#x}"
+            );
+            // idempotent
+            routeb_seed_dm_pathb_members(dm_b);
+            assert_eq!(
+                unsafe { std::ptr::read_unaligned((dm_b + off) as *const u64) },
+                p,
+                "PATH B member seed must be idempotent at +{off:#x}"
+            );
+        }
         // Guard: env-off never fires at StartLuaAppDM entry.
         let mut st = CpuState::new();
         let start = std::time::Instant::now();
