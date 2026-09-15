@@ -1210,6 +1210,40 @@ fn routeb_dm_real_ctor_drive_guard(_state: *mut CpuState, pc: u64) {
                     "[routeb-realctor] SH187: REAL DM ctor wrapper 0x{DM_WRAPPER:x} DROVE ok ret x0={r:#x}; obj vptr set = {w0:#x},{w1:#x},{w2:#x} {} (genuine={genuine})",
                     if genuine { "GENUINE MATCH" } else { "(note: not the expected set)" }
                 );
+                if genuine {
+                    // SH187b: the constructed DM is vptr-genuine. Plant it into the current-DM
+                    // holder (always, no crash) AND — only when JIT_ROUTEB_DM_REALCTOR_CONSUMER=1 —
+                    // best-effort drive the one bl-reachable consumer (get-or-create 0x2dbcd88,
+                    // from MemStorage_bind 0x24c61e8 / nativeOnDestroyed 0x275bd04 with
+                    // x0=obj+0x1f0) — recon deleg_f39b7cda. The consumer probe is gated because it
+                    // currently ABORTS (needs the 0x2dbd018 once-cell + 0x2411658 keyed lookup
+                    // seeded first); keep the default construction+plant path crash-free.
+                    let dm_base = r; // wrapper returned obj+0x1f0
+                    const CUR_DM_HOLDER: u64 = 0x106391908;
+                    // seed the known consumer-deref'd delegate slots to valid zeroed buffers so a
+                    // dispatch survives: dm+0xe8 / dm+0xf0 (MemStorage_bind delegates), dm+0xc0
+                    // (nativeOnDestroyed), +0x38c=0 (app-shell flag accessor, benign 0).
+                    let del0 = Box::leak(vec![0x0u8; 0x40].into_boxed_slice()).as_mut_ptr() as u64;
+                    let del1 = Box::leak(vec![0x0u8; 0x40].into_boxed_slice()).as_mut_ptr() as u64;
+                    let del2 = Box::leak(vec![0x0u8; 0x40].into_boxed_slice()).as_mut_ptr() as u64;
+                    for (off, v) in [(0xe8u64, del0), (0xf0u64, del1), (0xc0u64, del2)] {
+                        unsafe { std::ptr::write_unaligned((dm_base + off) as *mut u64, v) };
+                    }
+                    unsafe { std::ptr::write_unaligned((dm_base + 0x38c) as *mut u64, 0) };
+                    if routeb_ensure_writable(CUR_DM_HOLDER) {
+                        unsafe { std::ptr::write_unaligned(CUR_DM_HOLDER as *mut u64, dm_base) };
+                        eprintln!("[routeb-realctor] SH187b: planted constructed DM {dm_base:#x} into current-DM holder 0x{CUR_DM_HOLDER:x}");
+                    }
+                    if std::env::var_os("JIT_ROUTEB_DM_REALCTOR_CONSUMER").is_some() {
+                        const GET_OR_CREATE: u64 = 0x102dbcd88;
+                        match crate::jit::run_guest_callback(GET_OR_CREATE, [dm_base, 0, 0, 0, 0, 0, 0, 0], tp) {
+                            Ok(cr) => eprintln!("[routeb-realctor] SH187b: get-or-create consumer 0x{GET_OR_CREATE:x} DROVE ok ret x0={cr:#x} (survived; returns the DM if present)"),
+                            Err(e) => eprintln!("[routeb-realctor] SH187b: get-or-create consumer 0x{GET_OR_CREATE:x} drive err: {e} (next gate — seed the 0x2dbd018 once-cell / 0x2411658 keyed lookup)"),
+                        }
+                    } else {
+                        eprintln!("[routeb-realctor] SH187b: consumer probe gated (JIT_ROUTEB_DM_REALCTOR_CONSUMER unset) — holder plant only, path kept crash-free");
+                    }
+                }
             }
             Err(e) => eprintln!("[routeb-realctor] SH187: DM ctor wrapper drive err: {e}"),
         }
