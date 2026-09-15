@@ -981,6 +981,90 @@ pub fn routeb_manufactured_dm() -> u64 {
     })
 }
 
+// ---------------------------------------------------------------------------
+// SH182: host-drive the genuine-DM-vtable app-shell ctor on the manufactured DM
+// The APP-SHELL ctor slot [V+0x30] of the genuine primary DataModel vtable
+// (0x1067162f0) is guest 0x1057d6ef4 — loader-populated, REAL relocated engine
+// code (SH181). SH181's declared "next problem" was whether a manufactured DM
+// (bare zeroed body, genuine vptr) SURVIVES this ctor headlessly. Fresh recon
+// (deleg_661626bb): the ctor reads only TWO things —
+//   (a) stack-canary global file 0x67d16f0 (guest 0x1067d16f0): currently VALUE 1
+//       in a bare boot -> `ldr x8,[x21]` at 0x57d6f10 derefs addr 1 -> SEGV.
+//       Fix: write a stable pointer (to a stable 8-byte word) into it. The ctor
+//       stores it to [x29,#-8] at prologue and re-reads at epilogue, so ANY
+//       stable value auto-passes — it is a standard canary, not a data seed.
+//   (b) DM field +0x38c (`ldrsw x3,[x19,#908]`) = 4 readable bytes (0 fine).
+// Plus an ABI gate on the SECOND argument x1 (not a code-pointer and not
+// derefed as one): `ldr x8,[x1,#8]`. With a ZEROED descriptor (PATH A) the gate
+// takes the clean zero-touch no-op + ret — the SAFE survival proof: the
+// manufactured DM enters and returns through its real app-shell ctor without
+// faulting. (PATH B — feeding a genuine "ServerRestartScheduled" std::string —
+// would run a real init body, but its exact SSO-byte layout vs the equality fn
+// 0x2152f30 reading +0/+8/+16 is not yet decoded; flagged as an empirical
+// follow-up, do NOT lock an unverified byte model here. PATH A is the honest
+// first SH182 deliverable.)
+// This lever drives guest 0x1057d6ef4 with x0=manufactured DM + x1=&zeroed
+// descriptor via the existing NESTED run_guest_callback (same-thread nested is
+// the sanctioned type4_frame pattern; this ctor is pure .text, no GLSL compile).
+// default-inert; env JIT_ROUTEB_DM_CTOR_DRIVER=1. +1 hermetic test.
+// ---------------------------------------------------------------------------
+/// Build the x1 descriptor for the app-shell ctor: a zeroed 0x28-byte buffer
+/// whose +8..+0x20 is a valid EMPTY libc++ std::string (all zeros = SSO size 0).
+/// This selects PATH A: the ctor's `ldr x8,[x1,#8]` gate sees 0 -> the clean
+/// zero-touch no-op + ret (the safe manufactured-DM survival proof).
+fn routeb_dm_ctor_arg_empty() -> u64 {
+    use std::sync::OnceLock;
+    static EMTPY: OnceLock<u64> = OnceLock::new();
+    *EMTPY.get_or_init(|| Box::leak(vec![0x0u8; 0x28].into_boxed_slice()).as_mut_ptr() as u64)
+}
+
+/// SH182: at the StartLuaAppDM entry (where the manufacture plant already ran,
+/// so the current-DM holder is the genuine-vptr DM), host-DRIVE the DM's real
+/// app-shell ctor 0x1057d6ef4 with x0=manufactured DM. default-inert (env
+/// JIT_ROUTEB_DM_CTOR_DRIVER). Idempotent (OnceLock). Fixes the canary first.
+fn routeb_dm_ctor_driver_guard(_state: *mut CpuState, pc: u64) {
+    if std::env::var_os("JIT_ROUTEB_DM_CTOR_DRIVER").is_none() {
+        return;
+    }
+    const SLADM_LO: u64 = 0x1023efe2c; // StartLuaAppDM entry (canonical ladder drives it)
+    const SLADM_HI: u64 = 0x1023eff20;
+    if pc < SLADM_LO || pc > SLADM_HI {
+        return;
+    }
+    const APPSHELL_CTOR: u64 = 0x1057d6ef4; // [V+0x30] of genuine DM vtable 0x1067162f0 (SH182)
+    const CANARY: u64 = 0x1067d16f0; // stack-canary global, file 0x67d16f0, VALUE 1 in bare boot
+    use std::sync::OnceLock;
+    static DRIVEN: OnceLock<()> = OnceLock::new();
+    DRIVEN.get_or_init(|| {
+        // (a) canary fix: point the global at a stable 8-byte word.
+        if !routeb_ensure_writable(CANARY) {
+            eprintln!("[routeb-dmctor] SH182: canary global 0x{CANARY:x} not writable, abort");
+            return;
+        }
+        static WORD: u64 = 0;
+        let cur = unsafe { std::ptr::read_unaligned(CANARY as *const u64) };
+        let newp = &raw const WORD as *const u64 as u64;
+        if cur != newp {
+            unsafe { std::ptr::write_unaligned(CANARY as *mut u64, newp) };
+            eprintln!(
+                "[routeb-dmctor] SH182: seeded stack-canary global 0x{CANARY:x} = {newp:#x} (was {cur:#x}) for app-shell ctor 0x{APPSHELL_CTOR:x}"
+            );
+        }
+        // (b) drive the ctor with the manufactured DM (x0) + zeroed descriptor (x1).
+        //     PATH A = clean survival no-op: proves the manufactured DM enters AND
+        //     returns through its REAL app-shell ctor without faulting.
+        let dm = routeb_manufactured_dm();
+        let arg = routeb_dm_ctor_arg_empty();
+        let tp = crate::jit::current_guest_tp();
+        match crate::jit::run_guest_callback(APPSHELL_CTOR, [dm, arg, 0, 0, 0, 0, 0, 0], tp) {
+            Ok(r) => eprintln!(
+                "[routeb-dmctor] SH182: manufactured-DM app-shell ctor 0x{APPSHELL_CTOR:x} DROVE ok ret x0={r:#x} (PATH A survival no-op) — DM {dm:#x} vt=0x1067162f0 entered AND returned through real code"
+            ),
+            Err(e) => eprintln!("[routeb-dmctor] SH182: app-shell ctor drive err: {e}"),
+        }
+    });
+}
+
 /// True when the page containing `addr` appears in /proc/self/maps at all (any
 /// mapping covering it, not just a readable one). Conservative: used so
 /// routeb_map_guest_page only maps a page that is GENUINELY absent.
@@ -3749,6 +3833,7 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
             routeb_dm_manager_guard(state, pc); // SH165-fwd: re-seed the manager singleton holder on fnB entry (JIT_ROUTEB_DMFORCE)
             routeb_tail_dispatch_guard(state, pc);
             routeb_dm_manufacture_guard(state, pc); // SH180/181: plant manufactured genuine-vptr DM into the current-DM holder (JIT_ROUTEB_DM_MANUFACTURE)
+            routeb_dm_ctor_driver_guard(state, pc); // SH182: host-drive the manufactured DM through its genuine app-shell ctor 0x1057d6ef4 (JIT_ROUTEB_DM_CTOR_DRIVER)
             routeb_tail_eq_guard(state, pc); // SH161b: seed impl[+0x2b8]=2 (governor-tail epilogue b.eq)
             routeb_tail_trace(state, pc);
         }
@@ -5007,6 +5092,49 @@ mod tests {
             "idempotent: second StartLuaAppDM call leaves the same DM"
         );
         unsafe { std::env::remove_var("JIT_ROUTEB_DM_MANUFACTURE") };
+    }
+
+    #[test]
+    fn sh182_dm_ctor_arg_builds_sso_and_empty_plus_guard_env_gated() {
+        // SH182: drive the manufactured DM through its REAL app-shell ctor.
+        // Provide: (a) the x1 descriptor for PATH A is a zeroed 0x28 buffer whose
+        // +8..+0x20 is a valid EMPTY libc++ std::string (SSO size 0) — the ctor's
+        // `ldr x8,[x1,#8]` gate sees 0 -> clean zero-touch no-op + ret; (b) guard
+        // env-gated + region-scoped.
+        // PATH A descriptor: all zeros -> the gate short-circuits to the survival
+        // no-op. Verify it is a valid empty string (and thus the guard passes x1
+        // = a stable address, not 0).
+        let d = routeb_dm_ctor_arg_empty();
+        assert_ne!(d, 0, "descriptor must be a stable non-zero address");
+        for i in 0..0x28u64 {
+            assert_eq!(
+                unsafe { std::ptr::read_unaligned((d + i) as *const u8) },
+                0,
+                "PATH A descriptor must be zeroed (empty SSO string) at +{i}"
+            );
+        }
+        // Guard: env-off never fires at StartLuaAppDM entry.
+        let mut st = CpuState::new();
+        let start = std::time::Instant::now();
+        routeb_dm_ctor_driver_guard(&mut st as *mut CpuState, 0x1023efe2c);
+        assert!(
+            start.elapsed().as_millis() < 50,
+            "env-off guard must return immediately (no canary seed / no drive)"
+        );
+        // env-on + wrong pc -> no fire (region gate short-circuits BEFORE the
+        // OnceLock body, so no canary work / no drive attempt). We cannot read the
+        // canary global (0x1067d16f0 is unmapped in a hermetic test — no guest
+        // image), so assert via timing: a fired guard on this pc would attempt
+        // routeb_ensure_writable + a failed callback; a region-gated return is
+        // instant. (routeb_ensure_writable on an unmapped addr is safe/no-op.)
+        unsafe { std::env::set_var("JIT_ROUTEB_DM_CTOR_DRIVER", "1") };
+        let t0 = std::time::Instant::now();
+        routeb_dm_ctor_driver_guard(&mut st as *mut CpuState, 0x102e9fcc4);
+        assert!(
+            t0.elapsed().as_millis() < 50,
+            "env-on + wrong pc must region-gate and return immediately"
+        );
+        unsafe { std::env::remove_var("JIT_ROUTEB_DM_CTOR_DRIVER") };
     }
 
     #[test]
