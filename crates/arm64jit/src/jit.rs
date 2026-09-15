@@ -745,6 +745,222 @@ pub fn routeb_dm_force_shell() -> u64 {
     })
 }
 
+/// SH165-fwd (recon deleg_62a86bcd task-0, authoritative): fnB (0x102bd1b98 engine-init)
+/// bl 0x102bd8ce8, which reads its arg's +0x18 C-string and forwards it to a
+/// NativeDataModelManager manager via vtable slots +0xf8/+0x108/+0x1f0
+/// (continueAfterFlagsLoaded_). The manager singleton comes from the getter 0x102174c04,
+/// which returns the holder global at GUEST 0x102727550 — but JNI_OnLoad (boot entry
+/// 0x102173ff4) already stlr'd a host JavaVM* into that global, so under the DMFORCE
+/// ladder the getter would return a host JNINativeInterface* and the engine-init's
+/// vt[+0xf8] blr would dispatch into RAW HOST JNI. THIS guard re-seeds 0x102727550 with
+/// a fabricated all-leaf-vtable manager M so the getter returns M and the subsequent
+/// vt dispatches (+0xf8/+0x108/+0x1f0) resolve to benign leaves; with all other vt slots
+/// 0 (=> vt[+0x720]==0) the post-FFI continuation 0x2bd9058 soft-returns cleanly. SCOPED:
+/// fires ONLY on entry to the fnB engine-init region (0x102bd1b98), gated on the same
+/// JIT_ROUTEB_DMFORCE flag that forces fnB — it never blanket-clobbers the JNI-critical
+/// global on the normal boot path. Idempotent. Layout: vt[+0x30]=write-leaf
+/// (str x0,[x1]; mov w0,#0; ret — getter fills its out-field [x1] with `this`), vt[+0xf8]/
+/// [+0x108]/[+0x1f0]=leaf, all other slots 0; M[+0]=vt, M[+8]=0 (getter tail-helper
+/// 0x624e6c0 cbz-cleans on M[+8]==0).
+fn routeb_dm_manager_guard(_state: *mut CpuState, pc: u64) {
+    if std::env::var_os("JIT_ROUTEB_DMFORCE").is_none() {
+        return;
+    }
+    // Fire only on the fnB engine-init entry (the region SH165's shell dispatches into).
+    if pc < 0x102bd1a30 || pc > 0x102bd1d08 {
+        return;
+    }
+    const HOLDER: u64 = 0x102727550; // guest NativeDataModelManager singleton holder
+    // The holder is a fixed .bss/singleton global. At fnB time its page is either left
+    // UNMAPPED by the engine's boot remapping (the SH116 class) or mapped READ-ONLY
+    // (file-backed .data) — but the getter 0x2174c04 reads it via ldar and we must seed
+    // it, so an unwritable page faults. Ensure the page is writable (map anon RW when
+    // genuinely absent; mprotect RW when file-backed RO), then seed.
+    if !routeb_ensure_writable(HOLDER) {
+        return;
+    }
+    let m = routeb_dm_manager_fabricated();
+    let cur = unsafe { std::ptr::read_unaligned(HOLDER as *const u64) };
+    if cur == m {
+        return; // already seeded (idempotent)
+    }
+    unsafe { std::ptr::write_unaligned(HOLDER as *mut u64, m) };
+    eprintln!(
+        "[routeb-dmforce] SH165 manager singleton holder 0x{HOLDER:x} -> fabricated all-leaf-vtable manager {m:#x} (vt[+0x30]=write-leaf, +0xf8/+0x108/+0x1f0=leaf, vt[+0x720]==0) at pc={pc:#x} -> 0x102bd8ce8 vt dispatches resolve benign (was host JavaVM* {cur:#x})"
+    );
+}
+
+/// True when the page containing `addr` appears in /proc/self/maps at all (any
+/// mapping covering it, not just a readable one). Conservative: used so
+/// routeb_map_guest_page only maps a page that is GENUINELY absent.
+fn any_page_mapped(addr: u64) -> bool {
+    let page = addr & !0xfff;
+    if let Ok(map) = std::fs::read_to_string("/proc/self/maps") {
+        map.lines().any(|l| {
+            let mut it = l.split_whitespace();
+            let (Some(begin_end), Some(_perms)) = (it.next(), it.next()) else {
+                return false;
+            };
+            let Some((b, e)) = begin_end.split_once('-') else {
+                return false;
+            };
+            let (Ok(lo), Ok(hi)) = (u64::from_str_radix(b, 16), u64::from_str_radix(e, 16)) else {
+                return false;
+            };
+            lo <= page && page < hi
+        })
+    } else {
+        false
+    }
+}
+
+/// SH165-fwd: ensure the page containing `addr` is mapped readable (the SH156
+/// .bss-page-remap pattern). Some .bss/data pages are left UNMAPPED by the
+/// engine's boot remapping (the SH116 class) — here, the NativeDataModelManager
+/// singleton holder at guest 0x102727550, which the getter 0x2174c04 reads via
+/// ldar and the engine writes during dispatch. A guarded write to an unmapped
+/// page SIGSEGVs. When the page is already present in /proc/self/maps we leave
+/// it untouched (never clobber file-backed content); only a genuinely-unmapped
+/// page gets a fresh zeroed anon RW mapping (MAP_FIXED, guest==host). Returns
+/// true if the page is mapped+readable afterwards.
+fn routeb_map_guest_page(addr: u64) -> bool {
+    if page_is_mapped(addr) {
+        return true;
+    }
+    if any_page_mapped(addr) {
+        return false; // present but not readable — never clobber it here
+    }
+    let page = addr & !0xfff;
+    let r = unsafe {
+        libc::mmap(
+            page as *mut libc::c_void,
+            0x1000,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+            -1,
+            0,
+        )
+    };
+    r != libc::MAP_FAILED && page_is_mapped(addr)
+}
+
+/// True when the page containing `addr` is mapped writable (perms contain 'w').
+fn page_is_writable(addr: u64) -> bool {
+    let page = addr & !0xfff;
+    if let Ok(map) = std::fs::read_to_string("/proc/self/maps") {
+        map.lines().any(|l| {
+            let mut it = l.split_whitespace();
+            let (Some(begin_end), Some(perms)) = (it.next(), it.next()) else {
+                return false;
+            };
+            let Some((b, e)) = begin_end.split_once('-') else {
+                return false;
+            };
+            if !perms.contains('w') {
+                return false;
+            }
+            let (Ok(lo), Ok(hi)) = (u64::from_str_radix(b, 16), u64::from_str_radix(e, 16)) else {
+                return false;
+            };
+            lo <= page && page < hi
+        })
+    } else {
+        false
+    }
+}
+
+/// SH165-fwd: ensure the page containing `addr` is mapped writable so a seeded .bss/singleton
+/// global can actually be written. Three cases: already writable (no-op); genuinely unmapped
+/// -> map anon RW (routeb_map_guest_page, the SH156 pattern); mapped-but-read-only (a real
+/// file-backed .data page, like the NativeDataModelManager singleton holder) -> mprotect RW
+/// (private file mapping COWs safely). Returns true when writable afterwards.
+fn routeb_ensure_writable(addr: u64) -> bool {
+    if page_is_writable(addr) {
+        return true;
+    }
+    if !any_page_mapped(addr) {
+        return routeb_map_guest_page(addr);
+    }
+    let page = addr & !0xfff;
+    let rc = unsafe {
+        libc::mprotect(
+            page as *mut libc::c_void,
+            0x1000,
+            libc::PROT_READ | libc::PROT_WRITE,
+        )
+    };
+    rc == 0 && page_is_writable(addr)
+}
+
+/// True when the 0x1000-byte page containing `addr` is present in /proc/self/maps
+/// (so a guard may avoid faulting on a fixed .bss global whose page isn't mapped in
+/// the current process/image). Mirrors elfjit.rs guest_page_mapped for in-crate use.
+fn page_is_mapped(addr: u64) -> bool {
+    let page = addr & !0xfff;
+    if let Ok(map) = std::fs::read_to_string("/proc/self/maps") {
+        map.lines().any(|l| {
+            let mut it = l.split_whitespace();
+            let (Some(begin_end), Some(perms)) = (it.next(), it.next()) else {
+                return false;
+            };
+            let Some((b, e)) = begin_end.split_once('-') else {
+                return false;
+            };
+            if !perms.contains('r') {
+                return false;
+            }
+            let (Ok(lo), Ok(hi)) = (u64::from_str_radix(b, 16), u64::from_str_radix(e, 16)) else {
+                return false;
+            };
+            lo <= page && page < hi
+        })
+    } else {
+        false
+    }
+}
+
+/// Build (once) the fabricated manager M + its all-leaf vtable V (see
+/// routeb_dm_manager_guard). Returns M's guest address.
+pub fn routeb_dm_manager_fabricated() -> u64 {
+    use std::sync::OnceLock;
+    static M: OnceLock<u64> = OnceLock::new();
+    *M.get_or_init(|| {
+        let v = Box::leak(vec![0x0u8; 0x740usize].into_boxed_slice()).as_mut_ptr() as u64;
+        let m = Box::leak(vec![0x0u8; 0x20usize].into_boxed_slice()).as_mut_ptr() as u64;
+        let leaf = *REGISTERED_MANAGER_LEAF().get_or_init(|| {
+            let a = register_host_call_auto(routeb_dm_manager_write_leaf);
+            a
+        });
+        unsafe {
+            // Only +0x30 (write-leaf), +0xf8/+0x108/+0x1f0 (benign leaf) are live; every
+            // other slot stays 0 so the post-FFI vt[+0x720] read is 0 -> benign soft-return.
+            std::ptr::write_unaligned((v + 0x30) as *mut u64, leaf);
+            std::ptr::write_unaligned((v + 0xf8) as *mut u64, leaf);
+            std::ptr::write_unaligned((v + 0x108) as *mut u64, leaf);
+            std::ptr::write_unaligned((v + 0x1f0) as *mut u64, leaf);
+            // M[+0]=vt, M[+8]=0 (getter tail-helper cbz-cleans on [M+8]==0).
+            std::ptr::write_unaligned(m as *mut u64, v);
+        }
+        m
+    })
+}
+
+/// The manager's +0x30 write-leaf (see routeb_dm_manager_guard): `str x0,[x1]; mov w0,#0;
+/// ret` semantics at host-call level — write the first guest arg into the second guest arg
+/// (the getter's out-field), return 0 (not -2, which the getter treats as failure).
+extern "C" fn routeb_dm_manager_write_leaf(a0: u64, a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64) -> u64 {
+    if a1 != 0 {
+        unsafe { std::ptr::write_unaligned(a1 as *mut u64, a0) };
+    }
+    0
+}
+
+/// Static slot for the manager leaf address (once-registered).
+fn REGISTERED_MANAGER_LEAF() -> &'static std::sync::OnceLock<u64> {
+    static L: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    &L
+}
+
 /// SH88: the coherent empty span-hash map seeded by the --v2boot harness for the
 /// OTel/pb_defaults BSS registry slots, used to substitute for a non-zero sub-image
 /// map/this candidate (a `.data.rel.ro` protobuf TAG constant like 0x1800064, which
@@ -3098,6 +3314,7 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // live host-heap object address, only known at runtime — hence the hook.
         if routeb_setfix_enabled() {
             routeb_dm_force_guard(state, pc); // SH164: force real engine-init dispatch (JIT_ROUTEB_DMFORCE)
+            routeb_dm_manager_guard(state, pc); // SH165-fwd: re-seed the manager singleton holder on fnB entry (JIT_ROUTEB_DMFORCE)
             routeb_tail_dispatch_guard(state, pc);
             routeb_tail_eq_guard(state, pc); // SH161b: seed impl[+0x2b8]=2 (governor-tail epilogue b.eq)
             routeb_tail_trace(state, pc);
@@ -4152,6 +4369,84 @@ mod tests {
         // impl==0 -> no crash with env set.
         st.x[19] = 0;
         routeb_dm_force_guard(&mut st as *mut CpuState, 0x102e9fcc4);
+        unsafe { std::env::remove_var("JIT_ROUTEB_DMFORCE") };
+    }
+
+    #[test]
+    fn sh165_dm_manager_guard_is_scoped_leaf_vtable_and_env_gated() {
+        // SH165-fwd (recon deleg_62a86bcd task-0): routeb_dm_manager_guard must (a) be
+        // inert without JIT_ROUTEB_DMFORCE, (b) fire ONLY in the fnB engine-init region
+        // (0x102bd1a30..0x102bd1d08), (c) write a fabricated manager M (all-leaf-vtable:
+        // +0x30 write-leaf, +0xf8/+0x108/+0x1f0 leaf, every other slot 0) into the guest
+        // holder 0x102727550, idempotently. The manager's own vtable must NOT carry
+        // engine-init at +0x30 (that would recurse into 0x102bd8ce8 forever).
+        //
+        // (a) env unset -> holder untouched.
+        unsafe { std::env::remove_var("JIT_ROUTEB_DMFORCE") };
+        const HOLDER: u64 = 0x102727550;
+        // The holder is a fixed .bss global NOT loaded by any unit-test process
+        // (the libroblox image is never mapped here), so its page is genuinely
+        // unmapped — this exercises routeb_map_guest_page (the SH156 pattern:
+        // map anon RW into the fully-absent page, never clobber file-backed).
+        assert!(!any_page_mapped(HOLDER), "precondition: holder page genuinely absent in a unit test");
+        assert!(
+            routeb_map_guest_page(HOLDER),
+            "routeb_map_guest_page must map a genuinely-unmapped page anon RW"
+        );
+        assert!(
+            page_is_mapped(HOLDER),
+            "routeb_map_guest_page must leave the page mapped+readable"
+        );
+        assert!(
+            routeb_map_guest_page(HOLDER),
+            "already-mapped page untouched (idempotent)"
+        );
+        assert!(
+            page_is_writable(HOLDER),
+            "anon RW mapping is writable"
+        );
+        assert!(
+            routeb_ensure_writable(HOLDER),
+            "already-writable page untouched (idempotent)"
+        );
+        unsafe { std::ptr::write_unaligned(HOLDER as *mut u64, 0xdead_beef_00000000) };
+        let orig = unsafe { std::ptr::read_unaligned(HOLDER as *const u64) };
+        let mut st = CpuState::new();
+        st.x[19] = 0x1111; // any impl; guard self-gates on the region + env only
+        routeb_dm_manager_guard(&mut st as *mut CpuState, 0x102bd1b98);
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned(HOLDER as *const u64) },
+            orig,
+            "manager guard must not touch the holder when env is off"
+        );
+        // (b/d) env set + a NON-fnB pc (the governor tail, where the shell is dispatched)
+        // must NOT write (the manager seed is scoped to the engine-init region).
+        unsafe { std::env::set_var("JIT_ROUTEB_DMFORCE", "1") };
+        routeb_dm_manager_guard(&mut st as *mut CpuState, 0x102e9fcc4);
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned(HOLDER as *const u64) },
+            orig,
+            "manager guard must not fire outside the fnB engine-init region"
+        );
+        // (c) env set + fnB region -> writes the fabricated manager, idempotent.
+        routeb_dm_manager_guard(&mut st as *mut CpuState, 0x102bd1b98);
+        let m = unsafe { std::ptr::read_unaligned(HOLDER as *const u64) };
+        assert_ne!(m, orig, "manager holder must be re-seeded on fnB entry");
+        let vt = unsafe { std::ptr::read_unaligned(m as *const u64) }; // M[+0]
+        // +0x30 = write-leaf (NOT the engine-init fnB -> no recursion).
+        let leaf30 = unsafe { std::ptr::read_unaligned((vt + 0x30) as *const u64) };
+        assert_ne!(leaf30, 0x102bd1b98, "manager vt[+0x30] must be a write-leaf, not engine-init");
+        // +0xf8/+0x108/+0x1f0 leaves live.
+        assert_ne!(unsafe { std::ptr::read_unaligned((vt + 0xf8) as *const u64) }, 0);
+        assert_ne!(unsafe { std::ptr::read_unaligned((vt + 0x108) as *const u64) }, 0);
+        assert_ne!(unsafe { std::ptr::read_unaligned((vt + 0x1f0) as *const u64) }, 0);
+        // vt[+0x720]==0 (post-FFI benign soft-return), M[+8]==0.
+        assert_eq!(unsafe { std::ptr::read_unaligned((vt + 0x720) as *const u64) }, 0);
+        assert_eq!(unsafe { std::ptr::read_unaligned((m + 8) as *const u64) }, 0);
+        // Idempotent: a second call leaves the same M.
+        let m2 = unsafe { std::ptr::read_unaligned(HOLDER as *const u64) };
+        routeb_dm_manager_guard(&mut st as *mut CpuState, 0x102bd1b98);
+        assert_eq!(unsafe { std::ptr::read_unaligned(HOLDER as *const u64) }, m2, "idempotent");
         unsafe { std::env::remove_var("JIT_ROUTEB_DMFORCE") };
     }
 
