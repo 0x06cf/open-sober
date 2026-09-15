@@ -1,0 +1,24 @@
+# SH183 — Consolidated Route-B re-examination with the manufacture lever LIVE (DMCONT continuation empirically re-run = latent-confirmed; DM vtable has NO GuiObject-producer slot)
+
+Date: Sep 15, 2026, hermes-worker. Workspace green (552/0). This cycle = docs + one empirical re-run; no new production code (a forcing edit would be cruft). Doc docs/frontier-sh183-routeb-recon-live-lever.md.
+
+## TL;DR
+Following the operator's Sep-15 directive ("return to Route B; re-attack live-DM construction with a fresh cone; don't settle for 'not seedable'"), SH182 first FALSIFIED the "can't dispatch the manufactured DM" premise (the genuine DM app-shell ctor [V+0x30]=0x1057d6ef4 now EXECUTES headlessly, `DROVE ok` through real relocated code). SH183 pushed the re-examination to its strongest answer yet:
+- **The DM vtable is NOT a GuiObject producer.** Full packed-RELA decode of the genuine primary vtable 0x1067162f0: every slot is a lifecycle accessor; the only content-adjacent slots (+13/+14 -> 0x57cbcf8/0x57cbd00 -> UniversalApp loader 0x24090a8) read `[x0]` (sub-object vtable) and on a zeroed manufactured DM read 0 -> `cbz` -> benign no-op. No DM slot builds the SceneGraph/render world.
+- **The DMCONT continuation (continueAfterFlagsLoaded_ 0x102bd1d68 -> nativeAppBridgeAppStart 0x2338ef4 -> app-shell ctor 0x2207b54) is LATENT-CONFIRMED even with the live lever** — empirically re-run this cycle: manager installs (JIT_ROUTEB_DMFORCE+JIT_ROUTEB_DMCONT), but continueAfterFlagsLoaded_ shows **0 region-watch entries**; nativeAppBridgeAppStart + app-shell ctor also 0. The +0xf8 network feature-flag fetch never synchronously completes headlessly, so +0x1f0 never fires (SH168 reconfirmed, now under the live lever).
+- **GuiObjects stay behind a genuine live DM.** The Lua app-shell / DataModelPatcher / CoreScriptLoader are constructed downstream of a live DataModel. SH183's decoded evidence narrows *why* to a hard structural fact: no headless path dispatches a GuiObject-producing consumer of the current-DM holder (its only reader is the caller-less getter 0x2dbcc10; registry consumers fire only on the NULL->real transition at ExperienceController::join), AND no DM-vtable slot is itself a producer.
+
+## Cone (deleg_b638c343, READ-ONLY, decisive)
+- Re-confirmed holder *0x106391908's only static reader = caller-less getter 0x2dbcc10; registry consumers 0x2db63f4/0x2db6460/0x2db64c8/0x2db6534 are copy/alloc wrappers receiving the DM as an invocation arg (0x2dbcd18 blr), firing only on the session-gated NULL->real transition. Even a non-NULL manufactured DM in the holder is never dispatched by a boot path — only host-driving (SH182) does.
+- Full primary-DM-vtable decode (packed-RELA): slot0 +0x538 read, slot1 sub-object +0x1f0 accessor, slot3/4 ctors, slot13/14 -> UniversalApp loader 0x24090a8 (reads [x0], benign no-op on zeroed DM). No GuiObject/SceneGraph producer slot exists.
+- Identity of the ONE highest-value, already-built, empirically-UNTESTED lever = the DMCONT continuation (this cycle RAN it -> latent-confirmed). Completed it reaches the app-shell ctor headlessly (max engine self-execution) but still does NOT produce GuiObjects, because the do-init builds the app-bridge, distinct from the manufactured DM; CoreScripts/content remain behind a live DM.
+
+## Empirics (real libroblox.so, llvmpipe)
+`JIT_ROUTEB_DMFORCE=1 JIT_ROUTEB_DMCONT=1 JIT_ROUTEB_DM_MANUFACTURE=1` + canonical ladder + region-watch:
+- Manager installs (continuation-routed, M+0x40=flags-holder, +0x1f0=REAL continueAfterFlagsLoaded_).
+- **continueAfterFlagsLoaded_ 0x102bd1d68 = 0 region entries** (the single text match is only the install log, not execution); nativeAppBridgeAppStart 0x2338ef4 = 0; app-shell ctor 0x2207b54 = 0.
+- Ladder clean, EXIT 124, 0 SIGSEGV/SIGABRT/stack-smash.
+- VERDICT: latent-confirmed (SH168 reconfirmed under the live lever). The +0xf8 network fetch never completes synchronously headlessly, so the real continuation is unreachable pre-session.
+
+## Standing + honest next
+Route-B GuiObjects remain behind a genuine live DataModel — now at the strongest evidentiary level: (a) the manufacture lever is LIVE (SH182, ctor dispatches real code), (b) yet the DM vtable has NO GuiObject-producer slot, and (c) the only real engine-init forward (DMCONT) is latent-confirmed. This is the re-examination the operator asked for, answered with the manufacture-lever falsification incorporated. Route-B's genuine live DM = MIGRATION GATE (real app-launch / GPU host / real input), and the SH174 capture latch remains the validated observer for that moment. The manufactured-DM line has now delivered its full headless value (SH181+SH182: latent -> live-dispatching); do NOT chase deeper PATH-B member reconstruction or the DMCONT continuation (both confirmed low-ROI / latent). Keep the Route-B cone armed per standing discipline, but the implementable headless progress on Route B is exhausted at this evidentiary depth.
