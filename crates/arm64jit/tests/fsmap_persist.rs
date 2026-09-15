@@ -330,10 +330,15 @@ fn fsmap_truncate_chdir_linkat_readlinkat_resolve_through_store() {
     // flock(32): LOCK_EX|LOCK_NB must succeed on a real host fd.
     let rfl = svc([fd2 as u64, (libc::LOCK_EX | libc::LOCK_NB) as u64, 0, 0, 0, 0], 32);
     assert_eq!(rfl, 0, "flock LOCK_EX failed: {rfl}");
-    // fallocate(285): grow the 4-byte file to 4096 (FALLOC_FL_KEEP_SIZE unset).
-    let rfa = svc([fd2 as u64, 0, 4, 4092, 0, 0], 285); // fd, mode=0, offset=4, len=4092
-    assert_eq!(rfa, 0, "fallocate failed: {rfa}");
+    // fallocate(47): grow the 4-byte file to 4096 (FALLOC_FL_KEEP_SIZE unset).
+    // 47 is the asm-generic/aarch64 syscall nr the guest emits (NOT the x86-64 285).
+    let rfa = svc([fd2 as u64, 0, 4, 4092, 0, 0], 47); // fd, mode=0, offset=4, len=4092
+    assert_eq!(rfa, 0, "fallocate(47) failed: {rfa}");
     assert!(std::fs::metadata(&host_file).unwrap().len() >= 4096, "fallocate did not grow host file");
+    // 285 legacy (x86-64 number) also still routes (kept for host-side callers).
+    let rfa285 = svc([fd2 as u64, 0, 4096, 3, 0, 0], 285); // grow 4096 -> 4099
+    assert_eq!(rfa285, 0, "fallocate(285) failed: {rfa285}");
+    assert!(std::fs::metadata(&host_file).unwrap().len() >= 4099, "fallocate(285) did not grow host file");
     // Release the lock so later ops on the same inode are clean.
     let _ = svc([fd2 as u64, libc::LOCK_UN as u64, 0, 0, 0, 0], 32);
     assert_eq!(svc([fd2 as u64, 0, 0, 0, 0, 0], 57), 0);

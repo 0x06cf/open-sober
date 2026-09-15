@@ -661,6 +661,90 @@ fn routeb_tail_dispatch_capture(state: *mut CpuState, pc: u64) {
     );
 }
 
+/// SH164 engine-init (recon task-0, authoritative): the governor-TAIL dispatch derefs
+/// impl[+0x408] (x0) then `ldr x8,[x0]; ldr x8,[x8,#48]; blr x8` calls vt[+0x30] with
+/// x0=x19=impl. On a real session that slot holds a NativeDataModelManager heap
+/// instance whose vt[+0x30]=0x102bd1b98 (the DM engine-init fn `fnB`). fnB has NO
+/// benign-tail and NO [this+0x10] dispatch — it unconditionally derefs
+/// [this+0x40]->[+0x18]->[+0x10] then `bl 0x102bd8ce8` (the engine-init /
+/// continueAfterFlagsLoaded pipeline). A zeroed shell SIGSEGVs at `ldr x8,[x8,#0x18]`
+/// (0x102bd1c08) — that's the standing Route-B wall. This opt-in (JIT_ROUTEB_DMFORCE=1)
+/// guard makes the tail dispatch a FABRICATED NativeDataModelManager instance whose
+/// vt[+0x30]=0x102bd1b98 with the +0x40/+0x18 settings chain pre-seeded, so the tail's
+/// `blr` ACTUALLY ENTERS the real engine-init and reaches `bl 0x102bd8ce8` — a dynamic
+/// trace that surfaces the NEXT empirical fault floor instead of the inert-leaf no-op.
+/// The chain: [shell+0x40]=P1, [P1+0x18]=P2, [P2+0x10]=P3, [shell+0x18]=valid, so fnB
+/// passes its [this+0x40]->[+0x18]->[+0x10] derefs and calls 0x102bd8ce8(P3). Idempotent
+/// (writes the same pointer each entry). Default-inert (env off -> no substitution;
+/// routeb_tail_dispatch_guard still seeds the inert DISPATCH under SETFIX as before).
+fn routeb_dm_force_guard(state: *mut CpuState, pc: u64) {
+    if std::env::var_os("JIT_ROUTEB_DMFORCE").is_none() {
+        return;
+    }
+    if pc < 0x102e9fcc4 || pc > 0x102e9fdc8 {
+        return;
+    }
+    let s = unsafe { &*state };
+    let implb = s.x[19];
+    if implb == 0 {
+        return;
+    }
+    let shell = routeb_dm_force_shell();
+    let slot = implb + 0x408;
+    unsafe { std::ptr::write_unaligned(slot as *mut u64, shell) };
+    eprintln!(
+        "[routeb-dmforce] SH164 governor-tail DISPATCH -> fabricated NativeDataModelManager instance {shell:#x} (vt[+0x30]=0x102bd1b98 engine-init, settings chain seeded) at pc={pc:#x} -> real engine-init entered, next fault = empirical floor"
+    );
+}
+
+/// Build (once) the fabricated NativeDataModelManager shell: a leaked 0x300-byte zeroed
+/// buffer + a leaked 0x60-byte all-benign vtable with vt[+0x30]=0x102bd1b98 (fnB), and
+/// the settings chain the tail dispatch + fnB deref:
+///   [shell+0x00]=vt, [shell+0x18]=P_ok (valid leaked), [shell+0x40]=P1, [P1+0x18]=P2,
+///   [P2+0x10]=P3 (P1/P2/P3 = small leaked zeroed buffers so fnB's [this+0x40]->[+0x18]->
+///   [+0x10] derefs resolve without fault). Returns the shell guest address.
+pub fn routeb_dm_force_shell() -> u64 {
+    use std::sync::OnceLock;
+    const ENGINE_INIT_FNB: u64 = 0x102bd1b98; // real engine-init (fnB), guest addr
+    static SHELL: OnceLock<u64> = OnceLock::new();
+    *SHELL.get_or_init(|| {
+        let vt = Box::leak(vec![0x0u8; 0x60usize].into_boxed_slice()).as_mut_ptr() as u64;
+        let shell = Box::leak(vec![0x0u8; 0x300usize].into_boxed_slice()).as_mut_ptr() as u64;
+        let p1 = Box::leak(vec![0x0u8; 0x40usize].into_boxed_slice()).as_mut_ptr() as u64;
+        let p2 = Box::leak(vec![0x0u8; 0x40usize].into_boxed_slice()).as_mut_ptr() as u64;
+        let p3 = Box::leak(vec![0x0u8; 0x40usize].into_boxed_slice()).as_mut_ptr() as u64;
+        // SH165-fwd (recon task-0): 0x102bd8ce8 reads [arg+0x18] as a C-string ptr and
+        // forwards it to the manager vt slots +0xf8/+0x108/+0x1f0. Seed a real
+        // NUL-terminated feature-flag/JSON payload ("{}") into [p3+0x18] so the engine-init
+        // pipeline advances one real step (arg=x0=[shell+0x40]->[+0x18]->[+0x10]=p3) and the
+        // next fault moves into the manager vtable impl derefs, not the string load.
+        let _flags_str = unsafe {
+            let c = b"{}\0";
+            let p = Box::leak(c.to_vec().into_boxed_slice()).as_mut_ptr() as *mut u8;
+            std::ptr::write_unaligned((p3 + 0x18) as *mut u64, p as u64);
+            p as u64
+        };
+        // All-leaf benign vtable (mirror the inert DISPATCH's 0x50 all-leaf pattern) so
+        // any slot read by surrounding dispatch resolves without fault; only +0x30 is the
+        // real engine-init.
+        for i in 0..(0x60u64 / 8) {
+            unsafe { std::ptr::write_unaligned((vt + i * 8) as *mut u64, 0x100000000) };
+        }
+        unsafe {
+            std::ptr::write_unaligned((vt + 0x30) as *mut u64, ENGINE_INIT_FNB);
+            // [shell+0x00]=vt (tail's `ldr x8,[x0]`)
+            std::ptr::write_unaligned(shell as *mut u64, vt);
+            // [shell+0x18]=P_ok (fnB consumes [x19,#24] per the 0x102bd8ce8 pipeline)
+            std::ptr::write_unaligned((shell + 0x18) as *mut u64, p3);
+            // [shell+0x40]=P1 (EngineSettings ref); [P1+0x18]=P2; [P2+0x10]=P3
+            std::ptr::write_unaligned((shell + 0x40) as *mut u64, p1);
+            std::ptr::write_unaligned((p1 + 0x18) as *mut u64, p2);
+            std::ptr::write_unaligned((p2 + 0x10) as *mut u64, p3);
+        }
+        shell
+    })
+}
+
 /// SH88: the coherent empty span-hash map seeded by the --v2boot harness for the
 /// OTel/pb_defaults BSS registry slots, used to substitute for a non-zero sub-image
 /// map/this candidate (a `.data.rel.ro` protobuf TAG constant like 0x1800064, which
@@ -1505,7 +1589,11 @@ pub extern "C" fn guest_svc(st: *mut CpuState) -> u64 {
         32 => unsafe { libc::flock(a[0] as c_int, a[1] as c_int) as c_long },
         // fallocate(285): preallocate space (SQLite + mmap-backed db files
         // grow via it). fd, mode, offset, len.
-        285 => unsafe {
+        // NOTE: the aarch64 guest emits fallocate as syscall nr **47** (the asm-generic
+        // number), NOT the x86-64 285. 285 was the previous wire and never fires under
+        // an aarch64 guest -> a real posix_fallocate fell through to the catch-all
+        // -ENOSYS. Wire BOTH (47 = real guest path, 285 kept harmless for host-side).
+        47 | 285 => unsafe {
             libc::syscall(
                 libc::SYS_fallocate, a[0] as usize, a[1] as usize,
                 a[2] as usize, a[3] as usize,
@@ -3009,6 +3097,7 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // into the impl slot so the vt[+0x30] blr resolves benignly. x19(impl) is a
         // live host-heap object address, only known at runtime — hence the hook.
         if routeb_setfix_enabled() {
+            routeb_dm_force_guard(state, pc); // SH164: force real engine-init dispatch (JIT_ROUTEB_DMFORCE)
             routeb_tail_dispatch_guard(state, pc);
             routeb_tail_eq_guard(state, pc); // SH161b: seed impl[+0x2b8]=2 (governor-tail epilogue b.eq)
             routeb_tail_trace(state, pc);
@@ -4009,6 +4098,61 @@ mod tests {
         // impl==0 -> no write, no crash.
         st.x[19] = 0;
         routeb_tail_eq_guard(&mut st as *mut CpuState, 0x102e9fe04);
+    }
+
+    #[test]
+    fn sh164_dm_force_shell_is_coherent_and_env_gated() {
+        // SH164 (recon task-0): routeb_dm_force_guard must (a) be inert without
+        // JIT_ROUTEB_DMFORCE (no write, no crash, even on a real slot), (b) at a
+        // tail-window entry with DMFORCE set, write the fabricated NativeDataModelManager
+        // shell into impl[+0x408], and (c) the shell must be guest-coherent: [shell+0]=vt,
+        // vt[+0x30]=0x102bd1b98 (real engine-init fnB), and the settings chain
+        // [shell+0x40]->[+0x18]->[+0x10] + [shell+0x18] all resolve without fault. Prove
+        // the shell layout so a real run that enters fnB derefs cleanly.
+        // (a) env unset -> no mutation.
+        unsafe { std::env::remove_var("JIT_ROUTEB_DMFORCE") };
+        let impl_buf = Box::leak(vec![0xAAu8; 0x500usize].into_boxed_slice()).as_mut_ptr() as u64;
+        let mut st = CpuState::new();
+        st.x[19] = impl_buf;
+        routeb_dm_force_guard(&mut st as *mut CpuState, 0x102e9fcc4);
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned((impl_buf + 0x408) as *const u64) },
+            0xAAAAAAAAAAAAAAAA,
+            "DMFORCE must not touch impl[+0x408] when the env is off"
+        );
+        // (b) env set -> substitutes the shell.
+        unsafe { std::env::set_var("JIT_ROUTEB_DMFORCE", "1") };
+        routeb_dm_force_guard(&mut st as *mut CpuState, 0x102e9fcc4);
+        let shell = unsafe { std::ptr::read_unaligned((impl_buf + 0x408) as *const u64) };
+        assert_ne!(shell, 0xAAAAAAAAAAAAAAAA, "shell must replace the impl slot");
+        // (c) shell coherence: [shell+0]=vt, vt[+0x30]=0x102bd1b98, and chain derefs.
+        let vt = unsafe { std::ptr::read_unaligned(shell as *const u64) };
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned((vt + 0x30) as *const u64) },
+            0x102bd1b98,
+            "vt[+0x30] must be the real engine-init fnB"
+        );
+        // [shell+0x40]=P1, [P1+0x18]=P2, [P2+0x10]=P3 — all resolve, no fault.
+        let p1 = unsafe { std::ptr::read_unaligned((shell + 0x40) as *const u64) };
+        let p2 = unsafe { std::ptr::read_unaligned((p1 + 0x18) as *const u64) };
+        let p3 = unsafe { std::ptr::read_unaligned((p2 + 0x10) as *const u64) };
+        assert_ne!(p1, 0);
+        assert_ne!(p2, 0);
+        assert_ne!(p3, 0);
+        // [shell+0x18] valid too (fnB consumes [x19,#24]).
+        assert_ne!(unsafe { std::ptr::read_unaligned((shell + 0x18) as *const u64) }, 0);
+        // Wrong pc (outside the tail window) must not touch the slot even with env set.
+        unsafe { std::ptr::write_unaligned((impl_buf + 0x408) as *mut u64, 0x987654321) };
+        routeb_dm_force_guard(&mut st as *mut CpuState, 0x102e9fe04);
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned((impl_buf + 0x408) as *const u64) },
+            0x987654321,
+            "DMFORCE must only fire in the tail window"
+        );
+        // impl==0 -> no crash with env set.
+        st.x[19] = 0;
+        routeb_dm_force_guard(&mut st as *mut CpuState, 0x102e9fcc4);
+        unsafe { std::env::remove_var("JIT_ROUTEB_DMFORCE") };
     }
 
     #[test]
