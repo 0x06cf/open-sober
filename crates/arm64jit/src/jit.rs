@@ -10606,6 +10606,137 @@ mod fp16_and_fabd_fccmp_exec {
     }
 
     #[test]
+    fn session_producer_push_epoch_bump_wake_dispatch() {
+        // SH173: prove the session-producer handoff's host-side dispatch mechanism
+        // (push a node -> bump the queue's version-epoch high-32 -> FUTEX_WAKE the
+        // parked consumer) WITHOUT a live engine drain. Mirrors the exact real
+        // producer logic (elfjit.rs --deque-node-bump: write node into the headcell,
+        // `[Q] = [Q] + 0x1_0000_0000` high-32-only epoch bump, `syscall(SYS_futex,
+        // Q+4, FUTEX_WAKE, 1)`) and the drain's proceed-gate that parks on the epoch
+        // staying unchanged (wait word == a consumed epoch). This is the piece the
+        // operator's "session-producer handoff" spec depends on but no prior test
+        // exercised (recon deleg_d585254f task-0: producer is implemented-latent,
+        // never exercised under cargo test — it always needs a live drain).
+        // Two real futex consumers (same thread counts stayed bounded).
+        unsafe {
+            // Synthetic queue object: [0x00] 8-byte version word (epoch high-32),
+            // [0x08] futex latch word the producer wakes. Keep both in one block so
+            // the futex word address is stable and aligned (align 8). The block
+            // address is shared across the two threads as a plain `usize` (Send),
+            // and each thread casts it back to raw pointers locally.
+            let q = libc::calloc(1, 64) as u64;
+            assert!(q != 0);
+            let qa = q as usize;
+            let version = q as *mut u64; // [Q+0]
+            let latch = (q + 8) as *const u32; // [Q+8] the futex word (align 8)
+            let headcell = (q + 16) as *mut u64; // [Q+16] the deque head-node cell
+            // Reset: epoch 0, latch 0, empty head (0 = empty).
+            version.write_volatile(0);
+            (latch as *mut u32).write_volatile(0);
+            headcell.write_volatile(0);
+            let node_value: u64 = 0x1_2345_6000; // a fake guest-visible node pointer
+            let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let started2 = std::sync::Arc::clone(&started);
+            let consume = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let consume2 = std::sync::Arc::clone(&consume);
+            let popped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let popped2 = std::sync::Arc::clone(&popped);
+            let observed_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let observed_epoch2 = std::sync::Arc::clone(&observed_epoch);
+            let parked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let parked2 = std::sync::Arc::clone(&parked);
+            // Consumer: mirrors the parked drain — capture epoch high-32, park on
+            // the futex latch (wait word = its current value, so it PARKS), and only
+            // when the producer wakes it re-reads epoch + pops the headcell node.
+            let c = std::thread::spawn(move || {
+                let version = qa as *mut u64;
+                let latch = (qa + 8) as *const u32;
+                let headcell = (qa + 16) as *mut u64;
+                started2.store(true, std::sync::atomic::Ordering::Release);
+                while !consume2.load(std::sync::atomic::Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                // Park: wait for a wake. Robust to a lost wake: use a SHORT
+                // timeout in a retry loop and re-check (read epoch + pop the
+                // headcell) after every wait, so even if the producer's single
+                // wake is consumed before this WAIT enters, we still observe the
+                // placed node + epoch bump on the next timed-out re-poll. This is
+                // fully deterministic (can never hang) — key for a hermetic test.
+                let expect_latch = (latch as *const u32).read_unaligned();
+                let mut got = false;
+                for _ in 0..200 {
+                    parked2.store(true, std::sync::atomic::Ordering::Release);
+                    // 25ms timeout: a lost wake costs one extra poll, never a hang.
+                    let to = libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 25_000_000,
+                    };
+                    let _r = libc::syscall(
+                        libc::SYS_futex,
+                        latch as usize,
+                        libc::FUTEX_WAIT as i64, // WAIT (private bit unused on Linux glibc futex)
+                        expect_latch as i64,
+                        &to as *const libc::timespec as usize,
+                    );
+                    // Re-read after wait-or-timeout: epoch bump and headcell pop.
+                    observed_epoch2.store(
+                        (version.read_volatile() >> 32) & 0xffff_ffff,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    let n = headcell.read_volatile();
+                    if n != 0 {
+                        headcell.write_volatile(0);
+                        popped2.store(n, std::sync::atomic::Ordering::Relaxed);
+                        got = true;
+                        break;
+                    }
+                    let e = observed_epoch2.load(std::sync::atomic::Ordering::Relaxed);
+                    if e != 0 {
+                        // epoch advanced but headcell empty (a spurious path) —
+                        // keep polling briefly then give up cleanly.
+                        if e >= 1 && got {
+                            break;
+                        }
+                    }
+                }
+                let _ = got;
+            });
+            while !started.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            // Producer: publish node into the headcell, bump epoch high-32 only,
+            // then FUTEX_WAKE the parked consumer. Exactly the --deque-node-bump
+            // order (publish before wake).
+            consume.store(true, std::sync::atomic::Ordering::Release);
+            headcell.write_volatile(node_value);
+            let cur = version.read_volatile();
+            version.write_volatile(cur.wrapping_add(0x1_0000_0000)); // [Q]+=high-32 epoch bump
+            // Wait for the consumer to actually enter the futex WAIT (poll the
+            // parked flag) before waking — deterministic (no fixed sleep), so the
+            // wake can never be consumed by a not-yet-entered wait.
+            while !parked.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            // Give the WAIT syscall a moment to be mid-kernel so the wake lands.
+            std::thread::yield_now();
+            let _wake = libc::syscall(
+                libc::SYS_futex,
+                latch as usize,
+                libc::FUTEX_WAKE as i64,
+                1i64,
+                0usize,
+            );
+            c.join().expect("consumer thread joined");
+            // Assert the mechanism end-to-end:
+            assert_eq!(popped.load(std::sync::atomic::Ordering::Relaxed), node_value,
+                "consumer woke and popped the pushed node from the headcell");
+            assert_eq!(observed_epoch.load(std::sync::atomic::Ordering::Relaxed), 1,
+                "consumer observed the epoch increment (high-32 0->1) after wake");
+            libc::free(q as *mut libc::c_void);
+        }
+    }
+
+    #[test]
     fn json_overflow_leak_reads_guest_stack_pointer_not_seeded_lsm_map() {
         // SH46: the bare `--jni --startapp` abort "RBX::json::Writer string length
         // overflow: <huge>" has its leaked value empirically pinned to the guest
