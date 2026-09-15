@@ -644,6 +644,65 @@ pub fn routeb_setfix_empty_set() -> u64 {
     })
 }
 
+/// SH175 (objective 2b / recon deleg_466252aa task-1): the pure-native cookie worker
+/// `0x102203148` (nativeSetMultipleCookies' native body, chars* x0 cookies, size_t x1
+/// clen, char* x2 url, size_t x3 ulen, int w4, int w5) reads the cookie-jar container
+/// via getter `0x21fce24` which is `adrp x8,6ed7000; ldr x0,[x8,#2592]; ret` =
+/// `*(std::string**)guest 0x106ed7a20`. In a bare boot that slot is 0, so the worker's
+/// SSO-header reads at 0x220321c/0x220331c (`ldrb [x0]` / `ldp [x0,#8]`) SIGSEGV with
+/// fault=0x0 — the exact SH129 'jar-CONSTRUCTION NULL' that prior recon labeled
+/// *structural / non-seedable*. That verdict is WRONG: the jar container is a seedable
+/// .bss global, not a constructed object. This guard fires at the worker's block entry
+/// and (when JIT_ROUTEB_COOKIE=1) ensures [0x106ed7a20] points at a valid EMPTY
+/// libc++ std::string (a zeroed 0x20 SSO buffer: __size_=0,__cap_=0 => short, empty —
+/// a valid default-constructed std::string) + clears BOTH boot-latch gate bits
+/// ([0x106dcfc30].bit0 and [0x1072739d4].bit0) so the worker classifies and records a
+/// `.ROBLESECURITY` cookie instead of faulting. Default-inert (env off -> no write).
+/// Idempotent: only seeds when the slot is 0 (a real session's constructed jar is
+/// preserved untouched). Honest boundary: clearing the jar-init deref is the proven
+/// advance; the deeper insert/commit path (0x22035c0..) may touch further unexercised
+/// singletons, observed as the NEXT gate if it faults.
+fn routeb_cookie_jar_guard(_state: *mut CpuState, pc: u64) {
+    if std::env::var_os("JIT_ROUTEB_COOKIE").is_none() {
+        return;
+    }
+    if pc != 0x102203148 {
+        return;
+    }
+    const JAR_SLOT: u64 = 0x106ed7a20; // *(std::string**) cookie-jar container global
+    const GATE_FLAGS: u64 = 0x1072739d4; // [0x72739d4].bit0 flags-loaded (usually already free)
+    const GATE_JAR: u64 = 0x106dcfc30; // [0x6dcfc30].bit0 second cookie jar gate
+    for a in [JAR_SLOT, GATE_FLAGS, GATE_JAR] {
+        if !routeb_ensure_writable(a) {
+            eprintln!(
+                "[routeb-cookie] SH175 WARN cannot make guest addr {a:#x} writable — skipping cookie-jar seed"
+            );
+            return;
+        }
+    }
+    let cur = unsafe { std::ptr::read_unaligned(JAR_SLOT as *const u64) };
+    if cur == 0 {
+        use std::sync::OnceLock;
+        static EMPTY_SSO: OnceLock<u64> = OnceLock::new();
+        let empty = *EMPTY_SSO.get_or_init(|| {
+            // Valid empty libc++ std::string: zeroed 0x20 (SSO short: size/cap 0).
+            Box::leak(vec![0u8; 0x20usize].into_boxed_slice()).as_mut_ptr() as u64
+        });
+        unsafe { std::ptr::write_unaligned(JAR_SLOT as *mut u64, empty) };
+        eprintln!(
+            "[routeb-cookie] SH175 seeded cookie-jar container [0x{JAR_SLOT:x}] = 0x{empty:x} (empty SSO std::string) at worker entry pc=0x{pc:x} (was NULL -> would fault 0x220331c)"
+        );
+    }
+    // Clear both gate latches (bit0) — the worker's boot checks read these.
+    for g in [GATE_FLAGS, GATE_JAR] {
+        let b = unsafe { *(g as *const u32) };
+        if b & 1 == 0 {
+            unsafe { *(g as *mut u32) = b | 1 };
+            eprintln!("[routeb-cookie] SH175 cleared cookie gate [{g:#x}].bit0 (was {b:#x})");
+        }
+    }
+}
+
 /// SH164 (recon deleg_94aac9d7): block-entry probe for the governor-tail dispatch.
 /// The tail (pc 0x102e9fcc4..0x102e9fdc8) loads x0=impl[+0x408], `ldr x8,[x0]; ldr
 /// x8,[x8,#48]; blr x8` dispatches vt[+0x30]. On a real session the slot holds a live
@@ -3603,6 +3662,7 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
             routeb_tail_eq_guard(state, pc); // SH161b: seed impl[+0x2b8]=2 (governor-tail epilogue b.eq)
             routeb_tail_trace(state, pc);
         }
+        routeb_cookie_jar_guard(state, pc); // SH175: seed cookie-jar container + gates at worker 0x102203148 (JIT_ROUTEB_COOKIE)
         // SH164 (recon deleg_94aac9d7): governor-tail dispatch block-entry capture.
         // Fires on EVERY run (self-gated on JIT_ROUTEB_DMTRACE) so a follow-up cycle
         // can observe whether the tail's vt[+0x30] dispatch ever resolves to the
@@ -4802,6 +4862,61 @@ mod tests {
             0x102bd1d68u64,
             "default all-leaf manager keeps +0x1f0 as a leaf (SH165-fwd benign unchanged)"
         );
+    }
+
+    #[test]
+    fn sh175_cookie_jar_guard_seeds_container_and_gates_env_gated() {
+        // SH175 (recon deleg_466252aa task-1, objective 2b): the cookie worker
+        // 0x102203148 derefs [0x106ed7a20] (cookie-jar container global, a std::string*)
+        // at 0x220321c/0x220331c. In a bare boot that slot is NULL -> SIGSEGV fault=0
+        // (the exact SH129 'jar-CONSTRUCTION NULL' mislabeled as structural). The guard
+        // must, ONLY with JIT_ROUTEB_COOKIE set and at the worker's entry pc, seed that
+        // global with a valid EMPTY libc++ std::string (a zeroed 0x20 SSO buffer) and
+        // clear both boot-latch gate bits. Idempotent; env-off and wrong-pc inert.
+        unsafe { std::env::remove_var("JIT_ROUTEB_COOKIE") };
+        const JAR: u64 = 0x106ed7a20;
+        const GATE_FLAGS: u64 = 0x1072739d4;
+        const GATE_JAR: u64 = 0x106dcfc30;
+        let mut st = CpuState::new();
+        // (a) env off -> nothing seeded (jar page may or may not be mapped; we just
+        // make it writable ourselves to read a baseline, then assert untouched).
+        routeb_ensure_writable(JAR);
+        routeb_ensure_writable(GATE_FLAGS);
+        routeb_ensure_writable(GATE_JAR);
+        unsafe { std::ptr::write_unaligned(JAR as *mut u64, 0) };
+        routeb_cookie_jar_guard(&mut st as *mut CpuState, 0x102203148);
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned(JAR as *const u64) },
+            0,
+            "cookie-jar guard must be inert when JIT_ROUTEB_COOKIE is unset"
+        );
+        // (b) env set but WRONG pc -> still inert.
+        unsafe { std::env::set_var("JIT_ROUTEB_COOKIE", "1") };
+        unsafe { std::ptr::write_unaligned(JAR as *mut u64, 0) };
+        routeb_cookie_jar_guard(&mut st as *mut CpuState, 0x102203144);
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned(JAR as *const u64) },
+            0,
+            "cookie-jar guard must only fire at the exact worker entry pc"
+        );
+        // (c) env set + exact worker pc -> seeds a non-NULL empty SSO std::string...
+        routeb_cookie_jar_guard(&mut st as *mut CpuState, 0x102203148);
+        let sso = unsafe { std::ptr::read_unaligned(JAR as *const u64) };
+        assert_ne!(sso, 0, "cookie-jar container must point at a valid std::string");
+        // ...and clears both gate latches' bit0.
+        assert_ne!(unsafe { std::ptr::read_unaligned(GATE_FLAGS as *const u32) } & 1, 0, "flags gate bit0 set");
+        assert_ne!(unsafe { std::ptr::read_unaligned(GATE_JAR as *const u32) } & 1, 0, "jar gate bit0 set");
+        // (d) idempotent: a second call leaves the SAME SSO pointer (real jar preserved).
+        let sso2 = unsafe { std::ptr::read_unaligned(JAR as *const u64) };
+        routeb_cookie_jar_guard(&mut st as *mut CpuState, 0x102203148);
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned(JAR as *const u64) },
+            sso2,
+            "idempotent — a real constructed jar is preserved"
+        );
+        // Sanity: the seeded SSO is a valid empty string (size 0 at +8 on libc++ SSO).
+        assert_eq!(unsafe { std::ptr::read_unaligned((sso + 8) as *const u64) }, 0, "empty SSO size==0");
+        unsafe { std::env::remove_var("JIT_ROUTEB_COOKIE") };
     }
 
     #[test]
