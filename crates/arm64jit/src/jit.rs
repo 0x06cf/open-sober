@@ -922,6 +922,65 @@ fn routeb_dm_manager_guard(_state: *mut CpuState, pc: u64) {
     );
 }
 
+/// SH180/181 (recon deleg_7effc85a, DECISIVE): JIT-side RBX::DataModel MANUFACTURE lever
+/// — a default-inert live-dispatch probe. The three GENUINE DataModel vtables
+/// (V=0x67162f0 / 0x67163a8 / 0x6716400, RTTI T=0x6714e18) are LOADER-POPULATED at runtime
+/// (189 packed androi RELATIVE relocs write REAL engine function pointers into every slot,
+/// incl. [V+0x30] -> 0x57d6ef4 and the RTTI word 0x6714e18 -> 0x6358df8). Prior sessions
+/// (SH178/SH180) declared the headless DM route DECISIVELY DEAD on the premise the vtable is
+/// inert — that premise is FALSIFIED: a manufactured object bearing a planted genuine vptr
+/// dispatches into REAL relocated engine code. This guard plants such an object into the
+/// current-DM holder *(0x106391908) (the setDataModelToCurrent GETTER 0x2dbcc10 target) so any
+/// downstream consumer of the current-DM reads a genuine-vptr, typeinfo-correct RBX::DataModel.
+/// It does NOT force any ctor; it is the live-dispatch seed the main loop then OBSERVES with
+/// JIT_REGION_WATCH (e.g. on 0x1057d6ef4) to find how far real DM code runs headlessly.
+/// - env JIT_ROUTEB_DM_MANUFACTURE=1, default-inert
+/// - scoped to the StartLuaAppDM entry region [0x1023efe2c,0x1023eff20]
+/// - idempotent (OnceLock build, plant only when holder != seeded object)
+fn routeb_dm_manufacture_guard(_state: *mut CpuState, pc: u64) {
+    if std::env::var_os("JIT_ROUTEB_DM_MANUFACTURE").is_none() {
+        return;
+    }
+    const SLADM_LO: u64 = 0x1023efe2c; // StartLuaAppDM entry (canonical ladder drives it, SH170)
+    const SLADM_HI: u64 = 0x1023eff20;
+    if pc < SLADM_LO || pc > SLADM_HI {
+        return;
+    }
+    const CUR_DM_HOLDER: u64 = 0x106391908; // setDataModelToCurrent GETTER return (SH172)
+    let dm = routeb_manufactured_dm();
+    if !routeb_ensure_writable(CUR_DM_HOLDER) {
+        return;
+    }
+    let cur = unsafe { std::ptr::read_unaligned(CUR_DM_HOLDER as *const u64) };
+    if cur == dm {
+        return; // idempotent
+    }
+    unsafe { std::ptr::write_unaligned(CUR_DM_HOLDER as *mut u64, dm) };
+    eprintln!(
+        "[routeb-dmmanufacture] SH180/181 planted a MANUFACTURED genuine-vptr RBX::DataModel {dm:#x} (vt=0x1067162f0 reloader-populated; +0x30->0x1057d6ef4) into current-DM holder 0x{CUR_DM_HOLDER:x} (was {cur:#x}) at pc={pc:#x} -> real DM vtable is live, now observing dispatch"
+    );
+}
+
+/// Build (once) the manufactured DataModel: a leaked zeroed DataModel-sized block with the
+/// GENUINE primary DataModel vptr (0x67162f0, guest 0x1067162f0 — loader-populated real vtable)
+/// at offset 0, per recon deleg_7effc85a. Zero-filled body so known-deref'd fields (+0x38c read
+/// via `ldrsw x3,[x19,#908]`, etc.) read 0 -> benign for a bare object; the exact field/context
+/// seeds needed to survive the app-shell ctor (0x57d6ef4's early [x1,#8] deref) are the OPEN
+/// problem a follow-up on the live dispatch addresses. Returns the guest address.
+pub fn routeb_manufactured_dm() -> u64 {
+    use std::sync::OnceLock;
+    const DM_VTABLE: u64 = 0x1067162f0; // guest: ceil(0x67162f0 image vtable) primary DataModel (SH179)
+    const DM_SIZE: u64 = 0x1108; // nearest candidate sizeof (SH179 op-new range 0x800..0x1200)
+    static DM: OnceLock<u64> = OnceLock::new();
+    *DM.get_or_init(|| {
+        let obj = Box::leak(vec![0x0u8; DM_SIZE as usize].into_boxed_slice()).as_mut_ptr() as u64;
+        unsafe { std::ptr::write_unaligned(obj as *mut u64, DM_VTABLE) };
+        // seed the known ctor-deref'd field to a benign 0 (already zero from Box::leak; explicit for clarity)
+        unsafe { std::ptr::write_unaligned((obj + 0x38c) as *mut u64, 0) };
+        obj
+    })
+}
+
 /// True when the page containing `addr` appears in /proc/self/maps at all (any
 /// mapping covering it, not just a readable one). Conservative: used so
 /// routeb_map_guest_page only maps a page that is GENUINELY absent.
@@ -3689,6 +3748,7 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
             routeb_dm_force_guard(state, pc); // SH164: force real engine-init dispatch (JIT_ROUTEB_DMFORCE)
             routeb_dm_manager_guard(state, pc); // SH165-fwd: re-seed the manager singleton holder on fnB entry (JIT_ROUTEB_DMFORCE)
             routeb_tail_dispatch_guard(state, pc);
+            routeb_dm_manufacture_guard(state, pc); // SH180/181: plant manufactured genuine-vptr DM into the current-DM holder (JIT_ROUTEB_DM_MANUFACTURE)
             routeb_tail_eq_guard(state, pc); // SH161b: seed impl[+0x2b8]=2 (governor-tail epilogue b.eq)
             routeb_tail_trace(state, pc);
         }
@@ -4901,6 +4961,52 @@ mod tests {
             0x102bd1d68u64,
             "default all-leaf manager keeps +0x1f0 as a leaf (SH165-fwd benign unchanged)"
         );
+    }
+
+    #[test]
+    fn sh181_dm_manufacture_guard_plants_genuine_vptr_env_gated() {
+        // SH180/181 (recon deleg_7effc85a, DECISIVE): the genuine DataModel vtables are
+        // loader-populated at runtime, so a manufactured object bearing the genuine vptr
+        // (0x1067162f0) dispatches into real relocated engine code — the one headless
+        // Route-B lever. The guard must be env-gated, region-scoped, idempotent, and plant
+        // an object whose first word is the GENUINE primary DataModel vtable.
+        const CUR_DM_HOLDER: u64 = 0x106391908; // setDataModelToCurrent GETTER return (SH172)
+        let _ = routeb_ensure_writable(CUR_DM_HOLDER);
+        let orig = unsafe { std::ptr::read_unaligned(CUR_DM_HOLDER as *const u64) };
+        let mut st = CpuState::new();
+        // (a) env off -> never touches the holder.
+        routeb_dm_manufacture_guard(&mut st as *mut CpuState, 0x1023efe2c);
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned(CUR_DM_HOLDER as *const u64) },
+            orig,
+            "manufacture guard must not touch the holder when env is off"
+        );
+        // (b) env on + a NON-StartLuaAppDM pc -> must NOT fire.
+        unsafe { std::env::set_var("JIT_ROUTEB_DM_MANUFACTURE", "1") };
+        routeb_dm_manufacture_guard(&mut st as *mut CpuState, 0x102e9fcc4);
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned(CUR_DM_HOLDER as *const u64) },
+            orig,
+            "manufacture guard must not fire outside the StartLuaAppDM region"
+        );
+        // (c) env on + StartLuaAppDM entry -> plants the manufactured DM.
+        routeb_dm_manufacture_guard(&mut st as *mut CpuState, 0x1023efe2c);
+        let dm = unsafe { std::ptr::read_unaligned(CUR_DM_HOLDER as *const u64) };
+        assert_ne!(dm, orig, "manufacture guard must plant the DM on StartLuaAppDM entry");
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned(dm as *const u64) },
+            0x1067162f0u64,
+            "planted DM first word must be the GENUINE primary DataModel vtable"
+        );
+        assert_eq!(routeb_manufactured_dm(), dm, "same OnceLock-built object");
+        // (d) idempotent.
+        routeb_dm_manufacture_guard(&mut st as *mut CpuState, 0x1023efe2c);
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned(CUR_DM_HOLDER as *const u64) },
+            dm,
+            "idempotent: second StartLuaAppDM call leaves the same DM"
+        );
+        unsafe { std::env::remove_var("JIT_ROUTEB_DM_MANUFACTURE") };
     }
 
     #[test]
