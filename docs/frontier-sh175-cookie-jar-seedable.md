@@ -68,6 +68,17 @@ SIGSEGVs at 0x10220331c; the worker can classify a .ROBLESECURITY cookie into th
 
 ## Verify
 
-- `/tmp` cleaned (5% used, was 40%). No new large dumps (the recon agent left
+- Hermetic sh175 test (jit.rs, 371/0 arm64jit) — env-off inert, wrong-pc inert, exact-pc
+  seeds container+gates, idempotent, SSO size 0.
+- `cargo test --workspace` + `cargo build --workspace` + `cargo build --example elfjit`
+  all green.
+- **Real-binary ladder with JIT_ROUTEB_COOKIE=1 (runs/sh175-cookie-ladder.txt, live):**
+  full 9-rung ladder completes (nativeGameGlobalInit -> StartLuaAppDM Ok(0x3e8) ->
+  ladder done), EXIT 124 (timeout-after-completion = clean), 0 SIGSEGV/0 SIGABRT, and
+  the cookie guard fired **0 times** — expected: the cookie worker 0x102203148 is not on
+  the boot path, so the guard is LATENT until a future drive (run_guest_callback
+  [cookies,clen,url,ulen,0,0,0,0]) enters it, at which point it clears the jar-init
+  SIGSEGV. No regression: default and env-on boots byte-identical up to the seed.
+- /tmp cleaned (5% used, was 40%). No new large dumps (the recon agent left
   reop scratch at /home/hermes-worker/recon_dm/ — small scripts; the 1.1GB
   text.dis there predates this session and is flagged for the operator, not repo).
