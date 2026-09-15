@@ -2,7 +2,7 @@
 
 Status: implemented + verified on the real binary (2/2 clean). Doc for the SH189 session.
 Frontier: Route-B — engine SELF-CONSTRUCTS its first GuiObject under a genuine DataModel.
-Commit: <SH189COMMIT>. Repro: runs/capture_sh189_dm_services.sh, log runs/sh189-dm-services.txt.
+Commit: dfa68e0 (SH189 PlayerGui) / 4513237 (SH189b ScreenGui). Repro: runs/capture_sh189_dm_services.sh, log runs/sh189-dm-services.txt.
 
 ## What was the gate
 The 3-agent Route-B cone (deleg_9884123a, deleg_3a08fcf0, deleg_58cfcb06) reconciled the
