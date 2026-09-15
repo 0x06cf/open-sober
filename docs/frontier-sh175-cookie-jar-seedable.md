@@ -2,7 +2,7 @@
 
 Status: IMPLEMENTED (default-inert, env-gated). Host: headless VPS (this change is a
 headless advance, not a migration item). Workspace green at HEAD (~476/0, arm64jit 371).
-Commit: <SH175COMMIT>. Author: hermes-worker, recon deleg_466252aa.
+Commit: 060eeb7. Author: hermes-worker, recon deleg_466252aa.
 
 ## What the recon cone found (3 parallel READ-ONLY Route-B agents)
 
