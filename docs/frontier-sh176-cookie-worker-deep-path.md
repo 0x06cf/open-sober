@@ -2,8 +2,8 @@
 
 Status: IMPLEMENTED (opt-in `--cookie-ingress` driver, env `JIT_ROUTEB_COOKIE=1`).
 Host: headless VPS (a genuine headless advance on login-persistence, not a
-migration item). Workspace green (~476/0). Commit: TBD. Author: hermes-worker,
-recon deleg_13d959ca / deleg_7cff8f6e / deleg_fe0ba3a0.
+migration item). Workspace green (~476/0). Commit: 8ca920e. Author: hermes-worker,
+recon deleg_13d959ca / deleg_7cff8f6e / deleg_fe7fe565.
 
 ## What this is
 
@@ -87,6 +87,17 @@ the jar (or any file/store). Details:
   main-thread StartApp on the shared boot_sp. Deterministic-Ok requires seeding
   all four + serializing the main StartApp behind LADDER_DONE. Not chased this
   cycle (the cookie drive is standalone and avoids the race entirely).
+- NEGATIVE RESULT (this cycle, empirically disproven): a proposed PATCH C
+  (per-rung re-assert of the dispatch-singleton .data records 0x106829a48/
+  0x106829a68 to fix `run_loop: pc ... outside image` on rung-0
+  nativeInitializeNativeFlags / setTaskSchedulerBM / V2Init) was IMPLEMENTED and
+  VERIFIED INEFFECTIVE — the identical pcs (0x178828948000000 /
+  0x828948000000e883) recur every run with or without it. The leak is NOT from
+  those two records; it is the pre-existing SH55/64 concurrent-thread host-code
+  class (documented deterministic-in-value, not ASLR-variable). Reverted; do not
+  re-tread. Making the ladder fully deterministic needs serializing the main
+  StartApp behind LADDER_DONE (bare-ladder JIT_SERIALIZE_RENDER regresses per
+  SH170), which the standalone cookie drive already sidesteps.
 
 ## Verify
 
