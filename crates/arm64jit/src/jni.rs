@@ -1229,6 +1229,11 @@ mod tests {
                 (GET_STATIC_METHOD_ID, "GetStaticMethodID"),
                 (NEW_STRING_UTF, "NewStringUTF"),
                 (GET_STRING_UTF_CHARS, "GetStringUTFChars"),
+                // The jstring->RBX-string helper (0x21e1fec) calls BOTH slot 169
+                // (GetStringUTFChars) AND slot 170 (ReleaseStringUTFChars) in the
+                // fabricated-jstring / SendAppEventOnAppReady step-2 path. Both must
+                // be non-null host thunks or the engine derefs a garbage vtable slot.
+                (RELEASE_STRING_UTF_CHARS, "ReleaseStringUTFChars"),
                 (REGISTER_NATIVES, "RegisterNatives"),
                 (GET_JAVA_VM, "GetJavaVM"),
             ] {
