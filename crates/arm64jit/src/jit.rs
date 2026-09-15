@@ -957,26 +957,41 @@ fn routeb_dm_manufacture_guard(_state: *mut CpuState, pc: u64) {
     }
     unsafe { std::ptr::write_unaligned(CUR_DM_HOLDER as *mut u64, dm) };
     eprintln!(
-        "[routeb-dmmanufacture] SH180/181 planted a MANUFACTURED genuine-vptr RBX::DataModel {dm:#x} (vt=0x1067162f0 reloader-populated; +0x30->0x1057d6ef4) into current-DM holder 0x{CUR_DM_HOLDER:x} (was {cur:#x}) at pc={pc:#x} -> real DM vtable is live, now observing dispatch"
+        "[routeb-dmmanufacture] SH180/181/+187 planted a MANUFACTURED genuine-vptr RBX::DataModel {dm:#x} (vt=0x1067162e8 primary, SH187 corrected base; +0x30->app-shell ctor region) into current-DM holder 0x{CUR_DM_HOLDER:x} (was {cur:#x}) at pc={pc:#x} -> real DM vtable is live, now observing dispatch"
     );
 }
 
-/// Build (once) the manufactured DataModel: a leaked zeroed DataModel-sized block with the
-/// GENUINE primary DataModel vptr (0x67162f0, guest 0x1067162f0 — loader-populated real vtable)
-/// at offset 0, per recon deleg_7effc85a. Zero-filled body so known-deref'd fields (+0x38c read
-/// via `ldrsw x3,[x19,#908]`, etc.) read 0 -> benign for a bare object; the exact field/context
-/// seeds needed to survive the app-shell ctor (0x57d6ef4's early [x1,#8] deref) are the OPEN
-/// problem a follow-up on the live dispatch addresses. Returns the guest address.
+/// Build (once) the manufactured DataModel: a leaked zeroed DataModel-sized block carrying the
+/// GENUINE primary RBX::DataModel vptr set at the exact offsets the REAL DM ctor (guest
+/// 0x1023f6038, disasm at file 0x23f6130) writes: `stp x8,x9,[x19]; str x8,[x19,#0x1f0]` with
+/// x8=0x67162e8, x9=0x67163a0 (+8 secondary MI base), 0x67163f8 (+0x1f0 tertiary). SH187:
+/// the TRUE vptr base is 0x67162e8 (guest 0x1067162e8), NOT the +8-off 0x67162f0 used by prior
+/// SH181/183 — RTTI typeinfo 0x6714e18 sits at vptr-8 (0x67162e0), so vptr = 0x67162e0+8.
+/// The prior "no static materialization" scan checked adrp+add on page 0x671000 (offsets
+/// 0x62f0/0x63a8/0x6400 all exceed the imm12 range 4095) and the +8 constants, and therefore
+/// MISSED this ctor which uses page 0x6716000 (offsets 0x2e8/0x3a0/0x3f8 all fit). This falsifies
+/// the SH179-186 "no static ctor / migration gate" proof-of-dead-end. The object's body stays
+/// zeroed; the genuine vptr set is what makes ANY dispatch reach real relocated engine code.
+/// Returns the guest address.
 pub fn routeb_manufactured_dm() -> u64 {
     use std::sync::OnceLock;
-    const DM_VTABLE: u64 = 0x1067162f0; // guest: ceil(0x67162f0 image vtable) primary DataModel (SH179)
-    const DM_SIZE: u64 = 0x1108; // nearest candidate sizeof (SH179 op-new range 0x800..0x1200)
+    const DM_OBJ: u64 = 0x1108; // nearest candidate sizeof (SH179 op-new range 0x800..0x1200)
     static DM: OnceLock<u64> = OnceLock::new();
     *DM.get_or_init(|| {
-        let obj = Box::leak(vec![0x0u8; DM_SIZE as usize].into_boxed_slice()).as_mut_ptr() as u64;
-        unsafe { std::ptr::write_unaligned(obj as *mut u64, DM_VTABLE) };
-        // seed the known ctor-deref'd field to a benign 0 (already zero from Box::leak; explicit for clarity)
-        unsafe { std::ptr::write_unaligned((obj + 0x38c) as *mut u64, 0) };
+        let obj = Box::leak(vec![0x0u8; DM_OBJ as usize].into_boxed_slice()).as_mut_ptr() as u64;
+        // GENUINE vptr set exactly as the real DM ctor 0x1023f6038 writes (SH187):
+        //   [obj+0]     = 0x67162e8 (primary  RBX::DataModel vptr)
+        //   [obj+8]     = 0x67163a0 (secondary MI base vptr)
+        //   [obj+0x1f0] = 0x67163f8 (tertiary  MI base vptr)
+        // Stored as guest addrs (image base = file_vaddr + 0x100000000).
+        let vp: [(u64, u64); 3] = [
+            (0x0, 0x1067162e8u64),
+            (0x8, 0x1067163a0u64),
+            (0x1f0, 0x1067163f8u64),
+        ];
+        for (off, v) in vp {
+            unsafe { std::ptr::write_unaligned((obj + off) as *mut u64, v) };
+        }
         obj
     })
 }
@@ -1078,7 +1093,7 @@ fn routeb_dm_ctor_driver_guard(_state: *mut CpuState, pc: u64) {
     if pc < SLADM_LO || pc > SLADM_HI {
         return;
     }
-    const APPSHELL_CTOR: u64 = 0x1057d6ef4; // [V+0x30] of genuine DM vtable 0x1067162f0 (SH182)
+    const APPSHELL_CTOR: u64 = 0x1057d6ef4; // [V+0x30] of the DM vtable 0x1067162f0 (=base 0x1067162e8 + 0x38, SH187-corrected) (SH182)
     const CANARY: u64 = 0x1067d16f0; // stack-canary global, file 0x67d16f0, VALUE 1 in bare boot
     use std::sync::OnceLock;
     static DRIVEN: OnceLock<()> = OnceLock::new();
@@ -1116,6 +1131,87 @@ fn routeb_dm_ctor_driver_guard(_state: *mut CpuState, pc: u64) {
                 if full { "PATH B: SSO 'ServerRestartScheduled' -> real init body" } else { "PATH A survival no-op" }
             ),
             Err(e) => eprintln!("[routeb-dmctor] SH182: app-shell ctor drive err: {e}"),
+        }
+    });
+}
+
+/// SH187 (recon deleg_1c244411, authoritative): drive the REAL DM ctor wrapper guest
+/// 0x1023f5ff8 (which `bl 0x23f6038` -> the DataModel ctor) via run_guest_callback so the JIT
+/// CONSTRUCTS a genuine DataModel through its real code (the operator's "dynamic DM-ctor trace"),
+/// rather than only hand-planting a manufactured vptr set. The wrapper's builder-descriptor ABI
+/// (decoded): desc[+0]=P0 -> small struct (subobject-init arg), desc[+8]=&A(u64), desc[+16]=&B(u32),
+/// desc[+24]=&C(u64), desc[+32]=&D(u64), each a pointer to a small guest cell; object size >= 0x998
+/// (stores to +0x990). If the drive survives, verify obj's first three words are the GENUINE vptr
+/// set {0x67162e8, 0x67163a0, 0x67163f8} and report. default-inert (env JIT_ROUTEB_DM_REALCTOR=1),
+/// scoped to StartLuaAppDM entry. Best-effort: any guest-side fault returns Ok from the drive and
+/// is reported, never propagated. This is a diagnostic route-B lever; the runner owns empiral
+/// verification.
+fn routeb_dm_real_ctor_drive_guard(_state: *mut CpuState, pc: u64) {
+    if std::env::var_os("JIT_ROUTEB_DM_REALCTOR").is_none() {
+        return;
+    }
+    const SLADM_LO: u64 = 0x1023efe2c; // StartLuaAppDM entry (canonical ladder drives it)
+    const SLADM_HI: u64 = 0x1023eff20;
+    if pc < SLADM_LO || pc > SLADM_HI {
+        return;
+    }
+    const DM_WRAPPER: u64 = 0x1023f5ff8; // wrapper: loads descriptor, bl 0x23f6038, returns obj+0x1f0
+    const OBJ_SZ: u64 = 0xb00;
+    // SH187 follow-up (recon deleg_fa2be765, authoritative): the ctor body 0x1023f6038..0x23f6130
+    // is BRANCH-FREE straight-line code; the drive halts INSIDE `bl 0x23f6b0c` (subobject ctor) at
+    // guest 0x1023f60b8 (opcode 0x94000295) — it does not return in the JIT (EXIT 124), it does
+    // NOT take an early-return branch. To fall through to the genuine-vptr writes at 0x23f6130,
+    // NOP `bl 0x23f6b0c` (aarch64 NOP = 0xd503201f). The subobject ctor's own protected vcall path
+    // (blr [vt+2]) is guarded by cbz/cbnz x20 (seeds to 0 = skipped), and its __stack_chk_fail
+    // guard reads the global 0x67d1000+0x6f0 canary — both non-issues once NOP'd (it never runs).
+    const NOP_SUBOBJ: u64 = 0x1023f60b8; // `bl 0x23f6b0c` insn slot
+    use std::sync::OnceLock;
+    static DRIVEN: OnceLock<()> = OnceLock::new();
+    DRIVEN.get_or_init(|| {
+        // NOP the subobject-ctor call so the ctor falls through and writes the genuine vptr set.
+        if !routeb_ensure_writable(NOP_SUBOBJ) {
+            eprintln!("[routeb-realctor] SH187: subobj-NOP slot 0x{NOP_SUBOBJ:x} not writable, skip patch");
+        } else {
+            let cur = unsafe { std::ptr::read_unaligned(NOP_SUBOBJ as *const u32) };
+            if cur == 0xd503201f {
+                eprintln!("[routeb-realctor] SH187: subobj-NOP already applied at 0x{NOP_SUBOBJ:x}");
+            } else if cur == 0x94000295 {
+                unsafe { std::ptr::write_unaligned(NOP_SUBOBJ as *mut u32, 0xd503201f) };
+                eprintln!("[routeb-realctor] SH187: NOP'd bl 0x23f6b0c at 0x{NOP_SUBOBJ:x} (0x94000295 -> 0xd503201f) so the ctor falls through to the genuine-vptr writes");
+            } else {
+                eprintln!("[routeb-realctor] SH187: unexpected opcode at 0x{NOP_SUBOBJ:x} = {cur:#x} (not the bl 0x23f6b0c), skip patch");
+            }
+        }
+        // object + descriptor + 4 small cells, all leaked+zeroed so any ref count/GOT stays 0.
+        let obj = Box::leak(vec![0x0u8; OBJ_SZ as usize].into_boxed_slice()).as_mut_ptr() as u64;
+        let desc = Box::leak(vec![0x0u8; 0x30].into_boxed_slice()).as_mut_ptr() as u64;
+        let c0 = Box::leak(vec![0x0u8; 0x40].into_boxed_slice()).as_mut_ptr() as u64; // A
+        let c1 = Box::leak(vec![0x0u8; 0x40].into_boxed_slice()).as_mut_ptr() as u64; // B
+        let c2 = Box::leak(vec![0x0u8; 0x40].into_boxed_slice()).as_mut_ptr() as u64; // C
+        let c3 = Box::leak(vec![0x0u8; 0x40].into_boxed_slice()).as_mut_ptr() as u64; // D
+        // desc[+8]=&A..[+32]=&D root from a sub-descriptor that carries them; the wrapper reads
+        // x8=desc[+8], x9=desc[+16], x10=desc[+24], x11=desc[+32], then [x8]/[x9]w/[x10]/[x11].
+        unsafe {
+            std::ptr::write_unaligned((desc + 0x00) as *mut u64, c0); // P0 (subobject-init arg)
+            std::ptr::write_unaligned((desc + 0x08) as *mut u64, c0); // &A
+            std::ptr::write_unaligned((desc + 0x10) as *mut u64, c1); // &B
+            std::ptr::write_unaligned((desc + 0x18) as *mut u64, c2); // &C
+            std::ptr::write_unaligned((desc + 0x20) as *mut u64, c3); // &D
+        }
+        let tp = crate::jit::current_guest_tp();
+        match crate::jit::run_guest_callback(DM_WRAPPER, [obj, desc, 0, 0, 0, 0, 0, 0], tp) {
+            Ok(r) => {
+                let w0 = unsafe { std::ptr::read_unaligned(obj as *const u64) };
+                let w1 = unsafe { std::ptr::read_unaligned((obj + 0x8) as *const u64) };
+                let w2 = unsafe { std::ptr::read_unaligned((obj + 0x1f0) as *const u64) };
+                let genuine = (w0, w1, w2)
+                    == (0x1067162e8u64, 0x1067163a0u64, 0x1067163f8u64);
+                eprintln!(
+                    "[routeb-realctor] SH187: REAL DM ctor wrapper 0x{DM_WRAPPER:x} DROVE ok ret x0={r:#x}; obj vptr set = {w0:#x},{w1:#x},{w2:#x} {} (genuine={genuine})",
+                    if genuine { "GENUINE MATCH" } else { "(note: not the expected set)" }
+                );
+            }
+            Err(e) => eprintln!("[routeb-realctor] SH187: DM ctor wrapper drive err: {e}"),
         }
     });
 }
@@ -3889,6 +3985,7 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
             routeb_tail_dispatch_guard(state, pc);
             routeb_dm_manufacture_guard(state, pc); // SH180/181: plant manufactured genuine-vptr DM into the current-DM holder (JIT_ROUTEB_DM_MANUFACTURE)
             routeb_dm_ctor_driver_guard(state, pc); // SH182: host-drive the manufactured DM through its genuine app-shell ctor 0x1057d6ef4 (JIT_ROUTEB_DM_CTOR_DRIVER)
+            routeb_dm_real_ctor_drive_guard(state, pc); // SH187: drive the REAL DataModel ctor wrapper 0x1023f5ff8 -> 0x1023f6038 (JIT_ROUTEB_DM_REALCTOR)
             routeb_tail_eq_guard(state, pc); // SH161b: seed impl[+0x2b8]=2 (governor-tail epilogue b.eq)
             routeb_tail_trace(state, pc);
         }
@@ -5105,11 +5202,12 @@ mod tests {
 
     #[test]
     fn sh181_dm_manufacture_guard_plants_genuine_vptr_env_gated() {
-        // SH180/181 (recon deleg_7effc85a, DECISIVE): the genuine DataModel vtables are
-        // loader-populated at runtime, so a manufactured object bearing the genuine vptr
-        // (0x1067162f0) dispatches into real relocated engine code — the one headless
-        // Route-B lever. The guard must be env-gated, region-scoped, idempotent, and plant
-        // an object whose first word is the GENUINE primary DataModel vtable.
+        // SH180/181 (recon deleg_7effc85a, DECISIVE) + SH187 (vptr-base CORRECTION): the genuine
+        // DataModel vtables are loader-populated at runtime, so a manufactured object bearing the
+        // genuine vptr (0x1067162e8, the TRUE base — not the +8-off 0x1067162f0) dispatches into
+        // real relocated engine code — the one headless Route-B lever. The guard must be
+        // env-gated, region-scoped, idempotent, and plant an object whose first three vptr words
+        // match EXACTLY what the real DM ctor 0x1023f6038 writes.
         const CUR_DM_HOLDER: u64 = 0x106391908; // setDataModelToCurrent GETTER return (SH172)
         let _ = routeb_ensure_writable(CUR_DM_HOLDER);
         let orig = unsafe { std::ptr::read_unaligned(CUR_DM_HOLDER as *const u64) };
@@ -5135,9 +5233,16 @@ mod tests {
         assert_ne!(dm, orig, "manufacture guard must plant the DM on StartLuaAppDM entry");
         assert_eq!(
             unsafe { std::ptr::read_unaligned(dm as *const u64) },
-            0x1067162f0u64,
-            "planted DM first word must be the GENUINE primary DataModel vtable"
+            0x1067162e8u64,
+            "planted DM first word must be the GENUINE primary RBX::DataModel vptr (SH187: base 0x67162e8, NOT the +8-off 0x67162f0)"
         );
+        // SH187: the manufactured DM must carry the FULL genuine vptr set at the exact offsets
+        // the real DM ctor 0x1023f6038 writes (stp x8,x9,[x19]; str x8,[x19,#0x1f0]) —
+        // [0]=0x1067162e8, [8]=0x1067163a0, [0x1f0]=0x1067163f8.
+        let vp0 = unsafe { std::ptr::read_unaligned(dm as *const u64) };
+        let vp1 = unsafe { std::ptr::read_unaligned((dm + 0x8) as *const u64) };
+        let vp2 = unsafe { std::ptr::read_unaligned((dm + 0x1f0) as *const u64) };
+        assert_eq!((vp0, vp1, vp2), (0x1067162e8u64, 0x1067163a0u64, 0x1067163f8u64), "manufactured DM vptr set must match the real ctor's write pattern");
         assert_eq!(routeb_manufactured_dm(), dm, "same OnceLock-built object");
         // (d) idempotent.
         routeb_dm_manufacture_guard(&mut st as *mut CpuState, 0x1023efe2c);
@@ -5230,6 +5335,32 @@ mod tests {
             "env-on + wrong pc must region-gate and return immediately"
         );
         unsafe { std::env::remove_var("JIT_ROUTEB_DM_CTOR_DRIVER") };
+    }
+
+    #[test]
+    fn sh187_real_ctor_drive_guard_env_and_region_gated() {
+        // SH187: the REAL DataModel ctor wrapper 0x1023f5ff8 (-> bl 0x1023f6038) is driveable to
+        // construct a genuine DataModel. The guard must be default-inert (env off), env-gated,
+        // and region-scoped to StartLuaAppDM entry. The actual drive is harness-owned; here we
+        // assert only the guard's gating (no guest side-effects in a hermetic test).
+        // routeb_manufactured_dm() now plants the GENUINE vptr set {0x1067162e8,0x1067163a0,
+        // 0x1067163f8} (SH187-corrected base — verified in sh181_dm_manufacture test above).
+        let mut st = CpuState::new();
+        // (a) env off -> no-op.
+        routeb_dm_real_ctor_drive_guard(&mut st as *mut CpuState, 0x1023efe2c);
+        // (b) env on + non-StartLuaAppDM pc -> no-op.
+        unsafe { std::env::set_var("JIT_ROUTEB_DM_REALCTOR", "1") };
+        let t0 = std::time::Instant::now();
+        routeb_dm_real_ctor_drive_guard(&mut st as *mut CpuState, 0x102e9fcc4);
+        assert!(
+            t0.elapsed().as_millis() < 50,
+            "env-on + wrong pc must region-gate and return immediately"
+        );
+        // (c) guard returns without error at the correct entry pc (the drive itself is harness-
+        //     owned: run_guest_callback needs a real loaded image with guest TLS, never invoked
+        //     here in the hermetic context).
+        routeb_dm_real_ctor_drive_guard(&mut st as *mut CpuState, 0x1023efe2c);
+        unsafe { std::env::remove_var("JIT_ROUTEB_DM_REALCTOR") };
     }
 
     #[test]
