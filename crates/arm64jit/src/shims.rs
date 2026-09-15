@@ -580,7 +580,25 @@ extern "C" fn aassetmanager_open(
     let rel = name.strip_prefix("assets/").unwrap_or(name);
     let joined = root.join(rel);
     let Ok(bytes) = std::fs::read(&joined) else {
-        return 0;
+        // SH164 content-path fallback: the engine's LocalAssetURI for the app-shell
+        // patch is "models/UniversalApp/UniversalApp.rbxm" while the physical asset
+        // lives under assets/ExtraContent/models/... — serve the bare models/<rel>
+        // by re-rooting to ExtraContent/models/<rel>. Latently-correct (fires the
+        // instant a live DataModel drives DataModelPatcher::apply); pure fallback,
+        // never shadows an existing file.
+        let rel2 = rel.strip_prefix("models/");
+        match rel2 {
+            Some(under_models) => match std::fs::read(root.join("ExtraContent").join("models").join(under_models)) {
+                Ok(bytes2) => {
+                    let boxed: Box<[u8]> = bytes2.into_boxed_slice();
+                    let h = next_asset_handle();
+                    open_assets().lock().unwrap().insert(h, boxed);
+                    return h;
+                }
+                Err(_) => return 0,
+            },
+            None => return 0,
+        }
     };
     let boxed: Box<[u8]> = bytes.into_boxed_slice();
     let h = next_asset_handle();
@@ -2067,6 +2085,49 @@ mod tests {
         let missing = b"shaders/does_not_exist.pack\0";
         assert_eq!(aassetmanager_open(mgr, missing.as_ptr() as u64, 0, 0, 0, 0, 0, 0), 0);
         assert_eq!(aassetmanager_open(0, 0, 0, 0, 0, 0, 0, 0), 0);
+
+        unsafe { std::env::remove_var("SOBER_ASSETS_ROOT") };
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// SH164 content-path fallback: the engine's LocalAssetURI for the app-shell
+    /// patch is "models/UniversalApp/UniversalApp.rbxm" while the physical asset
+    /// lives under assets/ExtraContent/models/... — a bare models/<rel> request
+    /// must be re-rooted to ExtraContent/models/<rel>. Pure fallback (takes effect
+    /// only when the direct path is absent); never shadows an existing file.
+    #[test]
+    fn aasset_fallback_re_roots_bare_models_to_extracontent() {
+        let _g = asset_test_lock().lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("os-sh164-fb-{}", std::process::id()));
+        let assets = dir.join("assets");
+        std::fs::create_dir_all(assets.join("ExtraContent/models/UniversalApp")).unwrap();
+        let payload = b"UNIVERSAL-APP-RBXM\\x00\\x01\\x02\\x03";
+        std::fs::write(
+            assets.join("ExtraContent/models/UniversalApp/UniversalApp.rbxm"),
+            payload,
+        )
+        .unwrap();
+        unsafe { std::env::set_var("SOBER_ASSETS_ROOT", &assets) };
+        let mgr = aassetmanager_fromjava(0, 0, 0, 0, 0, 0, 0, 0);
+
+        // Bare LocalAssetURI path (matches the config's models/UniversalApp/...).
+        let bare = b"models/UniversalApp/UniversalApp.rbxm\0";
+        let h = aassetmanager_open(mgr, bare.as_ptr() as u64, 0, 0, 0, 0, 0, 0);
+        assert_ne!(h, 0, "bare models/ URI must fall back to ExtraContent/models/");
+        assert_eq!(aasset_getlength(h, 0, 0, 0, 0, 0, 0, 0), payload.len() as u64);
+        let buf = aasset_getbuffer(h, 0, 0, 0, 0, 0, 0, 0);
+        let got = unsafe { std::slice::from_raw_parts(buf as *const u8, payload.len()) };
+        assert_eq!(got, payload);
+
+        // The ExtraContent-prefixed path still opens (direct exists -> direct).
+        let pref = b"ExtraContent/models/UniversalApp/UniversalApp.rbxm\0";
+        let h2 = aassetmanager_open(mgr, pref.as_ptr() as u64, 0, 0, 0, 0, 0, 0);
+        assert_ne!(h2, 0);
+
+        // A non-models relative path that doesn't exist still fails (fallback
+        // is models-scoped, so boot-facing safety is unchanged).
+        let other = b"textures/does_not_exist.dds\0";
+        assert_eq!(aassetmanager_open(mgr, other.as_ptr() as u64, 0, 0, 0, 0, 0, 0), 0);
 
         unsafe { std::env::remove_var("SOBER_ASSETS_ROOT") };
         std::fs::remove_dir_all(&dir).ok();

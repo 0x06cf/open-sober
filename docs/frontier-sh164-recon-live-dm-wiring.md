@@ -57,5 +57,28 @@ DataModelPatch feeding (strictly downstream), do-init ctor callees.
 
 ## Files
 - docs/frontier-sh164-recon-live-dm-wiring.md (this file)
+- **Code change (this session):** `aassetmanager_open` gains a models→ExtraContent
+  fallback (shims.rs) so the bare `models/UniversalApp/UniversalApp.rbxm` LocalAssetURI
+  is served from `assets/ExtraContent/models/...`. Latently-correct (fires the instant a
+  live DM drives DataModelPatcher::apply); pure fallback, models-scoped, never shadows.
+  +1 hermetic test `aasset_fallback_re_roots_bare_models_to_extracontent`.
 - Scratch that must NOT be committed (cleanup): /tmp/dmrecon, /tmp/sh163 (extracted .so).
-- No production code changed. Workspace 538/0.
+- No production code changed in the recon phase. Workspace 538/0.
+
+## Empirical verification (harness runs, this session) — the DM path is CONFIRMED un-reached
+Two healthy real-binary ladder runs (env JIT_ROUTEB_DM_SEED=1 + HASHFIX + JSON_ZERO_FIX +
+SETFIX + SH115, EXIT=0, ladder done, joined cleanly, 24 task frames) with JIT_REGION_WATCH:
+- Governor-tail region 0x102e9fa80..0x102e9fb28: **1 hit** at pc=0x102e9fa84, and the SH161
+  inert-DISPATCH seed fires at 0x102e9fcc4 (impl[+0x408]=0x106a72000). Positive control proves
+  the region-watch mechanism works and that the tail executes.
+- DM-creator region 0x102bd1a30..0x102bd1d08 (getFlagsFromEngine_/initEngine_): **0 hits**.
+- CONCLUSION: the ladder reaches the governor tail but is DIVERTED by the inert DISPATCH
+  before ever entering NativeDataModelManager. The real vt[+48] dispatch value is
+  loader-relocated/runtime-built (not a static constant), so a simple address substitution is
+  impossible; relaxing the guard restores the impl[+0x408]==0 SIGSEGV. A naive
+  `--v2boot-dm-creator` rung that jit_runs initEngine_ is also NOT viable (initEngine_ needs a
+  real NativeDataModelManager instance + engine-settings sub-object, and
+  createDataModelForTeleport's 0x102e1dc2c was disproven as a static thunk). Reaching a live DM
+  requires a harness DYNAMIC TRACE driving a real instance through the governor-tail dispatch —
+  outside a static-seed reach. This is the standing Route-B structural wall, now empirically
+  confirmed rather than inferred.
