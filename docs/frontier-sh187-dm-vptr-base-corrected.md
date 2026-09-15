@@ -65,9 +65,9 @@ explanation for the "manufacture lever fires into a slot nobody derefs / no disp
   EXIT 124.** This is the FIRST time the JIT has CONSTRUCTED a genuine RBX::DataModel through its
   REAL ctor code (not a hand-planted manufacturing dot) — suggests the ctor is fully driveable and
   leaves a live genuine-vptr DM in obj+0x1f0 (ret x0).
-- NEXT (honest, scoped): (1) verify the constructed obj (ret x0 = obj+0x1f0) is a coherent live DM
-  and whether feeding it to the current-DM holder 0x106391908 / DataModelServices consumer
-  0x2db63f4-family reaches real code; (2) re-derive the post-DM content path (UniversalApp /
+- NEXT (honest, scoped): (1) seed the get-or-create consumer gate (0x2dbd018 once-cell + 0x2411658
+  keyed lookup) so driving 0x2dbcd88 (JIT_ROUTEB_DM_REALCTOR_CONSUMER) survives and dispatches the
+  planted genuine DM -> real relocated code; (2) re-derive the post-DM content path (UniversalApp /
   GuiObject) against the corrected base — prior "migration-gate" closures were built on the wrong
   +8 vptr.
 - The prior "migration-gate" closures were built on the wrong vptr; they need re-derivation
