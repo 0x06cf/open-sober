@@ -1379,14 +1379,31 @@ fn routeb_dm_service_seed_guard(_state: *mut CpuState, pc: u64) {
             }
         }
         let tp = crate::jit::current_guest_tp();
+        // PlayerGui (proven SH189): clear two chained once-latches, drive the CALLER getter.
         match crate::jit::run_guest_callback(0x10201fce0, [0, 0, 0, 0, 0, 0, 0, 0], tp) {
             Ok(r) => eprintln!(
                 "[routeb-dmsvc] SH189: PlayerGui class-register GETTER 0x10201fce0 DROVE ok ret x0={r:#x}"
             ),
-            Err(e) => {
-                eprintln!("[routeb-dmsvc] SH189: PlayerGui getter drive err: {e} (next gate)");
-                return;
+            Err(e) => eprintln!("[routeb-dmsvc] SH189: PlayerGui getter drive err: {e} (next gate)"),
+        }
+        // ScreenGui (SH189b recon deleg_5c489b38): caller getter 0x10201f42c (NOT the body
+        // 0x10201f4f0, which null-derefs headless — guestpc 0x101db7e38 `str x0,[x22,#8]` at the
+        // class-member builder, source=0). Parameterless; clear its latch 0x106c980a28 + nested
+        // source-builder guard 0x106c96868.
+        for latch in [0x106c980a28u64, 0x106c96868u64] {
+            if page_is_mapped(latch) && routeb_ensure_writable(latch) {
+                let v = unsafe { std::ptr::read_unaligned(latch as *const u64) };
+                if v != 0 {
+                    unsafe { std::ptr::write_unaligned(latch as *mut u64, 0) };
+                    eprintln!("[routeb-dmsvc] SH189: cleared ScreenGui once-latch 0x{latch:x} (=0x{v:x})");
+                }
             }
+        }
+        match crate::jit::run_guest_callback(0x10201f42c, [0, 0, 0, 0, 0, 0, 0, 0], tp) {
+            Ok(r) => eprintln!(
+                "[routeb-dmsvc] SH189: ScreenGui class-register GETTER 0x10201f42c DROVE ok ret x0={r:#x}"
+            ),
+            Err(e) => eprintln!("[routeb-dmsvc] SH189: ScreenGui getter drive err: {e} (next gate)"),
         }
         // (3) Probe the global class-name registry class-desc counter: *(u32)0x106dca0e28 > 0
         //     means the PlayerGui descriptor was appended (recon task-0 success marker).
@@ -1415,6 +1432,25 @@ fn routeb_dm_service_seed_guard(_state: *mut CpuState, pc: u64) {
         eprintln!(
             "[routeb-dmsvc] SH189: class-desc counter [0x106dca0e28] = {count} (want >0), cached desc [0x106c97f28] = {cached:#x}, desc vtable [0x106c980b8] = {dv:#x} (want 0x1067a6150), PlayerGui vtable-family [0x106c980b8+0x230] = {vtslot:#x} (want 0x106648908)"
         );
+        // ScreenGui desc success markers (SH189b recon: desc vtable 0x1067a6230,
+        // vt-family [desc+0x230] == 0x106649c98; the getter RETURNS the desc object — the
+        // observed return was 0x106c98a40, i.e. recon's 0x106c980a40 is 0x2000 low — so probe
+        // BOTH the recon addr and the returned-object addr).
+        for (tag, saddr) in [("recon", 0x106c980a40u64), ("returned", 0x106c98a40u64)] {
+            let sdv = if page_is_mapped(saddr) {
+                unsafe { std::ptr::read_unaligned(saddr as *const u64) }
+            } else {
+                0
+            };
+            let svts = if page_is_mapped(saddr + 0x230) {
+                unsafe { std::ptr::read_unaligned((saddr + 0x230) as *const u64) }
+            } else {
+                0
+            };
+            eprintln!(
+                "[routeb-dmsvc] SH189: ScreenGui desc {tag} [{saddr:#x}] = {sdv:#x} (want 0x1067a6230), vtable-family [{saddr:#x}+0x230] = {svts:#x} (want 0x106649c98)"
+            );
+        }
     });
 }
 

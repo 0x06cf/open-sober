@@ -78,3 +78,18 @@ resolver can answer the DM's getService by name.
    assert [el+0x10]==0x87e — the strongest registry-side success proof.
 3. The PlayerGui SERVICE NODE + ScreenGui INSTANCE stay the migration gate (vt-dispatched ctor /
    live app-shell). Do NOT re-derive the service node (recon-negative). The cone stays armed.
+
+## SH189b addendum (same session, committed): SCREENGUI CLASS-DESCRIPTOR REGISTRATION too.
+Corrected ABI (recon deleg_5c489b38): the ScreenGui register BODY 0x10201f4f0 null-derefs
+headless (guestpc 0x101db7e38 `str x0,[x22,#8]` at the class-member builder, source=0) — it must
+be driven via its CALLER GETTER **0x10201f42c** (parameterless; latch 0x106c980a28 + nested
+source-builder guard 0x106c96868), exactly the PlayerGui pattern. StarterGui getter 0x102020120
+is NOT all-zero-safe (forwards caller x0->source into the register helper; needs a real source).
+VERIFIED (real binary, 2/2 clean EXIT 124, 0 crash): ScreenGui getter 0x10201f42c DROVE ok
+ret x0=0x106c98a40 — **recon's desc addr 0x106c980a40 is 0x2000 LOW; the real desc object is the
+RETURNED addr 0x106c98a40**, whose vtable-family slot [0x106c98a40+0x230]=**0x106649c98** (exact
+recon-expected ScreenGui value) and desc vtable [0x106c98a40]=0x1067a6150 (shared
+DescribedCreatable descriptor vtable, same base for PlayerGui+ScreenGui). Both PlayerGui (0x87e)
+and ScreenGui (0x1b87) class descriptors are now registered headlessly in the engine's own
+global class-name registry. StarterGui left un-driven (ABI needs a real source descriptor; its
+source-builder not isolated — documented follow-up, low ROI while it's a descriptor-only gain).
