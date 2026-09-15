@@ -389,6 +389,32 @@ static NEXT_TID: AtomicU64 = AtomicU64::new(1);
 /// just defers their first run to post-ladder. Default OFF (product path unregressed).
 pub static WORKER_ADMISSION_GATE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// SH174-hardening: bounded worker-gate park used by both the clone-worker and
+/// pthread-worker spawn sites. Mirrors the bounded LADDER_DONE waits (elfjit.rs
+/// renderinit/start_app use a 300s deadline + WARN fallthrough): if the gate is
+/// set, yield-wait up to a 300s deadline, then fall through (WARN) instead of
+/// spinning forever. Without a bound, a worker the do-init legitimately needs
+/// while the gate is wrongly set (the SH170 config-sensitive abort class) would
+/// livelock until the harness's outer 300s timeout masks it as EXIT 124;
+/// bounding it turns that silent hang into a diagnosed fallthrough.
+fn park_until_worker_gate_cleared() {
+    if !WORKER_ADMISSION_GATE.load(Ordering::Acquire) {
+        return;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    while WORKER_ADMISSION_GATE.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    if WORKER_ADMISSION_GATE.load(Ordering::Acquire) {
+        eprintln!(
+            "[worker-gate] SH174 WARN WORKER_ADMISSION_GATE not cleared in 300s — \
+             running this worker unparked (do-init-worker fallthrough; if the gate \
+             was wrongly set on a non-combined run, expect a do-init abort, SH170 class)"
+        );
+    }
+}
+
 thread_local! {
     static CURRENT_TP: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
     // Depth of nested jit_run dispatch loops on this thread (outer boot loop +
@@ -1018,6 +1044,16 @@ pub fn routeb_dm_manager_cont() -> u64 {
     })
 }
 
+/// SH174: whether an allocation routed through the DM-capture trail is worth
+/// logging. A base that VALIDATES as a real in-image-vtable object (`base_ok`)
+/// is captured regardless of byte size — the old rule required size in
+/// [0x1000,0x40000], which silently dropped a genuine sub-4KB RBX::DataModel
+/// (allocation #N>>8, past the FIRST-8 window). The size window remains an OR
+/// for validation-flaky cases. Pure + testable.
+fn dm_capture_worth(bytes: usize, base_ok: bool) -> bool {
+    base_ok || (0x1000..=0x4_0000).contains(&bytes)
+}
+
 /// SH167 (recon cone deleg_35857472 task-2 + SH169 delegation-extension task-0, authoritative):
 /// DM ALLOCATION-CAPTURE HOOK.
 /// The engine's CRT operator-new wrapper (guest 0x102a0d9b8, file 0x2a0d9b8) reads the
@@ -1090,10 +1126,21 @@ extern "C" fn routeb_dm_alloc_capture(
     // vtable'd object) or the base itself outside the low image region. A garbage
     // base (0 / host-bogus) is not worth capturing.
     let base_ok = base != 0 && read_vt_in_image(base);
-    let budgeted = CAPTURED_DM_ALLOC.load(std::sync::atomic::Ordering::Relaxed) < 64;
+    // SH174-hardening: a genuine RBX::DataModel is a lean few-hundred-to-few-thousand-byte
+    // object (sizeof is statically unknowable; the only tree analogue is a 608-byte
+    // manager-shell). The old rule captured ONLY sizes in [0x1000,0x40000], and since the
+    // make_shared<DataModel> is allocation #N>>8 (past the FIRST-8 window), a sub-4KB DM
+    // was SILENTLY DROPPED at this gate — wasting the very GPU-host session the capture is
+    // for. Any base that validates as a real in-image-vtable object is now captured
+    // regardless of byte size; the size window remains an OR for validation-flaky cases.
+    // Still budget-bounded + env-gated + delegating (default-inert when JIT_DM_ALLOC_CAPTURE
+    // is unset), so only genuine engine objects are logged.
+    let dm_plausible = (0x1000..=0x4_0000).contains(&bytes);
+    let budgeted = CAPTURED_DM_ALLOC.load(std::sync::atomic::Ordering::Relaxed) < 256;
     let first = TRAIL_INVOKED.load(std::sync::atomic::Ordering::Relaxed) <= 8;
-    if first || (dm_plausible && budgeted && base_ok) {
-        if first || (dm_plausible && base_ok) {
+    let worth = dm_capture_worth(bytes, base_ok);
+    if first || (budgeted && worth) {
+        if first || worth {
             CAPTURED_DM_ALLOC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             eprintln!(
                 "[routeb-dmalloc]{} call#{}: bytes=0x{bytes:x} a0={a0:#x} a1={a1:#x} a2={a2:#x} -> base 0x{base:x}{} (delegate prev_hook {:#x})",
@@ -2593,12 +2640,7 @@ fn spawn_guest_thread(
                 // its top-level jit_run. Deadlock-safe — the gate is cleared by
                 // the ladder thread after its rungs complete, independent of any
                 // clone worker.
-                if WORKER_ADMISSION_GATE.load(Ordering::Acquire) {
-                    while WORKER_ADMISSION_GATE.load(Ordering::Acquire) {
-                        std::thread::yield_now();
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
-                }
+                park_until_worker_gate_cleared();
                 // The child runs to its thread-local exit, then pc==0 halts
                 // jit_run and the host thread ends.
                 let _ = jit_run(image, base, post_svc, &mut child as *mut CpuState);
@@ -3811,12 +3853,7 @@ pub fn spawn_pthread(start_routine: u64, arg: u64) -> i64 {
         // top-level jit_run until the harness clears it (LADDER_DONE). Kills the
         // SH55/64 combined-run race (clone workers racing the ladder's rungs)
         // at its source without touching a single guest byte.
-        if WORKER_ADMISSION_GATE.load(Ordering::Acquire) {
-            while WORKER_ADMISSION_GATE.load(Ordering::Acquire) {
-                std::thread::yield_now();
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-        }
+        park_until_worker_gate_cleared();
         let _ = jit_run(image, base, start_routine, &mut child as *mut CpuState);
     });
     tid as i64
@@ -4455,6 +4492,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn worker_gate_park_bounded_wait_unparks_promptly() {
+        // (a) Gate clear (default) -> park returns immediately, no spin/hang.
+        WORKER_ADMISSION_GATE.store(false, Ordering::SeqCst);
+        let before = std::time::Instant::now();
+        park_until_worker_gate_cleared();
+        assert!(
+            before.elapsed() < std::time::Duration::from_millis(2000),
+            "no-gate park must not wait"
+        );
+        // (b) Gate set -> a parker blocks; clearing the gate unparks it promptly
+        // (well inside the 300s bound). Proves the wait loop observes the clear.
+        // Both phases in ONE test so the process-global gate state is never
+        // raced by parallel tests.
+        WORKER_ADMISSION_GATE.store(true, Ordering::SeqCst);
+        let h = std::thread::spawn(park_until_worker_gate_cleared);
+        // Let the parker enter its wait loop, then clear the gate.
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        WORKER_ADMISSION_GATE.store(false, Ordering::SeqCst);
+        let before = std::time::Instant::now();
+        h.join().expect("worker park thread must finish");
+        // Restore the process-global default so real runs see OFF.
+        WORKER_ADMISSION_GATE.store(false, Ordering::SeqCst);
+        assert!(
+            before.elapsed() < std::time::Duration::from_secs(5),
+            "cleared gate must unpark promptly (not wait out the 300s bound)"
+        );
+    }
+
+    #[test]
     fn block_cache_drop_region_compiles_fresh_after_eviction() {
         // block_cache_drop_region lets a host-side patcher (elfjit --deque-node-live
         // arming force-pop) invalidate a hot region AFTER it was already compiled,
@@ -4735,6 +4801,37 @@ mod tests {
             unsafe { std::ptr::read_unaligned((vt_leaf + 0x1f0) as *const u64) },
             0x102bd1d68u64,
             "default all-leaf manager keeps +0x1f0 as a leaf (SH165-fwd benign unchanged)"
+        );
+    }
+
+    #[test]
+    fn sh174_capture_worth_keeps_small_validated_data_model() {
+        // SH174-hardening (recon deleg_84be9ca6 task-1): the old capture rule
+        // required bytes in [0x1000,0x40000], so a genuine sub-4KB RBX::DataModel
+        // (allocation #N>>8, long past the FIRST-8 window) was silently dropped —
+        // wasting the GPU-host session the capture exists for. A base that
+        // validates as an in-image vtable object is now worth capturing at ANY
+        // size; the size window stays an OR only for validation-flaky cases.
+        // Small VALIDATED object (the DELETE case pre-fix):
+        assert!(
+            dm_capture_worth(0x400, true),
+            "sub-4KB validated object (a real tiny DataModel) MUST be captured"
+        );
+        assert!(
+            dm_capture_worth(0xfff, true),
+            "size just under the old 0x1000 floor + validated must be captured"
+        );
+        // Small size window still captures DM-plausible sizes regardless of validation.
+        assert!(dm_capture_worth(0x2000, false), "in-window size captured even if vt check flaky");
+        assert!(dm_capture_worth(0x4_0000, false), "window upper edge in-window");
+        // Non-plausible AND unvalidated stays suppressed (garbage / boot noise).
+        assert!(
+            !dm_capture_worth(0x200, false),
+            "tiny unvalidated (boot noise / host-calloc garbage) stays suppressed"
+        );
+        assert!(
+            !dm_capture_worth(0x4_0001, false),
+            "above-window unvalidated stays suppressed"
         );
     }
 

@@ -21,7 +21,7 @@ engine-self-constructed GuiObject scene node appears at the render-manager R+0x1
 
 ## STEP A — ENV MATRIX (host of the real session)
 - JIT_DM_ALLOC_CAPTURE=1        — master switch. Without it the guard returns at once
-  (jit.rs:1163); every other var is inert. Arms the SH167 latch at pc 0x102a0d9b8.
+  (jit.rs:1189); every other var is inert. Arms the SH167 latch at pc 0x102a0d9b8.
 - JIT_DM_ALLOC_CAPTURE_DELEGATE=1 — delegation opt-in. The real binary ships its OWN
   nonzero ACTIVE allocator hook; plain latch never clobbers a live hook. With DELEGATE=1
   the engine's hook is SAVED into PREV_DM_ALLOC_HOOK and the trail performs the real
