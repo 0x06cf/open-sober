@@ -21,3 +21,4 @@ __pycache__/
 
 # Run-capture logs belong in runs/, not in git (project discipline: keep the tree clean)
 /runs/*.txt
+runs/cycle2/
