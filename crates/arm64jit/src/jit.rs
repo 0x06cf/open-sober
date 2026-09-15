@@ -1291,6 +1291,133 @@ fn routeb_dm_real_ctor_drive_guard(_state: *mut CpuState, pc: u64) {
     });
 }
 
+/// SH189 (Route-B): the genuine DM's service container ([dm+0x68] singly-linked list,
+/// [dm+0x78] 16-byte-stride class-descriptor vector) is built LAZILY by name-resolution,
+/// and the global class-name registry (header guest 0x106dca0e70, resolver 0x102373dec)
+/// is .bss-zeroed until a class-registration once-init runs. PlayerGui/CoreGui/ScreenGui
+/// are NEVER constructed in the DM ctor (SH189 recon deleg_58cfcb06 authoritative) — the
+/// first unsynthesized object on the path to an engine-self-constructed GuiObject is the
+/// PlayerGui class descriptor in that registry, populated by the register stub
+/// 0x10201fda4 (guard 0x6c980b8, classid 0x87e, typeid 0x298, name 0x10595eeb). This guard,
+/// armed on the SH187-constructed genuine DM holder (*0x106391908 == ctor ret == obj+0x1f0),
+/// (1) hangs a coherent EMPTY service list on the DM so the walkers
+/// (0x105e09bc8 / 0x10237da38) never NULL-walk, and (2) DRIVES the real PlayerGui register
+/// stub through the JIT to populate the global class-name registry, then probes the
+/// registry element count. default-inert (env JIT_ROUTEB_DM_SERVICES=1), idempotent,
+/// best-effort (any guest fault returns Ok and is reported). The manual loop resolves the
+/// one-next-unsynthesized-object.
+fn routeb_dm_service_seed_guard(_state: *mut CpuState, pc: u64) {
+    if std::env::var_os("JIT_ROUTEB_DM_SERVICES").is_none() {
+        return;
+    }
+    const SLADM_LO: u64 = 0x1023efe2c; // StartLuaAppDM entry
+    const SLADM_HI: u64 = 0x1023eff40;
+    if pc < SLADM_LO || pc > SLADM_HI {
+        return;
+    }
+    const DM_HOLDER: u64 = 0x106391908; // current-DM holder (SH172: getter returns &0x6391908)
+    const SERVICE_LIST_OFF: u64 = 0x68; // dm+0x68 = service-list head (singly-linked)
+    const SERVICE_VEC_OFF: u64 = 0x78; // dm+0x78 = {begin,end} class-descriptor vector
+    use std::sync::OnceLock;
+    static SEEDED: OnceLock<()> = OnceLock::new();
+    SEEDED.get_or_init(|| {
+        // Only run on a genuine constructed DM (holder planted by SH187b, or a vptr-genuine).
+        // Guard the raw read: in a hermetic test there is no guest image, so the holder page is
+        // unmapped and a direct deref would SIGSEGV. gate on the page being mapped first.
+        if !page_is_mapped(DM_HOLDER) {
+            eprintln!(
+                "[routeb-dmsvc] SH189: DM holder 0x{DM_HOLDER:x} page not mapped (no guest image), skip"
+            );
+            return;
+        }
+        if !routeb_ensure_writable(DM_HOLDER) {
+            eprintln!("[routeb-dmsvc] SH189: DM holder 0x{DM_HOLDER:x} not writable, skip");
+            return;
+        }
+        let dm = unsafe { std::ptr::read_unaligned(DM_HOLDER as *const u64) };
+        if dm == 0 {
+            eprintln!("[routeb-dmsvc] SH189: DM holder 0x{DM_HOLDER:x} = 0 (no constructed DM), skip");
+            return;
+        }
+        // (1) Seed a coherent EMPTY service list + empty vector so the walkers early-out.
+        // Only if the container is currently empty/NULL (never clobber a real built service).
+        if routeb_ensure_writable(dm + SERVICE_LIST_OFF) {
+            let head = unsafe { std::ptr::read_unaligned((dm + SERVICE_LIST_OFF) as *const u64) };
+            if head == 0 {
+                // zeroed head node: [+0x18]=classid 0, [+0x68]=next 0 => walkers return not-found
+                let empty_head = Box::leak(vec![0x0u8; 0x80].into_boxed_slice()).as_mut_ptr() as u64;
+                unsafe { std::ptr::write_unaligned((dm + SERVICE_LIST_OFF) as *mut u64, empty_head) };
+                eprintln!(
+                    "[routeb-dmsvc] SH189: seeded empty service-list head 0x{empty_head:x} at [dm+0x{SERVICE_LIST_OFF:x}] ({dm:#x})"
+                );
+            }
+        }
+        if routeb_ensure_writable(dm + SERVICE_VEC_OFF) {
+            let vec = unsafe { std::ptr::read_unaligned((dm + SERVICE_VEC_OFF) as *const u64) };
+            if vec == 0 {
+                unsafe { std::ptr::write_unaligned((dm + SERVICE_VEC_OFF) as *mut u64, 0) };
+                eprintln!("[routeb-dmsvc] SH189: service vector [dm+0x{SERVICE_VEC_OFF:x}] = 0 (empty, walkers early-out)");
+            }
+        }
+        // (2) Drive the REAL PlayerGui class-registration through the JIT. Recon (deleg_9b2cfbef
+        //     task-0, verified against objdump): 0x10201fda4 is the once-BODY (classid/typeid/name
+        //     are HARDCODED literals w3=0x87e/w4=0x298/x2=&"PlayerGui"; it does not deref caller
+        //     x0/x1 — calling with zero args is safe). But the once-LATCH lives in the CALLER
+        //     getter 0x10201fce0 (guest 0x10201fce0): latch bucket guest 0x106c97f30 -> runs body
+        //     0x201fd50 -> bl 0x201e95c (source-descriptor builder, ITS OWN nested once-latch
+        //     guest 0x106c883a0 + cache 0x106c88398) -> bl 0x10201fda4 -> once-end latch. The
+        //     registry write increments the class-desc count at guest *(u32)0x106dca0e28. So the
+        //     correct drive = clear BOTH chained latches, then run the GETTER 0x10201fce0 (not the
+        //     body). 0x106c980b8 is the descriptor OBJECT, not a latch — do not clear it.
+        for latch in [0x106c97f30u64, 0x106c883a0u64] {
+            if page_is_mapped(latch) && routeb_ensure_writable(latch) {
+                let v = unsafe { std::ptr::read_unaligned(latch as *const u64) };
+                if v != 0 {
+                    unsafe { std::ptr::write_unaligned(latch as *mut u64, 0) };
+                    eprintln!("[routeb-dmsvc] SH189: cleared PlayerGui once-latch 0x{latch:x} (=0x{v:x})");
+                }
+            }
+        }
+        let tp = crate::jit::current_guest_tp();
+        match crate::jit::run_guest_callback(0x10201fce0, [0, 0, 0, 0, 0, 0, 0, 0], tp) {
+            Ok(r) => eprintln!(
+                "[routeb-dmsvc] SH189: PlayerGui class-register GETTER 0x10201fce0 DROVE ok ret x0={r:#x}"
+            ),
+            Err(e) => {
+                eprintln!("[routeb-dmsvc] SH189: PlayerGui getter drive err: {e} (next gate)");
+                return;
+            }
+        }
+        // (3) Probe the global class-name registry class-desc counter: *(u32)0x106dca0e28 > 0
+        //     means the PlayerGui descriptor was appended (recon task-0 success marker).
+        let count = if page_is_mapped(0x106dca0e28) && routeb_ensure_writable(0x106dca0e28) {
+            unsafe { std::ptr::read_unaligned(0x106dca0e28 as *const u32) }
+        } else {
+            0
+        };
+        let cached = if page_is_mapped(0x106c97f28) {
+            unsafe { std::ptr::read_unaligned(0x106c97f28 as *const u64) }
+        } else {
+            0
+        };
+        // recon task-0 success markers: (b) [0x106c980b8] == 0x1067a6150 (PlayerGui descriptor
+        // vtable), [0x106c980b8+0x230] == 0x106648908 (PlayerGui class vtable-family slot).
+        let dv = if page_is_mapped(0x106c980b8u64) {
+            unsafe { std::ptr::read_unaligned(0x106c980b8u64 as *const u64) }
+        } else {
+            0
+        };
+        let vtslot = if page_is_mapped(0x106c980b8u64 + 0x230) {
+            unsafe { std::ptr::read_unaligned((0x106c980b8u64 + 0x230) as *const u64) }
+        } else {
+            0
+        };
+        eprintln!(
+            "[routeb-dmsvc] SH189: class-desc counter [0x106dca0e28] = {count} (want >0), cached desc [0x106c97f28] = {cached:#x}, desc vtable [0x106c980b8] = {dv:#x} (want 0x1067a6150), PlayerGui vtable-family [0x106c980b8+0x230] = {vtslot:#x} (want 0x106648908)"
+        );
+    });
+}
+
 /// True when the page containing `addr` appears in /proc/self/maps at all (any
 /// mapping covering it, not just a readable one). Conservative: used so
 /// routeb_map_guest_page only maps a page that is GENUINELY absent.
@@ -4061,6 +4188,7 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
             routeb_dm_manufacture_guard(state, pc); // SH180/181: plant manufactured genuine-vptr DM into the current-DM holder (JIT_ROUTEB_DM_MANUFACTURE)
             routeb_dm_ctor_driver_guard(state, pc); // SH182: host-drive the manufactured DM through its genuine app-shell ctor 0x1057d6ef4 (JIT_ROUTEB_DM_CTOR_DRIVER)
             routeb_dm_real_ctor_drive_guard(state, pc); // SH187: drive the REAL DataModel ctor wrapper 0x1023f5ff8 -> 0x1023f6038 (JIT_ROUTEB_DM_REALCTOR)
+            routeb_dm_service_seed_guard(state, pc); // SH189: seed empty DM service container + drive PlayerGui class-registry register (JIT_ROUTEB_DM_SERVICES)
             routeb_tail_eq_guard(state, pc); // SH161b: seed impl[+0x2b8]=2 (governor-tail epilogue b.eq)
             routeb_tail_trace(state, pc);
         }
@@ -5436,6 +5564,31 @@ mod tests {
         //     here in the hermetic context).
         routeb_dm_real_ctor_drive_guard(&mut st as *mut CpuState, 0x1023efe2c);
         unsafe { std::env::remove_var("JIT_ROUTEB_DM_REALCTOR") };
+    }
+
+    #[test]
+    fn sh189_dm_service_seed_guard_env_and_region_gated() {
+        // SH189 (Route-B): the global class-name registry (0x106dca0e70) is .bss-zeroed until
+        // the PlayerGui register once-init runs (stub 0x10201fda4). This guard must be
+        // default-inert (env off), env-gated (JIT_ROUTEB_DM_SERVICES), and region-scoped to
+        // StartLuaAppDM entry. All guest-side mutation + the drive live on the harness's real
+        // run; here we assert only gating (no guest side-effects in a hermetic context).
+        let mut st = CpuState::new();
+        // (a) env off -> no-op (includes the once-init region).
+        routeb_dm_service_seed_guard(&mut st as *mut CpuState, 0x1023efe2c);
+        // (b) env on + non-StartLuaAppDM pc -> no-op (region gate).
+        unsafe { std::env::set_var("JIT_ROUTEB_DM_SERVICES", "1") };
+        let t0 = std::time::Instant::now();
+        routeb_dm_service_seed_guard(&mut st as *mut CpuState, 0x102e9fcc4);
+        assert!(
+            t0.elapsed().as_millis() < 50,
+            "env-on + wrong pc must region-gate and return immediately"
+        );
+        // (c) guard returns without error at the correct entry pc (the drive + registry readback
+        //     are harness-owned; run_guest_callback needs a real loaded guest image, never run
+        //     in a hermetic test).
+        routeb_dm_service_seed_guard(&mut st as *mut CpuState, 0x1023efe2c);
+        unsafe { std::env::remove_var("JIT_ROUTEB_DM_SERVICES") };
     }
 
     #[test]
