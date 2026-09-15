@@ -29,17 +29,20 @@ agent): version-gate on 0x683d350/0x683d358 -> `bl 0x21fd00c` FLog
 ScriptContext / MessageBus construction. w19=4 vs 1 vs 5 changes only the logged
 integer. So this path is NOT a session-advance lever regardless of the w19 value.
 
-## EMPIRICAL residual (open, low priority): fabricated jstring resolves EMPTY at runtime
-Probe on the real binary: driving the rung with `new_string_utf_handle(b"Home")` in
-x5 produced w19=0x1 AND the event RBX-string at [sp] was SSO len 0 (empty), which
-would require GetStringUTFChars (slot 169) to have returned 0 (the `cbz x0 ->
-empty` path at 0x21e201c/0x21e204c). Current source wires slot 169 to the identity
-shim `jni_get_string_utf_chars` (jni.rs:1034/570) which returns the handle untouched
-(non-null). The two agents disagree on why the run shows empty: agent-2 (source
-trace) says the wiring is correct in the tree so the empty implies a stale/un-hit
-slot; agent-1 (broader disasm) did not isolate it. Since the path is telemetry-only,
-resolving this is low value vs the Route-B live-DM wall. Reserved pending a real
-session if a genuine jstring payload ever needs to reach that FLog.
+## Empirical discrepancy SETTLED (3rd agent + re-check): no jstring-production bug
+The earlier "empty RBX-string at [sp]" observation was an INVALID reading: it
+probed `boot_sp-0x140` AFTER jit_run returned, i.e. the function's frame had been
+unwound and the stack bytes were stale — not the live in-function string. A fresh
+read-only trace refutes all four dead-end causes for an empty string:
+(1) handle ABI-correct (x5 -> x19 -> helper x1, non-zero str_handle); (2) builder
+0x1d9d074 provably emits a len-4 "Home" SSO for a 4-char input (strlen<0x17 ->
+len<<1 + memmove); (3) env x0 is build_jni's, whose slot 169 = identity shim that
+returned non-zero (JIT bridge stores it into x0, so 0x21e201c `cbz x0` cannot
+fire); (4) no other jstring->RBX path. Net: the fabricated-jstring wiring is
+CORRECT; any observed empty/w19-1 mismatch points at hostcall dispatch for the
+guest-bl-entered nested helper frame (jit.rs:2978-2999), which is only reachable
+when the rung actually nested BL's — not a jni.rs or call-site defect. Since the
+whole path is telemetry-only, this is not chased further.
 
 ## Actionable takeaway
 - w19=4 == "Home" (operator premise CORRECT; the earlier SH171 "Home->5" note was a
