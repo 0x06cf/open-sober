@@ -1,57 +1,28 @@
 # Open-Sober STATUS.md (worker ledger)
-## Session (Sep 15, 2026, hermes-worker): SH173 — Session-producer dispatch HERMETIC PROOF (code) + auth/R1/render-seam recon corrections. Workspace green (546/0, arm64jit 368). Commit e799a7e. Doc docs/frontier-sh173-producer-hermetic-auth-recon.md.
-- **CODE (jit.rs, +1 test):** `session_producer_push_epoch_bump_wake_dispatch` proves the session-producer push->epoch-bump->wake mechanism WITHOUT a live drain (mirrors --deque-node-bump; fake consumer parks on futex, re-reads epoch + pops headcell; lost-wake-robust, deterministic, 0 guest). Closes the gap that this dispatch was only exercisable with a running engine drain (recon deleg_d585254f task-0: implemented-latent).
-- **AUTH CORRECTION:** login artifact = `.ROBLOSECURITY` cookie (SH129 mis-typed `.ROBLESECURITY`). No native DB file (0 refs to session.db/shared_prefs/app_webview/cookies.db; rbx-storage.db=content cache). Persists via JAVA universalapp cookie manager: restore JNICookieManager_setCookiesFromDisk (0x2bcbebc) -> inject nativeSetMultipleCookies (0x2202ff8) -> SessionService. Cookie-write+inject reachable PRE-live-DM; session-restore behind migration gate. SH168 prestage targets the WRONG artifact for auth.
-- **RENDER-SEAM (task-2, HARD-CONFIRMED):** present-walker 0x105b2ed48 node loop has ZERO DM/Luau gate (only R+0x22f/0x288/0x298/0x2a0/0x260 host-touchable bytes + R+0x180/0x188 list). Engine RENDERING of fabricated nodes IS host-seedable — but that is the already-done Route-A plane (SH152/153/154), NOT Route-B self-construction. Do NOT polish Route-A at Route-B's expense.
-- **STANDING (unchanged):** live-DM = MIGRATION GATE (~29 recon angles). Type-4 vector [0x106829ea8] host-install-only; session-producer handoff latent-but-correct.
-## Session (prior, retained below): SH172 — DataModelServices arming-spec CORRECTION (ABI-decoded). READ-ONLY recon; no production change (arming spec in prior ledger falsified). Doc docs/frontier-sh172-dmservices-arming-corrected.md. Workspace green (545/0, arm64jit 367).
-- **CORRECTION (SH171-cone deleg_3bdfca3c task-0, objdump-verified):** the SH169 registry-arming claim (write DM* into std::function capture word **0x106391918**) is a CATEGORY ERROR. `setDataModelToCurrent` (0x2dbcc10) is a pure leaf GETTER — `adrp/add/ret` returns **&0x6391908** (guest 0x106391908), zero direct bl callers, never touches 0x6391918. The registry std::function receives the DM as an INVOCATION ARG (dispatch 0x2dbcd18: stack-temp then `blr x21`), not from a capture slot. Correct post-migration arming target = the current-DM holder the getter RETURNS: **guest 0x106391908** (verified in LOAD#2 RW data [0x62dc1c0,0x67d27c0)). Invokable __func vt 0x106358d40 + __f_ 0x6391900 are loader-runtime-built (all-zero in file) — arming is migration-time/in-process/post-migration only, never a static seed (relocated-vt hand-clobber rule). `crates/` references none of these addrs (repo-wide zero hits) — capture latch unchanged, no code edit warranted.
-- **STANDBY (same cone):** (a) R1 recon-v3 premise CORRUPTED — the CoreScript/NoCoreScripts/UniversalApp literals ARE all present (rbxasset://scripts/CoreScripts @0x232ee7, NoCoreScripts @0x4b546b, UniversalApp.rbxm @0x6c9a40), the earlier "absent" claim measured the wrong premise; BUT R1 still dead for the CORRECT reason (reachability — CoreScriptLoader 0x1f1d8ac is downstream of a live DM; the only hook aassetmanager_open is pull-only, never fires pre-DM). (b) Next-object recon: the next un-synthesized object is a live RBX::DataModel (inlined make_shared at ExperienceController::join), structural, seedable=false.
-- **STANDING (unchanged):** live-DM = MIGRATION GATE (~28 recon angles). SH169 capture latch is the ready observer; arming target corrected to 0x106391908.
-## Session (prior, retained below): SH169 — DM capture upgraded to DELEGATING + VALIDATING (migration readiness) + 3-agent recon.
-- **SH169 CODE (impl):** `routeb_dm_alloc_capture` now DELEGATES the real allocation through the JIT to the engine's OWN allocator hook (run_guest_callback saved prev_hook, passing current_guest_tp()) when one is saved — the returned base stays in the engine's pool and its free-path stays valid (fixes the SH167 host-calloc SIGABRT). Validates base vt in-image (read_vt_in_image) so only genuine vtable'd DM objects count [validated]. `JIT_DM_ALLOC_CAPTURE_DELEGATE=1` saves the live hook + arms the trail; without it the SH167 never-clobber latch is preserved byte-for-byte. Idempotent; default-inert; latent readiness. tpidr fix (audit deleg_fe92d2e1): was passing 0 which jit_run_inner republishes (clobbers guest TLS base + faults engine TLS operator-new) — now current_guest_tp(). +2 hermetic tests.
-- **RECON (3-agent, deleg_fe92d2e1, all READ-ONLY, code-grounded):**
-  1. NEXT-3 do-init seeds (deleg_8d5648cf) all DEAD — #1 real cell 0x107333aa0 (16MB off), #2 telemetry -1 is an ANTI-ADVANCE (std::call_once never parks single-threaded), #3 page 0x10673336000 is bogus (>27GB). R1 synthetic CoreScript dead (filesdir never joined to a CoreScripts Lua path). Do NOT build those levers.
-  2. Post-ladder JNI re-entry FALSIFIED — once-guard [0x106a68410] self-latches on run 1 so DM-construct lambda never re-runs; second run is a no-op de-accumulator hitting the same empty-handler-list (q+0x7c0) benign ret. No accumulation toward a live DM.
-  3. DataModelServices registry-arming spec — 0x2dbcc10 is a GETTER not a setter; entry (0x106391900..0x106391920) loader-populated except ONE spare capture word 0x106391918 (+0x18); invokable vt 0x106358d40 runtime-only. Arming must run in-process post-migration, never as a static seed. pre_migration_safe=NO.
-  4. SH169 trail AUDIT — ABI (x0=size,x1=tag,x2=flags) correct per real disasm; guard fires at true block-entry pc; nested re-entry is the proven qsort/pthread_once mechanism (not SH151 GLES class). Only latent bug was tpidr=0 — FIXED.
-- **STANDING (unchanged):** live-DM structural wall = GPU-host / real-input migration gate (~16 recon angles). SH169 makes the capture latch functional at that instant. Next = real app-launch session with JIT_DM_ALLOC_CAPTURE=1 + JIT_DM_ALLOC_CAPTURE_DELEGATE=1, then arm DataModelServices per the spec (post-migration, in-process).
-## Session (prior, retained below): SH166 + SH167 + SH168 — DMCONT latency authority-closed, manager-shell EXHAUSTED, live-DM migration gate ABSOLUTE, DM allocation-capture latch + data-persistence pre-staging shipped. Workspace green (all suites 0 fail, arm64jit 366). Tree clean on dev (d1267ac, SH167 1d5bdc0, SH168 57f7a2f).
-- **SH168 (impl, 57f7a2f)**: scripts/prestage_data_init.py — data-persistence readiness (objective 2b).
-  Recon deleg_6a9bf0d6: rbx-storage.db opens from CACHE dir (/data/user/0/com.roblox.client/cache/),
-  NOT the SH131b files-dir global; it's the content cache (8-col files DDL + 5 indexes). Script stages
-  the app-data skeleton + a valid empty SQLite db with the engine's EXACT schema. Host-disk only,
-  idempotent, zero boot disturbance (unset SOBER_ANDROID_ROOT -> fsmap passthrough). Auth
-  (.ROBLESECURITY) is a separate native plane behind SH129.
-- **SH166-cone + SH167-cone (deleg_35857472, deleg_6a9bf0d6; ~13 recon angles total, code-grounded)**: the
-  live-DM/app-shell wall is an ABSOLUTE MIGRATION GATE — the do-init ladder bottoms out in telemetry
-  (0x2208354 = max-counter registrar, no allocation); createDataModelForTeleport + scene-walker have ZERO
-  direct bl callers; the NativeHelper callbacks are effect-signals not drivers; a headless session cannot
-  form. Only forward = engine-internal make_shared<DataModel> during a REAL session at migration time.
-- (earlier this session: SH156-SH165-fwd, SH166, SH167 — see git log / HANDOFF.md)
-- **SH166 (d1267ac, doc+trace)** — DMCONT empirical floor + CORRECTED disassembly of 0x102bd8ce8 (vt[+0xf8]/+0x108/+0x1f0 dispatched UNCONDITIONALLY/serially; getter 0x2174c04 tail-calls 0x624e6c0 -> vt[+0x720]). Supersedes the stale "vt[+0xf8] must complete" premise. Clean EXIT 124 / 0 crash.
-- **SH166-cone DECISIVE (deleg_35857472, 3 agents, code-grounded):** (a) computed-`blr` always terminates the trace (translate.rs:6924) -> no region-watch hit at 0x102bd1d68 PROVES the +0x1f0->continueAfterFlagsLoaded_ dispatch did NOT execute. (b) manager-shell line EXHAUSTED (AppStart closure = lifecycle/telemetry only; DM factory + scene-walker 0x105b2ed48 have 0 direct bl callers) -> STOP it for the UI goal. (c) headless session IMPOSSIBLE (NativeHelper callbacks are effect-signals, not drivers) -> the GPU-host/real-input MIGRATION GATE.
-- **SH167 (impl, doc)** — DM allocation-capture hook (JIT_DM_ALLOC_CAPTURE=1), latent migration-readiness: routeb_dm_alloc_capture host-call trail on operator-new wrapper 0x102a0d9b8 (active-hook 0x1067daaf0). 3-arg ABI EMPIRICALLY = (size=a0, callsite-tag=a1, flags=a2). **Empirical: engine ships its OWN nonzero active hook; FORCE-replacing it with host calloc guest-SIGABRTs the free-path (probe EXIT 134).** Guard seeds only when hook==0; mechanism+ABI PROVEN. Default-inert. +1 hermetic sh167.
-- **Housekeeping:** /tmp 100% full (7.7G tmpfs from recon disasm dumps) -> ENOSPC broke 7 pre-existing tests; cleared to 5%, all green (NOT a regression).
-- **NEXT (honest):** Route-B frontier = live-DM structural wall (~12 angles agree no seed crosses it). Only real forward = engine-internal make_shared<DataModel> during a REAL session at migration time; SH167 is the ready capture latch. Do NOT return to the manager-shell line (verified exhausted).
-- (earlier this session: SH156-SH165-fwd, all green — see git log / HANDOFF.md)
-- **SH156** — the GlobalInit do-init now EXECUTES real GlobalInit construction. Opt-in JIT_ROUTEB_DM_SEED=1 rung: seeds a live 0x10 object at DM-root [0x106a68818] with the real dispatch vtable 0x10635cce0, pins vtable[+0x30]=0x102207b50 (the genuine global-init ctor), and remaps the once-faulting .bss pages ([0x7285fb0] etc., SH116 class). VERIFIED 2/2 (EXIT 0, 24 real task frames): ctor-guard [0x6a64d70] self-latches 0->1 (the ctor's OWN __call_once completed — first time), the once-faulting ldr [0x7285fb0] now reads 0. Recon deleg_94c0be26: the do-init match dispatch brs into the real engine-boot body 0x1023eff4c -> AppBridgeV2 governor 0x102e9fa84 -> nativeAppBridgeStartAppWithParams — the next frontier marker, NOT a fault. (commit SH156; docs frontier-sh156-routeb-dmseed-ctor.md + recon-sh156-startluaappdm-postdoinit.md; repro runs/sh156-r3a/r3b.txt)
-- (earlier this session: SH148-SH155, all green — see git log / HANDOFF.md)
-
-## Confirmed-closed recons (both primary + fallback next items are DONE)
-- deleg_eeec00a2: the DataModel-primary vtable +0x30 is a trivial getter, NOT the app-shell ctor (corrected SH155's premise); the real GlobalInit dispatch vtable is 0x10635cce0 whose +0x30 = the global-init ctor 0x102207b50.
-- deleg_69ab5272: the [0x7285fb0] flags gate is conditional (needs 0x306 only on a telemetry path a healthy run skips) — do NOT pre-seed; mapping the page readable is correct.
-- deleg_94c0be26: on the StartLuaAppDM path the do-init match dispatch lands in REAL engine-boot code (0x1023eff4c -> AppBridgeV2 governor 0x102e9fa84), all vtable slots packed-RELA-resolved (no zero-vtable leak). Next gates: AppBridgeV2 once-guard [0x106a70618] left CLEAR + flag [0x106a64da0]==0.
-- deleg_636bbc4f: BOTH recon-v3 deliverables CLOSED (type4 self-driven frame thunk 24 real swap Ok(0x1); JSON-abort closed by JIT_JSON_ZERO_FIX).
-- deleg_7734b24f: Route-B init ladder FULLY CLOSED (7 rungs to "ladder done" + 24 frames; latch 0x72739d4). All 5 NativeHelper callbacks wired (set-only). Wiring callbacks = DEAD-END (never invoked).
-- deleg_d8c3d2b2: Route-B DM-root structural wall root-caused — superseded by SH156's live-DM-seed advance.
-
-## Standing gates (all structural/latent unless otherwise noted)
-- **NEXT frontier marker (SH156): AppBridgeV2 governor startup 0x102e9fa84 -> nativeAppBridgeStartAppWithParams** — the do-init now reaches real engine-boot. Probe inside 0x102e9fa84 for the first sub-object/soft-return. Keep AppBridgeV2 once-guard [0x106a70618] CLEAR; flag [0x106a64da0]==0 default.
-- **The ONLY gate to real screens is STRUCTURAL — a live heap-planted DataModel that the engine's real app-launch constructs** (SH156 gets the do-init into real GlobalInit/app-boot, but full session construction + a live DM at [0x106a68818] still needs the app-launch heap store). Behind that: Lua app-shell + rbx-storage.db login-persist (ScriptContext/CoreScripts loader runs after the live DM).
-- **SendAppEventOnAppReady** body soft-returns at the SH115 singleton-vtable leak before its discriminator runs (latent-but-correct; event now in x5).
-- **Audio (FMOD fake-AAudio, SH132)** / **cookie-ingress .ROBLESECURITY (SH129)** — both strictly latent behind the same structural wall.
-
-## Next when the wall eventually falls (headless-host / GPU-host migration)
-- Dedicated host-side GLES context-owner thread so type-4 task frames carry real engine content (SH151-negative doc's sanctioned design).
-- Then audio (AAudio/FMOD via fake-aaudio bridge SH132), input, performance.
+## Session (Sep 15, 2026, hermes-worker): SH178 — Route-B cone CORRECTION: the "ExperienceController::join make_shared<DataModel>" premise is MISATTRIBUTED (reloc-level law wall). Workspace green (550/0). Doc docs/frontier-sh178-routeb-join-misattribution.md. No code change.
+- **3-agent fresh Route-B cone (operator's "return to Route B" directive) + independent packed-RELA decode:**
+  (1) The text the prior cones cited for "the only make_shared<DataModel> is inlined at
+  ExperienceController::join" is MISLABELLED. file 0x2206c40/0x2206d74 = GlobalInit do-init
+  (ldar once-guard -> bl 0x2173b3c -> store [0x106a68408]; operator-news only 0x28/0x40/0x100/0x1000,
+  no DM-size). file 0x2173b3c = string-intern GetOrCreate (strcmp + hash-bucket), NOT an RTApp
+  app-registry / DM allocator. 0x2206db8 dispatch needs [obj+#32]=real vtable'd obj whose +0x30=
+  real ctor = the SH156 JIT_ROUTEB_DM_SEED path to the governor dead-head. The genuine DM alloc
+  site was NEVER located — it sits in a region no cone reached.
+  (2) LAW-LEVEL WALL PROVEN AT THE RELOC LEVEL (main-loop decode of 568,272 packed ANDROID_RELA):
+  the reloc writing guest 0x106391908 (setDataModelToCurrent getter return / SH172 holder) =
+  (0x6391908, R_AARCH64_RELATIVE, addend 0x6358d40) -> loader writes base+0x6358d40 from an
+  all-zero on-disk .data.rel.ro cell; 490 relocs populate [0x1063915a0,0x106392600). The DM
+  holder/registry is RELOCATION- + SESSION-populated (wired consumer std::function + live current
+  shared_ptr exist only post-session) — circular with the construction we lack. Not seedable.
+  (3) R1 (synthetic CoreScript) reconfirmed dead for the CORRECT reason: rbxasset://scripts/
+  CoreScripts at 3 pull-only URI-builder sites; CoreScriptLoader 0x101f1d8ac has ZERO direct bl
+  callers; filesdir 0x10726d600 never joins a CoreScripts Lua path. R2 (UniversalApp.rbxm) still
+  blocked on the same live-DM (0x229006/0x288090/0x2d87b18). Type-4 producer [0x106829ea8]
+  latent-only. Present-walker node-list = Route-A plane (do-not-polish).
+- **VERDICT:** do NOT build the headless dynamic-DM-trace attempt (re-treads SH156/164c, targets a
+  misattributed address, expected fault on .data.rel.ro registry). Live-DM = LAW-level migration
+  wall; the SH169 DELEGATE+VALIDATE capture latch is the ready observer for a real app-launch
+  (GPU host / real input). Future re-chase must first locate the genuine join inline via a fresh
+  packed-RELA decode of the DM vtable/ctor, not reuse 0x2206d74/0x2173b3c.
+- Cookie line fully persisted (SH175/176/177 committed, 3006fd3/8ca920e/060eeb7). Workspace
+  550/0. /tmp cleaned (453M used on 7.7G).
