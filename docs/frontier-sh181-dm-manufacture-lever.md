@@ -1,7 +1,7 @@
 # SH181 — JIT-side DataModel MANUFACTURE lever (default-inert, env-gated) — the Route-B "dead wall" premise falsified
 
 Date: Sep 15, 2026, hermes-worker. Workspace green (550/0 baseline; SH181 adds 1 hermetic test).
-Doc docs/frontier-sh181-dm-manufacture-lever.md. Commit <SH181COMMIT>.
+Doc docs/frontier-sh181-dm-manufacture-lever.md. Commit 4da4da1.
 
 ## TL;DR
 A fresh 2-agent Route-B cone (following SH179's pinned genuine DataModel vtable family up
