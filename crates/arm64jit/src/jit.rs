@@ -1235,10 +1235,51 @@ fn routeb_dm_real_ctor_drive_guard(_state: *mut CpuState, pc: u64) {
                         eprintln!("[routeb-realctor] SH187b: planted constructed DM {dm_base:#x} into current-DM holder 0x{CUR_DM_HOLDER:x}");
                     }
                     if std::env::var_os("JIT_ROUTEB_DM_REALCTOR_CONSUMER").is_some() {
+                        // SH187c (recon deleg_c64972f1, authoritative): make get-or-create
+                        // 0x102dbcd88 return the planted DM (fast mode) OR dispatch the genuine DM
+                        // vtable (dispatch mode). Seeding (guest addrs; D = 16B-aligned scratch):
+                        //   outer once-guard 0x106a665a0 = 1, inner once-guard 0x106a665b0 = 1,
+                        //   key slot 0x106a665a8 = 0 -> singleton returns key 0 without do-init;
+                        //   OBJ+0xb0 = D (keyed-lookup vector data), OBJ+0xc0 = D+16 (end, cap 1);
+                        //   fast: *(D)=OBJ (non-null -> fast-path return); dispatch: *(D)=0 AND
+                        //   0x106dbf238=1 -> create-path `ldr x8,[x19](=DM vptr); slot +0x1c0; blr`
+                        //   at 0x2dbce80 = real relocated code dispatch of the genuine DM.
                         const GET_OR_CREATE: u64 = 0x102dbcd88;
+                        let d = Box::leak(vec![0x0u8; 0x40].into_boxed_slice()).as_mut_ptr() as u64;
+                        // (a) once-guards + key => singleton returns without do-init.
+                        for g in [0x106a665a0u64, 0x106a665b0u64] {
+                            if routeb_ensure_writable(g) {
+                                unsafe { std::ptr::write_unaligned(g as *mut u64, 1) };
+                            }
+                        }
+                        if routeb_ensure_writable(0x106a665a8) {
+                            unsafe { std::ptr::write_unaligned(0x106a665a8 as *mut u64, 0) };
+                        }
+                        // (b) keyed-lookup vector metadata on the DM so element[0] is in-bounds.
+                        unsafe {
+                            std::ptr::write_unaligned((dm_base + 0xb0) as *mut u64, d);
+                            std::ptr::write_unaligned((dm_base + 0xc0) as *mut u64, d + 16);
+                        }
+                        // (c) dispatch mode: element NULL + the create-path flag -> genuine DM blr.
+                        let dispatch = std::env::var_os("JIT_ROUTEB_DM_REALCTOR_DISPATCH").is_some();
+                        unsafe {
+                            std::ptr::write_unaligned(d as *mut u64, if dispatch { 0 } else { dm_base });
+                        }
+                        if dispatch && routeb_ensure_writable(0x106dbf238) {
+                            unsafe {
+                                let v = std::ptr::read_unaligned(0x106dbf238 as *const u64);
+                                if v == 0 {
+                                    std::ptr::write_unaligned(0x106dbf238 as *mut u64, 1);
+                                }
+                                eprintln!("[routeb-realctor] SH187c: dispatch-mode seeded 0x106dbf238 (=0x{:x}) -> create-path `blr [DM-vptr+0x1c0]` at 0x2dbce80", v);
+                            }
+                        }
                         match crate::jit::run_guest_callback(GET_OR_CREATE, [dm_base, 0, 0, 0, 0, 0, 0, 0], tp) {
-                            Ok(cr) => eprintln!("[routeb-realctor] SH187b: get-or-create consumer 0x{GET_OR_CREATE:x} DROVE ok ret x0={cr:#x} (survived; returns the DM if present)"),
-                            Err(e) => eprintln!("[routeb-realctor] SH187b: get-or-create consumer 0x{GET_OR_CREATE:x} drive err: {e} (next gate — seed the 0x2dbd018 once-cell / 0x2411658 keyed lookup)"),
+                            Ok(cr) => eprintln!(
+                                "[routeb-realctor] SH187c: get-or-create consumer 0x{GET_OR_CREATE:x} DROVE ok ret x0={cr:#x} (mode: {}, genuine-DM dispatch at 0x2dbce70/0x2dbce80 if dispatch+flag)",
+                                if dispatch { "DISPATCH" } else { "FAST" }
+                            ),
+                            Err(e) => eprintln!("[routeb-realctor] SH187c: get-or-create consumer 0x{GET_OR_CREATE:x} drive err: {e} (next gate)"),
                         }
                     } else {
                         eprintln!("[routeb-realctor] SH187b: consumer probe gated (JIT_ROUTEB_DM_REALCTOR_CONSUMER unset) — holder plant only, path kept crash-free");
