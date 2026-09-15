@@ -57,18 +57,23 @@ Agent-2 — the host-drive API + nesting rule:
   [0x1023efe2c, 0x1023eff20]): (a) routeb_ensure_writable + seed the stack-canary
   global 0x1067d16f0 to a stable 8-byte word; (b) OnceLock-drive the genuine
   app-shell ctor guest 0x1057d6ef4 via run_guest_callback with
-  x0=routeb_manufactured_dm(), x1=routeb_dm_ctor_arg_empty() (zeroed 0x28 descriptor
-  -> PATH A empty-string survival no-op). Idempotent; env-off byte-identical.
-- `routeb_dm_ctor_arg_empty` — the PATH A x1 descriptor: a leaked zeroed 0x28 buffer
-  whose +8..+0x20 is a valid EMPTY libc++ std::string (SSO size 0) so the ctor's
-  `ldr x8,[x1,#8]` gate sees 0 -> clean return.
-- test `sh182_dm_ctor_arg_builds_sso_and_empty_plus_guard_env_gated` — descriptor is
-  a stable non-zero zeroed buffer; env-off guard returns immediately; env-on + wrong
-  pc region-gates immediately (no canary seed / no drive).
+  x0=routeb_manufactured_dm(), x1=routeb_dm_ctor_arg(full). Default PATH A; PATH B
+  when `JIT_DM_CTOR_FULL=1`. Idempotent; env-off byte-identical.
+- `routeb_dm_ctor_arg(full)` — PATH A (false): a leaked zeroed 0x28 buffer whose
+  +8..+0x20 is a valid EMPTY libc++ std::string (SSO size 0) -> the ctor's
+  `ldr x8,[x1,#8]` gate reads 0 -> clean return. PATH B (true): [descriptor+8] =
+  pointer to a SHORT-form SSO std::string "ServerRestartScheduled" (byte0=0x2c =
+  22<<1 size, bit0=0 short; bytes 1..22 inline data; byte23=0) per recon
+  deleg_aac54e43 (the equality fn 0x2152f30 reads SHORT form: length=byte0>>1,
+  data at base+1, bytes>0x17 ignored) -> the ctor's comparison returns true and
+  the ctor's REAL init body runs.
+- test `sh182_dm_ctor_arg_builds_sso_and_empty_plus_guard_env_gated` — PATH A
+  descriptor zeroed + stable; PATH B SSO byte-exact (0x2c, data, byte23=0);
+  env-off returns immediately; env-on + wrong pc region-gates immediately.
 
 ## Empirics (real libroblox.so, llvmpipe)
 `JIT_ROUTEB_DM_MANUFACTURE=1 JIT_ROUTEB_DM_CTOR_DRIVER=1` + the canonical ladder +
-`JIT_REGION_WATCH=0x1057d6ef4-0x1057d7100`:
+`JIT_REGION_WATCH=0x1057d6ef4-0x1057d7100` (PATH A, default):
 - **[region-watch] entered region 0x1057d6ef4-0x1057d7100 at guest pc=0x1057d6ef4**
   (SH181 was 0 'entered region' — the DM vtable now DISPATCHES headlessly).
 - **[routeb-dmctor] seeded stack-canary global 0x1067d16f0 ... for app-shell ctor**
@@ -80,14 +85,23 @@ Default env-off unregressed (the SH55/64 concurrent-thread flake is run-variable
 pre-existing — confirmed by a 2nd bare run EXIT 124, 0 crashes; SH182 code fires 0
 times env-off).
 
+PATH B (`JIT_DM_CTOR_FULL=1`): the ctor REACHES and RUNS its real init body (it
+passes the string-equality gate — otherwise it would be the PATH A clean no-op) then
+faults at `fault=0x28` with guestpc a host-heap address, x0=0x28, lr=0x102b53a78 —
+the zeroed manufactured DM's internal fields are not yet seeded enough to survive the
+real init body (the component ctor 0x2bc4f64 / AppBridgeV2Init chain reads DM/sub-
+object state a bare zeroed object lacks). This is EXACTLY SH181's flagged "emergent
+next problem" and is now a concrete next gate: seed the specific DM members the
+0x2bc4f64/0x238e0bc/0x2286ed0/0x22b737c chain reads. PATH B is default-inert
+(env-gated off), so the healthy PATH A / bare default paths are unaffected.
+
 ## Honest scope + next
 This is the FIRST headless execution of the engineered manufactured genuine-vptr DM
-through its real relocated app-shell ctor — the missing half of SH181's lever. It is
-still PATH A (empty-string survival no-op): the ctor RUNS real code but with a
-zeroed descriptor it takes the clean no-op + ret, so it does NOT build DM sub-objects
-/LICENSE or render. Route B's real self-constructed GuiObjects still need PATH B
-(seed a genuine "ServerRestartScheduled" std::string to run the init body — its exact
-SSO layout vs equality fn 0x2152f30 is the next decode), and beyond that the real
-live-DataModel session (migration). SH182 proves the manufacture lever now DISPATCHES
-and returns cleanly headlessly; PATH B is a concrete, grounded next step on the same
-line. Standing: live-DM session = migration gate; manufacture lever live-correct.
+through its real relocated app-shell ctor — the missing half of SH181's lever. PATH A
+(empty-string survival no-op) is verified clean end-to-end. PATH B proved on the real
+binary that the ctor's real init body IS reached and starts executing headlessly,
+faulting only on the unseeded DM-internal fields — the next concrete seeded-forward.
+Route B's real self-constructed GuiObjects still need PATH B's DM-field seed + beyond
+that the real live-DataModel session (migration). SH182 advances the manufacture lever
+from latent to live-dispatching-and-running; PATH B field reconstruction is a grounded
+next step on the same line. Standing: live-DM session = migration gate.

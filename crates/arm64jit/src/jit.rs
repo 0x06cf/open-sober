@@ -1008,14 +1008,38 @@ pub fn routeb_manufactured_dm() -> u64 {
 // the sanctioned type4_frame pattern; this ctor is pure .text, no GLSL compile).
 // default-inert; env JIT_ROUTEB_DM_CTOR_DRIVER=1. +1 hermetic test.
 // ---------------------------------------------------------------------------
-/// Build the x1 descriptor for the app-shell ctor: a zeroed 0x28-byte buffer
-/// whose +8..+0x20 is a valid EMPTY libc++ std::string (all zeros = SSO size 0).
-/// This selects PATH A: the ctor's `ldr x8,[x1,#8]` gate sees 0 -> the clean
-/// zero-touch no-op + ret (the safe manufactured-DM survival proof).
-fn routeb_dm_ctor_arg_empty() -> u64 {
+/// Build the x1 descriptor for the app-shell ctor. `full` selects the PATH B
+/// descriptor: [descriptor+8] = pointer to a SHORT-form (SSO) libc++ std::string
+/// `"ServerRestartScheduled"` — byte0=0x2c (size 22<<1, bit0=0 short), bytes
+/// 1..22 inline data, byte23=0 (recon deleg_aac54e43: the ctor builds its own
+/// comparison literal the same way, and fn 0x2152f30 reads SHORT form: length
+/// = byte0>>1, data at base+1; bytes>0x17 ignored). PATH B runs the ctor's REAL
+/// init body (component ctor 0x2bc4f64, AppBridgeV2Init 0x238e0bc, placeVersion
+/// vector append). `false` selects PATH A: a zeroed descriptor whose +8..+0x20
+/// is a valid EMPTY libc++ std::string (SSO size 0) -> the ctor's `ldr x8,[x1,#8]`
+/// gate reads 0 -> clean zero-touch no-op + ret (the safe survival proof).
+fn routeb_dm_ctor_arg(full: bool) -> u64 {
     use std::sync::OnceLock;
-    static EMTPY: OnceLock<u64> = OnceLock::new();
-    *EMTPY.get_or_init(|| Box::leak(vec![0x0u8; 0x28].into_boxed_slice()).as_mut_ptr() as u64)
+    static PATHB: OnceLock<u64> = OnceLock::new();
+    static PATHA: OnceLock<u64> = OnceLock::new();
+    if full {
+        *PATHB.get_or_init(|| {
+            // descriptor: [0..8] spare 0, [8..16] = pointer to the SSO string obj.
+            let buf = Box::leak(vec![0x0u8; 0x28].into_boxed_slice()).as_mut_ptr() as u64;
+            let sso = Box::leak(vec![0x0u8; 0x18].into_boxed_slice()).as_mut_ptr() as u64;
+            // libc++ SHORT std::string "ServerRestartScheduled" (22 chars): byte0
+            // = 22<<1 = 0x2c (bit0 0 = short), data at base+1.
+            unsafe { std::ptr::write_unaligned(sso as *mut u8, 0x2c) };
+            for (i, b) in b"ServerRestartScheduled".iter().enumerate() {
+                unsafe { std::ptr::write_unaligned((sso + 1 + i as u64) as *mut u8, *b) };
+            }
+            unsafe { std::ptr::write_unaligned(buf as *mut u64, 0) };
+            unsafe { std::ptr::write_unaligned((buf + 8) as *mut u64, sso) };
+            buf
+        })
+    } else {
+        *PATHA.get_or_init(|| Box::leak(vec![0x0u8; 0x28].into_boxed_slice()).as_mut_ptr() as u64)
+    }
 }
 
 /// SH182: at the StartLuaAppDM entry (where the manufacture plant already ran,
@@ -1050,15 +1074,20 @@ fn routeb_dm_ctor_driver_guard(_state: *mut CpuState, pc: u64) {
                 "[routeb-dmctor] SH182: seeded stack-canary global 0x{CANARY:x} = {newp:#x} (was {cur:#x}) for app-shell ctor 0x{APPSHELL_CTOR:x}"
             );
         }
-        // (b) drive the ctor with the manufactured DM (x0) + zeroed descriptor (x1).
-        //     PATH A = clean survival no-op: proves the manufactured DM enters AND
-        //     returns through its REAL app-shell ctor without faulting.
+        // (b) drive the ctor with the manufactured DM (x0) + descriptor (x1).
+        //     PATH A (default) = zeroed descriptor -> clean survival no-op: proves
+        //     the manufactured DM enters AND returns through its REAL app-shell
+        //     ctor without faulting. PATH B (JIT_DM_CTOR_FULL=1) = SSO
+        //     "ServerRestartScheduled" descriptor -> runs the ctor's REAL init body
+        //     (component ctor + AppBridgeV2Init + placeVersion vector append).
         let dm = routeb_manufactured_dm();
-        let arg = routeb_dm_ctor_arg_empty();
+        let full = std::env::var_os("JIT_DM_CTOR_FULL").is_some();
+        let arg = routeb_dm_ctor_arg(full);
         let tp = crate::jit::current_guest_tp();
         match crate::jit::run_guest_callback(APPSHELL_CTOR, [dm, arg, 0, 0, 0, 0, 0, 0], tp) {
             Ok(r) => eprintln!(
-                "[routeb-dmctor] SH182: manufactured-DM app-shell ctor 0x{APPSHELL_CTOR:x} DROVE ok ret x0={r:#x} (PATH A survival no-op) — DM {dm:#x} vt=0x1067162f0 entered AND returned through real code"
+                "[routeb-dmctor] SH182: manufactured-DM app-shell ctor 0x{APPSHELL_CTOR:x} DROVE ok ret x0={r:#x} ({}) — DM {dm:#x} vt=0x1067162f0 entered AND returned through real code",
+                if full { "PATH B: SSO 'ServerRestartScheduled' -> real init body" } else { "PATH A survival no-op" }
             ),
             Err(e) => eprintln!("[routeb-dmctor] SH182: app-shell ctor drive err: {e}"),
         }
@@ -5097,22 +5126,42 @@ mod tests {
     #[test]
     fn sh182_dm_ctor_arg_builds_sso_and_empty_plus_guard_env_gated() {
         // SH182: drive the manufactured DM through its REAL app-shell ctor.
-        // Provide: (a) the x1 descriptor for PATH A is a zeroed 0x28 buffer whose
-        // +8..+0x20 is a valid EMPTY libc++ std::string (SSO size 0) — the ctor's
-        // `ldr x8,[x1,#8]` gate sees 0 -> clean zero-touch no-op + ret; (b) guard
-        // env-gated + region-scoped.
-        // PATH A descriptor: all zeros -> the gate short-circuits to the survival
-        // no-op. Verify it is a valid empty string (and thus the guard passes x1
-        // = a stable address, not 0).
-        let d = routeb_dm_ctor_arg_empty();
-        assert_ne!(d, 0, "descriptor must be a stable non-zero address");
+        // Provide: (a) PATH A x1 descriptor is a zeroed 0x28 buffer (+8..+0x20
+        // EMPTY SSO std::string) -> clean survival no-op; (b) PATH B descriptor
+        // holds a SHORT-form SSO "ServerRestartScheduled" at [d+8] (byte0=0x2c
+        // size 22<<1, bytes1..22 data, byte23=0) -> runs the real init body;
+        // (c) guard env-gated + region-scoped.
+        // PATH A: all zeros -> the gate short-circuits to the survival no-op.
+        let da = routeb_dm_ctor_arg(false);
+        assert_ne!(da, 0, "PATH A descriptor must be a stable non-zero address");
         for i in 0..0x28u64 {
             assert_eq!(
-                unsafe { std::ptr::read_unaligned((d + i) as *const u8) },
+                unsafe { std::ptr::read_unaligned((da + i) as *const u8) },
                 0,
                 "PATH A descriptor must be zeroed (empty SSO string) at +{i}"
             );
         }
+        // PATH B: [db+8] points at a SHORT-form SSO "ServerRestartScheduled".
+        let db = routeb_dm_ctor_arg(true);
+        let sso = unsafe { std::ptr::read_unaligned((db + 8) as *const u64) };
+        assert_ne!(sso, 0, "PATH B descriptor +8 must point at the SSO string obj");
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned(sso as *const u8) },
+            0x2c,
+            "SSO byte0 = size 22<<1 (short form)"
+        );
+        for (i, b) in b"ServerRestartScheduled".iter().enumerate() {
+            assert_eq!(
+                unsafe { std::ptr::read_unaligned((sso + 1 + i as u64) as *const u8) },
+                *b,
+                "SSO data byte {i}"
+            );
+        }
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned((sso + 23) as *const u8) },
+            0,
+            "SSO byte23 = 0"
+        );
         // Guard: env-off never fires at StartLuaAppDM entry.
         let mut st = CpuState::new();
         let start = std::time::Instant::now();
