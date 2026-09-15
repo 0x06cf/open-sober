@@ -1018,6 +1018,117 @@ pub fn routeb_dm_manager_cont() -> u64 {
     })
 }
 
+/// SH167 (recon cone deleg_35857472 task-2, authoritative): DM ALLOCATION-CAPTURE HOOK.
+/// The engine's CRT operator-new wrapper (guest 0x102a0d9b8, file 0x2a0d9b8) reads the
+/// ACTIVE allocator-hook global [guest 0x1067daaf0] and the DEFAULT hook [guest
+/// 0x1067d0840]; `cmp x8,x9; b.eq` takes an inline fast path when equal, else
+/// `blr x8` calls the active hook. The live RBX::DataModel is created ONLY by the
+/// engine's OWN make_shared driver during a REAL app-launch session (sizeof is an
+/// inlined immediate — not statically recoverable). To capture that pointer the
+/// moment a real session forms (post GPU-host / real-input migration — the
+/// documented gate), this guard seeds the ACTIVE global with a host-call trail that
+/// (a) performs the real allocation (calloc, over-sized to cover either arg ordering
+/// of the 3-arg new hook) and (b) LOGS/captures the returned base for DM-plausible
+/// sizes. Fires at the operator-new wrapper block entry under JIT_DM_ALLOC_CAPTURE=1.
+/// Default-inert (env off -> no seed, no trailing; the fast/live allocator path is
+/// byte-identical). Idempotent; only seeds when the active hook is currently 0 so it
+/// never clobbers a real engine-installed allocator hook. LATENT: no real session
+/// forms headlessly, so it does not fire on the current ladder — it is migration
+/// readiness (the recon's single concrete harness delta).
+extern "C" fn routeb_dm_alloc_capture(
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    _a3: u64,
+    _a4: u64,
+    _a5: u64,
+    _a6: u64,
+    _a7: u64,
+) -> u64 {
+    // EMPIRICALLY VERIFIED ABI (DMCONT+JIT_DM_ALLOC_CAPTURE run, real binary): the 3-arg new hook is
+    // (size, call-site-tag, flags) — a0 is the real byte size (e.g. 0x18); a1 is a code/rodata
+    // address tag naming the allocation call site; a2 is a flag/line word. Use a0 as the size.
+    let bytes = if a0 != 0 { a0 } else { a1.max(1) } as usize;
+    // Plausible DM/Instance size window — only these are worth capturing/logging.
+    let dm_plausible = (0x1000..=0x4_0000).contains(&bytes);
+    let budgeted = CAPTURED_DM_ALLOC.load(std::sync::atomic::Ordering::Relaxed) < 64;
+    let base = unsafe { libc::calloc(1, bytes) } as u64;
+    // Log the first few invocations unconditionally (bounded) + DM-plausible ones, so a probe
+    // run reveals whether the trail is the real allocator and the actual size distribution.
+    TRAIL_INVOKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let first = TRAIL_INVOKED.load(std::sync::atomic::Ordering::Relaxed) <= 8;
+    if first || (dm_plausible && budgeted && base != 0) {
+        if first || dm_plausible {
+            CAPTURED_DM_ALLOC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // alignment hint in a2 (0 or a power of two up to 16 is satisfied by glibc).
+            eprintln!(
+                "[routeb-dmalloc]{} call#{}: bytes=0x{bytes:x} a0={a0:#x} a1={a1:#x} a2={a2:#x} -> base 0x{base:x}",
+                if first { " FIRST" } else { "" },
+                TRAIL_INVOKED.load(std::sync::atomic::Ordering::Relaxed),
+            );
+        }
+    }
+    base
+}
+
+/// Global capture counter so the trail stays bounded (first handful of DM-plausible allocs).
+static CAPTURED_DM_ALLOC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Total operator-new invocations routed through the capture trail (diagnostic counter).
+static TRAIL_INVOKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Guest addresses of the CRT operator-new hook globals (guest = file vaddr + 0x100000000;
+/// file slots: active [0x67daaf0], default [0x67d0840]).
+const OP_NEW_WRAPPER: u64 = 0x102a0d9b8; // the new wrapper entry (block-key pc)
+const OP_NEW_ACTIVE_HOOK: u64 = 0x1067daaf0; // ACTIVE allocator-hook global
+const OP_NEW_DEFAULT_HOOK: u64 = 0x1067d0840; // DEFAULT allocator-hook global
+
+/// Static slot for the register_host_call_auto address of routeb_dm_alloc_capture.
+fn REGISTERED_DM_ALLOC_CAPTURE() -> &'static std::sync::OnceLock<u64> {
+    static L: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    &L
+}
+
+/// SH167 guard: at the operator-new wrapper block entry, when JIT_DM_ALLOC_CAPTURE=1 and the ACTIVE
+/// allocator-hook global is currently 0 (none installed), seed it with the capture trail. EMPIRICAL
+/// (real binary): the engine ships its OWN nonzero ACTIVE hook, and REPLACING it with a host-calloc
+/// trail is INVALID — the engine's operator-delete/free-path expects allocations from its own pool and
+/// guest-SIGABRTs (SH167 probe run: EXIT 134). So this guard deliberately fires only when no hook is
+/// installed (safe latch), and the trail records allocations; a capture-only (delegating) design is the
+/// correct migration-time route to observe the live DataModel without perturbing the allocator. The
+/// trail's mechanism + 3-arg ABI (a0=size) are PROVEN by the probe run, not assumed. Default-inert
+/// (env off -> no seed, the live allocator path is byte-identical). Idempotent.
+fn routeb_dm_alloc_capture_guard(_state: *mut CpuState, pc: u64) {
+    if std::env::var_os("JIT_DM_ALLOC_CAPTURE").is_none() {
+        return;
+    }
+    if pc != OP_NEW_WRAPPER {
+        return;
+    }
+    let trail = *REGISTERED_DM_ALLOC_CAPTURE().get_or_init(|| {
+        let t = register_host_call_auto(routeb_dm_alloc_capture);
+        crate::jit::name_host_call_slot(t, "routeb.dm_alloc_capture(x0=size)");
+        t
+    });
+    if !routeb_ensure_writable(OP_NEW_ACTIVE_HOOK) {
+        return;
+    }
+    let cur = unsafe { std::ptr::read_unaligned(OP_NEW_ACTIVE_HOOK as *const u64) };
+    // Safely only when the engine has NOT installed its own allocator hook (it normally has, so
+    // this normally stays inert — replacing a live allocator guest-SIGABRTs the engine).
+    if cur != 0 {
+        return;
+    }
+    let default_hook = if routeb_ensure_writable(OP_NEW_DEFAULT_HOOK) {
+        unsafe { std::ptr::read_unaligned(OP_NEW_DEFAULT_HOOK as *const u64) }
+    } else {
+        0
+    };
+    unsafe { std::ptr::write_unaligned(OP_NEW_ACTIVE_HOOK as *mut u64, trail) };
+    eprintln!(
+        "[routeb-dmalloc] SH167 routed CRT operator-new ACTIVE hook {OP_NEW_ACTIVE_HOOK:#x} -> capture trail {trail:#x} (default_hook {default_hook:#x}) at pc={pc:#x} -> all operator-new blr the capture trail (latent until a real session make_shared<DataModel>)"
+    );
+}
+
 /// SH88: the coherent empty span-hash map seeded by the --v2boot harness for the
 /// OTel/pb_defaults BSS registry slots, used to substitute for a non-zero sub-image
 /// map/this candidate (a `.data.rel.ro` protobuf TAG constant like 0x1800064, which
@@ -3382,6 +3493,10 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // loader-relocated DM-creator family (NativeDataModelManager). Independent of
         // routeb_tail_dispatch_guard above (it only logs; it does not mutate the slot).
         routeb_tail_dispatch_capture(state, pc);
+        // SH167: DM allocation-capture hook (JIT_DM_ALLOC_CAPTURE=1, latent migration-readiness).
+        // Fires at the CRT operator-new wrapper block entry; self-gated on env, does not disturb
+        // the fast/live allocator path when off. Only seeds a zero (never-engine-installed) active hook.
+        routeb_dm_alloc_capture_guard(state, pc);
         unsafe { run(&block, state) };
         if step_trace {
             let s = unsafe { &*state };
@@ -4547,6 +4662,69 @@ mod tests {
             0x102bd1d68u64,
             "default all-leaf manager keeps +0x1f0 as a leaf (SH165-fwd benign unchanged)"
         );
+    }
+
+    #[test]
+    fn sh167_dm_alloc_capture_is_env_gated_and_never_clobbers_live_hook() {
+        // SH167 (recon cone deleg_35857472 task-2): the CRT operator-new capture hook. The
+        // guard must (a) be inert without JIT_DM_ALLOC_CAPTURE, (b) fire ONLY at the wrapper
+        // block-entry pc 0x102a0d9b8, (c) seed the ACTIVE allocator-hook global 0x1067daaf0
+        // with a host-call trail that returns a REAL allocation, (d) be idempotent, and
+        // (e) NEVER clobber a nonzero (engine-installed) live hook.
+        const ACTIVE: u64 = OP_NEW_ACTIVE_HOOK;
+        unsafe { std::env::remove_var("JIT_DM_ALLOC_CAPTURE") };
+        assert!(
+            routeb_ensure_writable(ACTIVE),
+            "map the (unit-test-absent) hook page anon RW"
+        );
+        unsafe { std::ptr::write_unaligned(ACTIVE as *mut u64, 0) };
+        let mut st = CpuState::new();
+        // (a) env off -> no seed at the exact wrapper pc.
+        routeb_dm_alloc_capture_guard(&mut st as *mut CpuState, OP_NEW_WRAPPER);
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned(ACTIVE as *const u64) },
+            0,
+            "env-off must not seed the active hook"
+        );
+        // (b) env on + wrong pc -> no seed.
+        unsafe { std::env::set_var("JIT_DM_ALLOC_CAPTURE", "1") };
+        routeb_dm_alloc_capture_guard(&mut st as *mut CpuState, 0x102a0d9a4);
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned(ACTIVE as *const u64) },
+            0,
+            "wrong-pc must not seed"
+        );
+        // (c) env on + exact wrapper pc + zero active -> seed the capture trail.
+        routeb_dm_alloc_capture_guard(&mut st as *mut CpuState, OP_NEW_WRAPPER);
+        let trail = unsafe { std::ptr::read_unaligned(ACTIVE as *const u64) };
+        assert_ne!(trail, 0, "guard must seed the active hook at the wrapper pc");
+        // Idempotent: a second call leaves the same trail.
+        routeb_dm_alloc_capture_guard(&mut st as *mut CpuState, OP_NEW_WRAPPER);
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned(ACTIVE as *const u64) },
+            trail,
+            "idempotent"
+        );
+        // (d) the trail ALLOCATES and honors max(a0,a1) (covers either arg ordering of the
+        //     3-arg new hook); it returns a valid, non-null, writable allocation.
+        let base = routeb_dm_alloc_capture(0x2000, 8, 0, 0, 0, 0, 0, 0);
+        assert_ne!(base, 0, "trail must return a real allocation");
+        unsafe { std::ptr::write_unaligned(base as *mut u8, 0xAB) };
+        assert_eq!(unsafe { std::ptr::read_unaligned(base as *const u8) }, 0xAB);
+        unsafe { libc::free(base as *mut _) };
+        // (e) a nonzero LIVE active hook (the engine ships its own) is never clobbered — replacing
+        //     a live allocator hook guest-SIGABRTs the free-path (SH167 probe run: EXIT 134).
+        unsafe { std::ptr::write_unaligned(ACTIVE as *mut u64, 0xfeedface_cafebeef) };
+        routeb_dm_alloc_capture_guard(&mut st as *mut CpuState, OP_NEW_WRAPPER);
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned(ACTIVE as *const u64) },
+            0xfeedface_cafebeef,
+            "must never clobber a live engine-installed allocator hook"
+        );
+        unsafe {
+            std::ptr::write_unaligned(ACTIVE as *mut u64, 0);
+            std::env::remove_var("JIT_DM_ALLOC_CAPTURE");
+        }
     }
 
     #[test]
