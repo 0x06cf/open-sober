@@ -1,5 +1,17 @@
 # Open-Sober STATUS.md (worker ledger)
-## Session (Sep 15, 2026, hermes-worker): SH166 + SH167 — DMCONT latency authority-closed, manager-shell EXHAUSTED verdict, DM allocation-capture latch, /tmp ENOSPC handled. Workspace green (all suites 0 fail). Tree clean on dev (d1267ac + SH167).
+## Session (Sep 15, 2026, hermes-worker): SH166 + SH167 + SH168 — DMCONT latency authority-closed, manager-shell EXHAUSTED, live-DM migration gate ABSOLUTE, DM allocation-capture latch + data-persistence pre-staging shipped. Workspace green (all suites 0 fail, arm64jit 366). Tree clean on dev (d1267ac, SH167 1d5bdc0, SH168 57f7a2f).
+- **SH168 (impl, 57f7a2f)**: scripts/prestage_data_init.py — data-persistence readiness (objective 2b).
+  Recon deleg_6a9bf0d6: rbx-storage.db opens from CACHE dir (/data/user/0/com.roblox.client/cache/),
+  NOT the SH131b files-dir global; it's the content cache (8-col files DDL + 5 indexes). Script stages
+  the app-data skeleton + a valid empty SQLite db with the engine's EXACT schema. Host-disk only,
+  idempotent, zero boot disturbance (unset SOBER_ANDROID_ROOT -> fsmap passthrough). Auth
+  (.ROBLESECURITY) is a separate native plane behind SH129.
+- **SH166-cone + SH167-cone (deleg_35857472, deleg_6a9bf0d6; ~13 recon angles total, code-grounded)**: the
+  live-DM/app-shell wall is an ABSOLUTE MIGRATION GATE — the do-init ladder bottoms out in telemetry
+  (0x2208354 = max-counter registrar, no allocation); createDataModelForTeleport + scene-walker have ZERO
+  direct bl callers; the NativeHelper callbacks are effect-signals not drivers; a headless session cannot
+  form. Only forward = engine-internal make_shared<DataModel> during a REAL session at migration time.
+- (earlier this session: SH156-SH165-fwd, SH166, SH167 — see git log / HANDOFF.md)
 - **SH166 (d1267ac, doc+trace)** — DMCONT empirical floor + CORRECTED disassembly of 0x102bd8ce8 (vt[+0xf8]/+0x108/+0x1f0 dispatched UNCONDITIONALLY/serially; getter 0x2174c04 tail-calls 0x624e6c0 -> vt[+0x720]). Supersedes the stale "vt[+0xf8] must complete" premise. Clean EXIT 124 / 0 crash.
 - **SH166-cone DECISIVE (deleg_35857472, 3 agents, code-grounded):** (a) computed-`blr` always terminates the trace (translate.rs:6924) -> no region-watch hit at 0x102bd1d68 PROVES the +0x1f0->continueAfterFlagsLoaded_ dispatch did NOT execute. (b) manager-shell line EXHAUSTED (AppStart closure = lifecycle/telemetry only; DM factory + scene-walker 0x105b2ed48 have 0 direct bl callers) -> STOP it for the UI goal. (c) headless session IMPOSSIBLE (NativeHelper callbacks are effect-signals, not drivers) -> the GPU-host/real-input MIGRATION GATE.
 - **SH167 (impl, doc)** — DM allocation-capture hook (JIT_DM_ALLOC_CAPTURE=1), latent migration-readiness: routeb_dm_alloc_capture host-call trail on operator-new wrapper 0x102a0d9b8 (active-hook 0x1067daaf0). 3-arg ABI EMPIRICALLY = (size=a0, callsite-tag=a1, flags=a2). **Empirical: engine ships its OWN nonzero active hook; FORCE-replacing it with host calloc guest-SIGABRTs the free-path (probe EXIT 134).** Guard seeds only when hook==0; mechanism+ABI PROVEN. Default-inert. +1 hermetic sh167.
