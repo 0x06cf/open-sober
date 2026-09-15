@@ -1018,7 +1018,8 @@ pub fn routeb_dm_manager_cont() -> u64 {
     })
 }
 
-/// SH167 (recon cone deleg_35857472 task-2, authoritative): DM ALLOCATION-CAPTURE HOOK.
+/// SH167 (recon cone deleg_35857472 task-2 + SH169 delegation-extension task-0, authoritative):
+/// DM ALLOCATION-CAPTURE HOOK.
 /// The engine's CRT operator-new wrapper (guest 0x102a0d9b8, file 0x2a0d9b8) reads the
 /// ACTIVE allocator-hook global [guest 0x1067daaf0] and the DEFAULT hook [guest
 /// 0x1067d0840]; `cmp x8,x9; b.eq` takes an inline fast path when equal, else
@@ -1027,14 +1028,23 @@ pub fn routeb_dm_manager_cont() -> u64 {
 /// inlined immediate — not statically recoverable). To capture that pointer the
 /// moment a real session forms (post GPU-host / real-input migration — the
 /// documented gate), this guard seeds the ACTIVE global with a host-call trail that
-/// (a) performs the real allocation (calloc, over-sized to cover either arg ordering
-/// of the 3-arg new hook) and (b) LOGS/captures the returned base for DM-plausible
+/// (a) performs the real allocation and (b) LOGS/captures the returned base for DM-plausible
 /// sizes. Fires at the operator-new wrapper block entry under JIT_DM_ALLOC_CAPTURE=1.
 /// Default-inert (env off -> no seed, no trailing; the fast/live allocator path is
-/// byte-identical). Idempotent; only seeds when the active hook is currently 0 so it
-/// never clobbers a real engine-installed allocator hook. LATENT: no real session
-/// forms headlessly, so it does not fire on the current ladder — it is migration
-/// readiness (the recon's single concrete harness delta).
+/// byte-identical). Idempotent.
+///
+/// SH169 DELEGATION EXTENSION: SH167 empirically proved that REPLACING the engine's
+/// own nonzero ACTIVE hook with a host-calloc trail guest-SIGABRTs the free-path
+/// (EXIT 134) — engine allocations come from its own pool, so a host-calloc result
+/// is un-freable by the engine's free. The delegating design fixes that: when the
+/// ACTIVE hook is the engine's real hook (nonzero), the guard SAVES it into
+/// PREV_DM_ALLOC_HOOK before installing the trail, and the trail, whenever a prev
+/// hook exists, performs the real allocation by calling THROUGH the JIT to the
+/// engine's own hook (run_guest_callback) — so the returned base is from the engine's
+/// pool and its free path stays valid. It then captures+validates the base (vt word
+/// in-image) instead of blindly logging. This is capture-only DELEGATION (the
+/// SH167-documented correct migration-time design), not replacement. Latent until a
+/// real session's make_shared<DataModel> runs.
 extern "C" fn routeb_dm_alloc_capture(
     a0: u64,
     a1: u64,
@@ -1049,32 +1059,83 @@ extern "C" fn routeb_dm_alloc_capture(
     // (size, call-site-tag, flags) — a0 is the real byte size (e.g. 0x18); a1 is a code/rodata
     // address tag naming the allocation call site; a2 is a flag/line word. Use a0 as the size.
     let bytes = if a0 != 0 { a0 } else { a1.max(1) } as usize;
-    // Plausible DM/Instance size window — only these are worth capturing/logging.
-    let dm_plausible = (0x1000..=0x4_0000).contains(&bytes);
-    let budgeted = CAPTURED_DM_ALLOC.load(std::sync::atomic::Ordering::Relaxed) < 64;
-    let base = unsafe { libc::calloc(1, bytes) } as u64;
-    // Log the first few invocations unconditionally (bounded) + DM-plausible ones, so a probe
-    // run reveals whether the trail is the real allocator and the actual size distribution.
     TRAIL_INVOKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // DELEGATION: if the engine shipped its own hook, route the real allocation through it
+    // (the JIT) so the returned base is from the engine's allocator pool and its free-path
+    // stays valid (fixes the SH167 host-calloc SIGABRT). If no prev hook / JIT unavailable,
+    // fall back to host-calloc (the no-engine-hook case is safe to satisfy with host memory).
+    let prev_hook = PREV_DM_ALLOC_HOOK.load(std::sync::atomic::Ordering::Relaxed);
+    let allocating = if prev_hook != 0 {
+        // SH169 audit (deleg_*fe92d2e1 task-2): pass the CURRENT thread's guest TP, never 0 —
+        // jit_run_inner republishes CURRENT_TP from the callback state with no restore, so a
+        // 0 here would clobber this thread's published guest TLS base for the rest of the outer
+        // run AND the engine's TLS-based operator-new hook would fault reading TP=0 at migration
+        // time. Every other re-entry site (qsort/dl_iterate_phdr/pthread_once shims) passes
+        // current_guest_tp(); the delegating trail does too.
+        match run_guest_callback(
+            prev_hook,
+            [a0, a1, a2, _a3, _a4, _a5, _a6, _a7],
+            crate::jit::current_guest_tp(),
+        ) {
+            Ok(base) => base,
+            Err(_) => (unsafe { libc::calloc(1, bytes) } as u64),
+        }
+    } else {
+        (unsafe { libc::calloc(1, bytes) } as u64)
+    };
+    let base = allocating;
+    // DM-plausible size window — only these are worth capturing/logging.
+    let dm_plausible = (0x1000..=0x4_0000).contains(&bytes);
+    // Validate the returned base: the first word (vt) should be in-image (a real
+    // vtable'd object) or the base itself outside the low image region. A garbage
+    // base (0 / host-bogus) is not worth capturing.
+    let base_ok = base != 0 && read_vt_in_image(base);
+    let budgeted = CAPTURED_DM_ALLOC.load(std::sync::atomic::Ordering::Relaxed) < 64;
     let first = TRAIL_INVOKED.load(std::sync::atomic::Ordering::Relaxed) <= 8;
-    if first || (dm_plausible && budgeted && base != 0) {
-        if first || dm_plausible {
+    if first || (dm_plausible && budgeted && base_ok) {
+        if first || (dm_plausible && base_ok) {
             CAPTURED_DM_ALLOC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // alignment hint in a2 (0 or a power of two up to 16 is satisfied by glibc).
             eprintln!(
-                "[routeb-dmalloc]{} call#{}: bytes=0x{bytes:x} a0={a0:#x} a1={a1:#x} a2={a2:#x} -> base 0x{base:x}",
+                "[routeb-dmalloc]{} call#{}: bytes=0x{bytes:x} a0={a0:#x} a1={a1:#x} a2={a2:#x} -> base 0x{base:x}{} (delegate prev_hook {:#x})",
                 if first { " FIRST" } else { "" },
                 TRAIL_INVOKED.load(std::sync::atomic::Ordering::Relaxed),
+                if base_ok && !first { " [validated]" } else { "" },
+                prev_hook,
             );
         }
     }
     base
 }
 
+/// True when `addr` is inside the current guest image (used to validate a captured
+/// allocation base's first word == a real vtable pointer).
+fn read_vt_in_image(addr: u64) -> bool {
+    // The base itself must be addressable (non-trivial heap), and its first
+    // word (the vt) should fall in the image. Read it defensively.
+    let vt = unsafe { (addr as *const u64).read_unaligned() };
+    let (base, len) = {
+        let guard = EXEC_CTX.lock().unwrap();
+        match guard.as_ref() {
+            Some(ctx) => (ctx.base, ctx.image_len as u64),
+            None => return false,
+        }
+    };
+    vt != 0 && vt >= base && vt - base < len
+}
+
 /// Global capture counter so the trail stays bounded (first handful of DM-plausible allocs).
 static CAPTURED_DM_ALLOC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Total operator-new invocations routed through the capture trail (diagnostic counter).
 static TRAIL_INVOKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The engine's OWN active allocator hook saved before the trail was installed — the
+/// delegation target for the real allocation (SH169: perform through it, not host-calloc).
+static PREV_DM_ALLOC_HOOK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Reset the capture trail's delegation + accounting state (for hermetic tests / re-arming).
+fn routeb_dm_alloc_capture_reset() {
+    CAPTURED_DM_ALLOC.store(0, std::sync::atomic::Ordering::Relaxed);
+    TRAIL_INVOKED.store(0, std::sync::atomic::Ordering::Relaxed);
+    PREV_DM_ALLOC_HOOK.store(0, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Guest addresses of the CRT operator-new hook globals (guest = file vaddr + 0x100000000;
 /// file slots: active [0x67daaf0], default [0x67d0840]).
@@ -1088,15 +1149,16 @@ fn REGISTERED_DM_ALLOC_CAPTURE() -> &'static std::sync::OnceLock<u64> {
     &L
 }
 
-/// SH167 guard: at the operator-new wrapper block entry, when JIT_DM_ALLOC_CAPTURE=1 and the ACTIVE
-/// allocator-hook global is currently 0 (none installed), seed it with the capture trail. EMPIRICAL
-/// (real binary): the engine ships its OWN nonzero ACTIVE hook, and REPLACING it with a host-calloc
-/// trail is INVALID — the engine's operator-delete/free-path expects allocations from its own pool and
-/// guest-SIGABRTs (SH167 probe run: EXIT 134). So this guard deliberately fires only when no hook is
-/// installed (safe latch), and the trail records allocations; a capture-only (delegating) design is the
-/// correct migration-time route to observe the live DataModel without perturbing the allocator. The
-/// trail's mechanism + 3-arg ABI (a0=size) are PROVEN by the probe run, not assumed. Default-inert
-/// (env off -> no seed, the live allocator path is byte-identical). Idempotent.
+/// SH167/169 guard: at the operator-new wrapper block entry, when JIT_DM_ALLOC_CAPTURE=1 and the
+/// ACTIVE allocator-hook global is currently 0 (none installed), seed it with the capture trail.
+/// EMPIRICAL (real binary): the engine ships its OWN nonzero ACTIVE hook. REPLACING it with a
+/// host-calloc trail is INVALID — the engine's operator-delete/free-path expects allocations from
+/// its own pool and guest-SIGABRTs (SH167 probe run: EXIT 134). So this guard deliberately seeds
+/// ONLY when no hook is installed (safe latch) — unless JIT_DM_ALLOC_CAPTURE_DELEGATE=1, in which
+/// case an engine-installed hook is SAVED into PREV_DM_ALLOC_HOOK and the trail DELEGATES the real
+/// allocation through it (run_guest_callback) so the base stays in the engine's pool and its
+/// free-path remains valid (the SH169 capture-only delegation design). Default-inert (env off ->
+/// no seed, the live allocator path is byte-identical). Idempotent.
 fn routeb_dm_alloc_capture_guard(_state: *mut CpuState, pc: u64) {
     if std::env::var_os("JIT_DM_ALLOC_CAPTURE").is_none() {
         return;
@@ -1113,10 +1175,21 @@ fn routeb_dm_alloc_capture_guard(_state: *mut CpuState, pc: u64) {
         return;
     }
     let cur = unsafe { std::ptr::read_unaligned(OP_NEW_ACTIVE_HOOK as *const u64) };
-    // Safely only when the engine has NOT installed its own allocator hook (it normally has, so
-    // this normally stays inert — replacing a live allocator guest-SIGABRTs the engine).
-    if cur != 0 {
+    // Alread-y-installed (we wrote it) -> idempotent no-op.
+    if cur == trail {
         return;
+    }
+    // DELEGATION (SH169): an engine-installed hook is the engine's real allocator. With the
+    // explicit JIT_DM_ALLOC_CAPTURE_DELEGATE=1 env, save it as the delegation target and install
+    // the trail that forwards allocations through it. Without that env, keep the SH167 safe
+    // latch (never replace a live engine allocator hook).
+    let delegate = std::env::var_os("JIT_DM_ALLOC_CAPTURE_DELEGATE").is_some();
+    if cur != 0 {
+        if delegate {
+            PREV_DM_ALLOC_HOOK.store(cur, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            return;
+        }
     }
     let default_hook = if routeb_ensure_writable(OP_NEW_DEFAULT_HOOK) {
         unsafe { std::ptr::read_unaligned(OP_NEW_DEFAULT_HOOK as *const u64) }
@@ -1125,7 +1198,8 @@ fn routeb_dm_alloc_capture_guard(_state: *mut CpuState, pc: u64) {
     };
     unsafe { std::ptr::write_unaligned(OP_NEW_ACTIVE_HOOK as *mut u64, trail) };
     eprintln!(
-        "[routeb-dmalloc] SH167 routed CRT operator-new ACTIVE hook {OP_NEW_ACTIVE_HOOK:#x} -> capture trail {trail:#x} (default_hook {default_hook:#x}) at pc={pc:#x} -> all operator-new blr the capture trail (latent until a real session make_shared<DataModel>)"
+        "[routeb-dmalloc] SH167/SH169 routed CRT operator-new ACTIVE hook {OP_NEW_ACTIVE_HOOK:#x} -> capture trail {trail:#x} (prev_hook {:x}, default_hook {default_hook:#x}) at pc={pc:#x} -> all operator-new blr the capture trail (latent until a real session make_shared<DataModel>)",
+        PREV_DM_ALLOC_HOOK.load(std::sync::atomic::Ordering::Relaxed),
     );
 }
 
@@ -4712,19 +4786,65 @@ mod tests {
         unsafe { std::ptr::write_unaligned(base as *mut u8, 0xAB) };
         assert_eq!(unsafe { std::ptr::read_unaligned(base as *const u8) }, 0xAB);
         unsafe { libc::free(base as *mut _) };
-        // (e) a nonzero LIVE active hook (the engine ships its own) is never clobbered — replacing
-        //     a live allocator hook guest-SIGABRTs the free-path (SH167 probe run: EXIT 134).
+        // (e) a nonzero LIVE active hook (the engine ships its own) is never clobbered by the
+        //     default JIT_DM_ALLOC_CAPTURE path — replacing a live allocator hook guest-SIGABRTs
+        //     the free-path (SH167 probe run: EXIT 134).
         unsafe { std::ptr::write_unaligned(ACTIVE as *mut u64, 0xfeedface_cafebeef) };
         routeb_dm_alloc_capture_guard(&mut st as *mut CpuState, OP_NEW_WRAPPER);
         assert_eq!(
             unsafe { std::ptr::read_unaligned(ACTIVE as *const u64) },
             0xfeedface_cafebeef,
-            "must never clobber a live engine-installed allocator hook"
+            "JIT_DM_ALLOC_CAPTURE alone must never clobber a live engine-installed allocator hook"
+        );
+        // SH169 delegation: with the explicit JIT_DM_ALLOC_CAPTURE_DELEGATE=1 env, a live engine
+        // hook is SAVED as the delegation target and the trail replaces it (capture-only
+        // delegation), so the real allocation forwards through the engine's pool.
+        unsafe {
+            std::env::set_var("JIT_DM_ALLOC_CAPTURE_DELEGATE", "1");
+        }
+        routeb_dm_alloc_capture_guard(&mut st as *mut CpuState, OP_NEW_WRAPPER);
+        let installed = unsafe { std::ptr::read_unaligned(ACTIVE as *const u64) };
+        assert_ne!(
+            installed, 0xfeedface_cafebeef,
+            "delegate mode must replace the live hook with the trail"
+        );
+        assert_eq!(
+            PREV_DM_ALLOC_HOOK.load(std::sync::atomic::Ordering::Relaxed),
+            0xfeedface_cafebeef,
+            "delegate mode saves the engine's previous hook as the delegation target"
+        );
+        // idempotent in delegate mode: a second call keeps the same trail + target.
+        routeb_dm_alloc_capture_guard(&mut st as *mut CpuState, OP_NEW_WRAPPER);
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned(ACTIVE as *const u64) },
+            installed,
+            "delegate-mode install is idempotent"
         );
         unsafe {
+            std::env::remove_var("JIT_DM_ALLOC_CAPTURE_DELEGATE");
             std::ptr::write_unaligned(ACTIVE as *mut u64, 0);
             std::env::remove_var("JIT_DM_ALLOC_CAPTURE");
         }
+        routeb_dm_alloc_capture_reset();
+    }
+
+    #[test]
+    fn sh169_delegating_trail_falls_back_safely_when_no_guest_image() {
+        // SH169 delegation: with a saved engine hook (delegate mode), the capture trail routes
+        // the real allocation through the JIT to the engine's own hook. In a hermetic test there
+        // is no active guest image, so run_guest_callback must Err and the trail must fall back to
+        // host-calloc — still returning a REAL, writable allocation (never 0 / panic), and never
+        // deref-ing the bogus saved hook.
+        routeb_dm_alloc_capture_reset();
+        PREV_DM_ALLOC_HOOK.store(0xfeedface_cafebeef, std::sync::atomic::Ordering::Relaxed);
+        // No image primed in this test process.
+        let base = routeb_dm_alloc_capture(0x2000, 8, 0, 0, 0, 0, 0, 0);
+        assert_ne!(base, 0, "delegating trail must fall back to a real allocation");
+        unsafe { std::ptr::write_unaligned(base as *mut u8, 0xCD) };
+        assert_eq!(unsafe { std::ptr::read_unaligned(base as *const u8) }, 0xCD);
+        unsafe { libc::free(base as *mut _) };
+        // Non-DM-plausible + non-validated bases are still returned (capture is best-effort).
+        routeb_dm_alloc_capture_reset();
     }
 
     #[test]
