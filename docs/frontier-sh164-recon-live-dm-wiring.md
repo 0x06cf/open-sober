@@ -62,6 +62,13 @@ DataModelPatch feeding (strictly downstream), do-init ctor callees.
   is served from `assets/ExtraContent/models/...`. Latently-correct (fires the instant a
   live DM drives DataModelPatcher::apply); pure fallback, models-scoped, never shadows.
   +1 hermetic test `aasset_fallback_re_roots_bare_models_to_extracontent`.
+- **Code change (this session):** `routeb_tail_dispatch_capture` block-entry probe
+  (jit.rs, env-gated `JIT_ROUTEB_DMTRACE`) fires at governor-tail block entry on every
+  run, printing impl/slot/vt/vt[+0x30]+x0/x1/x2/x30 and flagging the DM-creator vt
+  family. VERIFIED on a real healthy run (fires at 0x102e9fcc4/0x102e9fdc8,
+  impl[+0x408]=0x106a72000 inert DISPATCH -> vt=0x106a72040 -> vt[+0x30]=host ptr, NOT
+  DM family — the honest mechanism confirmation). +1 hermetic test
+  `sh164_tail_dispatch_capture_reads_slot_and_is_env_gated`.
 - Scratch that must NOT be committed (cleanup): /tmp/dmrecon, /tmp/sh163 (extracted .so).
 - No production code changed in the recon phase. Workspace 538/0.
 

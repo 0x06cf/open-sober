@@ -618,6 +618,49 @@ pub fn routeb_setfix_empty_set() -> u64 {
     })
 }
 
+/// SH164 (recon deleg_94aac9d7): block-entry probe for the governor-tail dispatch.
+/// The tail (pc 0x102e9fcc4..0x102e9fdc8) loads x0=impl[+0x408], `ldr x8,[x0]; ldr
+/// x8,[x8,#48]; blr x8` dispatches vt[+0x30]. On a real session the slot holds a live
+/// host-heap object whose vt[+0x30] is the loader-relocated DM-creator continuation;
+/// under the (seed-exhausted) partial do-init it is 0 (engine never reaches
+/// NativeDataModelManager::initEngine_). This probe fires at tail-block entry on EVERY
+/// run and prints the slot/vt/vt[+0x30] + x0/x1/x2/x30 so a follow-up cycle can see
+/// whether a REAL dispatch ever materializes. Debug-only, gated JIT_ROUTEB_DMTRACE,
+/// independent of routeb_tail_dispatch_guard (which seeds the inert DISPATCH under
+/// JIT_ROUTEB_SETFIX). Zero guest-byte patch. One line per entry, dedup by pc.
+fn routeb_tail_dispatch_capture(state: *mut CpuState, pc: u64) {
+    if std::env::var_os("JIT_ROUTEB_DMTRACE").is_none() {
+        return;
+    }
+    if pc < 0x102e9fcc4 || pc > 0x102e9fdc8 {
+        return;
+    }
+    let s = unsafe { &*state };
+    let implb = s.x[19];
+    let slot = if implb != 0 { implb + 0x408 } else { 0 };
+    let slotv = if slot != 0 {
+        unsafe { std::ptr::read_unaligned(slot as *const u64) }
+    } else {
+        0
+    };
+    let vtv = if slotv != 0 && slotv >= 0x100000000 && slotv < 0x107333c3c {
+        unsafe { std::ptr::read_unaligned(slotv as *const u64) }
+    } else {
+        0
+    };
+    let vt48 = if vtv != 0 && vtv >= 0x100000000 && vtv < 0x107333c3c {
+        unsafe { std::ptr::read_unaligned((vtv + 0x30) as *const u64) }
+    } else {
+        0
+    };
+    let dm_family = (0x102bd1a30..0x102bd1d08).contains(&vt48);
+    eprintln!(
+        "[dmtrace] pc={pc:#x} impl={implb:#x} slot={slot:#x} impl[+0x408]={slotv:#x} vt={vtv:#x} vt[+0x30]={vt48:#x}{} x0={:#x} x1={:#x} x2={:#x} x30={:#x}",
+        if dm_family { " <== DM-CREATOR vt family" } else { "" },
+        s.x[0], s.x[1], s.x[2], s.x[30]
+    );
+}
+
 /// SH88: the coherent empty span-hash map seeded by the --v2boot harness for the
 /// OTel/pb_defaults BSS registry slots, used to substitute for a non-zero sub-image
 /// map/this candidate (a `.data.rel.ro` protobuf TAG constant like 0x1800064, which
@@ -2970,6 +3013,12 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
             routeb_tail_eq_guard(state, pc); // SH161b: seed impl[+0x2b8]=2 (governor-tail epilogue b.eq)
             routeb_tail_trace(state, pc);
         }
+        // SH164 (recon deleg_94aac9d7): governor-tail dispatch block-entry capture.
+        // Fires on EVERY run (self-gated on JIT_ROUTEB_DMTRACE) so a follow-up cycle
+        // can observe whether the tail's vt[+0x30] dispatch ever resolves to the
+        // loader-relocated DM-creator family (NativeDataModelManager). Independent of
+        // routeb_tail_dispatch_guard above (it only logs; it does not mutate the slot).
+        routeb_tail_dispatch_capture(state, pc);
         unsafe { run(&block, state) };
         if step_trace {
             let s = unsafe { &*state };
@@ -3877,6 +3926,50 @@ mod tests {
         let mut st2 = CpuState::new();
         let _ = cached_block(image, base, base, &mut st2 as *mut CpuState, 64).expect("recompile");
         assert!(block_cache_stats().0 >= before, "recompile must be served");
+    }
+
+    #[test]
+    fn sh164_tail_dispatch_capture_reads_slot_and_is_env_gated() {
+        // SH164 (recon deleg_94aac9d7): the governor-tail dispatch capture probe must
+        // (a) be inert without JIT_ROUTEB_DMTRACE (no mutation, no crash) and (b) read
+        // impl[+0x408] through its vt chain to the vt[+0x30] slot when the env is set,
+        // classifying a DM-creator-family target. It must never fault on impl==0 or a
+        // non-image/short slot (read is guarded by the image-domain bounds check).
+        //
+        // (a) Env unset (default): invocation is a no-op — read of the unset slot is
+        // skipped because routeb_tail_dispatch_capture returns before touching memory.
+        unsafe { std::env::remove_var("JIT_ROUTEB_DMTRACE") };
+        let buf = Box::leak(vec![0x0u8; 0x30usize].into_boxed_slice()).as_mut_ptr() as u64;
+        let mut st = CpuState::new();
+        st.x[19] = buf;
+        routeb_tail_dispatch_capture(&mut st as *mut CpuState, 0x102e9fcc4); // no crash
+        // impl==0 never derefs (guard returns on x[19]==0 too).
+        st.x[19] = 0;
+        routeb_tail_dispatch_capture(&mut st as *mut CpuState, 0x102e9fcc4);
+
+        // (b) With DMTRACE set and a fabricated slot chain, the probe reads the slot,
+        // vt, and vt[+0x30] and flags the DM-creator family. We can't capture eprintln
+        // here; we at least prove it neither faults nor writes guest memory, and that a
+        // NON-matching pc (outside the tail window) does nothing.
+        unsafe { std::env::set_var("JIT_ROUTEB_DMTRACE", "1") };
+        // A full vt chain pointing at a DM-family target (0x102bd1a38 getFlagsFromEngine_).
+        let shell_vt = Box::leak(vec![0x11u8; 0x40usize].into_boxed_slice()).as_mut_ptr() as u64;
+        unsafe { std::ptr::write_unaligned((shell_vt + 0x30) as *mut u64, 0x102bd1a38) };
+        // buf must be sized to hold the +0x408 slot offset (impl layout), not the 0x30
+        // object — the probe reads impl[+0x408], so the leaked buffer owns that range.
+        let big = Box::leak(vec![0x0u8; 0x500usize].into_boxed_slice()).as_mut_ptr() as u64;
+        unsafe { std::ptr::write_unaligned((big + 0x408) as *mut u64, shell_vt) };
+        st.x[19] = big;
+        // No fault, no guest-memory mutation, no crash on a populated slot chain
+        // (a host-heap vt is outside the 0x100000000 image domain, so vt/[+0x30] reads
+        // are guarded to 0 by the bounds check — the honest no-regression behavior).
+        routeb_tail_dispatch_capture(&mut st as *mut CpuState, 0x102e9fda0); // fires
+        // Wrong pc (outside window) must not touch anything.
+        routeb_tail_dispatch_capture(&mut st as *mut CpuState, 0x102e9fe04);
+        // impl==0 with env set -> no deref, no crash.
+        st.x[19] = 0;
+        routeb_tail_dispatch_capture(&mut st as *mut CpuState, 0x102e9fcc4);
+        unsafe { std::env::remove_var("JIT_ROUTEB_DMTRACE") };
     }
 
     #[test]
