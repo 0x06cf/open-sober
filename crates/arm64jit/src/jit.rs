@@ -779,14 +779,31 @@ fn routeb_dm_manager_guard(_state: *mut CpuState, pc: u64) {
     if !routeb_ensure_writable(HOLDER) {
         return;
     }
-    let m = routeb_dm_manager_fabricated();
+    // JIT_ROUTEB_DMCONT: ALSO route the manager's continuation (+0x1f0) to the REAL
+    // continueAfterFlagsLoaded_ (0x102bd1d68) so the engine-init pipeline actually EXECUTES it
+    // to nativeAppBridgeAppStart (the SH165-fwd-cone forward, deleg_7e5b7101 task-0). Requires
+    // the app-launched latch [0x683d920]==0 (else continueAfterFlagsLoaded_ skips app-start) and
+    // the logging mask [0x683d8f8]==0. Default (no DMCONT) stays the verified all-leaf benign.
+    let cont = std::env::var_os("JIT_ROUTEB_DMCONT").is_some();
+    let m = if cont { routeb_dm_manager_cont() } else { routeb_dm_manager_fabricated() };
+    if cont {
+        for g in [0x683d920u64, 0x683d8f8u64] {
+            if routeb_ensure_writable(g) {
+                unsafe { std::ptr::write_unaligned(g as *mut u64, 0) };
+            }
+        }
+    }
     let cur = unsafe { std::ptr::read_unaligned(HOLDER as *const u64) };
     if cur == m {
         return; // already seeded (idempotent)
     }
     unsafe { std::ptr::write_unaligned(HOLDER as *mut u64, m) };
     eprintln!(
-        "[routeb-dmforce] SH165 manager singleton holder 0x{HOLDER:x} -> fabricated all-leaf-vtable manager {m:#x} (vt[+0x30]=write-leaf, +0xf8/+0x108/+0x1f0=leaf, vt[+0x720]==0) at pc={pc:#x} -> 0x102bd8ce8 vt dispatches resolve benign (was host JavaVM* {cur:#x})"
+        "[routeb-dmforce] SH165 manager singleton holder 0x{HOLDER:x} -> {} manager {m:#x} (vt[+0x30]=write-leaf, +0xf8/+0x108=leaf, +0x1f0={}, vt[+0x720]==0, {}) at pc={pc:#x} -> 0x102bd8ce8 vt dispatches {}(was host JavaVM* {cur:#x})",
+        if cont { "continuation-routed" } else { "all-leaf" },
+        if cont { "REAL continueAfterFlagsLoaded_ (0x102bd1d68)" } else { "leaf" },
+        if cont { "M+0x40=flags-holder, M>=0x260" } else { "M=0x20 all-leaf" },
+        if cont { "run REAL NativeDataModelManager continuation to nativeAppBridgeAppStart" } else { "resolve benign" }
     );
 }
 
@@ -959,6 +976,46 @@ extern "C" fn routeb_dm_manager_write_leaf(a0: u64, a1: u64, _a2: u64, _a3: u64,
 fn REGISTERED_MANAGER_LEAF() -> &'static std::sync::OnceLock<u64> {
     static L: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     &L
+}
+
+/// SH165-fwd-cone (deleg_7e5b7101 task-0, authoritative): the CONTINUATION-routed manager.
+/// Same fabricated all-leaf vtable as `routeb_dm_manager_fabricated`, EXCEPT vt[+0x1f0] is
+/// routed to the REAL continueAfterFlagsLoaded_ (guest 0x102bd1d68), and M is sized to hold the
+/// flags-blob writes (continueAfterFlagsLoaded_ writes M+0x48..0x240) with M+0x40 -> a
+/// fabricated-but-structural flags-holder F. Routing +0x1f0 to real guest 0x102bd1d68 makes
+/// 0x102bd8ce8's dispatch actually EXECUTE the real continuation: it locks F+0x300 (zeroed =
+/// PTHREAD_MUTEX_INITIALIZER), serializes F+0xf0 (zeroed = empty SSO strings), fills M+0x48..,
+/// then `bl 0x2338ef4` nativeAppBridgeAppStart(x0=1, x1=baseUrl(from M+0x48), x2=str2(from
+/// M+0x78), x3=empty, w4=0). Gated by the caller only under JIT_ROUTEB_DMCONT; `routeb_dm_manager_fabricated`
+/// stays the all-leaf default so SH165-fwd's verified benign-complete is unchanged.
+/// Expected empirical floor: after nativeAppBridgeAppStart returns, the routine derefs
+/// *(*F+0x18)+16 (0x2bd2080-94) and allocates a 0x28 closure (0x2bd2128) — with F+0x18==0 that
+/// is the post-app-start fault, i.e. the NEXT structural gate observed.
+pub fn routeb_dm_manager_cont() -> u64 {
+    use std::sync::OnceLock;
+    static M: OnceLock<u64> = OnceLock::new();
+    *M.get_or_init(|| {
+        let v = Box::leak(vec![0x0u8; 0x740usize].into_boxed_slice()).as_mut_ptr() as u64;
+        // continueAfterFlagsLoaded_ writes M+0x48..0x240 (+0x18 for the last 24B string) -> 0x260.
+        let m = Box::leak(vec![0x0u8; 0x260usize].into_boxed_slice()).as_mut_ptr() as u64;
+        // Fabricated-but-structural flags-holder F (0x310 zeroed): F+0x300=0 (zeroed
+        // pthread_mutex = PTHREAD_MUTEX_INITIALIZER), F+0xf0=0 (empty SSO inline strings),
+        // F+0x18=0 (post-app-start controller — expected empirical floor).
+        let f = Box::leak(vec![0x0u8; 0x310usize].into_boxed_slice()).as_mut_ptr() as u64;
+        let leaf = *REGISTERED_MANAGER_LEAF().get_or_init(|| register_host_call_auto(routeb_dm_manager_write_leaf));
+        unsafe {
+            // vt[+0x30]=write-leaf (getter install), +0xf8/+0x108=benign leaf (network fetch
+            // returns no flags), +0x1f0=REAL continueAfterFlagsLoaded_. All else 0 -> vt[+0x720]==0.
+            std::ptr::write_unaligned((v + 0x30) as *mut u64, leaf);
+            std::ptr::write_unaligned((v + 0xf8) as *mut u64, leaf);
+            std::ptr::write_unaligned((v + 0x108) as *mut u64, leaf);
+            std::ptr::write_unaligned((v + 0x1f0) as *mut u64, 0x102bd1d68u64); // real continuation
+            // M[+0]=vt, M[+8]=0 (getter tail cbz-cleans), M[+0x40]=F (flags-holder).
+            std::ptr::write_unaligned(m as *mut u64, v);
+            std::ptr::write_unaligned((m + 0x40) as *mut u64, f);
+        }
+        m
+    })
 }
 
 /// SH88: the coherent empty span-hash map seeded by the --v2boot harness for the
@@ -4448,6 +4505,48 @@ mod tests {
         routeb_dm_manager_guard(&mut st as *mut CpuState, 0x102bd1b98);
         assert_eq!(unsafe { std::ptr::read_unaligned(HOLDER as *const u64) }, m2, "idempotent");
         unsafe { std::env::remove_var("JIT_ROUTEB_DMFORCE") };
+    }
+
+    #[test]
+    fn sh165fwd_cont_manager_is_routed_structural_and_env_gated() {
+        // SH165-fwd-cone (deleg_7e5b7101 task-0/routable): the JIT_ROUTEB_DMCONT continuation
+        // manager must (a) be a distinct 0x260+ manager with M+0x40 -> a fabricated flags-holder
+        // F (F+0x300 mutex zeroed, F+0xf0 empty SSO) and vt[+0x1f0] -> the REAL
+        // continueAfterFlagsLoaded_ (0x102bd1d68), so 0x102bd8ce8's +0x1f0 dispatch EXECUTES real
+        // engine code to nativeAppBridgeAppStart; (b) still keep vt[+0x30]=write-leaf (not fnB);
+        // (c) leave the DEFAULT all-leaf routeb_dm_manager_fabricated (M=0x20, +0x1f0=leaf)
+        // unchanged so SH165-fwd's verified benign-complete is preserved.
+        let m_cont = routeb_dm_manager_cont();
+        let vt = unsafe { std::ptr::read_unaligned(m_cont as *const u64) };
+        // +0x1f0 routed to the REAL continuation (NOT a leaf / NOT 0).
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned((vt + 0x1f0) as *const u64) },
+            0x102bd1d68u64,
+            "continuation manager vt[+0x1f0] must route to REAL continueAfterFlagsLoaded_"
+        );
+        // +0x30 stays the write-leaf (never engine-init fnB -> no recursion).
+        assert_ne!(unsafe { std::ptr::read_unaligned((vt + 0x30) as *const u64) }, 0x102bd1b98u64);
+        assert_ne!(unsafe { std::ptr::read_unaligned((vt + 0xf8) as *const u64) }, 0);
+        assert_ne!(unsafe { std::ptr::read_unaligned((vt + 0x108) as *const u64) }, 0);
+        // vt[+0x720]==0 (post-FFI benign gate), M[+8]==0.
+        assert_eq!(unsafe { std::ptr::read_unaligned((vt + 0x720) as *const u64) }, 0);
+        assert_eq!(unsafe { std::ptr::read_unaligned((m_cont + 8) as *const u64) }, 0);
+        // M+0x40 -> a real (non-NULL) fabricated flags-holder F with zeroed mutex (F+0x300) and
+        // empty SSO blob (F+0xf0).
+        let f = unsafe { std::ptr::read_unaligned((m_cont + 0x40) as *const u64) };
+        assert_ne!(f, 0, "continuation manager M+0x40 must point to a flags-holder F");
+        let f_mutex = unsafe { std::ptr::read_unaligned((f + 0x300) as *const u64) };
+        assert_eq!(f_mutex, 0, "F+0x300 zeroed pthread_mutex == PTHREAD_MUTEX_INITIALIZER");
+        assert_eq!(unsafe { std::ptr::read_unaligned((f + 0xf0) as *const u64) }, 0, "F+0xf0 empty SSO blob");
+        // The default all-leaf manager is a DIFFERENT object (0x20, +0x1f0=leaf) — unchanged.
+        let m_leaf = routeb_dm_manager_fabricated();
+        assert_ne!(m_leaf, m_cont, "default and continuation managers are distinct objects");
+        let vt_leaf = unsafe { std::ptr::read_unaligned(m_leaf as *const u64) };
+        assert_ne!(
+            unsafe { std::ptr::read_unaligned((vt_leaf + 0x1f0) as *const u64) },
+            0x102bd1d68u64,
+            "default all-leaf manager keeps +0x1f0 as a leaf (SH165-fwd benign unchanged)"
+        );
     }
 
     #[test]
