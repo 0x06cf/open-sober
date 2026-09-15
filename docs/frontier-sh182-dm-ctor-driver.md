@@ -87,13 +87,19 @@ times env-off).
 
 PATH B (`JIT_DM_CTOR_FULL=1`): the ctor REACHES and RUNS its real init body (it
 passes the string-equality gate — otherwise it would be the PATH A clean no-op) then
-faults at `fault=0x28` with guestpc a host-heap address, x0=0x28, lr=0x102b53a78 —
-the zeroed manufactured DM's internal fields are not yet seeded enough to survive the
-real init body (the component ctor 0x2bc4f64 / AppBridgeV2Init chain reads DM/sub-
-object state a bare zeroed object lacks). This is EXACTLY SH181's flagged "emergent
-next problem" and is now a concrete next gate: seed the specific DM members the
-0x2bc4f64/0x238e0bc/0x2286ed0/0x22b737c chain reads. PATH B is default-inert
-(env-gated off), so the healthy PATH A / bare default paths are unaffected.
+faults at `fault=0x28` (lr 0x102b53a78 = Mutex::lock wrapper's pthread_mutex_lock on a
+NULL member +0x28). Recon deleg_623cac1f: the ctor's own body reads only DM+0x38c
+(scalar, safe 0); the fault is a TRANSITIVE init-chain deref of NULL DM pointer
+members — the fault frame derives sub-object bases at DM+0x610 + DM+0x648. Seeding
+those two (routeb_seed_dm_pathb_members, DM+0x610/+0x648 -> valid zeroed buffers with
++0x28 PTHREAD_MUTEX_INITIALIZER) does NOT clear the fault (still fault=0x28 at a DEEPER
+NULL member). CONFIRMS (per deleg_661626bb's authoritative ctor decode): this ctor is a
+THIN SUB-INIT — it does NOT build the SceneGraph/render world/DM sub-objects, so
+completing PATH B requires unbounded one-NULL-at-a-time reconstruction into the live
+DM's internal mutex graph and does NOT itself produce GuiObjects. PATH B is kept as a
+default-inert diagnostic (env-gated off) proving the drive extends into real init code;
+chasing it deeper would be low-ROI member reconstruction at Route-B's expense.
+PATH A survival no-op remains the clean verified deliverable.
 
 ## Honest scope + next
 This is the FIRST headless execution of the engineered manufactured genuine-vptr DM
