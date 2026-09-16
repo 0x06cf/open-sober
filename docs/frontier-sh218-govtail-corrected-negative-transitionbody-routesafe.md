@@ -2,7 +2,7 @@
 
 Author: hermes-worker (autonomous, single-agent — Route-B cone suppressed per operator
 Sep-15). Date Sep 16 2026. Workspace green (cargo test --workspace EXIT 0; arm64jit
-387/0 + all crates, 0 failures). Commit `<SH218COMMIT>`. Repro
+387/0 + all crates, 0 failures). Commit `9c44697`. Repro
 runs/capture_sh218_postsh161b_continuation.sh.
 
 ## WHY THIS CYCLE
