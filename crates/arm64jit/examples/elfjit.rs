@@ -2272,6 +2272,109 @@ fn routeb_patch_nativeinit_flagmap_helper() {
     }
     ROUTEB_FLAGMAP_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
+static ROUTEB_FLAGMANAGER_PATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Pure: emit the two load-slot words for SH116b's site (movz x8,#hw0 + movk
+/// x8,#hw1 of the low 32-bit flag-manager object address). Round-trippable so a
+/// hermetic test can pin the encoding + reconstruction of `obj`.
+fn sh116b_flagmanager_words(obj: u64) -> [u32; 2] {
+    [
+        0xD280_0008u32 | (((obj & 0xffff) as u32) << 5), // movz x8,#imm16 hw0
+        (0xF2A0_0008u32) | ((((obj >> 16) & 0xffff) as u32) << 5), // movk x8,#imm16 hw1
+    ]
+}
+/// SH116b: nativeInitializeNativeFlags reads the flag-manager object global
+/// `*(0x10672739b0)` via a SECOND site (file 0x2320a24 `adrp x8,7273000; ldr
+/// x8,[x8,#2480]`) — sibling of SH116's helper 0x2320710 which reads the same
+/// global — and locks `&obj+0x28` (0x2320a6c `add x0,x0,#0x28`). Headlessly the
+/// global reads 0, so the lock derefs &0+0x28 via the shared helper 0x2b53a68 and
+/// faults (measured: SIGSEGV host-call slot 0x22b0 pthread_mutex_lock, x0=0x28,
+/// lr 0x102b53a78; GSDSP caller ra 0x102320a98 = this site). The .bss page holding
+/// the global is UNMAPPED at harness seed time (SH116: ENOMEM — the engine maps
+/// it only during boot), so a startup store to it crashes. Mirror SH116's proven
+/// code-patch mechanism instead: replace the site's load slot (0x2320a30 `ldr
+/// x8,[x8,#2480]`) with movz/movk x8 = the address of a low fixed zeroed page (2
+/// slots = low 32-bit only, unlike SH116's 3-slot heap obj — but a page whose
+/// +0x28 is zeros is a valid PTHREAD_MUTEX_INITIALIZER regardless of address).
+/// The `add x0,x0,#0x28` lock then targets a real mapped zeroed page.
+/// Idempotent, non-vtable-widening, default-inert (JIT_SH115_SINGLETON_PATCH).
+static FLAGMANAGER_OBJ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn routeb_flagmanager_obj() -> u64 {
+    let cur = FLAGMANAGER_OBJ.load(std::sync::atomic::Ordering::Relaxed);
+    if cur != 0 {
+        return cur;
+    }
+    // Low fixed zeroed page (< 2^32 so it fits two movz/movk load slots). map it
+    // once, leak it, keep zeroed; its +0x28 == 0 == valid mutex initializer. The
+    // page is at a guest-neutral address the engine may also write fields into.
+    let addr = unsafe {
+        libc::mmap(
+            0x6000_0000 as *mut libc::c_void,
+            0x1000,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
+            -1,
+            0,
+        )
+    };
+    let a = if addr == libc::MAP_FAILED {
+        // fall back to MAP_FIXED (MAP_FIXED_NOREPLACE may be unavailable)
+        unsafe {
+            libc::mmap(
+                0x6000_0000 as *mut libc::c_void,
+                0x1000,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+                -1,
+                0,
+            ) as u64
+        }
+    } else {
+        (addr as u64)
+    };
+    if a == libc::MAP_FAILED as u64 || a == 0 {
+        eprintln!("[elfjit:routeB] WARN SH116b mmap low page failed errno={}", std::io::Error::last_os_error());
+        return 0;
+    }
+    FLAGMANAGER_OBJ.store(a, std::sync::atomic::Ordering::Relaxed);
+    a
+}
+fn routeb_patch_nativeinit_flagmanager() {
+    if ROUTEB_FLAGMANAGER_PATCHED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let obj = routeb_flagmanager_obj();
+    if obj == 0 || obj > 0xffff_ffffu64 {
+        ROUTEB_FLAGMANAGER_PATCHED.store(true, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    // site slots: 0x2320a24 adrp x8,7273000 (f0027a88) ; 0x2320a30 ldr x8,[x8,#2480]
+    // (f944d908) -> movz x8,#hw0 ; movk x8,#hw1 = low page address.
+    let start = 0x102320a24u64;
+    let words: [u32; 2] = sh116b_flagmanager_words(obj);
+    let page = (start & !0xfff) as *mut libc::c_void;
+    unsafe {
+        if libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_WRITE) != 0 {
+            eprintln!("[elfjit:routeB] WARN mprotect RW failed for SH116b site @0x{start:x} errno={}", std::io::Error::last_os_error());
+            ROUTEB_FLAGMANAGER_PATCHED.store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        // slot0 is the adrp; guard the OLD value at 0x2320a24 == adrp x8,7273000.
+        let before = *(start as *const u32);
+        if before != 0xf002_7a88u32 {
+            eprintln!("[elfjit:routeB] WARN SH116b site @0x{start:x} unexpected slot0 {before:08x}, not patched");
+            libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+            ROUTEB_FLAGMANAGER_PATCHED.store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        for (i, w) in words.iter().enumerate() {
+            *((start + (i as u64) * 4) as *mut u32) = *w;
+        }
+        libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+        arm64jit::jit::block_cache_drop_region(start, start + 8);
+        eprintln!("[elfjit:routeB] SH116b patched nativeInit flag-manager site @0x{start:x} 8B -> x8=low zeroed 0x{obj:x} (mutex@+0x28 = PTHREAD_MUTEX_INITIALIZER)");
+    }
+    ROUTEB_FLAGMANAGER_PATCHED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
 static ROUTEB_RUNG0_DISPATCH_PATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// SH126-followup (recon deleg_fcd65c31): with JIT_SERIALIZE_RENDER the drain
 /// overlap is gone, but the residual run-variable rung-0 crash is a null-store in
@@ -5927,6 +6030,45 @@ unsafe fn install_fault_debug() {
             );
             let b = s.as_bytes();
             libc::write(2, b.as_ptr() as *const libc::c_void, b.len());
+            // Diagnostic (default-inert, env JIT_GUEST_STACK_DUMP=1): dump the
+            // guest stack words immediately below sp (and the saved-frame chain
+            // for a tiny leaf helper whose prologue did `stp x29,x30,[sp,#-16]!`
+            // — the caller's return address then sits at [sp + 8]). Records are
+            // only for words that resolve to in-image guest text so the caller
+            // bl-site is identifiable without dumping unbounded host heap. This
+            // turns a crash at a cross-called out-of-image slot (e.g. a guest
+            // mutex-lock helper invoked with a NULL `this`) into the exact
+            // caller return-address, which is NOT in CpuState (only the fault
+            // pc is coarse guestpc and x30 is the leaf's own return target).
+            {
+                let dump_stack =
+                    std::env::var("JIT_GUEST_STACK_DUMP").map(|v| v == "1").unwrap_or(false);
+                if dump_stack && state_matches {
+                    let mut q = String::from("\n  GSDSP[");
+                    let base = sp & !7;
+                    // Prologue `stp x29,x30,[sp,#-16]!` puts caller ra at [sp+8].
+                    // Step by 8 (8-byte aligned words) — 0..8 of i8 steps would
+                    // deref misaligned addresses and panic inside the handler.
+                    let mut idxs: Vec<u64> = (0..8u64).map(|i| i * 8).collect();
+                    idxs.push(8);
+                    for &off in &idxs {
+                        let addr = base.wrapping_add(off);
+                        let w = unsafe { *(addr as *const u64) };
+                        let tag = if (0x100000000..0x120000000).contains(&w) {
+                            format!("GUEST({w:#x})")
+                        } else if w >= 0x7f0000000000 {
+                            format!("HOST({w:#x})")
+                        } else if w != 0 {
+                            format!("0x{w:x}")
+                        } else {
+                            "0".to_string()
+                        };
+                        q.push_str(&format!("+{off}={tag} "));
+                    }
+                    q.push_str("]\n");
+                    libc::write(2, q.as_bytes().as_ptr() as *const libc::c_void, q.len());
+                }
+            }
             // Native frame-pointer backtrace (SysV: rbp chain, [rbp]=prev rbp,
             // [rbp+8]=return addr). Classifies every ret addr as host-JIT vs
             // guest-text vs libc so we see WHICH dispatcher path jumped to guest.
@@ -6638,6 +6780,19 @@ fn main() {
                 // bucket-array; leaf-rewrite it to `ret` so the caller takes the
                 // 'found' path and the flag-registration loop advances.
                 routeb_patch_nativeinit_flagmap_helper();
+                // SH116b: after SH115/116/117 the nativeInit path advances into
+                // a SECOND read site (file 0x2320a24: `adrp x8,7273000; ldr
+                // x8,[x8,#2480]` = *(0x10672739b0), sibling of SH116's helper
+                // which reads the SAME global via 0x2320710). The flag-manager
+                // object global reads 0 headlessly (page mapped-readable, unlike
+                // SH116's ENOMEM assumption for the +0x10 sibling), so the
+                // `add x0,x0,#0x28; bl pthread_mutex_lock` (0x2320a6c/0x2320a94
+                // via shared helper 0x2b53a68) locks &0+0x28 = faults. Seed the
+                // global with a stable zeroed object (valid mutex at +0x28 =
+                // PTHREAD_MUTEX_INITIALIZER) when it reads 0, mirroring SH116's
+                // materialized object. Also seed *0x10672739c0 for the same
+                // family. Idempotent, non-vtable-widening.
+                routeb_patch_nativeinit_flagmanager();
                 // SH119: SendAppEventOnAppReady's two ungated singleton lambdas
                 // (0x6251610 off 0xf0, 0x6260a68 off 0x550) still soft-return;
                 // materialize the stable object into x0 at both so the body
@@ -12610,6 +12765,38 @@ mod sh115_tests {
         let _48 = (w[3] >> 5) & 0xffff;
         let rebuilt = (lo as u64) | ((_16 as u64) << 16) | ((_32 as u64) << 32) | ((_48 as u64) << 48);
         assert_eq!(rebuilt, oj);
+    }
+    #[test]
+    fn sh116b_flagmanager_words_roundtrip_and_real_site_guard() {
+        // movz/movk x8 hw0/hw1 must reconstruct the low-32-bit object exactly.
+        let obj: u64 = 0x6000_1234;
+        let w = sh116b_flagmanager_words(obj);
+        assert_eq!(w[0], 0xD280_0008u32 | ((0x1234u32) << 5), "movz x8,#0x1234 hw0");
+        assert_eq!(w[1], 0xF2A0_0008u32 | ((0x6000u32) << 5), "movk x8,#0x6000 hw1");
+        let lo = (w[0] >> 5) & 0xffff;
+        let hi = (w[1] >> 5) & 0xffff;
+        let rebuilt = (lo as u64) | ((hi as u64) << 16);
+        assert_eq!(rebuilt, obj, "movz/movk hw0/hw1 round-trip reconstructs the low-32-bit obj");
+        // Both words target x8 (rd=8): movz x8 base 0xD280_0008, movk hw1 0xF2A0_0008.
+        assert_eq!(w[0] & 0x1f, 8, "movz must write x8 (rd=8)");
+        assert_eq!(w[1] & 0x1f, 8, "movk must write x8 (rd=8)");
+        // Real-image site guard: SH116b patches file vaddr 0x2320a24, whose
+        // original slot0 must be `adrp x8,7273000` = 0xf002_7a88, else the
+        // shift-guard aborts. Read the real word when the image is present.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let off = 0x2320a24usize;
+            let w0 = u32::from_le_bytes([img[off], img[off + 1], img[off + 2], img[off + 3]]);
+            assert_eq!(
+                w0, 0xf002_7a88,
+                "SH116b site file vaddr 0x2320a24 slot0 is `adrp x8,7273000` (0xf002_7a88)"
+            );
+        } else {
+            eprintln!("sh116b real-image guard: no real libroblox.so, skipping");
+        }
+        // A wide (>=2^32) object must be rejected by the caller's width guard.
+        assert!(0x1_0000_0000u64 > 0xffff_ffffu64, "caller's obj <= 0xffff_ffff gate");
     }
     #[test]
     fn sh200_v2_dispatch_window_materializes_obj_and_nops_to_blr() {
