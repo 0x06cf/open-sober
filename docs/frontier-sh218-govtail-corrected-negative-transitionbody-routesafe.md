@@ -104,3 +104,39 @@ capture-latch arming *(0x106391908) at a real make_shared<DataModel>) are unchan
   sh161b-seedlines / deepest tail pcs / worldbuild+dmcreator hits / verdict).
 - cargo test --workspace green (arm64jit 387/0 + all crates, 0 failures).
 - recon-v3 + manufacture lever re-verified at HEAD (above), no regression.
+
+## SH218b ADDENDUM — the LAST apparent continuation angle CLOSED at the surface rung
+
+Fresh disasm found a SECOND call site to the world-build fn 0x102ea3b14, inside
+`nativeAppBridgeV2UpdateSurfaceAppWithPlatformParams` (file 0x25f5e04, fn entry 0x25f5fec):
+
+```
+25f5dcc adrp x8,6a70000 ; ldrb w8,[x8,#1384]  = [0x106a70568]  <-- SAME SH199 byte
+25f5dd4 cbz  w8, 25f5e10    (skip world-build if gate==0)
+25f5e00 mov  x0,x19
+25f5e04 bl   2ea3b14        (WORLD-BUILD: op-new 0x18 + ctor 0x2eacccc + bl nativeAppBridgeAppStart__)
+25f5e08 mov  x1,x20 ; bl 2eacdb4
+```
+
+SH199/204 only ever examined the V2Init call site (0x10236810c, gated by the same
+[0x106a70568] byte, measured UNREACHED -> SETWORLDBUILD latent). This is a DIFFERENT,
+never-examined caller — and it fires inside the surface-handoff rung that SH210/202 freely
+drive REAL (returns Ok XID). If that rung's body reached its `bl 0x2ea3b14`, seeding
+[0x106a70568] (SETWORLDBUILD) could drive the world-build fn from a NEW reachable caller.
+
+**MEASURED (real libroblox.so, canonical completing ladder + SETWORLDBUILD=1, region-watch
+on fn 0x1025f5fec..0x1025f6110 + world-build 0x102ea3b14..0x102ea3c50, EXIT 124):**
+region-watch hit **ONLY the fn-entry pc 0x1025f5fec** — never the gate block 0x1025f5dd0,
+never the `bl 0x2ea3b14` at 0x1025f5e04, never the world-build body. `V2UpdateSurface returned
+Ok(0x3e8)` = the SAME benign soft-return class as V2Init/V2Start (SH199/200 singleton-dispatch
+short-circuit). **The surface rung soft-returns before executing its body**, so its world-build
+call is unreached too. Combined with SH204 (V2Init call-site unreached), fn 0x102ea3b14's world
+build now has **EVERY call site empirically measured unreached** (both `bl 0x2ea3b14` sites:
+0x10236810c SH204+0x25f5e04 SH218b). Do-not-re-tread.
+
+### Least-convinced note
+The fn-entry-only region hit + Ok(0x3e8) return is strong but the soft-return pc (the exact
+`blr`/materialized-singleton site) was not captured this run; it is the same SH199/200 class and
+not seedable as a DM producer regardless (the endpoint is the SH174-closed nativeAppBridgeAppStart
+line). The verdict — world-build fn unreachable from every caller, structural gate holds — is robust
+to that detail.
