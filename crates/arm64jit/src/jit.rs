@@ -614,6 +614,38 @@ fn routeb_tail_eq_guard(state: *mut CpuState, pc: u64) {
     );
 }
 
+/// SH198-surface (this cycle): the V2InitWithParams rung's gate block at
+/// 0x102368100 (`adrp x8,6a70000; ldrb w8,[x8,#1384]; cbz w8,0x102368114`) only calls
+/// the "world-build" fn 0x102ea3b14 (`bl 0x2ea3b14` at 0x236810c) when byte guest
+/// [0x106a70568] is NONZERO. That byte is a zero-default .bss cell, so in a bare boot
+/// 0x102ea3b14 is NEVER reached headlessly (SH198 measured the do-init->app-shell->
+/// governor->governor-tail continuation ends at the ret thunk 0x102ea30dc; the deeper
+/// contiguous construction fn 0x2ea3b14 is the next body, which calls operator-new(0x18)
+/// + ctor 0x2eacce4 + nativeAppBridgeAppStart__ 0x2365960). This guard seeds that byte to 1
+/// at the gate block entry so the rung's OWN next construction body executes — an
+/// explicitly-measurable "does the continuation go one level deeper" probe, gated on
+/// JIT_ROUTEB_SETWORLDBUILD (default-inert). Idempotent (only writes when 0), preserves a
+/// real nonzero session value.
+fn routeb_worldbuild_gate_seed(_state: *mut CpuState, pc: u64) {
+    if std::env::var_os("JIT_ROUTEB_SETWORLDBUILD").is_none() {
+        return;
+    }
+    // the gate block occupies [0x102368100, 0x102368114): adrp/ldrb (0x100/0x104),
+    // cbz (0x108), then mov x0,x19 + bl (0x10c). Fire once per entry anywhere in it.
+    if pc < 0x102368100 || pc >= 0x102368114 {
+        return;
+    }
+    let cell = 0x106a70568u64 as *mut u8;
+    let cur = unsafe { std::ptr::read_unaligned(cell) };
+    if cur != 0 {
+        return; // already set — real session / already seeded.
+    }
+    unsafe { std::ptr::write_unaligned(cell, 1) };
+    eprintln!(
+        "[routeb-worldbuild] SH198-surface: seeded app-bridge world-build gate byte [0x106a70568]=1 at pc={pc:#x} -> V2InitWithParams rung now falls through to bl 0x102ea3b14 (nativeAppBridgeAppStart__ world-build), deeper DMCONT continuation (was {cur})"
+    );
+}
+
 /// SH161 (recon deleg_c94a8b2f): broad tail-entry probe — log every block entry whose
 /// pc falls in the governor-tail region so we can pin exactly which block contains the
 /// NULL-deref dispatch. Debug-only, gated on JIT_ROUTEB_SETFIX + JIT_ROUTEB_TAILTRACE.
@@ -4849,6 +4881,7 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
             routeb_dm_instance_guard(state, pc); // SH189c: drive the real PlayerGui/ScreenGui INSTANCE ctor chain (JIT_ROUTEB_DM_INSTANCE)
             routeb_dm_service_resolve_guard(state, pc); // SH191: host-link the constructed PlayerGui as a service node on [dm+0x68] + drive getService walker (JIT_ROUTEB_DM_SERVICE_NODE)
             routeb_tail_eq_guard(state, pc); // SH161b: seed impl[+0x2b8]=2 (governor-tail epilogue b.eq)
+            routeb_worldbuild_gate_seed(state, pc); // SH198-surface: seed [0x106a70568]=1 so V2Init falls through to the world-build fn 0x102ea3b14 (JIT_ROUTEB_SETWORLDBUILD)
             routeb_tail_trace(state, pc);
         }
         routeb_cookie_jar_guard(state, pc); // SH175: seed cookie-jar container + gates at worker 0x102203148 (JIT_ROUTEB_COOKIE)
@@ -5970,6 +6003,56 @@ mod tests {
         // impl==0 -> no write, no crash.
         st.x[19] = 0;
         routeb_tail_eq_guard(&mut st as *mut CpuState, 0x102e9fe04);
+    }
+
+    #[test]
+    fn sh198surface_routeb_worldbuild_gate_seed_env_and_pc_and_idempotent() {
+        // SH198-surface: the V2InitWithParams rung's gate block (0x102368100) only
+        // calls the world-build fn 0x102ea3b14 when byte guest [0x106a70568] is
+        // nonzero. routeb_worldbuild_gate_seed must (a) be inert without
+        // JIT_ROUTEB_SETWORLDBUILD (even at the exact gate pc), (b) at a pc in
+        // [0x102368100,0x102368114] with the env set, write 1 to that .bss byte,
+        // and (c) leave a real nonzero value untouched (idempotent — fires once,
+        // preserves a live session). The write target is a .bss page that is not
+        // mapped in a hermetic test, so map it first (routeb_map_guest_page).
+        let target = 0x106a70568u64;
+        let page_mapped = routeb_map_guest_page(target);
+        assert!(page_mapped, "must be able to map the .bss gate page for the test");
+        let cell = target as *mut u8;
+        // (a) env off -> inert even at the exact gate entry pc.
+        unsafe { std::ptr::write_unaligned(cell, 0) };
+        routeb_worldbuild_gate_seed(&mut CpuState::new() as *mut CpuState, 0x102368100);
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned(cell) },
+            0,
+            "SETWORLDBUILD env off must not write the world-build gate byte"
+        );
+        // (b) env on + gate pc -> writes 1.
+        unsafe { std::env::set_var("JIT_ROUTEB_SETWORLDBUILD", "1") };
+        routeb_worldbuild_gate_seed(&mut CpuState::new() as *mut CpuState, 0x102368100);
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned(cell) },
+            1,
+            "gate pc + env on must seed [0x106a70568]=1"
+        );
+        // wrong pc (outside the gate block, e.g. the delivered 0x102368114-taken-pc
+        // target or an unrelated V2Init address) must not fire again / not change.
+        unsafe { std::ptr::write_unaligned(cell, 0) };
+        routeb_worldbuild_gate_seed(&mut CpuState::new() as *mut CpuState, 0x102368114);
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned(cell) },
+            0,
+            "pc == cbz-taken target must NOT be within the seed window"
+        );
+        // (c) real nonzero value preserved (idempotent).
+        unsafe { std::ptr::write_unaligned(cell, 0x5a) };
+        routeb_worldbuild_gate_seed(&mut CpuState::new() as *mut CpuState, 0x102368100);
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned(cell) },
+            0x5a,
+            "a live nonzero world-build gate byte must be preserved"
+        );
+        unsafe { std::env::remove_var("JIT_ROUTEB_SETWORLDBUILD") };
     }
 
     #[test]
