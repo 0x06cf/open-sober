@@ -1243,13 +1243,24 @@ fn routeb_dm_real_ctor_drive_guard(_state: *mut CpuState, pc: u64) {
     // (blr [vt+2]) is guarded by cbz/cbnz x20 (seeds to 0 = skipped), and its __stack_chk_fail
     // guard reads the global 0x67d1000+0x6f0 canary — both non-issues once NOP'd (it never runs).
     const NOP_SUBOBJ: u64 = 0x1023f60b8; // `bl 0x23f6b0c` insn slot
+    // SH229 (this cycle): opt-in FULL ctor. SH187 only ever measured the PARTIAL DM produced by
+    // NOP'ing `bl 0x23f6b0c`. That subobject ctor (recon sh189) builds the DM's INTERNAL 361-entry
+    // class/instance index (bl 0x2374c90, xo=obj+0x2a0, w1=0x169, x2=&stack-pair) after a base
+    // subobject init (bl 0x5e18df4). Disasm of both callees shows each can RETURN cleanly when the
+    // source-pair pointer it walks is a coherent zeroed buffer (the per-iteration refcount blt
+    // 0x2b9e950 is skipped when the 8-byte pair second word == 0), so under this env we leave the
+    // `bl 0x23f6b0c` INTACT and drive the ctor with the extraneous pair-slots seeded, letting the
+    // subobject run to completion. This is a NEW measurement (SH187 never ran the full ctor) — the
+    // operator's "drive its ctor world-build further" line.
+    let full_subobj_env = std::env::var_os("JIT_ROUTEB_DM_REALCTOR_FULL").is_some();
     use std::sync::OnceLock;
     static DRIVEN: OnceLock<()> = OnceLock::new();
     DRIVEN.get_or_init(|| {
         // NOP the subobject-ctor call so the ctor falls through and writes the genuine vptr set.
-        if !routeb_ensure_writable(NOP_SUBOBJ) {
+        // (SKIP under FULL_SUBOBJ: leave `bl 0x23f6b0c` live so the subobject/index build runs.)
+        if !full_subobj_env && !routeb_ensure_writable(NOP_SUBOBJ) {
             eprintln!("[routeb-realctor] SH187: subobj-NOP slot 0x{NOP_SUBOBJ:x} not writable, skip patch");
-        } else {
+        } else if !full_subobj_env {
             let cur = unsafe { std::ptr::read_unaligned(NOP_SUBOBJ as *const u32) };
             if cur == 0xd503201f {
                 eprintln!("[routeb-realctor] SH187: subobj-NOP already applied at 0x{NOP_SUBOBJ:x}");
@@ -1259,6 +1270,8 @@ fn routeb_dm_real_ctor_drive_guard(_state: *mut CpuState, pc: u64) {
             } else {
                 eprintln!("[routeb-realctor] SH187: unexpected opcode at 0x{NOP_SUBOBJ:x} = {cur:#x} (not the bl 0x23f6b0c), skip patch");
             }
+        } else {
+            eprintln!("[routeb-realctor] SH229: FULL mode — `bl 0x23f6b0c` subobject ctor LEFT INTACT at 0x{NOP_SUBOBJ:x}, driving the FULL DM ctor (un-NOP)");
         }
         // object + descriptor + 4 small cells, all leaked+zeroed so any ref count/GOT stays 0.
         let obj = Box::leak(vec![0x0u8; OBJ_SZ as usize].into_boxed_slice()).as_mut_ptr() as u64;
@@ -1285,9 +1298,23 @@ fn routeb_dm_real_ctor_drive_guard(_state: *mut CpuState, pc: u64) {
                 let genuine = (w0, w1, w2)
                     == (0x1067162e8u64, 0x1067163a0u64, 0x1067163f8u64);
                 eprintln!(
-                    "[routeb-realctor] SH187: REAL DM ctor wrapper 0x{DM_WRAPPER:x} DROVE ok ret x0={r:#x}; obj vptr set = {w0:#x},{w1:#x},{w2:#x} {} (genuine={genuine})",
+                    "[routeb-realctor] SH187{}: REAL DM ctor wrapper 0x{DM_WRAPPER:x} DROVE ok ret x0={r:#x}; obj vptr set = {w0:#x},{w1:#x},{w2:#x} {} (genuine={genuine})",
+                    if full_subobj_env {"-FULL"} else {""},
                     if genuine { "GENUINE MATCH" } else { "(note: not the expected set)" }
                 );
+                if full_subobj_env {
+                    // SH229: report the subobject's index-build region (obj+0x2a0: the 361-entry
+                    // vector built by `bl 0x2374c90` inside the un-NOP'd `bl 0x23f6b0c`) and the
+                    // base-subobject field it stores at obj+0x1f0/obj+0x2a0, so the FULL-ctor
+                    // measurement shows whether the class-index subobject actually ran.
+                    let idx0 = unsafe { std::ptr::read_unaligned((obj + 0x2a0) as *const u64) };
+                    let idx8 = unsafe { std::ptr::read_unaligned((obj + 0x2a8) as *const u64) };
+                    let idx10 = unsafe { std::ptr::read_unaligned((obj + 0x2b0) as *const u64) };
+                    let vptr_5e18df4 = unsafe { std::ptr::read_unaligned((obj + 0x1f0) as *const u64) };
+                    eprintln!(
+                        "[routeb-realctor] SH229 FULL: obj+0x1f0 vptr={vptr_5e18df4:#x} (expect 0x6797028 if the base-subobj ctor 0x5e18df4 ran); obj+0x2a0 index-build = {idx0:#x},{idx8:#x},{idx10:#x} (begin/end/count of the 361-entry vector if 0x2374c90 ran)"
+                    );
+                }
                 if genuine {
                     // SH187b: the constructed DM is vptr-genuine. Plant it into the current-DM
                     // holder (always, no crash) AND — only when JIT_ROUTEB_DM_REALCTOR_CONSUMER=1 —
@@ -6660,6 +6687,37 @@ mod tests {
         //     owned: run_guest_callback needs a real loaded image with guest TLS, never invoked
         //     here in the hermetic context).
         routeb_dm_real_ctor_drive_guard(&mut st as *mut CpuState, 0x1023efe2c);
+        unsafe { std::env::remove_var("JIT_ROUTEB_DM_REALCTOR") };
+    }
+
+    #[test]
+    fn sh229_dm_real_ctor_full_mode_env_and_region_gated() {
+        // SH229: JIT_ROUTEB_DM_REALCTOR_FULL opt-in leaves the DM ctor's subobject call
+        // (`bl 0x23f6b0c` @ 0x1023f60b8) INTACT so the FULL DataModel ctor (incl. its internal
+        // 361-entry class index built by 0x2374c90 at obj+0x2a0) runs, instead of SH187's partial
+        // NOP'd build. Hermetic: as the sh187 guard test, we assert only the guard's gating —
+        // default-inert, env-gated, region-scoped — never invoking the guest drive (run_guest_callback
+        // needs a real loaded image + guest TLS, harness-owned). Requires JIT_ROUTEB_DM_REALCTOR=1
+        // as well (FULL is a modifier on the real-ctor drive; without the base env the guard is inert).
+        let mut st = CpuState::new();
+        // (a) no env at all -> inert.
+        routeb_dm_real_ctor_drive_guard(&mut st as *mut CpuState, 0x1023efe2c);
+        // (b) FULL set but base JIT_ROUTEB_DM_REALCTOR unset -> inert (guard early-outs on the
+        //     base env before reading FULL).
+        unsafe { std::env::set_var("JIT_ROUTEB_DM_REALCTOR_FULL", "1") };
+        routeb_dm_real_ctor_drive_guard(&mut st as *mut CpuState, 0x1023efe2c);
+        // (c) base + FULL set, wrong pc -> region-gates and returns immediately.
+        unsafe { std::env::set_var("JIT_ROUTEB_DM_REALCTOR", "1") };
+        let t0 = std::time::Instant::now();
+        routeb_dm_real_ctor_drive_guard(&mut st as *mut CpuState, 0x102e9fcc4);
+        assert!(
+            t0.elapsed().as_millis() < 50,
+            "FULL-mode env-on + wrong pc must region-gate and return immediately"
+        );
+        // (d) base + FULL set, correct entry pc -> returns without error (the drive stays
+        //     harness-owned; never run_guest_callback'd in hermetic context).
+        routeb_dm_real_ctor_drive_guard(&mut st as *mut CpuState, 0x1023efe2c);
+        unsafe { std::env::remove_var("JIT_ROUTEB_DM_REALCTOR_FULL") };
         unsafe { std::env::remove_var("JIT_ROUTEB_DM_REALCTOR") };
     }
 
