@@ -662,6 +662,28 @@ pub fn region_watch_contains(spec: &str, pc: u64) -> bool {
     false
 }
 
+/// SH198: return a ring-buffer's contents oldest -> newest, skipping zero (unwritten)
+/// slots. `ring_i` is the next-write index (i.e. the oldest entry if fully written).
+/// Unit-tested; the dispatcher records each iteration's pc here so an out-of-image
+/// stop can report the exact last in-image transition without a full JIT_TRACE dump.
+pub fn ring_ordered(ring: &[u64], ring_i: usize) -> Vec<u64> {
+    let n = ring.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mask = if n.is_power_of_two() { n - 1 } else { n }; // fallback: full scan below
+    (0..n)
+        .filter_map(|k| {
+            let v = if n.is_power_of_two() {
+                ring[(ring_i + k) & mask]
+            } else {
+                ring[(ring_i + k) % n]
+            };
+            (v != 0).then_some(v)
+        })
+        .collect()
+}
+
 /// SH175 (objective 2b / recon deleg_466252aa task-1): the pure-native cookie worker
 /// `0x102203148` (nativeSetMultipleCookies' native body, chars* x0 cookies, size_t x1
 /// clen, char* x2 url, size_t x3 ulen, int w4, int w5) reads the cookie-jar container
@@ -4121,6 +4143,17 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
     const MAX_STEPS: u64 = 20_000_000;
     // (last_sample_step, compiles_at_that_step) — init to (0, current compiles].
     let mut sample_compiles: (u64, u64) = (0, block_cache_stats().0);
+    // SH198: bounded ring-buffer of the last few guest block-entry pcs leading up
+    // to the current dispatcher iteration. When a `blr`/`ret` leaks a host-heap
+    // or garbage address into pc (the SH176/SH103/SH109 singleton-vtable class —
+    // a run-variable stop where pc is a host pointer, 0x55e7..., 0xc0e0..., or a
+    // tiny 0x9e/0xcd that is NOT a static seedable slot), the only way to the
+    // SOURCE is a full `JIT_TRACE` register/step dump. This gives the same
+    // answer cheaply and unconditionally: the exact transition out of the image
+    // (last in-image pc -> the bad pc). Two trivial stores per iteration; only
+    // the print (at the outside-image stop, gated JIT_OUTSIDE_TRACE) costs.
+    let mut ring: [u64; 16] = [0; 16];
+    let mut ring_i: usize = 0;
     loop {
         if guard >= MAX_STEPS {
             let (c, _h) = block_cache_stats();
@@ -4188,6 +4221,9 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
             }
         }
         let pc = unsafe { (*state).pc };
+        // SH198: record into the ring-buffer (16 is a power of two, so `& 15` wraps).
+        ring[ring_i] = pc;
+        ring_i = ((ring_i as u64) + 1 & (ring.len() as u64 - 1)) as usize;
         if pc == 0 {
             return Ok(unsafe { (*state).x[0] });
         }
@@ -4308,6 +4344,22 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
                 eprintln!(
                     "[outside-image] x24={:#x} x25={:#x} x26={:#x} x27={:#x} x28={:#x} x29={:#x} x30={:#x} pc={:#x}",
                     s.x[24], s.x[25], s.x[26], s.x[27], s.x[28], s.x[29], s.x[30], s.pc
+                );
+            }
+            // SH198: deterministically show the SOURCE of the out-of-image
+            // transition (last few in-image pcs -> the bad pc) without needing
+            // the full JIT_TRACE register/step dump. Gated on
+            // JIT_OUTSIDE_TRACE (default off); independent of the JIT_TRACE
+            // block above. The transition is the last pair — the final in-image
+            // pc that `blr`/`ret`-ed out and the bad pc it landed on.
+            if std::env::var_os("JIT_OUTSIDE_TRACE").is_some() {
+                eprintln!("[outside-image] recent block pcs (newest last):");
+                for (k, v) in ring_ordered(&ring, ring_i).iter().enumerate() {
+                    eprintln!("  [{k:2}] 0x{v:x}");
+                }
+                eprintln!(
+                    "  ^ last in-image pc is the top of this list before the bad pc; pc(now)=0x{pc:x} x30=0x{:x}",
+                    unsafe { (*state).x[30] }
                 );
             }
             return Err(format!(
@@ -5789,6 +5841,26 @@ mod tests {
         assert!(!region_watch_contains("bogus-spec", 0x1234));
         assert!(!region_watch_contains("0xnope-0x0", 0x1234));
         assert!(!region_watch_contains("", 0x1234));
+    }
+
+    #[test]
+    fn ring_ordered_reports_oldest_to_newest_and_skips_unwritten() {
+        // SH198: the dispatcher records each iteration's pc into a bounded ring; on
+        // an out-of-image stop the ordered view (oldest->newest) shows the exact
+        // last in-image transition without a full JIT_TRACE dump. Lock the order.
+        // Partially-filled ring: ring_i points at the next-write slot (=0), so
+        // index 0 is the oldest written value and the rest are zero (unwritten).
+        let mut ring = [0u64; 4];
+        ring[0] = 0x111;
+        ring[1] = 0x222;
+        assert_eq!(ring_ordered(&ring, 0), vec![0x111, 0x222]);
+        // Fully wrapped: ring_i points at the oldest entry; oldest->newest wraps.
+        let ring2 = [0x101u64, 0x202, 0x303, 0x404];
+        assert_eq!(ring_ordered(&ring2, 0), vec![0x101, 0x202, 0x303, 0x404]);
+        // ring_i=2 => index 2 is oldest; order wraps 2,3,0,1.
+        assert_eq!(ring_ordered(&ring2, 2), vec![0x303, 0x404, 0x101, 0x202]);
+        // zero-length never crashes
+        assert!(ring_ordered(&[], 0).is_empty());
     }
 
     #[test]
