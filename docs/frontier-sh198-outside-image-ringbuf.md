@@ -100,3 +100,14 @@ MODERN startAppWithParams blob-path (0x258c6e4) was confirmed REACHED this cycle
 (region-watch 0x10258b144 + 0x10258c6e4 both fire), closing SH197 §6 lever (a)'s
 "does the blob-path even execute" question with a positive; the residual stop is
 non-seedable. Route-B live-DM world-build remains the standing structural gate.
+
+## 7. Governor-tail terminal (extends SH197, same cycle)
+
+Watching the FULL governor region [0x102e9fa84, 0x102ea4000] (past the SH197
+0x30dc floor): the tail's deepest execution is `0x102ea3084/0x102ea30d0/
+0x102ea30dc` — a stack-canary `ret` thunk (`ldp x29,x30,[sp,#32]; ret`). Execution
+NEVER reaches the larger fn at 0x2ea3b14 (`ldr x0,[x0,#688]`, the deeper
+app-bridge/world-build body). So the manufacture/DMCONT continuation ends cleanly
+at the governor-tail ret; the next real construction fn (0x2ea3b14) is unreached
+headlessly — the same live-world-build gate, now measured one level deeper with 0
+crash / EXIT 124.
