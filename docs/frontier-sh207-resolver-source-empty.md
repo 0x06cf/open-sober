@@ -2,7 +2,7 @@
 
 **Session type:** verification/characterization + a genuine production fix (futex
 flake). No new seed warranted. Workspace green (386/0 arm64jit + all crates / 15
-test binaries). Commit <SH207COMMIT>.
+test binaries). Commit 9f39594.
 
 ## 1. Production fix: the `futex_requeue_actually_moves_waiter` flake (JIT test to green)
 
