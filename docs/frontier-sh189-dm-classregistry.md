@@ -100,7 +100,7 @@ The FULL PlayerGui-class layer (vptr 0x106648950) is now written headlessly — 
 point: not just the instance base (0x106796dc0), but the derived PlayerGui class vptr, with the
 whole ctor body executing to completion. Default (NOP-off) capture UNREGRESSED (3/3 EXIT 124,
 instance-base-only 0x106796dc0). +1 hermetic sh190c_dm_instance_nop_member_seed_... (env/pc/window/
-long-form/idempotent-capture). Workspace green (arm64jit 379/0). COMMITS: 89c9a55.
+long-form/idempotent-capture). Workspace green (arm64jit 379/0). COMMITS: b0693b5.
 NEXT (honest): the constructed PlayerGui is a standalone instance — it is NOT yet attached as a
 service NODE on [dm+0x68] ([node+0x18]==0x87e) nor parented to a ScreenGui scene (R+0x180/0x188).
 That attach remains behind the live-app-shell/vt-dispatched service arming (recon-negative do-not-
