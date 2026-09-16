@@ -1454,6 +1454,83 @@ fn routeb_dm_service_seed_guard(_state: *mut CpuState, pc: u64) {
     });
 }
 
+/// SH189c (Route-B instance construction): with the class-name registry now populated
+/// (PlayerGui+ScreenGui descriptors registered headlessly by `routeb_dm_service_seed_guard`),
+/// the engine's REAL PlayerGui/ScreenGui INSTANCE ctor chain becomes headlessly reachable
+/// (recon deleg_5d14fcbe, verified vs objdump): the core creator ServiceProvider::getOrCreate
+/// 0x102373458 (class-manager resolve -> operator-new -> blr ctor functor -> insert) is invoked
+/// by the pair-consumers 0x10255d0e4 (PlayerGui) / 0x10247a88c (ScreenGui), and the real ctors
+/// 0x10255d1dc (PlayerGui vptr 0x106648950) / 0x10247a984 (ScreenGui vptr 0x106649ce0) are
+/// NON-virtual. The ONE remaining headless gate: the creator's class-manager lazy path derefs
+/// the global current-DM at guest 0x107333948 (`adrp x8,0x7333000; add #0x948; ldar x0,[x8]` at
+/// 0x23737d4-0x23737dc) then bl 0x21daef8 — different from the loop's *0x106391908 holder. So
+/// plant *(0x107333948)=constructed DM, then drive the PlayerGui pair-consumer 0x10255d0e4
+/// (w0=typeid 0x298, w3=classid 0x87e, x4=ctor-functor 0x255d1b4, x5=&{dm,classid}, x8=&out via
+/// run_guest_callback_x8). default-inert (env JIT_ROUTEB_DM_INSTANCE=1). The instance
+/// construction itself is the Route-B frontier; this is the first headless instance-ctor drive.
+fn routeb_dm_instance_guard(_state: *mut CpuState, pc: u64) {
+    if std::env::var_os("JIT_ROUTEB_DM_INSTANCE").is_none() {
+        return;
+    }
+    const SLADM_LO: u64 = 0x1023efe2c; // StartLuaAppDM entry
+    const SLADM_HI: u64 = 0x1023eff40;
+    if pc < SLADM_LO || pc > SLADM_HI {
+        return;
+    }
+    const DM_HOLDER: u64 = 0x106391908; // loop's current-DM holder
+    const CUR_DM_GLOBAL: u64 = 0x107333948; // creator's current-DM global (0x7333000+0x948)
+    const PGI_CONSUMER: u64 = 0x10255d0e4; // PlayerGui pair-consumer (getter bl 0x201fce0 + core creator)
+    const SGI_CONSUMER: u64 = 0x10247a88c; // ScreenGui pair-consumer
+    use std::sync::OnceLock;
+    static DRIVEN: OnceLock<()> = OnceLock::new();
+    DRIVEN.get_or_init(|| {
+        if !page_is_mapped(DM_HOLDER) {
+            eprintln!("[routeb-dmins] SH189c: DM holder page not mapped, skip");
+            return;
+        }
+        if !routeb_ensure_writable(DM_HOLDER) {
+            eprintln!("[routeb-dmins] SH189c: DM holder 0x{DM_HOLDER:x} not writable, skip");
+            return;
+        }
+        let dm = unsafe { std::ptr::read_unaligned(DM_HOLDER as *const u64) };
+        if dm == 0 {
+            eprintln!("[routeb-dmins] SH189c: DM holder = 0 (no constructed DM), skip");
+            return;
+        }
+        // Plant the constructed DM into the creator's current-DM global so the class-manager
+        // lazy-init's `ldar x0,[0x107333948]` -> bl 0x21daef8 sees a live DM (was 0).
+        if page_is_mapped(CUR_DM_GLOBAL) && routeb_ensure_writable(CUR_DM_GLOBAL) {
+            unsafe { std::ptr::write_unaligned(CUR_DM_GLOBAL as *mut u64, dm) };
+            eprintln!("[routeb-dmins] SH189c: planted DM {dm:#x} into creator current-DM global 0x{CUR_DM_GLOBAL:x}");
+        }
+        let tp = crate::jit::current_guest_tp();
+        // Drive the PlayerGui pair-consumer 0x10255d0e4 with x0 = the DM. Disasm: `str x0,[sp,16]`
+        // then `add x5,sp,#0x10` -> x5=&{dm,classid}; the ctor-functor 0x255d1b4 does
+        // `ldr x1,[x1]` (=dm) -> bl 0x255d1dc -> instance ctor 0x2374310 with x1=dm as the owner
+        // (mov x23,x1). Passing x0=dm feeds a non-null owner so `ldr x8,[x23]` at 0x2374378
+        // reads *dm (vtable > 7 -> clean default completer b.hi 0x23744bc) instead of the
+        // x23=0 null-deref. x8 = &out (leaked 0x40 buffer).
+        let out = Box::leak(vec![0x0u8; 0x40].into_boxed_slice()).as_mut_ptr() as u64;
+        match crate::jit::run_guest_callback_x8(PGI_CONSUMER, [dm, 0, 0, 0, 0, 0, 0, 0], out, tp) {
+            Ok(r) => {
+                let a = unsafe { std::ptr::read_unaligned(out as *const u64) };
+                let b = unsafe { std::ptr::read_unaligned((out + 8) as *const u64) };
+                // If a PlayerGui instance was built, [out]==instance (or its ref wrapper) and
+                // its vptr == 0x106648950.
+                let vp = if a != 0 && page_is_mapped(a) {
+                    unsafe { std::ptr::read_unaligned(a as *const u64) }
+                } else {
+                    0
+                };
+                eprintln!(
+                    "[routeb-dmins] SH189c: PlayerGui pair-consumer 0x{PGI_CONSUMER:x} DROVE ok ret x0={r:#x}; out={{{a:#x},{b:#x}}} obj vptr={vp:#x} (PlayerGui want 0x106648950 / ScreenGui 0x106649ce0)"
+                );
+            }
+            Err(e) => eprintln!("[routeb-dmins] SH189c: PlayerGui pair-consumer drive err: {e} (next gate)"),
+        }
+    });
+}
+
 /// True when the page containing `addr` appears in /proc/self/maps at all (any
 /// mapping covering it, not just a readable one). Conservative: used so
 /// routeb_map_guest_page only maps a page that is GENUINELY absent.
@@ -4225,6 +4302,7 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
             routeb_dm_ctor_driver_guard(state, pc); // SH182: host-drive the manufactured DM through its genuine app-shell ctor 0x1057d6ef4 (JIT_ROUTEB_DM_CTOR_DRIVER)
             routeb_dm_real_ctor_drive_guard(state, pc); // SH187: drive the REAL DataModel ctor wrapper 0x1023f5ff8 -> 0x1023f6038 (JIT_ROUTEB_DM_REALCTOR)
             routeb_dm_service_seed_guard(state, pc); // SH189: seed empty DM service container + drive PlayerGui class-registry register (JIT_ROUTEB_DM_SERVICES)
+            routeb_dm_instance_guard(state, pc); // SH189c: drive the real PlayerGui/ScreenGui INSTANCE ctor chain (JIT_ROUTEB_DM_INSTANCE)
             routeb_tail_eq_guard(state, pc); // SH161b: seed impl[+0x2b8]=2 (governor-tail epilogue b.eq)
             routeb_tail_trace(state, pc);
         }
@@ -4315,6 +4393,39 @@ pub fn run_guest_callback_on(
     st.tpidr = tpidr;
     st.x[..8].copy_from_slice(&args);
     st.x[31] = (stack) + (stack_size as u64) - 16; // aligned top
+    jit_run(image, base, fn_addr, &mut st as *mut CpuState)?;
+    Ok(st.x[0])
+}
+
+/// A variant of `run_guest_callback` that ALSO sets the x8 register (used as an
+/// out-pointer by ServiceProvider get-or-create / the class-register pair-consumers,
+/// which `args[8]` cannot reach since it maps to x0–x7). x8 must point at a valid
+/// writable guest-visible buffer (caller-leaked). Everything else identical.
+pub fn run_guest_callback_x8(
+    fn_addr: u64,
+    args: [u64; 8],
+    x8: u64,
+    tpidr: u64,
+) -> Result<u64, String> {
+    const STACK: usize = 1 << 20;
+    let stack = Box::leak(vec![0u8; STACK].into_boxed_slice());
+    let (image_addr, image_len, base) = {
+        let guard = EXEC_CTX.lock().unwrap();
+        let ctx = guard.as_ref().ok_or("run_guest_callback_x8: no active guest image")?;
+        (ctx.image_addr, ctx.image_len, ctx.base)
+    };
+    if fn_addr < base || fn_addr - base >= image_len as u64 {
+        return Err(format!(
+            "run_guest_callback_x8: fn {fn_addr:#x} outside image [{base:#x}, {:#x})",
+            base + image_len as u64
+        ));
+    }
+    let image = unsafe { std::slice::from_raw_parts(image_addr as *const u8, image_len) };
+    let mut st = CpuState::new();
+    st.tpidr = tpidr;
+    st.x[..8].copy_from_slice(&args);
+    st.x[8] = x8;
+    st.x[31] = stack.as_mut_ptr() as u64 + (STACK as u64) - 16; // aligned top
     jit_run(image, base, fn_addr, &mut st as *mut CpuState)?;
     Ok(st.x[0])
 }
@@ -5625,6 +5736,26 @@ mod tests {
         //     in a hermetic test).
         routeb_dm_service_seed_guard(&mut st as *mut CpuState, 0x1023efe2c);
         unsafe { std::env::remove_var("JIT_ROUTEB_DM_SERVICES") };
+    }
+
+    #[test]
+    fn sh189c_dm_instance_guard_env_and_region_gated() {
+        // SH189c (Route-B instance construction): the real PlayerGui/ScreenGui INSTANCE ctor
+        // chain (pair-consumers 0x10255d0e4/0x10247a88c, core creator 0x102373458) is reachable
+        // headlessly once the current-DM global 0x107333948 is planted. Guard must be
+        // default-inert (env off), env-gated (JIT_ROUTEB_DM_INSTANCE), region-scoped to
+        // StartLuaAppDM entry. Guest drive (run_guest_callback_x8) is harness-owned.
+        let mut st = CpuState::new();
+        routeb_dm_instance_guard(&mut st as *mut CpuState, 0x1023efe2c);
+        unsafe { std::env::set_var("JIT_ROUTEB_DM_INSTANCE", "1") };
+        let t0 = std::time::Instant::now();
+        routeb_dm_instance_guard(&mut st as *mut CpuState, 0x102e9fcc4);
+        assert!(
+            t0.elapsed().as_millis() < 50,
+            "env-on + wrong pc must region-gate and return immediately"
+        );
+        routeb_dm_instance_guard(&mut st as *mut CpuState, 0x1023efe2c);
+        unsafe { std::env::remove_var("JIT_ROUTEB_DM_INSTANCE") };
     }
 
     #[test]
