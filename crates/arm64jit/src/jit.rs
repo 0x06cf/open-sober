@@ -644,6 +644,24 @@ pub fn routeb_setfix_empty_set() -> u64 {
     })
 }
 
+/// JIT_REGION_WATCH spec helper: returns true when `pc` falls inside any of the
+/// comma-separated `lo-hex-hi-hex` ranges. A malformed entry is skipped (does not
+/// abort the whole spec). Supports multiple regions so a single diagnostic run can
+/// watch the do-init -> app-shell ctor -> governor continuation chain at once.
+pub fn region_watch_contains(spec: &str, pc: u64) -> bool {
+    for pair in spec.split(',') {
+        if let Some((lo_s, hi_s)) = pair.split_once('-') {
+            if let (Ok(lo), Ok(hi)) = (u64::from_str_radix(lo_s.trim_start_matches("0x"), 16),
+                                       u64::from_str_radix(hi_s.trim_start_matches("0x"), 16)) {
+                if pc >= lo && pc < hi {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// SH175 (objective 2b / recon deleg_466252aa task-1): the pure-native cookie worker
 /// `0x102203148` (nativeSetMultipleCookies' native body, chars* x0 cookies, size_t x1
 /// clen, char* x2 url, size_t x3 ulen, int w4, int w5) reads the cookie-jar container
@@ -4319,25 +4337,35 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
                 .unwrap_or(8192)
         };
         let block = cached_block(image, base, pc, state, block_budget)?;
-        // JIT_REGION_WATCH=<lo-hex>-<hi-hex>: on entering ANY block whose guest pc
-        // lies in [lo, hi), log it once (dedup by pc) so a diagnostic run can tell
-        // whether the boot/init reaches a particular guest code region (e.g. the
-        // engine's EGL/GLES render-init). Useful where a whole function's reach is
-        // in question (vs JIT_DUMP_PC's single exact pc).
+        // JIT_REGION_WATCH=<lo-hex>-<hi-hex>[,<lo2-hex>-<hi2-hex>,...]: on entering
+        // ANY block whose guest pc lies in one of the [lo,hi) ranges, log it once
+        // (dedup by pc) so a diagnostic run can tell whether the boot/init reaches
+        // a particular guest code region (e.g. the engine's EGL/GLES render-init or
+        // the Route-B do-init/constructor chain). Useful where a whole function's
+        // reach is in question (vs JIT_DUMP_PC's single exact pc). Comma-separated
+        // ranges are supported; an unparseable value is reported once, never treated
+        // as an empty-watch (which would silently fake a recon/region negative).
         if let Ok(rw) = std::env::var("JIT_REGION_WATCH") {
-            if let Some((lo_s, hi_s)) = rw.split_once('-') {
-                if let (Ok(lo), Ok(hi)) = (u64::from_str_radix(lo_s.trim_start_matches("0x"), 16),
-                                           u64::from_str_radix(hi_s.trim_start_matches("0x"), 16)) {
-                    if pc >= lo && pc < hi {
-                        use std::sync::OnceLock;
-                        static WATCHED: OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> = OnceLock::new();
-                        let seen = WATCHED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-                        let mut s = seen.lock().unwrap();
-                        if s.insert(pc) {
-                            eprintln!("[region-watch] entered region 0x{lo:x}-0x{hi:x} at guest pc=0x{pc:x}");
-                        }
-                    }
+            static RW_PARSE_WARNED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            use std::sync::OnceLock as OL;
+            static WATCHED: OL<std::sync::Mutex<std::collections::HashSet<u64>>> = OL::new();
+            if region_watch_contains(&rw, pc) {
+                let seen = WATCHED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+                let mut s = seen.lock().unwrap();
+                if s.insert(pc) {
+                    eprintln!("[region-watch] region hit at guest pc=0x{pc:x} (JIT_REGION_WATCH={rw})");
                 }
+            } else if !rw.split(',').any(|p| {
+                p.split_once('-')
+                    .map_or(false, |(lo_s, hi_s)| {
+                        u64::from_str_radix(lo_s.trim_start_matches("0x"), 16).is_ok()
+                            && u64::from_str_radix(hi_s.trim_start_matches("0x"), 16).is_ok()
+                    })
+            }) {
+                RW_PARSE_WARNED.get_or_init(|| {
+                    eprintln!("[region-watch] WARN unparseable JIT_REGION_WATCH={rw:?} (expected lo-hex-hi-hex[,lo2-hi2,...]); no region will be watched");
+                    true
+                });
             }
         }
         // JIT_DUMP_PC=<guest-hex>: on entering a block at exactly this guest PC,
@@ -5734,6 +5762,33 @@ mod tests {
             before.elapsed() < std::time::Duration::from_secs(5),
             "cleared gate must unpark promptly (not wait out the 300s bound)"
         );
+    }
+
+    #[test]
+    fn region_watch_contains_multiple_ranges_and_parse_err() {
+        // SH197: JIT_REGION_WATCH must accept comma-separated regions (so one run can
+        // watch the do-init -> app-shell ctor -> governor continuation chain) and must
+        // never treat a malformed spec as an empty/negative watch (that would silently
+        // fake a recon negative). Lock the parse behavior hermetically.
+        let spec = "0x1023eff4c-0x1023f0000,0x102207b50-0x102207c40,0x102e9fa84-0x102ea3b40";
+        assert!(region_watch_contains(spec, 0x1023eff4c));
+        assert!(region_watch_contains(spec, 0x102207b88), "mid-range ctor");
+        assert!(region_watch_contains(spec, 0x102e9fb58), "governor tail");
+        assert!(!region_watch_contains(spec, 0x1023f0abc), "beyond hi of range 0");
+        assert!(!region_watch_contains(spec, 0x1023eff00), "below lo of range 0");
+        assert!(!region_watch_contains(spec, 0x106829ea8), "in no range");
+        // boundary semantics: [lo, hi)
+        assert!(region_watch_contains(spec, 0x102207c40 - 1));
+        assert!(!region_watch_contains(spec, 0x102207c40));
+        // single range still works (back-compat)
+        assert!(region_watch_contains("0x1000-0x2000", 0x1abc));
+        assert!(!region_watch_contains("0x1000-0x2000", 0x2abc));
+        // a malformed entry is skipped, not fatal; the well-formed sibling still matches
+        assert!(region_watch_contains("garbage,0x1000-0x2000", 0x1abc));
+        // a wholly-malformed spec matches nothing (never crashes)
+        assert!(!region_watch_contains("bogus-spec", 0x1234));
+        assert!(!region_watch_contains("0xnope-0x0", 0x1234));
+        assert!(!region_watch_contains("", 0x1234));
     }
 
     #[test]
