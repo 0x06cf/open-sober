@@ -2068,6 +2068,124 @@ fn repoint_early_branch(branch: u64, expect_target: u64, new_target: u64, tag: &
         true
     }
 }
+// ---- SH201: precise v2-family scanner (characterization lever) ----
+//
+// SH200 patched 4 located V2 singleton-dispatch sites, but the empirical run
+// (capture_sh199_worldbuild.sh at 677331b) still stops V2InitWithParams at NEW
+// run-variable pcs (0x30656233616532="2ea3be", 0x6c626f722f6d6f63="com/robl")
+// — the ~365-site family body, each site reading objB's vtable PAST the
+// harness-seeded 0x60 leaf (slot >= 0x60 -> into host box-alloc bytes) and
+// blr'ing outside the image. SH200 named the fix as a "genuine future lever":
+// a scanner whose discriminator verifies a site really IS an objB-getter
+// dispatch before patching (the naive data-driven scan over-patched genuine
+// in-band `ldr x8,[x8,#N]; blr x8` with N<0xf0 -> SIGABRT).
+//
+// SH201 derives that precise discriminator + hermetic tests. The RUNTIME
+// family-wide patch is deliberately NOT shipped (a naive scribble of all sites
+// crash-loops the run in the SH55/64 region — the exact over-patch SH200
+// warned about). This stays a characterized lever + pure scanner, per the
+// SH192/SH194 build-then-revert discipline.
+
+const SH201_OBJ_GETTER: u64 = 0x6249eb8; // link vaddr of the objB singleton getter
+const SH201_LDR_X8_X0: u32 = 0xf940_0008; // ldr x8,[x0]
+const SH201_BLR_X8: u32 = 0xd63f_0100; // blr x8
+
+/// Pure SH201 classifier over raw image bytes (link-vaddr space; guest =
+/// link + 0x100000000, identity-loaded). Returns guest `(start, blr)` site
+/// pairs where `start` is the `ldr x8,[x0]` and `blr` is the dispatch, each
+/// gated by a preceding `bl 0x6249eb8` objB-getter within 16 slots and a
+/// vtable slot-load with byte offset >= 0x60 (past the seeded leaf).
+/// Unit-tested; the runtime `routeb_patch_v2_family` patches each returned
+/// site with the SH200 window.
+pub fn sh201_v2_family_scan(image: &[u8]) -> Vec<(u64, u64)> {
+    let n = image.len() / 4;
+    let mut out = Vec::new();
+    for i in 0..n {
+        let w = u32::from_le_bytes([
+            image[i * 4],
+            image[i * 4 + 1],
+            image[i * 4 + 2],
+            image[i * 4 + 3],
+        ]);
+        // This slot is a blr x8. Walk back up to 16 slots for the getter bl.
+        if w != SH201_BLR_X8 {
+            continue;
+        }
+        let pc = (i as u64) * 4; // link vaddr of the blr
+        // scan backward for `bl 0x6249eb8` (getter) and `ldr x8,[x0]`.
+        let mut getter_idx: Option<usize> = None;
+        let mut ldr_x0_idx: Option<usize> = None;
+        for back in 0..=16u64 {
+            if i < back as usize {
+                break;
+            }
+            let bi = i - back as usize;
+            let wb = u32::from_le_bytes([
+                image[bi * 4],
+                image[bi * 4 + 1],
+                image[bi * 4 + 2],
+                image[bi * 4 + 3],
+            ]);
+            if wb == SH201_LDR_X8_X0 {
+                ldr_x0_idx = Some(bi);
+            }
+            // bl 0x6249eb8: imm26 branch whose target == SH201_OBJ_GETTER.
+            // Sign-extend imm26 (26 bits, sign bit = bit25 = 0x200_0000): a set
+            // sign bit means backward; subtract 2^26 (**0x400_0000**, NOT
+            // 0x4000_0000=2^30 — that broke real backward `bl`s; only forward
+            // branches passed the hermetic test).
+            if (wb & 0xfc00_0000) == 0x9400_0000 {
+                let imm = wb & 0x3ff_ffff;
+                let imm = if imm & 0x2000_000 != 0 { imm.wrapping_sub(0x400_0000) } else { imm };
+                let bpc = (bi as u64) * 4;
+                let target = (bpc.wrapping_add((imm << 2) as u64)) & 0xffff_ffff;
+                if target == SH201_OBJ_GETTER {
+                    getter_idx = Some(bi);
+                }
+            }
+        }
+        // Need both, and the ldr x8,[x0] must be AFTER (higher index than) the
+        // getter — the getter produces objB in x0, the ldr then loads its vtable.
+        let (Some(get), Some(ldr)) = (getter_idx, ldr_x0_idx) else {
+            continue;
+        };
+        if ldr <= get {
+            continue;
+        }
+        // The vtable slot-load `ldr x8,[x8,#N]` with N*8>=0x60 (PAST the seeded
+        // leaf) must sit within the few slots immediately before the blr (real
+        // sites: ldr x8,[x8,#280]@ea8 / blr@eb4 = 3 slots apart). This is the
+        // past-leaf dispatch that blr's host bytes.
+        let mut got_past_slot = false;
+        let jstart = i.saturating_sub(4);
+        for j in jstart..=i {
+            let wj = u32::from_le_bytes([
+                image[j * 4],
+                image[j * 4 + 1],
+                image[j * 4 + 2],
+                image[j * 4 + 3],
+            ]);
+            if (wj & 0xffc0_0000) == 0xf940_0000 {
+                let rt = wj & 0x1f;
+                let rn = (wj >> 5) & 0x1f;
+                if rt == 8 && rn == 8 {
+                    let imm12 = (wj >> 10) & 0xfff;
+                    if (imm12 * 8) >= 0x60 {
+                        got_past_slot = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if got_past_slot {
+            // start = the ldr x8,[x0] slot (SH200/N115 window begins there),
+            // blr = the dispatch slot. Both are link vaddrs; guest = +0x100000000.
+            out.push(((ldr as u64) * 4, pc));
+        }
+    }
+    out
+}
+
 static ROUTEB_LOCK_OWNER_PATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// SH116: nativeInitializeNativeFlags' helper (file 0x2320710) reads the .bss
 /// global object via `adrp x8,7273000; ldr x0,[x8,#2480]` = *(guest 0x10672739c0).
@@ -6531,6 +6649,13 @@ fn main() {
                 // it like SH115/119 so V2Init/V2Start reach the SH199 world-build
                 // gate block 0x102368100 instead of soft-returning first.
                 routeb_patch_v2_dispatch();
+                // SH201: the ~365-site objB-getter singleton-dispatch family is
+                // LOCATED (sh201_v2_family_scan, precise getter+past-0x60+blr
+                // discriminator) but its runtime patch is NOT wired: the naive
+                // family-wide scribble crash-loops the run (SH55/64 region,
+                // over-patch — the exact restart SH200 warned about). Kept as a
+                // characterized lever + hermetic scanner, not a shipped patch.
+                // (Do NOT re-enable routeb_patch_v2_family at runtime.)
                 // SH120: the app-bridge event dispatch reads the shared dispatcher-
                 // node .bss global (0x10683a460) with an unseeded self-link; seed
                 // the DATA (NOT the generic shared leaf) to the benign empty state.
@@ -12518,6 +12643,73 @@ mod sh115_tests {
             assert_eq!(w4[i], w[i], "first 4 slots identical regardless of length");
         }
     }
+    #[test]
+    fn sh201_v2_family_scan_precise_discriminator() {
+        // Synthesize a minimal image with ONE genuine objB-getter dispatch site
+        // and one genuine in-band N<0xf0 dispatch (which must NOT be matched).
+        // Encode a `bl 0x6249eb8` at link 0x100 (byte offset 0x100).
+        let make_bl = |pc: u64, target: u64| -> u32 {
+            // AArch64 B/BL imm26 = (target - pc)/4 (PC = branch addr itself)
+            let off = target.wrapping_sub(pc);
+            let imm26 = ((off >> 2) as u32) & 0x3ff_ffff;
+            0x9400_0000u32 | imm26
+        };
+        let mut img = Vec::<u8>::new();
+        // helper: append a u32 word
+        fn w(img: &mut Vec<u8>, x: u32) {
+            img.extend_from_slice(&x.to_le_bytes());
+        }
+        // --- decoys @ link 0x0 (no getter prefix; must NOT match) ---
+        // in-band ldr x8,[x8,#0x40] (0x40<0x60) then blr, no getter
+        let decoy_ldr_hi = 0xf940_0000 | (0x40u32 / 8 << 10) | (8 << 5) | 8; // ldr x8,[x8,#0x40]
+        w(&mut img, decoy_ldr_hi);
+        w(&mut img, SH201_BLR_X8); // blr (no preceeding getter)
+        // another decoy: past-slot ldr x8,[x8,#0x70] + blr but NO getter
+        let decoy_past = 0xf940_0000 | (0x70u32 / 8 << 10) | (8 << 5) | 8; // ldr x8,[x8,#0x70] (>=0x60)
+        w(&mut img, decoy_past);
+        w(&mut img, SH201_BLR_X8);
+        // pad so the genuine block starts at 0x100
+        while img.len() < 0x100 {
+            w(&mut img, 0);
+        }
+        // --- genuine site @ link 0x100 ---
+        // bl 0x6249eb8 (objB getter)   @0x100
+        w(&mut img, make_bl(0x100, SH201_OBJ_GETTER));
+        // ldr x8,[x0]                  @0x104 (0xf9400008)
+        w(&mut img, SH201_LDR_X8_X0);
+        // ldr x8,[x8,#0x70] (past 0x60)@0x108
+        let imm12 = 0x70u32 / 8; // 14
+        w(&mut img, 0xf940_0000 | (imm12 << 10) | (8 << 5) | 8);
+        // blr x8                      @0x10c
+        w(&mut img, SH201_BLR_X8);
+        let sites = sh201_v2_family_scan(&img);
+        // exactly the one genuine site: (start=0x104, blr=0x10c)
+        assert_eq!(sites.len(), 1, "only the getter-gated past-0x60 site matches, got {sites:?}");
+        assert_eq!(sites[0], (0x104, 0x10c));
+    }
+
+    #[test]
+    fn sh201_v2_family_scan_real_image_nonempty() {
+        // Guard against a silent regression where the family scan returns 0 on
+        // the real binary (it found 384 on libroblox.so during SH201 dev). The
+        // real image path is present only on this VPS; skip elsewhere.
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if !p.exists() {
+            eprintln!("sh201 real-image test: no real libroblox.so present, skipping");
+            return;
+        }
+        let img = std::fs::read(p).expect("read real libroblox.so");
+        let sites = sh201_v2_family_scan(&img);
+        assert!(
+            sites.len() >= 100,
+            "real-image family scan must find >=100 objB-getter past-0x60 dispatch sites, got {}",
+            sites.len()
+        );
+        eprintln!("sh201 real-image family scan: {} sites", sites.len());
+    }
+
     #[test]
     fn sh115_sites_target_lazy_singleton_accessor_windows() {
         // Guest file vaddrs for the three accessor sites with their original
