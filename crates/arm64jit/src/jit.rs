@@ -1501,21 +1501,41 @@ fn routeb_dm_instance_ctor_capture(state: *mut CpuState, pc: u64) {
                 }
             });
         }
+        // SH190e (ScreenGui): the SGI ctor 0x247a984's derive body is diverted by its OWN sub-init
+        // `bl 0x4b5df04` at 0x247a99c (opcode 0x949b8d5a) before it reaches its vptr write at
+        // 0x247a9ac (`adrp x8,0x6628000; add #0x740; str x8,[x19]` = ScreenGui-class vptr
+        // 0x106628740). NOP that call so the SGI derive body continues to its own vptr write —
+        // exactly the PlayerGui pattern. Gated on the SGI pair-consumer 0x10247a88c entry pc.
+        static SGI_CALL_NOPPED: OnceLock<()> = OnceLock::new();
+        if pc == 0x10247a88c {
+            SGI_CALL_NOPPED.get_or_init(|| {
+                const SGI_SUBINIT_CALL: u64 = 0x10247a99c; // `bl 0x4b5df04` insn slot
+                if !routeb_ensure_writable(SGI_SUBINIT_CALL) {
+                    eprintln!("[routeb-dmins] SH190e: SGI sub-init call 0x{SGI_SUBINIT_CALL:x} not writable, skip");
+                    return;
+                }
+                let cur = unsafe { std::ptr::read_unaligned(SGI_SUBINIT_CALL as *const u32) };
+                if cur == 0xd503201f {
+                    eprintln!("[routeb-dmins] SH190e: SGI sub-init call already NOP at 0x{SGI_SUBINIT_CALL:x}");
+                } else if cur == 0x949b8d5a {
+                    unsafe { std::ptr::write_unaligned(SGI_SUBINIT_CALL as *mut u32, 0xd503201f) };
+                    eprintln!("[routeb-dmins] SH190e: NOP'd bl 0x4b5df04 at 0x{SGI_SUBINIT_CALL:x} (0x949b8d5a -> 0xd503201f) so the ScreenGui derive body runs and writes 0x106628740");
+                } else {
+                    eprintln!("[routeb-dmins] SH190e: unexpected opcode at 0x{SGI_SUBINIT_CALL:x} = {cur:#x} (want 0x949b8d5a), skip");
+                }
+            });
+        }
     }
-    // SH190c (Route-B PlayerGui member-seed, opt-in JIT_ROUTEB_DM_INSTANCE_NOP, diagnostics only):
-    // the derive body, after the call-site NOP, writes the PlayerGui-class vptr 0x106648950 at
-    // obj+0 (0x255d21c) then copy-assigns a std::string member (setter 0x2374d4c -> 0x5e1f380) whose
-    // mempool-garbage long-form __data_ pointer it derefs -> fault at 0x5e1f44c `ldr x9,[x20,#16]!`.
-    // EMPIRICAL ABI (crash dump + disasm): the string member is at obj+0x60, its __data_ lives at
-    // obj+0x70, and the assign helper reads [__data_+#8]/[+#16] UNCONDITIONALLY. So obj+0x60 must be
-    // a coherent LONG-FORM (cap bit0=1) empty string whose __data_ = a real zeroed buffer. A zeroed
-    // SSO fails (obj+0x70=NULL -> [0+8] faults); a cap constant fails (obj+0x70=0x101 -> [0x109]).
-    // Seed: obj+0x60 = LONG-FORM empty {cap=cap|1 long, size 0, __data_=zeroed 0x100 buffer}. Also
-    // zero the leading SSO members [obj+0x40,obj+0x60) and [obj+0x78,obj+0xa8) (adjacent strings).
-    // The derive body overwrites scalar/pointer fields above +0x158; we only seed the lower window
-    // it assigns into first. Gate: NOP env + exact PlayerGui ctor-entry pc + a readable/writable
-    // nontrivial object. Idempotent + transient (object is allocated per-drive).
-    if std::env::var_os("JIT_ROUTEB_DM_INSTANCE_NOP").is_some() && pc == PGI_CTOR_ENTRY {
+    // SH190d/e (Route-B PlayerGui + ScreenGui member-seed, opt-in JIT_ROUTEB_DM_INSTANCE_NOP,
+    // diagnostics only): after the call-site NOP(s), the derive body writes the class vptr then
+    // copy-assigns std::string members (setter 0x2374d4c -> 0x5e1f380) whose mempool-garbage
+    // long-form __data_ it derefs -> fault at 0x5e1f44c. EMPIRICAL ABI: the string member is at
+    // obj+0x60, its __data_ at obj+0x70, and the helper reads [__data_+#8]/[+#16] UNCONDITIONALLY
+    // (long-form). A zeroed SSO fails (NULL->[0x8]); a cap constant fails (0x101->[0x109]); a real
+    // buffer works. Seed obj+0x60 = coherent LONG-FORM empty string {cap|1 long, size 0,
+    // __data_=zeroed buffer}, + zero [obj+0x40,0x60) & [obj+0x78,0xa8) as EMPTY SSO. Same window
+    // works for both PlayerGui (obj+0x60..) and ScreenGui (obj+0x60..) derives (both setter-driven).
+    if std::env::var_os("JIT_ROUTEB_DM_INSTANCE_NOP").is_some() && (pc == PGI_CTOR_ENTRY || pc == SGI_CTOR_ENTRY) {
         let obj0 = unsafe { (*state).x[0] };
         if obj0 > 0x1000 && obj0 != u64::MAX && page_is_mapped(obj0) {
             const SSO_LO: u64 = 0x40;
@@ -1538,11 +1558,9 @@ fn routeb_dm_instance_ctor_capture(state: *mut CpuState, pc: u64) {
                     std::ptr::write_volatile((obj0 + STR_BASE + 0x8) as *mut u64, 0); // __size_
                     std::ptr::write_volatile((obj0 + STR_BASE + 0x10) as *mut u64, buf); // __data_ @ obj+0x70
                 }
-                eprintln!(
-                    "[routeb-dmins] SH190c: seeded obj+0x{STR_BASE:x} ({obj0:#x}) LONG-FORM empty {{cap=0x{BUF_SZ:02x}|1,size=0,data={buf:#x} @obj+0x{STR_BASE:02x}+0x10}} + SSO windows [{obj0:#x}+0x{SSO_LO:x},+0x{SSO_HI:x}) & [+0x{STR_BASE:02x}+0x18,+0x{STR_TAIL_HI:x}) at ctor-entry (derive copy-assign fault 0x5e1f44c)"
-                );
+                eprintln!("[routeb-dmins] SH190d/e: seeded {pc:#x} obj+0x{STR_BASE:x} ({obj0:#x}) LONG-FORM empty {{cap=0x{BUF_SZ:02x}|1,size=0,data={buf:#x}}} + SSO windows at ctor-entry");
             } else {
-                eprintln!("[routeb-dmins] SH190c: obj {obj0:#x} not writable, string-member seed skipped");
+                eprintln!("[routeb-dmins] SH190d/e: obj {obj0:#x} not writable, member-seed skipped");
             }
         }
     }
@@ -1712,6 +1730,47 @@ fn routeb_dm_instance_guard(_state: *mut CpuState, pc: u64) {
                 }
             }
             Err(e) => eprintln!("[routeb-dmins] SH189c: PlayerGui pair-consumer drive err: {e} (next gate)"),
+        }
+        // Capture the PGI obj atomic BEFORE the SGI drive overwrites it (the two drives share the
+        // single ROUTEB_DM_CTOR_OBJ capture atomic; restore it after SGI so the PGI artifact stands).
+        let captured_pgi_backup = ROUTEB_DM_CTOR_OBJ.load(std::sync::atomic::Ordering::Relaxed);
+        // SH190e (Route-B ScreenGui instance construction, same lever): drive the ScreenGui
+        // pair-consumer 0x10247a88c (bl ScreenGui class-register getter 0x201f42c, then getOrCreate
+        // functor -> ScreenGui ctor 0x247a984 -> vptr 0x106649ce0) with x0=dm + x8=&out, exactly the
+        // PlayerGui pattern. Under JIT_ROUTEB_DM_INSTANCE_NOP the member-seed (obj+0x60 long-form
+        // empty + SSO windows) applies at SGI_CTOR_ENTRY too, so the derive body completes. Note the
+        // shared ROUTEB_DM_CTOR_OBJ atomic is overwritten by the SGI ctor-entry capture — so walk the
+        // SGI object via its own ret (the SGI pair-consumer returns the op-new'd ScreenGui).
+        const SGI_CONSUMER_C: u64 = 0x10247a88c; // ScreenGui pair-consumer
+        const SGI_VPTR_WANT: u64 = 0x106649ce0; // ScreenGui class vptr (recon SH190b; observed on the constructed obj)
+        let out2 = Box::leak(vec![0x0u8; 0x40].into_boxed_slice()).as_mut_ptr() as u64;
+        let tp = crate::jit::current_guest_tp();
+        match crate::jit::run_guest_callback_x8(SGI_CONSUMER_C, [dm, 0, 0, 0, 0, 0, 0, 0], out2, tp) {
+            Ok(r2) => {
+                let a2 = unsafe { std::ptr::read_unaligned(out2 as *const u64) };
+                let b2 = unsafe { std::ptr::read_unaligned((out2 + 8) as *const u64) };
+                // The SGI object is the one CAPTURED at SGI_CTOR_ENTRY (block-entry fires into
+                // ROUTEB_DM_CTOR_OBJ while the SGI ctor body runs). The pair-consumer's ret x0 is
+                // the "Invalid da..." string (red herring, same as PGI) — walk the captured obj.
+                let captured_sgi = ROUTEB_DM_CTOR_OBJ.load(std::sync::atomic::Ordering::Relaxed);
+                let vp2 = if captured_sgi != 0 && captured_sgi > 0x1000 && page_is_mapped(captured_sgi) {
+                    unsafe { std::ptr::read_unaligned(captured_sgi as *const u64) }
+                } else if r2 != 0 && r2 > 0x1000 && page_is_mapped(r2) {
+                    unsafe { std::ptr::read_unaligned(r2 as *const u64) }
+                } else if a2 != 0 && a2 > 0x1000 && page_is_mapped(a2) {
+                    unsafe { std::ptr::read_unaligned(a2 as *const u64) }
+                } else {
+                    0
+                };
+                if vp2 == SGI_VPTR_WANT {
+                    eprintln!("[routeb-dmins] SH190e: *** CONFIRMED — engine SELF-CONSTRUCTED a real RBX::ScreenGui instance at {captured_sgi:#x} (vptr 0x{SGI_VPTR_WANT:x}) headlessly ***");
+                } else {
+                    eprintln!("[routeb-dmins] SH190e: ScreenGui pair-consumer 0x{SGI_CONSUMER_C:x} DROVE ok ret x0={r2:#x}; out={{{a2:#x},{b2:#x}}} ctor-obj={captured_sgi:#x} obj-vptr={vp2:#x} (want 0x{SGI_VPTR_WANT:x})");
+                }
+                // restore the PGI captured obj (the SGI drive overwrote ROUTEB_DM_CTOR_OBJ).
+                ROUTEB_DM_CTOR_OBJ.store(captured_pgi_backup, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(e) => eprintln!("[routeb-dmins] SH190e: ScreenGui pair-consumer drive err: {e} (next gate)"),
         }
     });
 }
@@ -5998,15 +6057,22 @@ mod tests {
             0x4142_4344_4546_4748,
             "env-off must not seed"
         );
-        // env ON + wrong pc (ScreenGui ctor-entry, share the NOP-env condition but wrong ctor) -> no seed.
+        // env ON + wrong pc (a non-ctor pc, e.g. the governor tail) -> no seed.
         unsafe { std::env::set_var("JIT_ROUTEB_DM_INSTANCE", "1") };
         unsafe { std::env::set_var("JIT_ROUTEB_DM_INSTANCE_NOP", "1") };
-        routeb_dm_instance_ctor_capture(&mut st as *mut CpuState, SGI_CTOR_ENTRY);
+        routeb_dm_instance_ctor_capture(&mut st as *mut CpuState, 0x102e9fcc4);
         assert_eq!(
             unsafe { std::ptr::read_volatile((obj + 0x60) as *const u64) },
             0x4142_4344_4546_4748,
             "wrong pc must not seed"
         );
+        // env ON + ScreenGui ctor-entry -> seeds too (the SGI derive is member-seed covered).
+        routeb_dm_instance_ctor_capture(&mut st as *mut CpuState, SGI_CTOR_ENTRY);
+        let sgi_cap = unsafe { std::ptr::read_volatile((obj + 0x60) as *const u64) };
+        assert_eq!(sgi_cap & 1, 1, "SGI ctor-entry must seed long-form string too");
+        // restore the garbage so the PGI assertion below measures only the PGI seed fresh.
+        unsafe { std::ptr::write_volatile((obj + 0x60) as *mut u64, 0x4142_4344_4546_4748) };
+        unsafe { std::ptr::write_volatile((obj + 0x78) as *mut u64, 0x4142_4344_4546_4748) };
         // env ON + exact PGI ctor-entry -> SSO windows zeroed + LONG-FORM string at obj+0x60.
         routeb_dm_instance_ctor_capture(&mut st as *mut CpuState, PGI_CTOR_ENTRY);
         let mut sso_all_zero = true;

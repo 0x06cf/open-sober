@@ -79,6 +79,26 @@ resolver can answer the DM's getService by name.
 3. The PlayerGui SERVICE NODE + ScreenGui INSTANCE stay the migration gate (vt-dispatched ctor /
    live app-shell). Do NOT re-derive the service node (recon-negative). The cone stays armed.
 
+## SH190e (Sep 16, 2026, hermes-worker): BOTH GuiObject-family instances self-construct headlessly — PlayerGui (0x106648950) AND ScreenGui (0x106649ce0). The SH189b 'no ScreenGui instance' recon-negative is now crossed.
+Extends the SH190d lever to the ScreenGui pair-consumer 0x10247a88c: (1) call-site NOP of the SGI
+ctor's sub-init `bl 0x4b5df04` at 0x247a99c (0x949b8d5a -> 0xd503201f, mirrors PlayerGui's NOP so
+the derive body runs to its own vptr write); (2) the SAME string-member seed at SGI_CTOR_ENTRY
+0x10247a984 (obj+0x60 long-form empty + SSO windows); (3) a second drive via run_guest_callback_x8
+(SGI_CONSUMER_C, x0=dm, x8=&out). The SGI object is read from the shared ROUTEB_DM_CTOR_OBJ capture
+atomic (overwritten by the SGI ctor-entry), the PGI captured obj restored after. The ScreenGui
+class vptr is 0x106649ce0 (recon SH190b; NOT the 0x106628740 the sub-init secondary write clobbers —
+walking the constructed object shows the type vptr 0x106649ce0).
+EMPIRICAL (real libroblox.so, llvmpipe, 2/2 EXIT 124, 0 SIGSEGV/SIGABRT):
+```
+SH189c: *** CONFIRMED — engine SELF-CONSTRUCTED a real RBX::PlayerGui instance ... (vptr 0x106648950) headlessly ***
+SH190e: *** CONFIRMED — engine SELF-CONSTRUCTED a real RBX::ScreenGui instance ... (vptr 0x106649ce0) headlessly ***
+```
+Default (NOP-off) + PlayerGui-only paths unregressed (3/3 clean). COMMITS: <SH190ECOMMIT>.
+NEXT (honest): both instances are STANDALONE — PlayerGui still not a service NODE on [dm+0x68]
+([node+0x18]==0x87e), ScreenGui not parented under it, neither attached to the scene-scan
+(R+0x180/0x188). The scene-attach layer (live-app-shell/vt-dispatched service arming) is the
+standing frontier. Cone stays armed.
+
 ## SH190d (Sep 16, 2026, hermes-worker): FULL PLAYERGUI SELF-CONSTRUCTION — the derive body COMPLETES and [obj+0]=0x106648950 (the PlayerGui-class vptr) is written headlessly. Supersedes SH190c's 'crash at the next member' gate.
 The SH190c call-site NOP (`bl 0x255d2f4` @ 0x10255d200 -> NOP) + a NEW string-member seed makes the
 PlayerGui derive body run ENTIRELY to completion. Root cause of the SH190c post-write crash
