@@ -7250,6 +7250,30 @@ fn main() {
                         // overwrite our SH156 seed here (never observed in ~30
                         // recon angles; the holder is relocation/session-built).
                         let holder = rd8(0x106391908);
+                        // SH197: now that the do-init -> app-shell ctor -> governor
+                        // continuation executes real code headlessly, its in-context
+                        // app-data-model register 0x2208354 -> bulk registrar 0x2208ae8
+                        // may populate the class-name RESOLVER map 0x106dca0e70 (the
+                        // map SH194 found EMPTY {0,0} when only driven standalone).
+                        // Probe its header {begin,end,count} + the REGISTER map
+                        // 0x106dca0f60 + resolver SOURCE 0x106dca0e90. These .bss pages
+                        // are left unmapped by the engine boot (SH116/SH196b class), so
+                        // map them first (SH156/SH194 pattern) or the read is meaningless
+                        // u64::MAX. begin!=0&&end!=0 => name->classid resolution is live.
+                        for mp in [0x106dca000u64, 0x106dca0f60, 0x106dca0e90] {
+                            arm64jit::jit::routeb_ensure_writable(mp);
+                        }
+                        let resolve_begin = rd8(0x106dca0e70);
+                        let resolve_end = rd8(0x106dca0e78);
+                        let resolve_count = rd8(0x106dca0e88);
+                        let src_begin = rd8(0x106dca0e90);
+                        let src_end = rd8(0x106dca0e98);
+                        let reg_begin = rd8(0x106dca0f60);
+                        let reg_end = rd8(0x106dca0f68);
+                        let resolve_live = resolve_begin != 0 && resolve_end != 0 && resolve_begin != u64::MAX;
+                        eprintln!(
+                            "[elfjit:dmcells] map-resolver[0x106dca0e70]={{0x{resolve_begin:x},0x{resolve_end:x},n=0x{resolve_count:x} live={resolve_live}}} src[0x106dca0e90]={{0x{src_begin:x},0x{src_end:x}}} register[0x106dca0f60]={{0x{reg_begin:x},0x{reg_end:x}}}"
+                        );
                         eprintln!(
                             "[elfjit:dmcells] SH196 do-init: once-guard[0x106a68410]={once_guard:#x} once-slot[0x106a68408]=0x{once_slot:x} DM-root[0x106a68818]=0x{dm_root:x} flags-latch[0x106a683e8]=0x{flags_latch:x} app-data-model[0x106dca000+0xe88]=0x{appdm:x} holder[0x106391908]=0x{holder:x}"
                         );

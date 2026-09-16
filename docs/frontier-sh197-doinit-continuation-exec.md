@@ -68,3 +68,29 @@ Run-variable: V2InitWithParams/V2StartAppWithParams occasionally stop at a tiny
 `pc 0x229/0x188 outside image` (unseeded singleton-vtable host-pointer class, SH176/SH103/
 SH109) — not this cycle's focus, and the continuation-chain finding is independent of it
 (the rung that matters, StartLuaAppDM -> do-init continuation, completes cleanly).
+
+## 5. Follow-on negative: resolver-map NOT populated even in-context (SH194 gate holds)
+
+Because the do-init -> app-shell ctor continuation now runs real code in-context, it calls
+the app-data-model register `0x2208354` which reaches the bulk registrar `0x2208ae8` — the
+exact writer SH194 identified for the class-name RESOLVER map `0x106dca0e70`. SH194 only
+drove that registrar *standalone* (host-slot + bad_weak_ptr, map stayed {0,0}); the open
+lever was "does it construct the map when reached in-context from the live continuation?"
+Measured at HEAD (default-inert `[elfjit:dmcells]` probe, JIT_THREADS+JIT_DMCELLS, pages
+ensure-writable-mapped first per SH156/SH194): **resolver[0x106dca0e70]={0,0,0 live=false},
+source[0x106dca0e90]={0,0}, register[0x106dca0f60]={0,0}** — all empty, 0 crashes, EXIT 124.
+The registrar runs but its SOURCE is empty pre-world-build, so it inserts nothing.
+=> name->classid resolution (the SH194 gate) is confirmed closed even with the continuation
+live: the resolver map needs a live class-registry world-build, not the do-init continuation.
+This removes the last "in-context may populate the resolver" hypothesis; SH191's linked
+PlayerGui service-node walker stays latent (fires only on a real session).
+
+## 6. NEXT (honest, after both measurements)
+
+The do-init continuation executes; the governor tail runs; but (a) the app-data-model
+cell is unmapped (no self-built DM from the world-build) and (b) the class-name resolver
+map stays empty even in context. So neither the do-init world-build nor the continuation
+produces the missing live-DM / resolver-map pieces. The next lever on the manufacture line
+is the governor MODERN startAppWithParams blob-path (get it past the run-variable
+outside-image stop) or a fresh region-watch on what the app-shell ctor / governor builds
+with a NON-empty source. Unchanged structural gate: a live class-registry world-build.
