@@ -553,6 +553,14 @@ fn next_asset_handle() -> u64 {
 /// AssetManager headlessly; the manager identity is the host assets root).
 const ASSET_MANAGER: u64 = 0x7f000000_0001;
 
+/// [asset-trace] logging gate (pure, for jit.rs hermetic tests). Default-inert:
+/// nothing logs unless JIT_ASSET_TRACE is set, so the product path is runtime-
+/// identical. This is the operator's delegated "log the engine's first
+/// rbxasset:// request to name the R1 CoreScript file to match" diagnostic.
+pub(crate) fn asset_trace_enabled() -> bool {
+    std::env::var_os("JIT_ASSET_TRACE").is_some()
+}
+
 extern "C" fn aassetmanager_fromjava(
     _env: u64, _instance: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
 ) -> u64 {
@@ -579,6 +587,7 @@ extern "C" fn aassetmanager_open(
     // echoes the same path back. Normalize any absolute assets/ prefix away.
     let rel = name.strip_prefix("assets/").unwrap_or(name);
     let joined = root.join(rel);
+    let trace = asset_trace_enabled();
     let Ok(bytes) = std::fs::read(&joined) else {
         // SH164 content-path fallback: the engine's LocalAssetURI for the app-shell
         // patch is "models/UniversalApp/UniversalApp.rbxm" while the physical asset
@@ -590,16 +599,39 @@ extern "C" fn aassetmanager_open(
         match rel2 {
             Some(under_models) => match std::fs::read(root.join("ExtraContent").join("models").join(under_models)) {
                 Ok(bytes2) => {
+                    if trace {
+                        eprintln!(
+                            "[asset-trace] open '{name}' -> HIT-fallback (re-root ExtraContent/models/{under_models:?}, {} bytes)",
+                            bytes2.len()
+                        );
+                    }
                     let boxed: Box<[u8]> = bytes2.into_boxed_slice();
                     let h = next_asset_handle();
                     open_assets().lock().unwrap().insert(h, boxed);
                     return h;
                 }
-                Err(_) => return 0,
+                Err(_) => {
+                    if trace {
+                        eprintln!(
+                            "[asset-trace] open '{name}' -> MISS (root={root:?}) re-root {rel2:?} also MISS"
+                        );
+                    }
+                    return 0;
+                }
             },
-            None => return 0,
+            None => {
+                if trace {
+                    eprintln!(
+                        "[asset-trace] open '{name}' -> MISS (root={root:?}, rel={rel:?}) no models/ fallback"
+                    );
+                }
+                return 0;
+            }
         }
     };
+    if trace {
+        eprintln!("[asset-trace] open '{name}' -> HIT (root={root:?}, rel={rel:?}, {} bytes)", bytes.len());
+    }
     let boxed: Box<[u8]> = bytes.into_boxed_slice();
     let h = next_asset_handle();
     open_assets().lock().unwrap().insert(h, boxed);
@@ -2131,6 +2163,21 @@ mod tests {
 
         unsafe { std::env::remove_var("SOBER_ASSETS_ROOT") };
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// JIT_ASSET_TRACE is the operator's delegated "log the engine's first
+    /// rbxasset:// request to name the R1 CoreScript file to match" diagnostic.
+    /// Default-inert: with the env absent nothing logs (asset shims behave
+    /// identically to the pre-trace path), and the gate is a pure helper so a
+    /// hermetic test can pin the behavior without stderr capture.
+    #[test]
+    fn asset_trace_gate_is_default_inert_and_env_optin() {
+        unsafe { std::env::remove_var("JIT_ASSET_TRACE") };
+        assert_eq!(asset_trace_enabled(), false, "JIT_ASSET_TRACE unset -> no tracing");
+        unsafe { std::env::set_var("JIT_ASSET_TRACE", "1") };
+        assert_eq!(asset_trace_enabled(), true, "JIT_ASSET_TRACE set -> tracing on");
+        unsafe { std::env::remove_var("JIT_ASSET_TRACE") };
+        assert_eq!(asset_trace_enabled(), false, "removed again -> inert");
     }
 
     /// The native-window layer is coherent: ANativeWindow_fromSurface hands out a
