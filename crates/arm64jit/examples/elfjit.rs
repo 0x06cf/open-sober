@@ -12922,6 +12922,15 @@ mod sh115_tests {
             // patch sites can't silently drift.
             assert_eq!(w(0x2856f24), 0x5280_0044, "heartbeat w4#2 orig = mov w4,#2");
             assert_eq!(w(0x2856f68), 0x5280_0064, "heartbeat w4#3 orig = mov w4,#3");
+            // type-4 dispatch site (recon-v3 self-driven-frame plane): the site the
+            // heartbeat patch routes into and the --taskv4-seed host-thunk dispatching
+            // through. `adrp x8,6829000; ldr x3,[x8,#3752]; cbz x3,skip; ...; br x3`
+            // (guest 0x102853784; file vaddr 0x2853784). A drift in these words would
+            // silently break the deliverable, so pin all four.
+            assert_eq!(w(0x2853784), 0xd001fea8, "type-4 dispatch: adrp x8,6829000");
+            assert_eq!(w(0x2853788), 0xf9475503, "type-4 dispatch: ldr x3,[x8,#3752] (vector)");
+            assert_eq!(w(0x285378c), 0xb4001b23, "type-4 dispatch: cbz x3,0x2853af0 (null-vector skip)");
+            assert_eq!(w(0x28537b8), 0xd61f0060, "type-4 dispatch: br x3 (tail into seeded vector)");
             // SendAppEventOnAppReady 'Home' discriminator (SH206 pin):
             // len==4 'Home' path -> movz w19,#4; ALT -> movz w19,#1.
             assert_eq!(w(0x2bb47c4), 0x5280_0093, "'Home' path discriminator = movz w19,#4");
