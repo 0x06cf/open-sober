@@ -13528,6 +13528,66 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh228_engineinit_dispatcher_sub_never_fires_blocks() {
+        // SH228 (Route-B re-attack, single-agent): closes SH166's explicitly-left-open
+        // question (a) — "does the vt[+0x1f0] dispatch execute, or is it diverted?" — at
+        // full block-entry confidence. Fresh region-watch (4 windows in ONE completing
+        // --v2boot ladder run, DMCONT=1): fnB (0x102bd1b98) AND the dispatcher
+        // (0x102bd8ce8) BOTH fire as their own block entries, but sub_2bd8dac (the
+        // `bl 0x2bd8dac` at 0x2bd8d60 is UNCONDITIONAL) and continueAfterFlagsLoaded_
+        // (0x102bd1d68) NEVER fire. Since the JIT creates a fresh block entry for each
+        // distinct function target, a separate-function entry that never appears as a
+        // block is ENTERED-NEVER (block-entry-definitive), not region-watch-blind.
+        // This (a) closes SH166(a) as a DEFINITIVE NEGATIVE, and (b) CORRECTS SH226's
+        // completion mechanism: SH226 claimed the pipeline "benign-completes via its
+        // 2nd-frame (sub_2bd8dac) -> 0x102bd9058 soft-return" — but sub_2bd8dac never
+        // even enters as a block, so the dispatcher completes through resolve/leaf
+        // paths WITHOUT reaching sub, and the +0x1f0 blr at 0x2bd8e28 never runs.
+        // Standing bottom line (unchanged): DMCONT continuation unreached; live-DM =
+        // structural gate. Each of the three anchor sites must stay pinned so a drift
+        // fails loudly instead of silently re-measuring 0 region hits.
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if p.exists() {
+            let el = libloader::elf::load_elf_image(p).expect("load real libroblox.so");
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            // [1] The unconditional `bl 0x2bd8dac` (sub) in the dispatcher — reached
+            //     only by falling through the +0xf8 / +0x108 leaves. If it drifts, the
+            //     measured "sub never fires" vanishes without a loud failure.
+            assert_eq!(word(0x102_bd8d60), 0x94000013, "sh228 dispatcher unconditional bl sub 0x2bd8dac");
+            assert_eq!(word(0x102_bd8d5c), 0xaa1403e0, "sh228 dispatcher mov x0,x20 (pre-bl sub)");
+            // [2] sub entry + the +0x1f0 dispatch inside it (the never-reached site).
+            assert_eq!(word(0x102_bd8dac), 0xd104c3ff, "sh228 sub_2bd8dac entry sub sp,#0x130");
+            assert_eq!(word(0x102_bd8e18), 0xf9400008, "sh228 sub ldr x8,[x0] (manager vt)");
+            assert_eq!(word(0x102_bd8e20), 0xf940f908, "sh228 sub ldr x8,[x8,#0x1f0] (vt+0x1f0)");
+            assert_eq!(word(0x102_bd8e28), 0xd63f0100, "sh228 sub blr x8 (dispatch vt+0x1f0)");
+            // [3] The two leaf-vt dispatches that come BEFORE the unconditional bl sub —
+            //     the leak: if either returns a diverted path, sub is skipped.
+            assert_eq!(word(0x102_bd8d24), 0xf9407d08, "sh228 dispatcher ldr x8,[x8,#0xf8] (vt+0xf8)");
+            assert_eq!(word(0x102_bd8d2c), 0xd63f0100, "sh228 dispatcher blr x8 (vt+0xf8 leaf)");
+            assert_eq!(word(0x102_bd8d38), 0xf9408508, "sh228 dispatcher ldr x8,[x8,#0x108] (vt+0x108)");
+            assert_eq!(word(0x102_bd8d50), 0xd63f0100, "sh228 dispatcher blr x8 (vt+0x108 leaf)");
+            // [4] continueAfterFlagsLoaded_ entry (must stay pinned: its non-appearance as
+            //     a block entry is the whole measured negative).
+            assert_eq!(word(0x102_bd1d68), 0xa9ba7bfd, "sh228 continueAfterFlagsLoaded_ prologue");
+            for (guest, name) in [
+                (0x102_bd8d60u64, "bl sub"), (0x102_bd8dacu64, "sub entry"),
+                (0x102_bd8e28u64, "blr vt+0x1f0"), (0x102_bd1d68u64, "continueAfterFlagsLoaded_"),
+            ] {
+                assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh228 {name} {guest:#x} in window");
+                assert!(guest & 3 == 0, "sh228 {name} {guest:#x} 4-aligned");
+            }
+            eprintln!("sh228 engine-init dispatcher sub/continueAfterFlagsLoaded_ anchors pinned on libroblox.so");
+        } else {
+            eprintln!("sh228 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh115_sites_target_lazy_singleton_accessor_windows() {
         // Guest file vaddrs for the three accessor sites with their original
         // slot0 (mov) guard bytes — the patch refuses to write if these shift.
