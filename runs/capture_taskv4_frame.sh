@@ -31,8 +31,8 @@ echo "=== TASK-DRIVEN FRAME PRESENTED (the deliverable marker) ==="
 grep -E "taskv4-frame\] present #" "$LOG" | tail -5
 echo "=== present count ==="
 grep -cE "taskv4-frame\] present #" "$LOG"
-echo "=== total w4=4 dispatches reaching the thunk ==="
-grep -oE "task #[0-9]+" "$LOG" | tail -1
+echo "=== total w4=4 dispatches reaching the thunk (incl. pre-recovery skips) ==="
+grep -oE "dispatch #[0-9]+" "$LOG" | tail -1
 echo "=== node pops (real task-driven drain activity) ==="
 grep -cE "NODE .* POPPED" "$LOG"
 echo "=== json-overflow / crash summary ==="
