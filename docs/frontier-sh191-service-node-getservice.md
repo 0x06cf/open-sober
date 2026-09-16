@@ -54,3 +54,37 @@ map on page 0x6dca000 needs its own writer). If the map is populated, the getSer
 will resolve "PlayerGui"→0x87e and return the linked instance (item vptr 0x106648950) — the
 engine genuinely returning its self-constructed PlayerGui as a service API to the caller
 headlessly. The scene-attach layer (R+0x180/0x188) sits behind that.
+
+## SH192 addendum (empirical recon-negative, do-not-re-tread)
+
+**The resolver-map registrar is LOCATED but non-constructive standalone.** The bulk
+class-name registrar that fills 0x106dca0e70 is **0x2208ae8** (in-image symbol
+`nativeGameGlobalInit+0x26e4`) — it IS reached during the headless ladder (region-watch
+`JIT_REGION_WATCH=0x102208ae8-0x102208e30` logs entries at 0x102208ae8/0x102208b6c/0x102208cf8
+every clean run). Decoded contract: `x0=&{key_ptr,key_len}` (16B), it hashes the key into the
+open-addressing table at 0x106dca0e70, inserts {key_ptr,key_len,classid} (stride 0x18,
+classid@+0x10), returns `x0=&element.classid` for the caller to fill.
+
+**Attempted (SH192, built + reverted, do NOT rebuild):** extend `routeb_dm_service_resolve_guard`
+to `routeb_ensure_writable` the map pages (0x106dca0e70/0x106dca0e90/0x106dca0f60) then
+drive 0x102208ae8 with a fabricated {&"PlayerGui",9} key and write 0x87e into the returned
+classid slot, then re-drive the getService walker. **Empirical result (3/3):** the registrar
+returns Ok with a HOST-heap slot (0x7f..036f90, NOT a guest map element), the resolver map
+stays `{0,0} EMPTY`, and the run afterwards aborts with
+`libc++abi: terminating ... bad_weak_ptr`. Root cause: 0x106dca0e70 is a *std::unordered_map
+object whose construction (bucket array + node allocator + count word at 0x106dca0e88) only
+runs inside live nativeGameGlobalInit*; headless global-init invokes the registrar with an
+EMPTY SOURCE (the per-class source vector 0x106dca0e90, itself only populated by the same
+world-build), so it inserts nothing and never constructs the map. Driving the registrar
+standalone on the raw zeroed map object lets it hash against garbage → returns a host slot
+and corrupts the shared map → later bad_weak_ptr on the real resolver consumer.
+
+**Conclusion (exactly the SH191 wall, now with the registrar identified):** the name→classid
+resolver map 0x106dca0e70 is constructed + populated only by the live class-registry
+world-build (same Route-B live-DM wall). Its registrar is headless-REACHABLE but inserts
+nothing because the class-name SOURCE (0x106dca0e90) is empty pre-world-build. Do NOT
+re-attempt driving 0x2208ae8 standalone; do NOT hand-write the hash element (SH189 warning).
+The getService "PlayerGui"→0x87e resolution, and thus the linked-node RETURN from the
+walker, sits behind the live class-registry construction. Scene-attach (R+0x180/0x188)
+remains behind that. Clean SH191 (link node + walker executes cleanly, not-found) is the
+shipped state — re-verified 3/3 EXIT 124, 0 SIGSEGV/0 SIGABRT.
