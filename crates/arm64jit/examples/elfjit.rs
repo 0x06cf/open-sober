@@ -12903,6 +12903,66 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh211_routeb_wiring_and_render_plane_opcode_anchors() {
+        // Byte-pin the load-bearing .text opcodes that the recon-v3 self-driven
+        // frame plane and the SH210 Route-B wiring verification depend on, so a
+        // future disassembly/patch error or in-image shift fails loudly instead
+        // of silently feeding the fetch/seed at the wrong byte (same guard
+        // family as sh116b/sh200). All are confirmed on the real libroblox.so;
+        // skipped when the image is absent (only this VPS keeps it).
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let w = |off: usize| -> u32 { u32::from_le_bytes([img[off], img[off+1], img[off+2], img[off+3]]) };
+            // type-4 drain idle heartbeats (recon-v3 capture_taskv4_frame.sh):
+            // patched to mov w4,#4 (0x52800084) to route every idle drain dispatch
+            // through the seeded type-4 vector. Pin the ORIGINAL words so the
+            // patch sites can't silently drift.
+            assert_eq!(w(0x2856f24), 0x5280_0044, "heartbeat w4#2 orig = mov w4,#2");
+            assert_eq!(w(0x2856f68), 0x5280_0064, "heartbeat w4#3 orig = mov w4,#3");
+            // SendAppEventOnAppReady 'Home' discriminator (SH206 pin):
+            // len==4 'Home' path -> movz w19,#4; ALT -> movz w19,#1.
+            assert_eq!(w(0x2bb47c4), 0x5280_0093, "'Home' path discriminator = movz w19,#4");
+            assert_eq!(w(0x2bb47cc), 0x5280_0033, "ALT discriminator = movz w19,#1");
+            eprintln!("sh211 real-image opcode anchors verified on libroblox.so");
+        } else {
+            eprintln!("sh211 real-image guard: no real libroblox.so, skipping byte pins");
+        }
+        // Guest = file vaddr + 0x100000000 (the identity-load transform every
+        // seed/patch uses). Pin the transform + 4-alignment for the same sites.
+        let anchors: [(u64, u64); 4] = [
+            (0x2856f24, 0x102856f24), // heartbeat w4#2
+            (0x2856f68, 0x102856f68), // heartbeat w4#3
+            (0x2bb47c4, 0x102bb47c4), // SendAppEvent 'Home' discriminator
+            (0x2bb47cc, 0x102bb47cc), // SendAppEvent ALT
+        ];
+        for (file, guest) in anchors {
+            assert_eq!(file.wrapping_add(0x1_0000_0000), guest, "guest = file + 0x100000000");
+            assert!(guest & 3 == 0, "site must be 4-aligned");
+            assert!(guest < 0x120_0000_00, "site within canonical identity-map window");
+        }
+        // Wiring cells (routeb_lever addresses) must sit in the identity-map
+        // window, 8-aligned as u64 slots. These are .bss/.data (no on-disk byte
+        // to pin), but this catches a mis-based/typo'd constant cheaply.
+        let cells: [u64; 8] = [
+            0x106829ea8, // type-4 producer vector (recon-v3 self-drive seed)
+            0x10683d348, // G1 surface XID cell (--v2boot-surface-handoff)
+            0x10726d600, // G3 files-dir libc++ string cell (--v2boot-set-filesdir)
+            0x106a70880, // SH157 governor router flag
+            0x106391908, // SH174 capture-latch arm (current-DM holder getter)
+            0x106a683e8, // flags-loaded latch (do-init getter 0x2206738)
+            0x106a68410, // do-init once-guard bit0 (__call_once gate)
+            0x106a68818, // DM-root (match dispatch slot)
+        ];
+        for c in cells {
+            assert!(c >= 0x1_0000_0000 && c < 0x120_0000_00, "cell 0x{c:x} in identity-map window");
+            assert!(c & 7 == 0, "cell 0x{c:x} 8-aligned u64 slot");
+        }
+    }
+
+    #[test]
     fn sh115_sites_target_lazy_singleton_accessor_windows() {
         // Guest file vaddrs for the three accessor sites with their original
         // slot0 (mov) guard bytes — the patch refuses to write if these shift.
