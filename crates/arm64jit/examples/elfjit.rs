@@ -13212,6 +13212,45 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh223_dm_creator_region_entries_pinned() {
+        // SH223 (Route-B re-attack, operator re-verify-at-newest-state doctrine): the
+        // operator's named re-attack target is the NativeDataModelManager DM-construction
+        // path — getFlagsFromEngine_/initEngine_ [0x102bd1a30,0x102bd1d08) + initializeLuaApp_/
+        // startLuaApp_ [0x102bd21d4,0x102bd2600). The SH209-style reachability re-measure
+        // (freshly re-run at the post-SH217 corrected-SH161b state = 3/3 clean completing
+        // runs, govtail control 75 pcs, DM-creator 0 hits) reads these EXACT region-entry
+        // addresses; a single shifted constant would silently report 0 hits and fabricate a
+        // false negative. Pin all six boundary words + the govtail control entry so a drift
+        // fails loudly. Skip-if-absent real-image guard family as sh219/sh213/sh211/sh222.
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let w = |off: usize| -> u32 { u32::from_le_bytes([img[off], img[off+1], img[off+2], img[off+3]]) };
+            // Region entries + exits (file vaddr; guest = +0x100000000). Word = first
+            // in-region instruction, fully disasm-derived from the real image.
+            let sites: [(usize, u32, u64, &str); 6] = [
+                (0x2bd1a30, 0xaa14_03e0, 0x102bd1a30, "getFlagsFromEngine_/initEngine_ entry"),
+                (0x2bd1d08, 0xb940_1268, 0x102bd1d08, "initEngine_ region exit"),
+                (0x2bd21d4, 0x912f_a063, 0x102bd21d4, "initializeLuaApp_ entry"),
+                (0x2bd2504, 0x910f_1063, 0x102bd2504, "startLuaApp_ entry"),
+                (0x2bd2600, 0xf940_02a8, 0x102bd2600, "startLuaApp_ region exit"),
+                (0x2e9fa84, 0xa9ba_7bfd, 0x102e9fa84, "govtail control entry"),
+            ];
+            for (off, word, guest, name) in sites {
+                assert_eq!(w(off), word, "sh223 {name} word @file 0x{off:x}");
+                assert_eq!((off as u64).wrapping_add(0x1_0000_0000), guest, "sh223 guest=file+0x100000000 for {name}");
+                assert!(guest & 3 == 0, "sh223 {name} 4-aligned");
+                assert!(guest < 0x120_0000_00, "sh223 {name} in canonical window");
+            }
+            eprintln!("sh223 DM-creator region entries + govtail control verified on libroblox.so");
+        } else {
+            eprintln!("sh223 real-image guard: no real libroblox.so, skipping byte pins");
+        }
+    }
+
+    #[test]
     fn sh115_sites_target_lazy_singleton_accessor_windows() {
         // Guest file vaddrs for the three accessor sites with their original
         // slot0 (mov) guard bytes — the patch refuses to write if these shift.
