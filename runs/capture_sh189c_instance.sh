@@ -2,11 +2,14 @@
 # SH189c EXPERIMENTAL: the real PlayerGui instance ctor chain headlessly. This is the Route-B
 # frontier probe. With the class-name registry populated (PlayerGui+ScreenGui descriptors) +
 # DM planted into the creator's current-DM global 0x107333948, the pair-consumer 0x10255d0e4
-# drives the core creator 0x102373458 -> operator-new -> blr 0x255d1b4 (ctor functor) ->
-# real ctor 0x255d1dc. VERIFIED it CONSTRUCTS a real object (vptr 0x106796dc0 at 0x2374358)
-# then faults on the deep unseeded owner member (ldr x8,[x23] at 0x2374378, x23=0) ->
-# expects EXIT 134 = the next unsynthesized-object gate (x23 owner), NOT a clean run.
-# This script documents that gate. Do NOT merge its env into the ^clean SH189/SH189b capture.
+# (driven with x0=dm so the instance ctor gets a non-null owner) drives
+#   core creator 0x102373458 -> operator-new -> blr 0x255d1b4 (ctor functor) -> PlayerGui ctor
+# 0x255d1dc -> instance ctor 0x2374310.
+# VERIFIED (2/2 isolated): the chain EXECUTES TO COMPLETION headlessly (DROVE ok, EXIT 124,
+# 0 crash). The pre-fix x23-owner null-deref (EXIT 134) is gone since x0=dm feeds the owner.
+# HONEST residual: out={0,0} — the instance is allocated (ret x0 host ptr) but not yet surfaced
+# through the out-buffer, so self-construction is not yet OBSERVED (next step: walk the
+# op-new'd object for the PlayerGui vptr 0x106648950).
 set -u
 cd "$(dirname "$0")/.."
 LOG=/home/hermes-worker/runs/open-sober/runs/sh189c-instance.txt
@@ -20,8 +23,8 @@ timeout 200 env JIT_DRIVE_LIFECYCLE=1 \
   --v2boot-surface-handoff --v2boot-send-appevent \
   > "$LOG" 2>&1
 EXIT=$?
-echo "EXIT=$EXIT (expect 134 = x23 owner next-gate fault, the instance drive's honest boundary)"
+echo "EXIT=$EXIT (expect 124 = the instance ctor chain DROVE ok to completion; the x23-owner
+fault was fixed by passing x0=dm. 134 would mean a fresh next-gate fault. A rare 139 after
+'planted DM' is the pre-existing SH55/64 clone-worker flake, NOT this guard.)"
 echo "=== SH189c instance drive (the frontier probe) ==="
 grep -E "routeb-dmins" "$LOG"
-echo "=== the next-gate fault (x23 owner deref at 0x102374378) ==="
-grep -E "guestpc=0x1023743|fault=0x0" "$LOG" | head -2
