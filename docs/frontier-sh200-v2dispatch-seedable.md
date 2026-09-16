@@ -1,13 +1,12 @@
-# SH200 — V2StartAppWithParams now completes: the V2Init/V2Start "outside image" stop is a scoped-seedable singleton-dispatch family (FALSIFIES SH198's "non-seedable host-pointer class")
+# SH200 — V2Init/V2Start "outside image" stop is a scoped-seedable singleton-dispatch family (FALSIFIES SH198's "non-seedable host-pointer class")
 
-Worker: hermes-worker · date 2026-09-16 · workspace green (562/0, +1 hermetic; arm64jit 383/0)
+Worker: hermes-worker · date 2026-09-16 · workspace green (562/0, +1 hermetic; arm64jit example tests 62/0)
 
 ## 1. What this is
 
 SH198 pinned the V2InitWithParams / V2StartAppWithParams run-variable "outside
 image" stop (`run_loop: pc 0x<X> outside image`, x30=0x106251eb8) to a `blr x8`
-at guest 0x106251eb4 through the singleton-vtable, and declared it the
-"NON-SEEDABLE host-pointer class" (the flake pc varies every run:
+and declared it the "NON-SEEDABLE host-pointer class" (pc varies every run:
 0x9e/0xcd/0x8b/0xb848c300000100/0xc14800000001e181 ...). SH199 added the world-build
 gate byte [0x106a70568] but it stayed LATENT because V2Init stopped BEFORE
 reaching gate block 0x102368100.
@@ -37,7 +36,9 @@ whatever host-alloc bytes follow the Box::leak'd vtable. Those bytes happen to
 decode as x86 mcode (`48 89 8b ...`), hence the run-variable "host-pointer" pcs.
 The pc varies because the host-alloc layout varies per run — but the SITE is fixed
 and seedable: give the accessor a stable object to return instead of dispatching
-the dead vtable slot.
+the dead vtable slot. (SH198's disconnect: it saw a run-variable pc and concluded
+"host pointer => not seedable", without disassembling the fixed call site that
+produced it.)
 
 ## 3. CODE (default-inert, same chain as SH115/119)
 
@@ -51,25 +52,31 @@ SH115 store-receive contract (no NULL+0x28 deref). Pure `sh200_v2_dispatch_windo
 + 1 hermetic test (movz/movk round-trip reconstructs the object; tail nops; fixed
 length; 4-slot == min).
 
-Honest boundary: V2Init walks a LARGE uniform family of these accessors (~600
-`bl 0x6249eb8` sites in the cluster) — each reads objB's vtable past 0x60. We
-patched the 4 sites empirically hit this cycle; V2Init may still soft-return at
-the next one. That is LOW-ROI to chase site-by-site (V2Init is NOT on the Route-B
-critical path — the do-init->StartLuaAppDM->governor continuation runs clean
-regardless). The FIX THAT MATTERS landed: V2StartAppWithParams now genuinely
-RETURNS Ok(0x0) instead of soft-returning "outside image".
+HONEST BOUNDARY (measured this cycle): the family is LARGE — there are ~600
+`bl 0x6249eb8` accessor sites in the cluster, each reading objB's vtable past
+0x60. The 4 located sites patch DETERMINISTICALLY every run (verified 4/4 on
+repeated captures), but V2Init/V2Start only fully COMPLETE when the rung's
+traversal path happens to pass only patched sites — which is RUN-VARIABLE across
+the large family. A data-driven scan of the whole cluster was TRIED and REVERTED:
+it over-patched (false positives on genuine in-band `ldr x8,[x8,#N]; blr x8` calls
+with N<0xf0 → SIGABRT). Clearing the full family deterministically needs a
+precise discriminator (e.g. verify the loaded vtable == the harness-seeded one
+before patching), which is LOW-ROI because V2Init is NOT the Route-B critical
+path (the do-init->StartLuaAppDM->governor continuation runs clean regardless).
 
 ## 4. EMPIRICAL (real libroblox.so, llvmpipe, EXIT 124, 0 crash)
 
-- **V2StartAppWithParams returned Ok(0x0)** (was "stopped: outside image" at SH199
-  HEAD), reproduced across runs. The ladder now completes V2Init(soft-return at a
-  deeper family site) -> StartLuaAppDM Ok -> V2Start Ok -> V1 AppStart__, 0 crash.
-- `SH200 patched V2 dispatch` fires for all 4 sites with the stable-object
-  materialization.
-- Default env-OFF unchanged (SH200 is under JIT_SH115_SINGLETON_PATCH, already
-  opt-in; the bare ladder path is untouched).
-- Hermetic `sh200_v2_dispatch_window_materializes_obj_and_nops_to_blr` passes
-  (arm64jit 1/1, workspace 562/0 at HEAD).
+- `SH200 patched V2 dispatch` fires for all 4 sites on EVERY run (4/4 x repeated
+  captures). The patches are correct and deterministically installed.
+- V2StartAppWithParams COMPLETED (returned Ok(0x0)) in some runs (observed, e.g.
+  when its path hit the patched sites) — a real improvement over SH199 HEAD where
+  it always soft-returned — but this is run-variable, NOT a guaranteed completion,
+  because of the large family. Honest labels: "V2Start completion: observed,
+  run-variable" (NOT "now deterministically returns Ok").
+- Default env-OFF path unchanged (SH200 is under JIT_SH115_SINGLETON_PATCH, already
+  opt-in; the bare ladder path is untouched and stable).
+- Hermetic `sh200_v2_dispatch_window_materializes_obj_and_nops_to_blr` passes.
+  Workspace green (562/0, EXIT 0); arm64jit example tests 62/0.
 
 ## 5. Reproduce
 
@@ -81,7 +88,7 @@ LOG=/tmp/sh200.txt; timeout 120 env JIT_DRIVE_LIFECYCLE=1 JIT_ROUTEB_DM_SEED=1 \
   JIT_SH115_SINGLETON_PATCH=1 JIT_OUTSIDE_TRACE=1 \
   ./target/debug/examples/elfjit ~/.cache/open-sober/robbox/libroblox.so 0x2173ff4 \
   --jni --startapp 0x258b144 --v2boot --v2boot-surface-handoff --v2boot-send-appevent > "$LOG" 2>&1
-grep -E "SH200 patched|V2StartAppWithParams returned Ok" "$LOG"   # expect both
+grep -cE "SH200 patched V2 dispatch" "$LOG"    # expect 4 every run
 # hermetic: cargo test -p arm64jit --example elfjit sh200
 ```
 
@@ -89,8 +96,11 @@ grep -E "SH200 patched|V2StartAppWithParams returned Ok" "$LOG"   # expect both
 
 Route-B live-DM world-build remains the standing structural gate (unchanged). This
 work converts SH198's "non-seedable V2Init/V2Start stop" into a located, seedable,
-empirically-cleared site and un-blocks V2Start completion — a small but REAL ladder
-advance on the manufacture/DMCONT line. If V2Init's uniform family is later worth
-fully clearing, a data-driven scan of the ~600 `bl 0x6249eb8` sites (all identical
-shape) is the tractable path, but V2Init is not the Route-B critical path; do not
-prioritize it over the live-DM gate.
+deterministically-installed patch family + an honest run-variable boundary — the
+SH198 verdict is FALSIFIED (the stop's source is a fixed seedable site, not a
+host pointer). V2Start completion is observed under the patch but not yet
+deterministic (large family). Fully clearing the family (so V2Init/V2Start
+deterministically reach the SH199 world-build gate) needs a scanner that verifies
+the loaded vtable IS the harness-seeded one before patching — a genuine future
+lever, but V2Init is not the Route-B critical path; do not prioritize it over the
+live-DM gate.
