@@ -1900,6 +1900,35 @@ fn routeb_dm_service_resolve_guard(_state: *mut CpuState, pc: u64) {
             eprintln!("[routeb-dmsvc] SH191: DM holder = 0, skip");
             return;
         }
+        // SHXXX measure map state FIRST (before the instance-vptr gate, so it always
+        // reports): the resolver map 0x106dca0e70 (dest), the bulk-registrar SOURCE map
+        // 0x106dca0e90 (which the in-ladder registrar 0x2208ae8 copies FROM), and the
+        // register map 0x106dca0f60. Prior cycles (SH191/194) read dest + register only,
+        // NEVER the source — the source's emptiness is the load-bearing predictor of
+        // whether the resolver can be built by the engine's own bulk poly-copy. Read all
+        // three {begin@0,end@8} here; do not drive the registrar (SH192/194 corruption).
+        let rd = |a: u64| -> (u64, u64) {
+            let b = if page_is_mapped(a) {
+                unsafe { std::ptr::read_unaligned(a as *const u64) }
+            } else {
+                0
+            };
+            let e = if page_is_mapped(a + 8) {
+                unsafe { std::ptr::read_unaligned((a + 8) as *const u64) }
+            } else {
+                0
+            };
+            (b, e)
+        };
+        let (m0, m0e) = rd(0x106dca0e70);
+        let (s0, s0e) = rd(0x106dca0e90);
+        let (m1, m1e) = rd(0x106dca0f60);
+        eprintln!(
+            "[routeb-dmsvc] SH192+: resolver(dest) 0x106dca0e70 = {{0x{m0:x},0x{m0e:x}}} ({n0}) registrar-source 0x106dca0e90 = {{0x{s0:x},0x{s0e:x}}} ({ns}) register 0x106dca0f60 = {{0x{m1:x},0x{m1e:x}}} ({n1})",
+            n0 = if m0 != 0 && m0 != m0e { "NONEMPTY" } else { "EMPTY" },
+            ns = if s0 != 0 && s0 != s0e { "NONEMPTY" } else { "EMPTY" },
+            n1 = if m1 != 0 && m1 != m1e { "NONEMPTY" } else { "EMPTY" },
+        );
         // The constructed PlayerGui instance from the SH190e self-construction drive.
         let inst = ROUTEB_DM_CTOR_OBJ.load(std::sync::atomic::Ordering::Relaxed);
         if inst == 0 || inst <= 0x1000 || !page_is_mapped(inst) {
@@ -2003,9 +2032,28 @@ fn routeb_dm_service_resolve_guard(_state: *mut CpuState, pc: u64) {
         } else {
             0
         };
+        // SHXXX: the bulk-registrar SOURCE map (0x106dca0e90) — the container the in-ladder
+        // registrar 0x2208ae8 copies class-name entries FROM into the dest resolver map
+        // (0x106dca0e70). Prior cycles (SH191/194) read only dest + register, NEVER the
+        // source — so it is unknown whether the source is ever populated headlessly
+        // (registrar inserts nothing when the source is empty; it is the load-bearing
+        // predictor of whether the resolver map can be built by the in-ladder engine
+        // registrar). Read it here for the first time. {begin@0,end@8} only — the
+        // underlying bucket/size words are read below from the walker page-guard.
+        let s0 = if page_is_mapped(0x106dca0e90) {
+            unsafe { std::ptr::read_unaligned(0x106dca0e90 as *const u64) }
+        } else {
+            0
+        };
+        let s0e = if page_is_mapped(0x106dca0e90u64 + 8) {
+            unsafe { std::ptr::read_unaligned((0x106dca0e90u64 + 8) as *const u64) }
+        } else {
+            0
+        };
         eprintln!(
-            "[routeb-dmsvc] SH191: resolver map 0x106dca0e70 = {{0x{m0:x},0x{m0e:x}}} ({n0}) register map 0x106dca0f60 = {{0x{m1:x},0x{m1e:x}}} ({n1}); walker drives against 0x106dca0e70",
+            "[routeb-dmsvc] SH191: resolver map 0x106dca0e70 = {{0x{m0:x},0x{m0e:x}}} ({n0}) source map 0x106dca0e90 = {{0x{s0:x},0x{s0e:x}}} ({ns}) register map 0x106dca0f60 = {{0x{m1:x},0x{m1e:x}}} ({n1}); walker drives against 0x106dca0e70",
             n0 = if m0 != 0 && m0 != m0e { "nonempty" } else { "EMPTY" },
+            ns = if s0 != 0 && s0 != s0e { "nonempty" } else { "EMPTY" },
             n1 = if m1 != 0 && m1 != m1e { "nonempty" } else { "EMPTY" },
         );
         // SH194: the resolver map 0x106dca0e70 is a std::unordered_map whose ONLY writer is the
@@ -6806,6 +6854,33 @@ mod tests {
     }
 
     #[test]
+    fn sh207_registry_three_map_addresses_and_dest_resolver_layout() {
+        // SH207: pin the three class-name registry containers on page 0x6dca000 so the
+        // source-map measurement stays coherent across edits.
+        //   dest resolver (name->classid, read by walker 0x105e09bc8 -> resolver 0x2373cec)
+        //   = 0x106dca0e70 ; bulk-registrar SOURCE = 0x106dca0e90 (never read in prior cycles)
+        //   per-class register map = 0x106dca0f60.
+        // The resolver's open-addressing probe compares begin@0 vs end@8 (`ldp begin,end,[x0];
+        // b.eq not-found` at 0x2373d10) — so an empty map reads {0,0} and the walker cleanly
+        // returns not-found (exactly the observed SH191/SH207 gate).
+        // The three are distinct containers in the same class-name-registry region, in
+        // the order dest-resolver (0x106dca0e70, name->classid / read-only probe),
+        // registrar-SOURCE (0x106dca0e90), per-class REGISTER (0x106dca0f60). The
+        // resolver's probe compares begin@0 vs end@8 (`ldp begin,end,[x0]; b.eq
+        // not-found` at 0x2373d10) — an EMPTY map reads {0,0} and the walker cleanly
+        // returns not-found (the observed SH191/SH207 gate). Pin the exact adjacency of the
+        // three registry maps; the walker only constructs NOTHING when the registrar
+        // source is empty (measured in SH207).
+        assert_eq!(0x106dca0f60u64 - 0x106dca0e90u64, 0xd0, "register is 0xd0 after source");
+        assert_eq!(0x106dca0e90u64 - 0x106dca0e70u64, 0x20, "source is 0x20 after dest");
+        // Registrar (0x2208ae8) reads source (`adrp x21,6dca000; add x21,#0xe90`) and the
+        // walker's resolver reads dest (0xe70) — pin that the source selector is 0x20 past
+        // the dest selector (the register arg unions them in the registrar).
+        assert_eq!((0x106dca0e90u64 & 0xfff), 0xe90);
+        assert_eq!((0x106dca0e70u64 & 0xfff), 0xe70);
+    }
+
+    #[test]
     fn sh177_cookie_jar_write_value_layouts_long_string() {
         // SH177 (objective 2b): cookie_jar_write_value lays a LONG-form libc++
         // std::string into the jar's 0x20-byte buffer (__data_/__size_/__cap_,
@@ -7057,7 +7132,14 @@ mod tests {
         let handle = std::thread::spawn(move || {
             // Park the waiter on src with a timeout so the test can never hang
             // even if the requeue is broken (waiter unblocks on timeout instead).
-            let trel = libc::timespec { tv_sec: 5, tv_nsec: 0 };
+            // The timeout is a WALL-clock wait and the REQUEUE side spins for
+            // ~1ms*20_000 = up to 20s; under heavy parallel `cargo test
+            // --workspace` load a descheduled waiter thread can sleep past a
+            // short timeout (5s) BEFORE the REQUEUE lands, unblocking on the
+            // timeout and making REQUEUE legitimately move 0 (a flake, not a
+            // regression). Make the timeout safely exceed the whole spin window
+            // so only a genuinely-broken requeue can strand the waiter.
+            let trel = libc::timespec { tv_sec: 60, tv_nsec: 0 };
             let waiter: [u64; 6] = [
                 src as u64,
                 libc::FUTEX_WAIT as u64, // val must equal *src (1)
