@@ -33,16 +33,22 @@ Live result (reproducible, EXIT 124 = timeout-after-completion, 0 crash):
    self-latches via std::call_once's stlrb on completion). This is the first
    empirical confirmation that the once-lambda COMPLETES on this JIT — the "never
    completes" premise (recon-routeB-globaltinit-unblock step 2) is now measured
-   as completing-but-not-producing-a-DM.
-2. **It produces a string-intern status, NOT a DataModel.** The lambda body
-   (file 0x2206d24..0x2206d74) computes two string addresses (adrp 0x2d3000/0x3d1000
-   + big imm12 adds) and calls `bl 0x2173b3c`, which is the strcmp-based string-
-   intern GetOrCreate (prologue `bl strcmp`, hash-bucket walk; SH178 already
-   identified it). Its return is stored at [0x6a68000+#1032] = [0x106a68408]
-   (`str x0,[x23,#1032]` at file 0x2206d74). Measured = 0x400000b — a small
-   interned-string status value, not a guest pointer into the image. So the
-   once-slot is NOT a DM controller; the do-init's completion does not construct
-   a DM.
+   as completing-but-not-producing-a-DM. **Independently confirmed without our
+   seeds applied:** an early-tick capture (sampler fired before the v2boot guard
+   seeds ran) showed once-guard=0x1, DM-root=0x0, holder=0x106358d40 (raw
+   unseeded) — the engine's own lambda ran and latched from the normal ladder,
+   not from our seed chain.
+2. **It produces a string/app-registry intern, NOT a DataModel.** The lambda body
+   (file 0x2206d24..0x2206d74) computes TWO string addresses and calls
+   `bl 0x2173b3c`, the strcmp-based RTApp app-registry GetOrCreate (prologue
+   `bl strcmp`, hash-bucket walk; SH178 identified it). **Fresh precise string
+   decode (the adrp+add+sub chain cancels to the straight rodata addrs):
+   x0=file 0x2d34ab = "App", x1=file 0x3d1ba8 = "Execute".** So the once-lambda
+   interns the RTApp registry handle for "App"+"Execute" (the Roblox RTApp
+   app-registry entry), and its small return (measured 0x400000b) is stored at
+   [0x6a68000+#1032] = [0x106a68408] (`str x0,[x23,#1032]` at file 0x2206d74).
+   The once-slot is therefore the RTApp app-registry intern value — NOT a DM
+   controller. No live DM is constructed by the do-init.**
 3. **The live DM stays behind the SH156 seed.** DM-root[0x106a68818] still holds our
    fabricated 0x10-byte dispatch object (object[0]=vt 0x10635cce0), not an
    engine-built DM. The world-build DID expand (compiles 1656 -> 5576, ~3900 new
