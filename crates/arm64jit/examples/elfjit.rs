@@ -13317,12 +13317,22 @@ mod sh115_tests {
         //   * first-call path 0x102206d10 bls 0x10284ce54 (the __call_once SH196 saw
         //     self-latch to a strcmp intern), then builds registry-key strings.
         //   * do-init then calls closure-build 0x102206db8 (file 0x206cdc bl).
-        //     Its dispatch reads x0=[x19,#4] (the app-bridge/binder object), x8=[x0]
-        //     (its vtable), x1=[x8,#0x30] (vt+0x30 slot), then `br x1` (file 0x206e24).
-        //     That vt+0x30 slot of the binder object at [x19+4] is the DM-construction
-        //     entry a fabricated binder must satisfy. (SH224 showed the *DM object's*
-        //     own vt+0x30 is only a tiny accessor — this is the binder/app-bridge
-        //     object's vtable, a DIFFERENT class.)
+        //     Its dispatch reads x0=[x19,#32] (the union's +0x30 slot — SH156's
+        //     original decode; NOTE: the 64-bit LDR scales imm12 by 8, so
+        //     word 0xf9401260 (imm12=4) = offset 4*8=#32, NOT #4 as SH225/226
+        //     mislabeled — SH225's "correction" applied the 32-bit ×4 scale),
+        //     x8=[x0] (the target object's vtable), x1=[x8,#0x30] (vt+0x30 slot),
+        //     then `br x1` (file 0x206e24). That vt+0x30 slot is the
+        //     DM-construction entry a live object would dispatch through.
+        //     (SH224 showed the *DM object's* own vt+0x30 is only a tiny
+        //     accessor — this is the object at [union+32]'s vtable, a DIFFERENT
+        //     class.) CRITICAL MEASURED GATE: on the ladder the `b.ne`
+        //     (pthread_self-vs-stored-main-id) at 0x206df0 is TAKEN -> jumps to
+        //     0x206e28 (LocalStorageManager path), so the binder-dispatch block
+        //     0x206df4..0x206e24 NEVER executes (region-watch, 3/3 runs) —
+        //     the SH225/226 "fabricate a binder at [union+4]" target is a
+        //     MEASURED dead-end both on decode (offset is #32 not #4) and on
+        //     reachability (b.ne bypass). See sh227.
         //   * a second fork bl 0x10221942c (file 0x206ce4) returns via a short helper.
         // A drift in any of these sites fails loudly instead of silently re-reading
         // changed control flow. Skip-if-absent real-image guard family.
@@ -13341,7 +13351,7 @@ mod sh115_tests {
                 (0x102_206c84, 0x36000469, "tbz w9,#0 -> 0x102206d10 (first-call)"),
                 (0x102_206cdc, 0x94000037, "bl closure-build 0x102206db8"),
                 (0x102_206ce4, 0x940049d2, "bl fork 0x10221942c"),
-                (0x102_206df4, 0xf9401260, "ldr x0,[x19,#4] (binder obj)"),
+                (0x102_206df4, 0xf9401260, "ldr x0,[x19,#32] (union +0x30 slot; imm12=4 scaled by size8 — NOT #4)"),
                 (0x102_206dfc, 0xf9400008, "ldr x8,[x0] (vtable)"),
                 (0x102_206e00, 0xf9401901, "ldr x1,[x8,#0x30] (vt+0x30 slot)"),
                 (0x102_206e24, 0xd61f0020, "br x1 (DM-construction dispatch)"),
@@ -13371,23 +13381,32 @@ mod sh115_tests {
 
     #[test]
     fn sh226_doinit_binder_dispatch_chain_reconciled() {
-        // SH226 (Route-B re-attack, single-agent): AUTHORITATIVE reconciliation of the
-        // do-init DM-construction dispatch. SH156 decoded the closure-build manually as
-        // `ldr x0,[x19,#32]` -> table[+0x30] -> 0x1023eff4c; SH225 re-decoded it (correctly)
-        // as `ldr x0,[x19,#4]` (the binder) -> vtable -> vt+0x30 -> br x1. Fresh decode this
-        // cycle CONFIRMS SH225 byte-for-byte, AND pins the complete provenance chain that
-        // would make the binder deterministic-NULL from StartLuaAppDM's own union layout:
+        // SH226 (Route-B re-attack, single-agent): reconciliation of the
+        // do-init DM-construction dispatch. SH156 decoded the closure-build load
+        // as `ldr x0,[x19,#32]`; SH225 "re-corrected" it to `ldr x0,[x19,#4]`
+        // (the binder). Fresh decode this cycle proves SH156 RIGHT and SH225/226
+        // WRONG on the offset: 0xf9401260 (imm12=4) is a 64-bit LDR scaled by size
+        // 8 => byte offset 4*8 = #32, NOT #4 (SH225 applied the 32-bit x4 scale).
+        // And measurably the blamed "binder dispatch" is bypassed at runtime by
+        // the thread-id `b.ne` (0x206df0 -> 0x206e28), so the block never executes
+        // headlessly (region-watch 3/3). This pins the provenance chain that SH156
+        // and SH197 agree on (the ladder DOES reach the governor 0x1023eff4c via a
+        // different mechanism, NOT via a binder at [union+4]):
         //   StartLuaAppDM 0x1023efe2c builds {[sp+0]=table, [sp+8..24]=0, [sp+32]=sp}
         //     -> 0x1023efeac bl dispatcher 0x102baeeec (x0=sp, w1=0)
         //   dispatcher 0x2baef08 mov x19,x0 (=sp) / 0x2baef04 mov x20,w1
         //     -> 0x102baef54 mov x1,x19 ; 0x102baef6c mov w2,wzr ; 0x102baef70 bl do-init 0x102206c40
         //   do-init 0x206c5c x19=x2 / 0x206c60 x20=x1
         //     -> 0x206cd4 mov x1,x20 ; 0x206cd8 mov x2,x19 ; 0x206cdc bl closure-build 0x102206db8
-        //   closure-build 0x206dd0 mov x19,x1
-        //     -> binder = [x19+4] = [closure-build-arg1 + 4] = [StartLuaAppDM-union + 4]
-        //     = high-half-of-table<2^32 coalesced with [union+8]=0 = 0
-        //     -> cbz x0 -> 0x102206ea4 benign soft-return (the harness's [union+8] fill
-        //        determines whether the dispatch fires; SH197 measured it fires into 0x1023eff4c).
+        //   closure-build 0x206dd0 mov x19,x1 (=closure-build arg1 = union)
+        //     -> the dispatch load x0=[union + 32] (0xf9401260, imm12=4 scaled by
+        //        size 8 -> #32, NOT #4) = [sp+32] = stack self-ref -> x0=sp (the
+        //        union base), so x8=[sp]=table slot0, x1=[table+0x30].
+        //     -> BUT the `b.ne` thread-match at 0x206df0 is TAKEN on the ladder,
+        //        so 0x206df4..0x206e24 (incl. br x1) NEVER executes headlessly.
+        //        The SH225/226 "binder at [union+4]" premise is FALSIFIED: the
+        //        offset is #32 (SH156 right), and runtime bypasses the dispatch
+        //        entirely (region-watch 3/3). See sh227.
         // Also pins the DMCONT continuation anchors (the operator's named re-attack target:
         // continueAfterFlagsLoaded_ 0x102bd1d68 -> app-shell ctor 0x2207b54) so a future drive
         // of the fabricated manager's vt[+0x1f0] starts from pinned bytes, not re-guessed ones.
@@ -13423,8 +13442,10 @@ mod sh115_tests {
                 assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh226 site {guest:#x} in window");
                 assert!(guest & 3 == 0, "sh226 site {guest:#x} 4-aligned");
             }
-            // [2] A drift into SH156's mis-decode (`[x19,#32]`, imm 32) fails loudly.
-            assert_eq!(word(0x102_206df4), 0xf9401260, "closure-build binder load = [x19,#4] (imm 4), NOT [x19,#32]");
+            // [2] A drift into SH225/226's mis-decode (`[x19,#4]`, applying the 32-bit
+            // scale to a 64-bit LDR) fails loudly — the word is 0xf9401260, whose
+            // imm12=4 on a size-8 load reads byte offset #32, matching SH156.
+            assert_eq!(word(0x102_206df4), 0xf9401260, "closure-build load [x19,#32] (imm12=4 x size 8; SH156 correct, SH225/226's '#4' is a mislabel)");
             // [3] The closure-build dispatch itself (sh225 already pins; re-assert the two
             // decisive words so the reconciliation is self-contained).
             assert_eq!(word(0x102_206e00), 0xf9401901, "closure-build ldr x1,[x8,#0x30] (vt+0x30)");
@@ -13447,6 +13468,62 @@ mod sh115_tests {
             eprintln!("sh226 do-init binder-dispatch chain + DMCONT continuation anchors verified on libroblox.so");
         } else {
             eprintln!("sh226 real-image guard: no real libroblox.so, skipping reconciliation pins");
+        }
+    }
+
+    #[test]
+    fn sh227_doinit_binder_dispatch_decode_corrected_and_bne_bypass() {
+        // SH227 (Route-B re-attack, single-agent) — a CORRECTION of the SH225/226
+        // pin. SH156 decoded the closure-build load as `ldr x0,[x19,#32]`; SH225
+        // "re-corrected" it to `ldr x0,[x19,#4]` and SH226 propagated "AUTHORITATIVE".
+        // Fresh decode this cycle (GNU objdump + arm64jit decode+translate) proves
+        // SH156 RIGHT and SH225/226 WRONG on the OFFSET:
+        //   word 0xf9401260 = LdStrImm { rn=19, imm=4, size=8 } and translate uses
+        //   address = rn + imm*size = x19 + 4*8 = x19 + #32.  (The imm12 field is the
+        //   BYTE count divided by the access size; for a 64-bit LDR size=8, so raw
+        //   imm12 4 => byte offset 32. SH225 applied the 32-bit size-4 scale, giving
+        //   the wrong "#4".)
+        // And on top of the mislabel, the dispatch block is MEASURED BYPASSED at
+        // runtime: closure-build entry 0x102206db8 -> `bl pthread_self` -> `cmp x0,
+        // x20` (stored main-thread id [0x106863a68]) -> `b.ne 0x102206e28` TAKEN on
+        // the ladder (this thread != main) -> jumps to the LocalStorageManager
+        // construction (mov x0,sp / bl op-new 0x1d96768), so the binder-dispatch
+        // block 0x102206df4 (ldr) .. 0x102206e24 (br x1) NEVER executes headlessly.
+        // Therefore the SH225/226 "fabricate a binder at [union+4]" next-target is a
+        // MEASURED DEAD-END on BOTH grounds (wrong offset AND reachability bypass) —
+        // the operator's proof-of-dead-end standard for that specific lever.
+        // This hermetic re-anchors: correct offset semantics (decode => #32), the
+        // b.ne thread-match gate, and the non-match LocalStorageManager target.
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if p.exists() {
+            let el = libloader::elf::load_elf_image(p).expect("load real libroblox.so");
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            // [1] The load word + its CORRECT decode semantics (offset #32, not #4).
+            assert_eq!(word(0x102_206df4), 0xf9401260, "closure-build load word");
+            let insn = 0xf9401260u32;
+            match arm64jit::decode::decode(insn) {
+                arm64jit::decode::Inst::LdStrImm { rn: 19, imm, size: 8, ld: true, .. } => {
+                    // byte offset = imm * size
+                    assert_eq!(imm * 8, 32, "64-bit LDR imm12 {} * size 8 = #32 (correct), NOT #4", imm);
+                }
+                other => panic!("sh227: 0xf9401260 must decode to 64-bit LDR(imm), got {other:?}"),
+            }
+            // [2] The b.ne thread-match gate: this is the branch that BYPASSES the
+            //     binder dispatch on the ladder (this thread != stored main id).
+            assert_eq!(word(0x102_206df0), 0x540001c1, "closure-build b.ne (thread-match gate)");
+            // [3] The non-match target 0x102206e28 = LocalStorageManager construction
+            //     (mov x0,sp) — NOT the dispatch. This pins WHERE the ladder actually
+            //     goes instead of the (never-fired) binder br.
+            assert_eq!(word(0x102_206e28), 0x910003e0, "closure-build b.ne target mov x0,sp (non-match path)");
+            assert_eq!(word(0x102_206e24), 0xd61f0020, "closure-build br x1 (dispatch — present in bytes but never executed on ladder)");
+            eprintln!("sh227 binder-dispatch decode corrected (#32) + b.ne bypass pinned on libroblox.so");
+        } else {
+            eprintln!("sh227 real-image guard: no real libroblox.so, skipping corrected-decode pins");
         }
     }
 
