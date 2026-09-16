@@ -13170,6 +13170,48 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh222_recon_v3_json_append_check_site_anchored() {
+        // recon-selfdrive-seed-jsonfix.md: the recon-v3 "JSON-ABORT" immediate-priority
+        // deliverable is JIT_JSON_ZERO_FIX — a pc-gated hook that fires at guest
+        // 0x102355d40 to force the leaking guest-stack libc++ std::string length to 0
+        // (SSO empty) instead of letting RBX::json::Writer throw a "string length
+        // overflow" abort. That block-entry pc is load-bearing (the recon-v3 plane
+        // depends on it), yet it had no real-image byte-pin in the guard family — a
+        // drifted constant would silently stop the fix from engaging. Pin the block-
+        // entry word (the fn prologue `stp x29,x30,[sp,#-48]!` = file 0x2355d40) +
+        // the cap-cell guest address it compares against (guest 0x107275648), so a
+        // future shift fails loudly. Skip-if-absent real-image guard family as sh219/
+        // sh213/sh211. Also pin the throw-helper site the fix prevents reaching.
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let w = |off: usize| -> u32 { u32::from_le_bytes([img[off], img[off+1], img[off+2], img[off+3]]) };
+            // Block entry the json-zero-fix hook gates on (fn prologue of the
+            // RBX::json::Writer append bound-check, guest 0x102355d40).
+            assert_eq!(w(0x2355d40), 0xa9bd_7bfd, "json append-check block entry = stp x29,x30,[sp,#-48]!");
+            let site: (u64, u64) = (0x2355d40, 0x102355d40);
+            assert_eq!(site.0.wrapping_add(0x1_0000_0000), site.1, "guest = file + 0x100000000");
+            assert!(site.1 & 3 == 0, "site must be 4-aligned");
+            assert!(site.1 < 0x120_0000_00, "site within canonical identity-map window");
+            // Capacity cell the check compares the length against (guest 0x107275648).
+            let cap_cell: u64 = 0x107275648;
+            assert!(cap_cell >= 0x1_0000_0000 && cap_cell < 0x120_0000_00, "cap cell in window");
+            assert!(cap_cell & 7 == 0, "cap cell 8-aligned u64 slot");
+            // The throw helper the fix prevents reaching (guest 0x1025fb6bc):
+            // `sub sp,sp,#0x150` fn prologue of RBX::json::Writer's overflow throw.
+            assert_eq!(w(0x25fb6bc), 0xd105_43ff, "json throw helper entry = sub sp,sp,#0x150");
+            let throw_site: (u64, u64) = (0x25fb6bc, 0x1025fb6bc);
+            assert_eq!(throw_site.0.wrapping_add(0x1_0000_0000), throw_site.1, "guest = file + 0x100000000");
+            assert!(throw_site.1 & 3 == 0, "throw site 4-aligned");
+            eprintln!("sh222 json append-check site + cap cell + throw helper verified on libroblox.so");
+        } else {
+            eprintln!("sh222 real-image guard: no real libroblox.so, skipping byte pins");
+        }
+    }
+
+    #[test]
     fn sh115_sites_target_lazy_singleton_accessor_windows() {
         // Guest file vaddrs for the three accessor sites with their original
         // slot0 (mov) guard bytes — the patch refuses to write if these shift.
