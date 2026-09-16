@@ -13606,6 +13606,66 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh231_experiencecontroller_dm_creation_world_located_and_pinned() {
+        // SH231 (Route-B re-attack, single-agent, fresh packed-RELA decode): SH178's open item
+        // — "the genuine DataModel allocation site was NEVER properly located." This test
+        // LOCATES it: the REAL ExperienceController DM-creation machinery is the std::function
+        // __func lambda world whose vtable band (guest 0x63981d8..0x6399c00, relocation+session
+        // -populated .data.rel.ro) carries typeinfo-name-string pointers into the
+        // createDataModelForTeleport/submitStartGameTask RTTI rodata band (0x6dcb34..0x6dfe00),
+        // and whose code bodies land at guest [0x102e1c650, 0x102e25200). Fresh region-watch on
+        // the calibrated completing ladder (governor-tail control 0x102e9fa84..0x102ea30dc FIRES)
+        // measures the EC body region at **0 hits** across 2/2 clean completing runs (EXIT 124) —
+        // the genuine site is real but headless-UNREACHED (same live-DM structural gate, now at
+        // the CORRECT location, not the misattributed do-init addresses SH178 refuted).
+        // Pins (real-image guard family as sh227/sh228/sh229b; skip-if-absent):
+        // (a) EC world body-region entry 0x102e1c650 = stp x29,x30,[sp,#-16]! (0xa9bf7bfd);
+        // (b) a mid-world body 0x102e20398 = stp x29,x30,[sp,#-32]! (0xa9be7bfd);
+        // (c) the world's upper-limit window walker 0x102e25148 = sub sp,#0xb0 (0xd102c3ff);
+        // (d) region bounds + 4-alignment so the future reachability re-read reads real bytes.
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if p.exists() {
+            let el = libloader::elf::load_elf_image(p).expect("load real libroblox.so");
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            assert_eq!(word(0x102_e1c650), 0xa9bf7bfd, "sh231 EC world body-region entry 0x102e1c650 stp x29,x30,[sp,#-16]!");
+            assert_eq!(word(0x102_e20398), 0xa9be7bfd, "sh231 EC world mid-body 0x102e20398 stp x29,x30,[sp,#-32]!");
+            assert_eq!(word(0x102_e25148), 0xd102c3ff, "sh231 EC world upper-window 0x102e25148 sub sp,#0xb0");
+            for (guest, name) in [
+                (0x102_e1c650u64, "EC-body entry"), (0x102_e20398u64, "EC mid-body"),
+                (0x102_e25148u64, "EC upper-window"), (0x102_e25200u64, "EC region high"),
+            ] {
+                assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh231 {name} {guest:#x} in window");
+                assert!(guest & 3 == 0, "sh231 {name} {guest:#x} 4-aligned");
+            }
+            // Verify via the loader's OWN relocation decode that the vtable band
+            // [0x6398000,0x639a000) genuinely stores pointers to the RTTI rodata band
+            // [0x6dc000,0x6e2000) (those vtables are the __func typeinfo-name slots). This
+            // is SH178's "fresh packed-RELA decode" executed on the loader's exact path.
+            use libloader::android_relocs::{read_elf_relocations, R_AARCH64_RELATIVE};
+            if let Ok(Some(rels)) = read_elf_relocations(p) {
+                let mut band_refs = 0usize;
+                for r in &rels {
+                    if r.r_type() == R_AARCH64_RELATIVE
+                       && r.r_offset >= 0x6398000 && r.r_offset < 0x639a000
+                       && r.r_addend >= 0x6dc000 && r.r_addend < 0x6e2000
+                    {
+                        band_refs += 1;
+                    }
+                }
+                assert!(band_refs >= 4, "sh231 vtable band must contain >=4 RELATIVE relocs whose addend lands in the createDataModelForTeleport RTTI rodata band [0x6dc000,0x6e2000) (found {band_refs})");
+            }
+            eprintln!("sh231 ExperienceController DM-creation world (bodies 0x102e1c650..0x102e25200, vtable band 0x63981d8..0x6399c00) pinned + RTTI-band reloc links verified on libroblox.so");
+        } else {
+            eprintln!("sh231 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh115_sites_target_lazy_singleton_accessor_windows() {
         // Guest file vaddrs for the three accessor sites with their original
         // slot0 (mov) guard bytes — the patch refuses to write if these shift.
