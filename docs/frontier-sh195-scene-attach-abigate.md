@@ -52,6 +52,16 @@ as a raw scene node: the walker has no way to supply the base object in x1. That
 world-build — the same live-DM migration gate. No host-side seed constructs it; a manufactured
 forwarder for it is a live-render-entry, out of reach headlessly.
 
+**Confirmed delegating thunk (disasm, this cycle):** 0x5fb2dac is an Itanium-style delegate —
+`x0=PlayerGui(this)`, `x1=base`; `ldr x9,[x1]; mov x8,x0(orig); mov x0,x1(base); mov x1,x8(PGI);
+ldr x3,[x9,#56]; br x3` — i.e. the honest PlayerGui draw forwards to the **base object's vtable
+slot +56**, moving the PlayerGui into x1. This is a *mechanism-level proof* (not a judgment) that
+the standalone self-constructed instance cannot be the thing a scene walker draws: its real draw
+contract requires the base/container render entry only a live scene-graph build provides. This is
+the operator-requested "concrete proof-of-dead-end" for the scene-attach sub-frontier (vs. an ROI
+call) — do NOT re-attempt under a "maybe we can fake x1" framing (faking x1's vt+56 = host thunk =
+Route-A host geometry, not engine-authored).
+
 ## Do-not-re-tread
 - Do NOT write the genuine PlayerGui (or ScreenGui) instance pointer into an R+0x180/0x188
   scene node's [node+8] and drive the present-walker — it jumps to the x1-stale bounce
