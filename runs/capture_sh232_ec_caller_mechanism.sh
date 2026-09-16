@@ -7,7 +7,7 @@
 # mechanism: do the caller bodies even translate themselves as blocks (entry pcs fire)?
 # Ranges (guest = file+0x100000000):
 #   EC target region:       0x102e1c650 0x102e25200
-#   StartLuaAppDM EC block: 0x1023f12d0 0x1023f1300   (arg-marshalling just before bl 0x2e24598)
+#   StartLuaAppDM EC block: 0x1023f1270 0x1023f1300   (marshalling 0x1270..0x1294 -> bl 0x2e24598, post-ret 0x1298)
 #   V2Init body deep EC blk:0x1023cfd40 0x1023cfd70   (before bl 0x2e24468)
 #   V2Init body entry area: 0x1023cfb40 0x1023cfc7c   (mid-fn near the EC callers)
 #   govtail control:        0x102e9fa80 0x102ea3b40   (ladder-completion control)
@@ -23,7 +23,7 @@ for i in $(seq 1 "$N"); do
     JIT_ROUTEB_DM_SEED=1 JIT_ROUTEB_HASHFIX=1 JIT_JSON_ZERO_FIX=1 \
     JIT_ROUTEB_SETFIX=1 JIT_SH115_SINGLETON_PATCH=1 \
     JIT_ROUTEB_V2_ONDEMAND=1 \
-    JIT_REGION_WATCH=0x102e1c650-0x102e25200,0x1023f12d0-0x1023f1300,0x1023cfd40-0x1023cfd70,0x1023cfb40-0x1023cfc7c,0x102e9fa80-0x102ea3b40 \
+    JIT_REGION_WATCH=0x102e1c650-0x102e25200,0x1023f1270-0x1023f1300,0x1023cfd40-0x1023cfd70,0x1023cfb40-0x1023cfc7c,0x102e9fa80-0x102ea3b40 \
     ./target/debug/examples/elfjit ~/.cache/open-sober/robbox/libroblox.so 0x2173ff4 \
     --jni --startapp 0x258b144 --v2boot --v2boot-surface-handoff --v2boot-send-appevent \
     > "$LOG" 2>&1
