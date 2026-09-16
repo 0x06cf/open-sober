@@ -651,4 +651,65 @@ mod tests {
         }
         let _ = std::fs::remove_file(&path);
     }
+
+    /// Route-B relocation-coverage completeness net (the operator's named
+    /// proof-of-dead-end criterion): a "specific gate provably unprocessable by
+    /// this JIT, e.g. a relocation type no loader pass can synthesize" is the
+    /// only acceptable grounds to declare Route-B dead. This pins the measured
+    /// fact that the REAL libroblox.so's full data-relocation type set is a
+    /// subset of {R_AARCH64_RELATIVE(1027), R_AARCH64_GLOB_DAT(1025),
+    /// R_AARCH64_ABS64(257)} — all of which this loader synthesizes
+    /// (android_relocs::apply_relatives for 1027; arm64jit plt bind_glob_dat
+    /// for 1025+257), plus R_AARCH64_JUMP_SLOT(1026) bound by the PLT resolver
+    /// from the separate DT_JMPREL table. If a future .so introduces ANY other
+    /// relocation type, this test fails and we know a synthesize pass is
+    /// missing before chasing anything else. (Syscall/libc imports are
+    /// UNDEF symbols the plt binder resolves via dlsym/host-thunk/resolver.)
+    #[test]
+    fn real_image_relocation_types_all_loader_synthesizable() {
+        let candidates = [
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+            "/home/hermes-worker/.cache/open-sober/android-env/lib/libroblox.so",
+            "/home/code-agent/.cache/open-sober/libs/libroblox.so",
+        ];
+        let p = candidates.iter().find(|c| std::path::Path::new(c).exists());
+        let Some(p) = p else {
+            eprintln!("skipping: no cached real libroblox.so present");
+            return;
+        };
+        let relas = read_elf_relocations(std::path::Path::new(p))
+            .expect("decode real libroblox.so relocations");
+        let Some(relas) = relas else {
+            panic!("real libroblox.so declares no relocation table");
+        };
+        assert!(!relas.is_empty(), "expected data relocs");
+        // Loader-synthesizable RELA-stream data-reloc types.
+        const RELATIVE: u64 = 1027;
+        const GLOB_DAT: u64 = 1025;
+        const ABS64: u64 = 257;
+        let mut seen: std::collections::BTreeMap<u64, usize> = Default::default();
+        let mut unsynthesizable: Vec<u64> = Vec::new();
+        for r in &relas {
+            let t = r.r_type();
+            *seen.entry(t).or_insert(0) += 1;
+            if t != RELATIVE && t != GLOB_DAT && t != ABS64 {
+                unsynthesizable.push(t);
+            }
+        }
+        assert!(
+            seen.contains_key(&RELATIVE),
+            "real image must carry RELATIVE data relocs; census {seen:?}"
+        );
+        assert!(
+            unsynthesizable.is_empty(),
+            "real libroblox.so contains relocation types the loader cannot synthesize \
+             (an unsynthesizable-type proof-of-dead-end): {unsynthesizable:?}; full census {seen:?}"
+        );
+        // Sanity: RELATIVE dominates; GLOB_DAT/ABS64 imports are the small remainder.
+        let total: usize = seen.values().sum();
+        eprintln!(
+            "sh216 reloc census on {}: {} data relocs {seen:?} — ALL loader-synthesizable",
+            p, total
+        );
+    }
 }
