@@ -91,3 +91,17 @@ SH174's capture-latch arming *(0x106391908) at a real make_shared<DataModel> ins
 session — nothing headless reaches it. recon-v3 immediate-priority deliverables stay shipped +
 verified. The caller pin makes any future session that DOES advance StartLuaAppDM past its
 benign return fail-loud if it drifts off the EC path.
+
+## Operator-named lever answered: DataModelServices::setDataModelToCurrent is ABI-downstream of the wall
+
+The operator's re-attack directive named `DataModelServices::setDataModelToCurrent` as a target
+(SH163's "next seed must target ExperienceController" family). Fresh recon closes it without a
+re-tread: the string at file 0x6cf8c5 is the mangled C++ name
+`DataModelServices::setDataModelToCurrent(shared_ptr<RBX::DataModel>)...$_0` — a lambda whose
+**own signature consumes `shared_ptr<RBX::DataModel>`**. To invoke it headlessly you must already
+hand it a live DataModel — the exact object Route-B's structural gate (SH209/218/223/224/228/231/
+232) proves is never manufactured on the completing ladder (once-slot=0x400000b intern, EC world
+unreached). It is the "make this DM the session's current" setter, definitionally DOWNSTREAM of
+DM creation, so it cannot be a lever that crosses the wall — it only fires after a real session
+possesses a DM. Classed as do-not-re-tread alongside initializeLuaAppWithDataModel for the same
+ABI reason (both consume the object they would need to create).
