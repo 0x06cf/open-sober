@@ -1775,6 +1775,169 @@ fn routeb_dm_instance_guard(_state: *mut CpuState, pc: u64) {
     });
 }
 
+/// SH191 (Route-B service-node attach): after SH190e self-constructs a real
+/// RBX::PlayerGui INSTANCE (engine-authored, [obj+0]=0x106648950), make it a real
+/// PlayerGui SERVICE NODE on the genuine DM's service list [dm+0x68] ([node+0x18]
+/// classid==0x87e), then drive the engine's OWN getService walker 0x105e09bc8 to
+/// RESOLVE "PlayerGui" -> classid and MATERIALIZE the instance into its out-pair.
+///
+/// This closes the exact SH190e-documented gap ("PlayerGui not a service NODE on
+/// [dm+0x68] ([node+0x18]==0x87e)") USING the engine-authored instance (not a
+/// fabricated one): the node's [node+8]= the captured PlayerGui obj (vptr
+/// 0x106648950), so the walker's materializer 0x2377600 reads {instance, refcount}
+/// at [node+8]/[node+16] and returns the SELF-constructed instance from the genuine
+/// DM. Host work = link the thin node only; the instance + resolution are engine.
+///
+/// WALKER ABI (disasm 0x5e09bc8): x0=dm, x1=&name (libc++ std::string), x8=&out
+/// (16-byte {item,refcount}). It resolves name->classid via the class-name registry
+/// 0x106dca0e70 (resolver 0x2373cec), then walks [dm+0x68] singly-linked (node[+0x18]
+/// == classid, node[+0x68]=next) and on match calls materializer 0x2377600(node,&out)
+/// which copies [node+8]/[node+16] into out.
+///
+/// NAME STRING decode in the walker (0x5e09bfc): `ldrb w8,[x1]; lsr x8,w8,#1` treats
+/// byte0 of x1 as (cap|bit0=long); long-str => w8.bit0=1, len = byte0_cap>>1, data at
+/// [x1+16]. We fabricate a long-form name {__cap_=0x13 (bit0=1 long, cap 9<<1=0x12),
+/// __size_=9, __data_=&"PlayerGui"} so the walker passes key-ptr=x1+16 ptr, len=9 to
+/// the resolver — matching the engine's own registry "PlayerGui" key (9 chars).
+///
+/// default-inert (env JIT_ROUTEB_DM_SERVICE_NODE=1). Node is thin + host-leaked;
+/// gated on a genuinely constructed instance (vptr 0x106648950).
+fn routeb_dm_service_resolve_guard(_state: *mut CpuState, pc: u64) {
+    if std::env::var_os("JIT_ROUTEB_DM_SERVICE_NODE").is_none() {
+        return;
+    }
+    const SLADM_LO: u64 = 0x1023efe2c; // StartLuaAppDM entry window
+    const SLADM_HI: u64 = 0x1023eff40;
+    if pc < SLADM_LO || pc > SLADM_HI {
+        return;
+    }
+    const DM_HOLDER: u64 = 0x106391908; // loop's current-DM holder (SH172)
+    const SERVICE_LIST_OFF: u64 = 0x68; // dm+0x68 = service-list head
+    const SVC_WALKER: u64 = 0x105e09bc8; // getService walker (dm, &name, x8=&out)
+    const PG_VPTR: u64 = 0x106648950; // PlayerGui class vptr (SH190d self-constructed)
+    const PG_CLASSID: u64 = 0x87e; // PlayerGui classid
+    use std::sync::OnceLock;
+    static RESOLVED: OnceLock<()> = OnceLock::new();
+    RESOLVED.get_or_init(|| {
+        if !page_is_mapped(DM_HOLDER) || !routeb_ensure_writable(DM_HOLDER) {
+            eprintln!("[routeb-dmsvc] SH191: DM holder not mapped/writable, skip");
+            return;
+        }
+        let dm = unsafe { std::ptr::read_unaligned(DM_HOLDER as *const u64) };
+        if dm == 0 {
+            eprintln!("[routeb-dmsvc] SH191: DM holder = 0, skip");
+            return;
+        }
+        // The constructed PlayerGui instance from the SH190e self-construction drive.
+        let inst = ROUTEB_DM_CTOR_OBJ.load(std::sync::atomic::Ordering::Relaxed);
+        if inst == 0 || inst <= 0x1000 || !page_is_mapped(inst) {
+            eprintln!("[routeb-dmsvc] SH191: no captured PlayerGui instance (captured={inst:#x}), skip");
+            return;
+        }
+        let inst_vp = unsafe { std::ptr::read_unaligned(inst as *const u64) };
+        if inst_vp != PG_VPTR {
+            eprintln!(
+                "[routeb-dmsvc] SH191: captured obj {inst:#x} vptr={inst_vp:#x} != PlayerGui {PG_VPTR:#x}, skip"
+            );
+            return;
+        }
+        // Build the thin service node: [node+8]=instance, [node+16]=refcount, [node+0x18]=classid,
+        // [node+0x68]=next. The walker only derefs [node+0x18] and [node+0x68] and the
+        // materializer reads [node+8]/[node+16]; [node+0] is unused by this path.
+        let node = Box::leak(vec![0x0u8; 0x70].into_boxed_slice()).as_mut_ptr() as u64;
+        if !routeb_ensure_writable(node + 8) {
+            eprintln!("[routeb-dmsvc] SH191: service node not writable, skip");
+            return;
+        }
+        unsafe {
+            std::ptr::write_unaligned((node + 8) as *mut u64, inst); // instance
+            std::ptr::write_unaligned((node + 16) as *mut u64, 0); // refcount
+            std::ptr::write_unaligned((node + 0x18) as *mut u64, PG_CLASSID); // classid 0x87e
+            std::ptr::write_unaligned((node + 0x68) as *mut u64, 0); // next
+        }
+        // Prepend (or replace the seeded empty head) at [dm+0x68]. Keep the existing head as our
+        // next link so any prior seeded node is preserved.
+        let old_head = if page_is_mapped(dm + SERVICE_LIST_OFF) {
+            unsafe { std::ptr::read_unaligned((dm + SERVICE_LIST_OFF) as *const u64) }
+        } else {
+            0
+        };
+        if routeb_ensure_writable(dm + SERVICE_LIST_OFF) {
+            unsafe { std::ptr::write_unaligned((node + 0x68) as *mut u64, old_head) };
+            unsafe { std::ptr::write_unaligned((dm + SERVICE_LIST_OFF) as *mut u64, node) };
+            eprintln!(
+                "[routeb-dmsvc] SH191: linked PlayerGui service node {node:#x} (classid {PG_CLASSID:#x}, instance {inst:#x}) at [dm+0x{SERVICE_LIST_OFF:x}] ({dm:#x})"
+            );
+        }
+        // Fabricate the name string {cap=0x13|bit0=1 long, size=9 @+8, data=&"PlayerGui"}.
+        let name_buf = Box::leak(b"PlayerGui\0".to_vec().into_boxed_slice()).as_mut_ptr() as u64;
+        let name_str = Box::leak(vec![0x0u8; 0x20].into_boxed_slice()).as_mut_ptr() as u64;
+        if routeb_ensure_writable(name_str) && routeb_ensure_writable(name_buf) {
+            unsafe {
+                std::ptr::write_unaligned(name_str as *mut u64, 0x13u64); // __cap_ = bit0(long) | 0x12
+                std::ptr::write_unaligned((name_str + 8) as *mut u64, 9); // __size_
+                std::ptr::write_unaligned((name_str + 16) as *mut u64, name_buf); // __data_
+            }
+        } else {
+            eprintln!("[routeb-dmsvc] SH191: name string not writable, skip walker drive");
+            return;
+        }
+        // Drive the engine's own getService walker.
+        let out = Box::leak(vec![0x0u8; 0x40].into_boxed_slice()).as_mut_ptr() as u64;
+        let tp = crate::jit::current_guest_tp();
+        // Diagnostic: read the resolver's class-name map header (0x106dca0e70) AND the register's
+        // map (0x106dca0f60) back so we can see WHICH one getService's name->classid resolution
+        // consults and whether it is empty (the SH189 class-desc counter stayed 0, suggesting the
+        // name->classid MAP is separate from the descriptor cache 0x106c980b8).
+        let m0 = if page_is_mapped(0x106dca0e70) {
+            unsafe { std::ptr::read_unaligned(0x106dca0e70 as *const u64) }
+        } else {
+            0
+        };
+        let m0e = if page_is_mapped(0x106dca0e70u64 + 8) {
+            unsafe { std::ptr::read_unaligned((0x106dca0e70u64 + 8) as *const u64) }
+        } else {
+            0
+        };
+        let m1 = if page_is_mapped(0x106dca0f60) {
+            unsafe { std::ptr::read_unaligned(0x106dca0f60 as *const u64) }
+        } else {
+            0
+        };
+        let m1e = if page_is_mapped(0x106dca0f60u64 + 8) {
+            unsafe { std::ptr::read_unaligned((0x106dca0f60u64 + 8) as *const u64) }
+        } else {
+            0
+        };
+        eprintln!(
+            "[routeb-dmsvc] SH191: resolver map 0x106dca0e70 = {{0x{m0:x},0x{m0e:x}}} ({n0}) register map 0x106dca0f60 = {{0x{m1:x},0x{m1e:x}}} ({n1}); walker drives against 0x106dca0e70",
+            n0 = if m0 != 0 && m0 != m0e { "nonempty" } else { "EMPTY" },
+            n1 = if m1 != 0 && m1 != m1e { "nonempty" } else { "EMPTY" },
+        );
+        match crate::jit::run_guest_callback_x8(SVC_WALKER, [dm, name_str, 0, 0, 0, 0, 0, 0], out, tp) {
+            Ok(r) => {
+                let item = unsafe { std::ptr::read_unaligned(out as *const u64) };
+                let rc = unsafe { std::ptr::read_unaligned((out + 8) as *const u64) };
+                let item_vp = if item != 0 && item > 0x1000 && page_is_mapped(item) {
+                    unsafe { std::ptr::read_unaligned(item as *const u64) }
+                } else {
+                    0
+                };
+                if item != 0 && item_vp == PG_VPTR {
+                    eprintln!(
+                        "[routeb-dmsvc] SH191: *** CONFIRMED — engine getService('PlayerGui') RESOLVED the self-constructed PlayerGui service node (item {item:#x} vptr {item_vp:#x}, refcount {rc}) from the genuine DM headlessly ***"
+                    );
+                } else {
+                    eprintln!(
+                        "[routeb-dmsvc] SH191: getService walker DROVE ok ret x0={r:#x} out={{{item:#x},{rc:#x}}} item-vptr={item_vp:#x} (want PlayerGui {PG_VPTR:#x})"
+                    );
+                }
+            }
+            Err(e) => eprintln!("[routeb-dmsvc] SH191: getService walker drive err: {e} (next gate)"),
+        }
+    });
+}
+
 /// True when the page containing `addr` appears in /proc/self/maps at all (any
 /// mapping covering it, not just a readable one). Conservative: used so
 /// routeb_map_guest_page only maps a page that is GENUINELY absent.
@@ -4548,6 +4711,7 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
             routeb_dm_real_ctor_drive_guard(state, pc); // SH187: drive the REAL DataModel ctor wrapper 0x1023f5ff8 -> 0x1023f6038 (JIT_ROUTEB_DM_REALCTOR)
             routeb_dm_service_seed_guard(state, pc); // SH189: seed empty DM service container + drive PlayerGui class-registry register (JIT_ROUTEB_DM_SERVICES)
             routeb_dm_instance_guard(state, pc); // SH189c: drive the real PlayerGui/ScreenGui INSTANCE ctor chain (JIT_ROUTEB_DM_INSTANCE)
+            routeb_dm_service_resolve_guard(state, pc); // SH191: host-link the constructed PlayerGui as a service node on [dm+0x68] + drive getService walker (JIT_ROUTEB_DM_SERVICE_NODE)
             routeb_tail_eq_guard(state, pc); // SH161b: seed impl[+0x2b8]=2 (governor-tail epilogue b.eq)
             routeb_tail_trace(state, pc);
         }
@@ -6128,6 +6292,42 @@ mod tests {
         );
         routeb_dm_instance_guard(&mut st as *mut CpuState, 0x1023efe2c);
         unsafe { std::env::remove_var("JIT_ROUTEB_DM_INSTANCE") };
+    }
+
+    #[test]
+    fn sh191_dm_service_resolve_guard_env_region_and_instance_gated() {
+        // SH191 (Route-B service-node attach): `routeb_dm_service_resolve_guard` must be
+        // (a) default-inert (env off), (b) StartLuaAppDM-region-gated, (c) skip unless a
+        // genuinely self-constructed PlayerGui instance (vptr 0x106648950) is captured, and
+        // (d) not fault when driving toward the walker in a hermetic context (no guest image
+        // -> the holder/name pages are unmapped -> safe early-return). The actual node-link +
+        // walker drive live on the harness's real run (run_guest_callback needs a live engine).
+        let _l = DM_INSTANCE_TEST_LOCK.lock().unwrap();
+        let mut st = CpuState::new();
+        let inst = Box::leak(vec![0x0u8; 0x100].into_boxed_slice()).as_mut_ptr() as u64;
+        unsafe { std::ptr::write_unaligned(inst as *mut u64, 0x106648950) }; // PlayerGui vptr
+
+        // (a) env off -> inert.
+        ROUTEB_DM_CTOR_OBJ.store(inst, std::sync::atomic::Ordering::Relaxed);
+        routeb_dm_service_resolve_guard(&mut st as *mut CpuState, 0x1023efe2c);
+
+        // (b) env on + wrong pc -> region-gated, returns immediately.
+        unsafe { std::env::set_var("JIT_ROUTEB_DM_SERVICE_NODE", "1") };
+        let t0 = std::time::Instant::now();
+        routeb_dm_service_resolve_guard(&mut st as *mut CpuState, 0x102e9fcc4);
+        assert!(
+            t0.elapsed().as_millis() < 50,
+            "env-on + wrong pc must region-gate and return immediately"
+        );
+
+        // (c) env on + correct pc + no captured instance -> skip (no guest image here, so the
+        //     holder page is unmapped -> the guard early-returns via the unmapped-DM branch before
+        //     touching the instance). Must not panic/fault.
+        ROUTEB_DM_CTOR_OBJ.store(inst, std::sync::atomic::Ordering::Relaxed);
+        routeb_dm_service_resolve_guard(&mut st as *mut CpuState, 0x1023efe2c);
+
+        unsafe { std::env::remove_var("JIT_ROUTEB_DM_SERVICE_NODE") };
+        ROUTEB_DM_CTOR_OBJ.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[test]
