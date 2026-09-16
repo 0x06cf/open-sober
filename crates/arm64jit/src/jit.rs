@@ -5347,6 +5347,11 @@ mod tests {
     /// suite deterministic; production (single jit_run thread per run) is untouched.
     static DM_CAPTURE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// SH190/SH189c: both tests mutate the JIT_ROUTEB_DM_INSTANCE process env (and sh190 reads
+    /// the ROUTEB_DM_CTOR_OBJ global), so they must serialize like the SH179 DM-capture pair —
+    /// otherwise the parallel harness makes sh190's "env-off must be inert" premies run-variable.
+    static DM_INSTANCE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn worker_gate_park_bounded_wait_unparks_promptly() {
         // (a) Gate clear (default) -> park returns immediately, no spin/hang.
@@ -5849,12 +5854,58 @@ mod tests {
     }
 
     #[test]
+    fn sh190_dm_instance_ctor_capture_env_region_and_nontrivial_gated() {
+        // SH190: `routeb_dm_instance_ctor_capture` must be (a) default-inert (env off), (b) only
+        // fire at the PlayerGui ctor-entry pc 0x10255d1dc, and (c) only store a NON-trivial object
+        // (never 0/0x1) into the global. It is the observation primitive that closed SH189c's
+        // "allocated but unobserved" residual (the pair-consumer ret/out walk was a red herring).
+        let _l = DM_INSTANCE_TEST_LOCK.lock().unwrap();
+        let mut st = CpuState::new();
+        ROUTEB_DM_CTOR_OBJ.store(0, std::sync::atomic::Ordering::Relaxed);
+        // env off -> inert, no store.
+        st.x[0] = 0xdead_beef_0000_1000;
+        routeb_dm_instance_ctor_capture(&mut st as *mut CpuState, 0x10255d1dc);
+        assert_eq!(
+            ROUTEB_DM_CTOR_OBJ.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "env-off must be inert"
+        );
+        // env on + wrong pc -> region-gated, no store.
+        unsafe { std::env::set_var("JIT_ROUTEB_DM_INSTANCE", "1") };
+        routeb_dm_instance_ctor_capture(&mut st as *mut CpuState, 0x102e9fcc4);
+        assert_eq!(
+            ROUTEB_DM_CTOR_OBJ.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "wrong pc must not store"
+        );
+        // env on + ctor-entry pc + non-trivial x0 -> stores the object.
+        st.x[0] = 0x1234_5678_9000_2000;
+        routeb_dm_instance_ctor_capture(&mut st as *mut CpuState, 0x10255d1dc);
+        assert_eq!(
+            ROUTEB_DM_CTOR_OBJ.load(std::sync::atomic::Ordering::Relaxed),
+            0x1234_5678_9000_2000,
+            "ctor-entry + non-trivial x0 must store the object"
+        );
+        // A trivial (0x1) x0 must NOT be stored (guards the atomic from garbage).
+        st.x[0] = 0x1;
+        routeb_dm_instance_ctor_capture(&mut st as *mut CpuState, 0x10255d1dc);
+        assert_eq!(
+            ROUTEB_DM_CTOR_OBJ.load(std::sync::atomic::Ordering::Relaxed),
+            0x1234_5678_9000_2000,
+            "trivial x0 must not clobber the stored object"
+        );
+        ROUTEB_DM_CTOR_OBJ.store(0, std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::env::remove_var("JIT_ROUTEB_DM_INSTANCE") };
+    }
+
+    #[test]
     fn sh189c_dm_instance_guard_env_and_region_gated() {
         // SH189c (Route-B instance construction): the real PlayerGui/ScreenGui INSTANCE ctor
         // chain (pair-consumers 0x10255d0e4/0x10247a88c, core creator 0x102373458) is reachable
         // headlessly once the current-DM global 0x107333948 is planted. Guard must be
         // default-inert (env off), env-gated (JIT_ROUTEB_DM_INSTANCE), region-scoped to
         // StartLuaAppDM entry. Guest drive (run_guest_callback_x8) is harness-owned.
+        let _l = DM_INSTANCE_TEST_LOCK.lock().unwrap();
         let mut st = CpuState::new();
         routeb_dm_instance_guard(&mut st as *mut CpuState, 0x1023efe2c);
         unsafe { std::env::set_var("JIT_ROUTEB_DM_INSTANCE", "1") };

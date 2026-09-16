@@ -79,6 +79,21 @@ resolver can answer the DM's getService by name.
 3. The PlayerGui SERVICE NODE + ScreenGui INSTANCE stay the migration gate (vt-dispatched ctor /
    live app-shell). Do NOT re-derive the service node (recon-negative). The cone stays armed.
 
+## SH190 ERRATUM (same session, empirical — do NOT re-tread): forcing the derived PlayerGui vptr did NOT land.
+After SH190 observed the instance-base construction, I tried the obvious next lever: patch the PlayerGui
+ctor's sub-init 0x255d2f4 tail `b 0x23768e8` (at 0x255d334, opcode 0x17f8656d) to `ret` (0xd65f03c0) so the
+derive body returns to 0x255d204 and writes the PlayerGui-class vptr 0x106648950 at 0x255d21c. EMPIRICAL:
+the patch FIRED ("PATCHED sub-init tail ... -> RET", 0 crashes, EXIT 124) but the post-drive object STILL
+holds vptr 0x106796dc0 (instance-ctor 0x2374310). Root-cause: the derive body's 0x255d21c write is NOT
+reached even with the tail ret — the post-drive object is re-initialized by getOrCreate's instance-ctor
+write path (order: PlayerGui derive write attempted but the object's settled vptr is the instance-base one).
+The block at 0x10255d204 is ALSO not a fresh block-entry, so a block-entry probe there never fires — do NOT
+reuse that as a reachability signal. VERDICT: getOrCreate constructs at the instance-base layer; the full
+PlayerGui-class vptr layer is order-dependent and NOT forceable by this single tail patch. The honest next
+gate for a REAL full PlayerGui is the class-keyed create path with the derive-body executing (needs the
+app-shell/live-DM vt-dispatched ctor), NOT this micro-branch. Kept default-inert observation (SH190) as the
+deliverable; the tail-RET patch was REVERTED (cruft). Do NOT re-tread 0x255d334/0x10255d204.
+
 ## SH190 addendum (same session, committed): INSTANCE OBJECT OBSERVED — the ctor-entry capture confirms a real, vtable'd engine object constructs headlessly.
 The SH189c residual ("instance allocated but not yet OBSERVED") is CLOSED. The ret/out-buffer walk
 was a RED HERRING: the pair-consumer's `ret x0` points into a string ("Invalid da...") and the
