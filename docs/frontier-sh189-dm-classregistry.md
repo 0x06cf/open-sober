@@ -79,6 +79,23 @@ resolver can answer the DM's getService by name.
 3. The PlayerGui SERVICE NODE + ScreenGui INSTANCE stay the migration gate (vt-dispatched ctor /
    live app-shell). Do NOT re-derive the service node (recon-negative). The cone stays armed.
 
+## SH190 ERRATUM + CORRECTION (same session, empirical): the derived PlayerGui vptr IS forceable — NOP the sub-init CALL, not the tail.
+The tail-RET erratum below was PARTIALLY wrong. Corrected diagnosis: the PlayerGui-class vptr 0x106648950 IS
+reached when the sub-init is bypassed at the CALL SITE. `routeb_dm_instance_ctor_capture` adds an opt-in
+JIT_ROUTEB_DM_INSTANCE_NOP=1 (SEPARATE env, so the standard JIT_ROUTEB_DM_INSTANCE-only capture stays clean
+EXIT 124): it NOPs `bl 0x255d2f4` at guest 0x10255d200 (opcode 0x9400003d -> 0xd503201f). EMPIRICAL
+(reproducible, runs/sh190-nop-derived-vptr.txt): the derive body then EXECUTES and the crash dump shows
+`x8=0x106648950` (the `adrp x8,0x6648000; add #0x950` at 0x255d214-0x255d218 loaded the PlayerGui-class
+vptr) — the class-vptr write is on the path. It then faults at guestpc 0x105e1f44c `ldr x9,[x20,#16]!`
+(fault=0x8) with x20=obj+0x70, x19=obj — a post-write NULL member (derived PlayerGui has a member at
+~obj+0x70/+0x80 the derive continues to deref). VERDICT: the OBJECTIVE "PlayerGui-class vptr write becomes
+reachable" is now ACHIEVED HEADLESSLY (was 'not forceable' per the erratum). The NEXT gate moved to the
+derive-body's post-write member init (obj+0x70/0x80 NULL). The tail-RET lever (0x255d334) stays REVERTED —
+the call-site NOP is the working mechanism. This is an opt-in DIAGNOSTIC (crashes EXIT 134 at the next
+member); it is NOT the default capture. To land a full PlayerGui: seed/clear the derive's post-write
+members (0x70/0x80 region) so the ctor completes, then observe [obj+0]=0x106648950. Do NOT re-tread the
+tail-RET; the call-site NOP is the lever.
+
 ## SH190 ERRATUM (same session, empirical — do NOT re-tread): forcing the derived PlayerGui vptr did NOT land.
 After SH190 observed the instance-base construction, I tried the obvious next lever: patch the PlayerGui
 ctor's sub-init 0x255d2f4 tail `b 0x23768e8` (at 0x255d334, opcode 0x17f8656d) to `ret` (0xd65f03c0) so the

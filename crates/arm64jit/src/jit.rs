@@ -1470,6 +1470,38 @@ fn routeb_dm_instance_ctor_capture(state: *mut CpuState, pc: u64) {
     if std::env::var_os("JIT_ROUTEB_DM_INSTANCE").is_none() {
         return;
     }
+    // SH190 EXPERIMENT (opt-in JIT_ROUTEB_DM_INSTANCE_NOP=1, clean SH187-pattern lever — distinct
+    // from the tail-RET erratum): the PlayerGui ctor 0x10255d1dc's derive body (0x255d204..0x255d254)
+    // is pure straight-line and writes the PlayerGui-class vptr 0x106648950 at [x19+0] (0x255d21c).
+    // Its ONLY diversion is `bl 0x255d2f4` (sub-init) at 0x255d200. NOP that call (0x9400003d ->
+    // 0xd503201f) so the derive body runs directly. EMPIRICAL (diagnostic only): the derive body
+    // EXECUTES and LOADS x8=0x106648950 (the adrp 0x6648000 add #0x950 at 0x255d214-0x255d218)
+    // before hitting a deeper NULL member at guestpc 0x105e1f44c fault=0x8 (crash EXIT 134) — so the
+    // PlayerGui-class vptr write is REACHED, but the post-write PlayerGui init chain derefs an
+    // unseeded member. Kept under a SEPARATE env so the standard SH189c capture (JIT_ROUTEB_DM_INSTANCE
+    // only) stays clean EXIT 124.
+    if std::env::var_os("JIT_ROUTEB_DM_INSTANCE_NOP").is_some() {
+        const SUBINIT_CALL: u64 = 0x10255d200; // `bl 0x255d2f4` insn slot, opcode 0x9400003d
+        use std::sync::OnceLock;
+        static CALL_NOPPED: OnceLock<()> = OnceLock::new();
+        if pc == 0x10255d0e4 {
+            CALL_NOPPED.get_or_init(|| {
+                if !routeb_ensure_writable(SUBINIT_CALL) {
+                    eprintln!("[routeb-dmins] SH190: sub-init call 0x{SUBINIT_CALL:x} not writable, skip");
+                    return;
+                }
+                let cur = unsafe { std::ptr::read_unaligned(SUBINIT_CALL as *const u32) };
+                if cur == 0xd503201f {
+                    eprintln!("[routeb-dmins] SH190: sub-init call already NOP at 0x{SUBINIT_CALL:x}");
+                } else if cur == 0x9400003d {
+                    unsafe { std::ptr::write_unaligned(SUBINIT_CALL as *mut u32, 0xd503201f) };
+                    eprintln!("[routeb-dmins] SH190: NOP'd bl 0x255d2f4 at 0x{SUBINIT_CALL:x} (0x9400003d -> 0xd503201f) so the PlayerGui derive body runs and writes 0x106648950");
+                } else {
+                    eprintln!("[routeb-dmins] SH190: unexpected opcode at 0x{SUBINIT_CALL:x} = {cur:#x} (want 0x9400003d), skip");
+                }
+            });
+        }
+    }
     let obj;
     if pc == PGI_CTOR_ENTRY {
         obj = unsafe { (*state).x[0] };
