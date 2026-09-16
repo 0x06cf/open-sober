@@ -13370,6 +13370,87 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh226_doinit_binder_dispatch_chain_reconciled() {
+        // SH226 (Route-B re-attack, single-agent): AUTHORITATIVE reconciliation of the
+        // do-init DM-construction dispatch. SH156 decoded the closure-build manually as
+        // `ldr x0,[x19,#32]` -> table[+0x30] -> 0x1023eff4c; SH225 re-decoded it (correctly)
+        // as `ldr x0,[x19,#4]` (the binder) -> vtable -> vt+0x30 -> br x1. Fresh decode this
+        // cycle CONFIRMS SH225 byte-for-byte, AND pins the complete provenance chain that
+        // would make the binder deterministic-NULL from StartLuaAppDM's own union layout:
+        //   StartLuaAppDM 0x1023efe2c builds {[sp+0]=table, [sp+8..24]=0, [sp+32]=sp}
+        //     -> 0x1023efeac bl dispatcher 0x102baeeec (x0=sp, w1=0)
+        //   dispatcher 0x2baef08 mov x19,x0 (=sp) / 0x2baef04 mov x20,w1
+        //     -> 0x102baef54 mov x1,x19 ; 0x102baef6c mov w2,wzr ; 0x102baef70 bl do-init 0x102206c40
+        //   do-init 0x206c5c x19=x2 / 0x206c60 x20=x1
+        //     -> 0x206cd4 mov x1,x20 ; 0x206cd8 mov x2,x19 ; 0x206cdc bl closure-build 0x102206db8
+        //   closure-build 0x206dd0 mov x19,x1
+        //     -> binder = [x19+4] = [closure-build-arg1 + 4] = [StartLuaAppDM-union + 4]
+        //     = high-half-of-table<2^32 coalesced with [union+8]=0 = 0
+        //     -> cbz x0 -> 0x102206ea4 benign soft-return (the harness's [union+8] fill
+        //        determines whether the dispatch fires; SH197 measured it fires into 0x1023eff4c).
+        // Also pins the DMCONT continuation anchors (the operator's named re-attack target:
+        // continueAfterFlagsLoaded_ 0x102bd1d68 -> app-shell ctor 0x2207b54) so a future drive
+        // of the fabricated manager's vt[+0x1f0] starts from pinned bytes, not re-guessed ones.
+        // Skip-if-absent real-image guard family (sh225/sh224/sh223 pattern).
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if p.exists() {
+            let el = libloader::elf::load_elf_image(p).expect("load real libroblox.so");
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            // [1] StartLuaAppDM union-build + bl dispatcher.
+            let chain: [(u64, u32, &str); 14] = [
+                (0x102_3efe98, 0x910003f4, "StartLuaAppDM mov x20,sp (union base)"),
+                (0x102_3efe9c, 0xf90003e8, "StartLuaAppDM str x8,[sp] (table slot0)"),
+                (0x102_3efea0, 0xf90013f4, "StartLuaAppDM str x20,[sp,#32] (stack self-ref)"),
+                (0x102_3efeac, 0x941efc10, "StartLuaAppDM bl dispatcher 0x102baeeec"),
+                (0x102_baef04, 0x2a0103f4, "dispatcher mov w20,w1"),
+                (0x102_baef08, 0xaa0003f3, "dispatcher mov x19,x0 (=union)"),
+                (0x102_baef54, 0xaa1303e1, "dispatcher mov x1,x19 (=union)"),
+                (0x102_baef58, 0xf9400500, "dispatcher ldr x0,[x8,#8] (gov this)"),
+                (0x102_baef6c, 0xaa1f03e2, "dispatcher mov w2,wzr"),
+                (0x102_baef70, 0x97d95f34, "dispatcher bl do-init 0x102206c40"),
+                (0x102_206c5c, 0xaa0203f3, "do-init mov x19,x2"),
+                (0x102_206c60, 0xaa0103f4, "do-init mov x20,x1 (=union)"),
+                (0x102_206cd4, 0xaa1403e1, "do-init mov x1,x20 (-> closure-build arg1)"),
+                (0x102_206cdc, 0x94000037, "do-init bl closure-build 0x102206db8"),
+            ];
+            for (guest, want, name) in chain {
+                assert_eq!(word(guest), want, "sh226 {name} @{guest:#x}");
+                assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh226 site {guest:#x} in window");
+                assert!(guest & 3 == 0, "sh226 site {guest:#x} 4-aligned");
+            }
+            // [2] A drift into SH156's mis-decode (`[x19,#32]`, imm 32) fails loudly.
+            assert_eq!(word(0x102_206df4), 0xf9401260, "closure-build binder load = [x19,#4] (imm 4), NOT [x19,#32]");
+            // [3] The closure-build dispatch itself (sh225 already pins; re-assert the two
+            // decisive words so the reconciliation is self-contained).
+            assert_eq!(word(0x102_206e00), 0xf9401901, "closure-build ldr x1,[x8,#0x30] (vt+0x30)");
+            assert_eq!(word(0x102_206e24), 0xd61f0020, "closure-build br x1");
+            // [4] The DMCONT continuation anchors (operator's named re-attack target).
+            let cont_chain: [(u64, u32, &str); 5] = [
+                (0x102_bd1d68, 0xa9ba7bfd, "continueAfterFlagsLoaded_ prologue (stp x29,x30,[sp,#-0x60]!)"),
+                (0x102_bd1de4, 0x52800088, "continueAfterFlagsLoaded_ mov w8,#4 (state)"),
+                (0x102_bd8e20, 0xf940f908, "engine-init dispatcher ldr x8,[x8,#0x1f0] (vt+0x1f0)"),
+                (0x102_bd8e28, 0xd63f0100, "engine-init dispatcher blr x8 (dispatch vt+0x1f0 -> continueAfterFlagsLoaded_)"),
+                (0x102_bd8dac, 0xd104c3ff, "engine-init dispatcher 2nd-frame sub sp,#0x130"),
+            ];
+            for (guest, want, name) in cont_chain {
+                assert_eq!(word(guest), want, "sh226 {name} @{guest:#x}");
+                assert!(guest & 3 == 0, "sh226 cont site {guest:#x} 4-aligned");
+            }
+            // [5] Hard anchor for the vt+0x1f0 target the DMCONT-routed manager points at.
+            assert_eq!(0x102bd1d68u64 & 3, 0, "continueAfterFlagsLoaded_ entry 4-aligned");
+            assert_eq!(0x102bd1d68u64 & 7, 0, "continueAfterFlagsLoaded_ entry 8-aligned (stp pair)");
+            eprintln!("sh226 do-init binder-dispatch chain + DMCONT continuation anchors verified on libroblox.so");
+        } else {
+            eprintln!("sh226 real-image guard: no real libroblox.so, skipping reconciliation pins");
+        }
+    }
+
+    #[test]
     fn sh115_sites_target_lazy_singleton_accessor_windows() {
         // Guest file vaddrs for the three accessor sites with their original
         // slot0 (mov) guard bytes — the patch refuses to write if these shift.
