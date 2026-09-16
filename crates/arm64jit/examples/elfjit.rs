@@ -13077,6 +13077,99 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh221_fp16_doc_flagged_simd_immediate_opcodes_decode_as_vecmovi() {
+        // docs/fp16-decode-gap.md (pre-4dd5e3d area) lists a "NEXT lever" of ~100
+        // `orc/bic/orr/mvni/movi Vd.2S/.4S` SIMD modified-immediate opcodes encoded
+        // 0x4f0177eX / 0x2f047400, claiming they fall to Inst::Unsupported and "will
+        // JIT-abort the moment the real boot reaches them". That verdict is STALE:
+        // the broad VecMovi gate (top byte {0F,1F,2F,4F,5F,6F}) + cmode-shift arms
+        // (kind 1=bic/AND~imm, 2=orr/OR imm) already decode them. Verify on the real
+        // image that (a) representative modified-immediate opcodes decode as the
+        // CORRECT VecMovi (right lo/hi immediates + kind, never Unsupported), and
+        // (b) a fresh decode of the real .text window [file 0x1d95980..+0x4540104]
+        // surfaces ZERO Unsupported — the durable "decode coverage must not regress"
+        // pin. Skip-if-absent real-image guard family as sh219/sh213/sh211.
+        use arm64jit::decode::{decode, Inst};
+        // kind: 0=write(movi/mvni), 1=bic(AND ~imm), 2=orr(OR imm).
+        let cases: &[(u32, Option<(u64, u64, u8)>, &str)] = &[
+            (0x4f0177e4, Some((0x3f00_0000_3f00_0000, 0x3f00_0000_3f00_0000, 2)), "orr .2S cmode7"),
+            (0x2f047400, Some((0x7fff_ffff_7fff_ffff, 0x0000_0000_0000_0000, 1)), "bic .2S cmode lsl16"),
+            (0x4f001fe0, Some((0x1f00_0000_1f, 0x1f00_0000_1f, 2)), "orr .2S cmode1 (imm8=0x1f)"),
+            (0x2f001fe0, Some((0xffff_ffe0_ffff_ffe0, 0x0000_0000_0000_0000, 1)), "bic .2S cmode1 (imm8=0x1f)"),
+        ];
+        for (w, expect, label) in cases {
+            match decode(*w) {
+                Inst::VecMovi { lo, hi, kind, .. } => {
+                    if let Some((elo, ehi, ekind)) = *expect {
+                        assert_eq!(lo, elo, "{label} lo must be correct immediate");
+                        assert_eq!(hi, ehi, "{label} hi must be correct immediate");
+                        assert_eq!(kind, ekind, "{label} kind (0=movi,1=bic,2=orr) must be correct");
+                    }
+                }
+                other => panic!("{label}: {w:#010x} must decode as VecMovi, got {other:?}"),
+            }
+        }
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            use libloader::elf::load_elf_image;
+            let el = load_elf_image(p).expect("load real libroblox.so");
+            // Mirror scandecode's reproducible full-image route but restrict the
+            // count to the REAL code window (guest [0x102d95980, 0x1072d5a84),
+            // the .text span the fp16 doc + commit 88db5be measured 0 over).
+            // Without the window the count is polluted by .rodata/.eh_frame/.rela
+            // DATA bytes living inside the single big R E LOAD segment (they are
+            // not instructions; the 4.2M whole-image "unsupported" are those).
+            let lo = 0x102d95980u64;
+            let hi = 0x1072d5a84u64;
+            let mut unsup = 0u64;
+            let mut panic_hits = 0u64;
+            let mut total_inst = 0u64;
+            for seg in &el.segments {
+                if !seg.prot.execute {
+                    continue;
+                }
+                let base = seg.vaddr as u64;
+                let size = seg.memsz as usize;
+                let image = unsafe { std::slice::from_raw_parts(base as *const u8, size) };
+                let guest_base = seg.guest_vaddr;
+                let mut off = 0usize;
+                while off + 4 <= image.len() {
+                    let pc = guest_base + off as u64;
+                    if pc < lo || pc + 4 > hi {
+                        off += 4;
+                        continue;
+                    }
+                    let w = u32::from_le_bytes([
+                        image[off],
+                        image[off + 1],
+                        image[off + 2],
+                        image[off + 3],
+                    ]);
+                    total_inst += 1;
+                    match std::panic::catch_unwind(|| decode(w)) {
+                        Ok(Inst::Unsupported(_)) => unsup += 1,
+                        Ok(_) => {}
+                        Err(_) => {
+                            unsup += 1;
+                            panic_hits += 1;
+                        }
+                    }
+                    off += 4;
+                }
+            }
+            assert_eq!(
+                unsup, 0,
+                "real code window [0x102d95980, 0x1072d5a84) must decode with 0 Unsupported (coverage pin); found {unsup} across {total_inst} instrs ({panic_hits} panics)"
+            );
+            eprintln!(
+                "sh221 real code-window decode coverage pin verified (0 unsupported over {total_inst} instrs)"
+            );
+        } else {
+            eprintln!("sh221 real-image guard: no real libroblox.so, skipping coverage pin");
+        }
+    }
+
+    #[test]
     fn sh115_sites_target_lazy_singleton_accessor_windows() {
         // Guest file vaddrs for the three accessor sites with their original
         // slot0 (mov) guard bytes — the patch refuses to write if these shift.

@@ -1,10 +1,20 @@
 # Decoder gap: real .text has 11,437 Unsupported (FP16/NEON) instructions
+> **[RESOLVED — SH221 re-measure, Sep 16 2026]** This entire ledger is STALE. A fresh
+> scandecode of the real libroblox.so on the same span [0x102d95980, 0x1072d5a84]
+> across 13,961,732 instructions now reports **0 Unsupported, 0 PANIC, 0 distinct**
+> (all closed since commit 88db5be declared 100% decode coverage). Every family in
+> this doc — scalar + SIMD FP16, orr/bic/movi/mvni modified-immediates,
+> fmaxnm/fminnm, fcvtas/fcvtzu, fabs/fneg/fsqrt — is already decoded. The doc is kept
+> only as a record of what was closed; do NOT re-implement any of it. Durable pin:
+> hermetic `sh221_fp16_doc_flagged_simd_immediate_opcodes_decode_as_vecmovi` (elfjit
+> example) asserts the full code-window decode coverage on the real image.
 
 **Reproducible scan (scandecode, .text span [0x102d95980, 0x1072d5a84]):**
 - total instructions:   13,961,732
 - Unsupported hits:     9,552    (was 11,437; **-1,885** this cycle)
 - decode() PANIC hits:  0        (decode never aborts — safe)
 - distinct opcodes:     5,735     (was 6,281)
+> **[SH221] current: 0 Unsupported / 0 PANIC / 0 distinct on this exact span.**
 
 **Closed this cycle — scalar FP16 + gate families (commit 4dd5e3d, -1,831), SIMD
 FP16 3-same (commit d284c2d, -1,650), and FP16 by-element fmla/fmls/fmul
@@ -69,13 +79,25 @@ Total distinct by-mnemonic: 1625 (many are just register-id rotations of the
 same shape: `fmla v28.8h`/`v29.8h`/`v30.8h` collapse to ONE translator rule).
 
 ## Next lever (SIMD-immediate orr/bic v.2s/.4s — ~100 real hits, 0x4f0177eX)
+> **[CLOSED — SH221 re-measure, Sep 16 2026]** This "NEXT lever" is STALE. The broad
+> `VecMovi` gate (top byte `{0F,1F,2F,4F,5F,6F}`, decode.rs:3254) + its cmode-shift arms
+> already decode the orr/bic/movi/mvni `.2S/.4S` modified-immediates (kind 1=bic,
+> 2=orr). Measured on the real libroblox.so: `0x4f0177e4`/`0x4f001fe0` decode as
+> `VecMovi` with the CORRECT immediates+kind, and a fresh scandecode of the real .text
+> window [0x102d95980, 0x1072d5a84) across 13,961,732 instructions reports **0
+> Unsupported, 0 PANIC** (was 9,552 at this doc's date). Durable pin: hermetic
+> `sh221_fp16_doc_flagged_simd_immediate_opcodes_decode_as_vecmovi` (elfjit example)
+> asserts these opcodes + the full code-window decode coverage on the real image
+> (skip-if-absent). Do NOT re-implement orr/bic — it is closed.
+
 The fmla-by-element family is CLOSED (f3251b7). The next-largest remaining
-families are the **vector modified-immediate** ops:
+families were the **vector modified-immediate** ops:
 - `orc/bic/orr/mvni/movi Vd.2S/.4S` encoded 0x4f0177eX / 0x2f047400 (cmode-based
-  128/64-bit immediate; ~sum 100+ real instances) — currently falling through
-  to `Unsupported` (or occasionally a wrong decode). Same AArch64 "vector ORR/
+  128/64-bit immediate; ~100 real instances) — currently falling through
+  to `Unsupported` (or occasionally a wrong decode). **[CLOSED by the VecMovi cmode
+  arms + verified 0-unsupported, SH221]** Same AArch64 "vector ORR/
   BIC/mov immediate" shape the existing VecMovi already handles for byte/word
-  cmodes; extend it for the .2S/.4S cmode-0001 shifts.
+  cmodes; extend it for the .2S/.4S cmode-0001 shifts. (Superseded — already done.)
 - `fmaxnm/fminnm Vd.4S/.2S/.4H` (0x4e21c8xx / 0x4ea0xxxx, ~30) — FP min/max
   (maxnm propagates NaN, minnm ignores; x86 maxss/minss differ only on NaN, a
   documented approximation).
