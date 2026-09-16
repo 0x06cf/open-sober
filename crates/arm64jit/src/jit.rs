@@ -1914,6 +1914,40 @@ fn routeb_dm_service_resolve_guard(_state: *mut CpuState, pc: u64) {
             n0 = if m0 != 0 && m0 != m0e { "nonempty" } else { "EMPTY" },
             n1 = if m1 != 0 && m1 != m1e { "nonempty" } else { "EMPTY" },
         );
+        // SH194: the resolver map 0x106dca0e70 is a std::unordered_map whose ONLY writer is the
+        // bulk registrar 0x2208ae8 (nativeGameGlobalInit+0x26e4, ABI x0=&{key_ptr,key_len} ->
+        // ret &element.classid), which copies entries into the map ONLY when the ladder has
+        // FIRST written the 48-byte map header at nativeGameGlobalInit+0x2014 (0x2208418). SH192
+        // drove 0x2208ae8 STANDALONE before that header existed -> hashed against garbage ->
+        // bad_weak_ptr. After the full ladder (this guard fires at StartLuaAppDM, post
+        // nativeGameGlobalInit) the map header SHOULD be a status quo empty unordered_map, so a
+        // registrar drive here inserts into a CONSTRUCTED container. Dump the full header to
+        // confirm coherence before attempting the drive.
+        let delt_l: Vec<u64> = (0..8)
+            .map(|i| {
+                let a = 0x106dca0e70u64 + i * 8;
+                if page_is_mapped(a) {
+                    unsafe { std::ptr::read_unaligned(a as *const u64) }
+                } else {
+                    u64::MAX
+                }
+            })
+            .collect();
+        eprintln!(
+            "[routeb-dmsvc] SH194: resolver-map header 0x106dca0e70 -> {delt:?} (8 x u64; unmapped=ff..f)",
+            delt = delt_l
+        );
+        // SH194 EMPIRICAL RECON-NEGATIVE (do not re-tread): the resolver map 0x106dca0e70 is NOT a
+        // live-constructed unordered_map headlessly even after the full ladder. The 48-byte header
+        // copy at nativeGameGlobalInit+0x2014 (0x2208418) writes DEFAULT-EMPTY {begin=0,end=0,
+        // bucket=0} from a stack default-ctor, leaving the map as zeroed .bss — the libc++ bucket
+        // sentinel (which a real unordered_map ctor allocates) is never established. Driving the
+        // bulk registrar 0x2208ae8 IN-CONTEXT here with a fabricated {&"PlayerGui",9} key returns a
+        // HOST slot (0x7fce...) and corrupts shared state -> bad_weak_ptr / EXIT 139 (verified, same
+        // symptom as SH192's standalone drive). The registrar hashes against the null bucket state.
+        // Resolution therefore sits behind a real world-build that constructs 0x106dca0e70's bucket
+        // array — the standing live-class-registry gate, now closed at mechanism level. Keep the
+        // header read-back as a diagnostic only; NEVER poke the registrar here.
         match crate::jit::run_guest_callback_x8(SVC_WALKER, [dm, name_str, 0, 0, 0, 0, 0, 0], out, tp) {
             Ok(r) => {
                 let item = unsafe { std::ptr::read_unaligned(out as *const u64) };
