@@ -79,6 +79,34 @@ resolver can answer the DM's getService by name.
 3. The PlayerGui SERVICE NODE + ScreenGui INSTANCE stay the migration gate (vt-dispatched ctor /
    live app-shell). Do NOT re-derive the service node (recon-negative). The cone stays armed.
 
+## SH190d (Sep 16, 2026, hermes-worker): FULL PLAYERGUI SELF-CONSTRUCTION — the derive body COMPLETES and [obj+0]=0x106648950 (the PlayerGui-class vptr) is written headlessly. Supersedes SH190c's 'crash at the next member' gate.
+The SH190c call-site NOP (`bl 0x255d2f4` @ 0x10255d200 -> NOP) + a NEW string-member seed makes the
+PlayerGui derive body run ENTIRELY to completion. Root cause of the SH190c post-write crash
+(0x5e1f44c `ldr x9,[x20,#16]!`, fault=0x8 then 0x109): the derive body copy-assigns std::string
+members via `setString` 0x2374d4c -> `operator=` helper 0x5e1f380; the DEST string is at obj+0x60
+and the helper derefs its LONG-FORM __data_ (obj+0x70) UNCONDITIONALLY. The object comes from the
+mempool (not calloc) so those slots hold garbage (mempool-tail 0xab-fill simulated in the hermetic
+test). A zeroed SSO fails (obj+0x70=NULL -> [0x8]); a cap-constant fails (obj+0x70=0x101 -> [0x109]).
+FIX (`routeb_dm_instance_ctor_capture` under JIT_ROUTEB_DM_INSTANCE_NOP, at PGI ctor-entry): seed
+obj+0x60 as a coherent LONG-FORM empty std::string {__cap_=0x100|1 (bit0=1 long), __size_=0,
+__data_=real zeroed 0x100 buffer}, and zero [obj+0x40,0x60) + [obj+0x78,0xa8) as EMPTY SSO.
+EMPIRICAL (real libroblox.so, llvmpipe, 3/3 EXIT 124, 0 SIGSEGV/SIGABRT):
+```
+SH190c: seeded obj+0x60 LONG-FORM empty {cap=0x100|1,size=0,data=...} + SSO windows ... 
+SH189c: *** CONFIRMED — engine SELF-CONSTRUCTED a real RBX::PlayerGui instance ... (vptr 0x106648950) headlessly ***
+obj [+0x0]=0x106648950 [+0x8]=0 [+0x10]=0 [+0x18]=0 [+0x20]=0 [+0x28]=0 [+0x30]=0 [+0x38]=0
+```
+The FULL PlayerGui-class layer (vptr 0x106648950) is now written headlessly — the deepest Route-B
+point: not just the instance base (0x106796dc0), but the derived PlayerGui class vptr, with the
+whole ctor body executing to completion. Default (NOP-off) capture UNREGRESSED (3/3 EXIT 124,
+instance-base-only 0x106796dc0). +1 hermetic sh190c_dm_instance_nop_member_seed_... (env/pc/window/
+long-form/idempotent-capture). Workspace green (arm64jit 379/0). COMMITS: 89c9a55.
+NEXT (honest): the constructed PlayerGui is a standalone instance — it is NOT yet attached as a
+service NODE on [dm+0x68] ([node+0x18]==0x87e) nor parented to a ScreenGui scene (R+0x180/0x188).
+That attach remains behind the live-app-shell/vt-dispatched service arming (recon-negative do-not-
+re-tread the walker); the observe-instance + scene-attach layers are the standing frontier. Cone
+stays armed per discipline.
+
 ## SH190 ERRATUM + CORRECTION (same session, empirical): the derived PlayerGui vptr IS forceable — NOP the sub-init CALL, not the tail.
 The tail-RET erratum below was PARTIALLY wrong. Corrected diagnosis: the PlayerGui-class vptr 0x106648950 IS
 reached when the sub-init is bypassed at the CALL SITE. `routeb_dm_instance_ctor_capture` adds an opt-in

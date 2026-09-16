@@ -1502,6 +1502,50 @@ fn routeb_dm_instance_ctor_capture(state: *mut CpuState, pc: u64) {
             });
         }
     }
+    // SH190c (Route-B PlayerGui member-seed, opt-in JIT_ROUTEB_DM_INSTANCE_NOP, diagnostics only):
+    // the derive body, after the call-site NOP, writes the PlayerGui-class vptr 0x106648950 at
+    // obj+0 (0x255d21c) then copy-assigns a std::string member (setter 0x2374d4c -> 0x5e1f380) whose
+    // mempool-garbage long-form __data_ pointer it derefs -> fault at 0x5e1f44c `ldr x9,[x20,#16]!`.
+    // EMPIRICAL ABI (crash dump + disasm): the string member is at obj+0x60, its __data_ lives at
+    // obj+0x70, and the assign helper reads [__data_+#8]/[+#16] UNCONDITIONALLY. So obj+0x60 must be
+    // a coherent LONG-FORM (cap bit0=1) empty string whose __data_ = a real zeroed buffer. A zeroed
+    // SSO fails (obj+0x70=NULL -> [0+8] faults); a cap constant fails (obj+0x70=0x101 -> [0x109]).
+    // Seed: obj+0x60 = LONG-FORM empty {cap=cap|1 long, size 0, __data_=zeroed 0x100 buffer}. Also
+    // zero the leading SSO members [obj+0x40,obj+0x60) and [obj+0x78,obj+0xa8) (adjacent strings).
+    // The derive body overwrites scalar/pointer fields above +0x158; we only seed the lower window
+    // it assigns into first. Gate: NOP env + exact PlayerGui ctor-entry pc + a readable/writable
+    // nontrivial object. Idempotent + transient (object is allocated per-drive).
+    if std::env::var_os("JIT_ROUTEB_DM_INSTANCE_NOP").is_some() && pc == PGI_CTOR_ENTRY {
+        let obj0 = unsafe { (*state).x[0] };
+        if obj0 > 0x1000 && obj0 != u64::MAX && page_is_mapped(obj0) {
+            const SSO_LO: u64 = 0x40;
+            const SSO_HI: u64 = 0x60; // leading SSO string members
+            const STR_BASE: u64 = 0x60; // the known long-form string (base obj+0x60, data @ obj+0x70)
+            const STR_TAIL_HI: u64 = 0xa8; // zero [obj+0x78,obj+0xa8) SSO for adjacent members
+            const BUF_SZ: u64 = 0x100;
+            if routeb_ensure_writable(obj0 + SSO_LO) {
+                // (1) zero the leading + trailing SSO members -> valid empty SSO (cap bit0=0)
+                for off in (SSO_LO..SSO_HI).step_by(8) {
+                    unsafe { std::ptr::write_volatile((obj0 + off) as *mut u64, 0) };
+                }
+                for off in ((STR_BASE + 0x18)..STR_TAIL_HI).step_by(8) {
+                    unsafe { std::ptr::write_volatile((obj0 + off) as *mut u64, 0) };
+                }
+                // (2) coherent LONG-FORM empty string at obj+0x60 with a real zeroed buffer.
+                let buf = Box::leak(vec![0x0u8; BUF_SZ as usize].into_boxed_slice()).as_mut_ptr() as u64;
+                unsafe {
+                    std::ptr::write_volatile((obj0 + STR_BASE) as *mut u64, BUF_SZ | 1); // __cap_ (bit0=1 => long)
+                    std::ptr::write_volatile((obj0 + STR_BASE + 0x8) as *mut u64, 0); // __size_
+                    std::ptr::write_volatile((obj0 + STR_BASE + 0x10) as *mut u64, buf); // __data_ @ obj+0x70
+                }
+                eprintln!(
+                    "[routeb-dmins] SH190c: seeded obj+0x{STR_BASE:x} ({obj0:#x}) LONG-FORM empty {{cap=0x{BUF_SZ:02x}|1,size=0,data={buf:#x} @obj+0x{STR_BASE:02x}+0x10}} + SSO windows [{obj0:#x}+0x{SSO_LO:x},+0x{SSO_HI:x}) & [+0x{STR_BASE:02x}+0x18,+0x{STR_TAIL_HI:x}) at ctor-entry (derive copy-assign fault 0x5e1f44c)"
+                );
+            } else {
+                eprintln!("[routeb-dmins] SH190c: obj {obj0:#x} not writable, string-member seed skipped");
+            }
+        }
+    }
     let obj;
     if pc == PGI_CTOR_ENTRY {
         obj = unsafe { (*state).x[0] };
@@ -5927,6 +5971,75 @@ mod tests {
             "trivial x0 must not clobber the stored object"
         );
         ROUTEB_DM_CTOR_OBJ.store(0, std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::env::remove_var("JIT_ROUTEB_DM_INSTANCE") };
+    }
+
+    #[test]
+    fn sh190c_dm_instance_nop_member_seed_zeroes_string_window() {
+        // SH190c: under JIT_ROUTEB_DM_INSTANCE_NOP at the PlayerGui ctor-entry pc, the string-member
+        // window is seeded so the derive body's copy-assign (into obj+0x60, __data_@obj+0x70) doesn't
+        // deref mempool-garbage. obj+0x60 -> coherent LONG-FORM empty string {cap bit0=1,size 0,
+        // __data_=real buffer at obj+0x70}; [obj+0x40,0x60) and [obj+0x78,0xa8) -> EMPTY SSO. Must be
+        // local to the seeded object, env-gated (NOP env on), and pc-gated (only PGI_CTOR_ENTRY),
+        // leaving the capture atomics untouched.
+        let _l = DM_INSTANCE_TEST_LOCK.lock().unwrap();
+        let mut st = CpuState::new();
+        // Allocate a fresh isolated object so the zeroing deals only with our own bytes.
+        let obj = Box::leak(vec![0xabu8; 0x200].into_boxed_slice()).as_mut_ptr() as u64;
+        // populate the window with nonzero garbage (mempool simulation)
+        for off in (0x40..0xc0).step_by(8) {
+            unsafe { std::ptr::write_volatile((obj + off) as *mut u64, 0x4142_4344_4546_4748) };
+        }
+        // env OFF -> no seeding even at the right pc.
+        st.x[0] = obj;
+        routeb_dm_instance_ctor_capture(&mut st as *mut CpuState, PGI_CTOR_ENTRY);
+        assert_eq!(
+            unsafe { std::ptr::read_volatile((obj + 0x40) as *const u64) },
+            0x4142_4344_4546_4748,
+            "env-off must not seed"
+        );
+        // env ON + wrong pc (ScreenGui ctor-entry, share the NOP-env condition but wrong ctor) -> no seed.
+        unsafe { std::env::set_var("JIT_ROUTEB_DM_INSTANCE", "1") };
+        unsafe { std::env::set_var("JIT_ROUTEB_DM_INSTANCE_NOP", "1") };
+        routeb_dm_instance_ctor_capture(&mut st as *mut CpuState, SGI_CTOR_ENTRY);
+        assert_eq!(
+            unsafe { std::ptr::read_volatile((obj + 0x60) as *const u64) },
+            0x4142_4344_4546_4748,
+            "wrong pc must not seed"
+        );
+        // env ON + exact PGI ctor-entry -> SSO windows zeroed + LONG-FORM string at obj+0x60.
+        routeb_dm_instance_ctor_capture(&mut st as *mut CpuState, PGI_CTOR_ENTRY);
+        let mut sso_all_zero = true;
+        for off in (0x40..0x60).step_by(8) {
+            if unsafe { std::ptr::read_volatile((obj + off) as *const u64) != 0 } {
+                sso_all_zero = false;
+            }
+        }
+        for off in (0x78..0xa8).step_by(8) {
+            if unsafe { std::ptr::read_volatile((obj + off) as *const u64) != 0 } {
+                sso_all_zero = false;
+            }
+        }
+        assert!(sso_all_zero, "env NOP + PGI ctor-entry must SSO [obj+0x40,0x60) & [obj+0x78,0xa8)");
+        // long-form string at obj+0x60: cap bit0=1, size 0, __data_ = mapped zeroed buffer@+0x70.
+        let cap = unsafe { std::ptr::read_volatile((obj + 0x60) as *const u64) };
+        assert_eq!(cap & 1, 1, "cap bit0 must be 1 (long-form)");
+        assert_eq!(
+            unsafe { std::ptr::read_volatile((obj + 0x68) as *const u64) },
+            0,
+            "size must be 0"
+        );
+        let data = unsafe { std::ptr::read_volatile((obj + 0x70) as *const u64) };
+        assert!(data > 0x1000, "long-form __data_ must be non-trivial");
+        assert_eq!(unsafe { std::ptr::read_volatile(data as *const u64) }, 0, "long-form buffer zeroed");
+        // The capture atomics (observation primitive) must still see the seeded object.
+        assert_eq!(
+            ROUTEB_DM_CTOR_OBJ.load(std::sync::atomic::Ordering::Relaxed),
+            obj,
+            "capture obj atomic must be set"
+        );
+        ROUTEB_DM_CTOR_OBJ.store(0, std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::env::remove_var("JIT_ROUTEB_DM_INSTANCE_NOP") };
         unsafe { std::env::remove_var("JIT_ROUTEB_DM_INSTANCE") };
     }
 
