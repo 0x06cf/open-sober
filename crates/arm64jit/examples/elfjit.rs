@@ -13666,6 +13666,62 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh232_ec_callers_pinned_to_ladder_rungs() {
+        // SH232 (Route-B re-attack, single-agent): SH231a found 241 static bl/b callers into the
+        // ExperienceController DM-creation world [0x102e1c650,0x102e25200) — incl. two inside LADDER
+        // rungs: StartLuaAppDM (0x1023f1294 -> bl 0x2e24598) and nativeAppBridgeV2InitWithParams
+        // (0x1023cfd68 -> bl 0x2e24468). SH231 measured the EC TARGET region at 0 hits on the
+        // completing ladder. This test byte-pins the CALLER bodies + their enclosing-function
+        // prologues so the mechanism stays fail-loud. Fresh SH232 runtime measurement: on
+        // govtail-positive (ladder-complete) runs the enclosing bodies ALSO stay 0 — StartLuaAppDM
+        // returns Ok(real heap) and V2InitWithParams its soft-return BEFORE reaching their own
+        // EC-call blocks, so the bls are never translated on the ladder (the live-DM structural
+        // gate one level deeper: the rungs benign-complete upstream of the EC world).
+        // Pins (real-image guard family as sh231; skip-if-absent):
+        //   StartLuaAppDM entry 0x1023efe2c = sub sp,#0x60 (0xd10183ff)
+        //   StartLuaAppDM EC-caller body 0x1023f1294 = bl 0x2e24598 (0x9428ccc1)
+        //   StartLuaAppDM EC-arg helper prologue 0x1023f11f4 = stp x29,x30,[sp,#-16]! (0xa9bf7bfd)
+        //   V2InitWithParams EC-caller body 0x1023cfd68 = bl 0x2e24468 (0x942951c0)
+        //   V2InitWithParams deep-branch prologue 0x1023cfafc = stp x29,x30,[sp,#-64]! (0xa9bc7bfd)
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if p.exists() {
+            let el = libloader::elf::load_elf_image(p).expect("load real libroblox.so");
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            assert_eq!(word(0x102_3efe2c), 0xd10183ff, "sh232 StartLuaAppDM entry sub sp,#0x60");
+            assert_eq!(word(0x102_3f1294), 0x9428ccc1, "sh232 StartLuaAppDM EC bl 0x2e24598");
+            assert_eq!(word(0x102_3f11f4), 0xa9bf7bfd, "sh232 StartLuaAppDM EC-arg helper prologue");
+            assert_eq!(word(0x102_3cfd68), 0x942951c0, "sh232 V2InitWithParams EC bl 0x2e24468");
+            assert_eq!(word(0x102_3cfafc), 0xa9bc7bfd, "sh232 V2InitWithParams deep-branch prologue");
+            // cross-check: the bl imm26 offsets resolve to the EC world both times (same transform
+            // the JIT imm26 branch decode uses: off = (target-pc)/4, sign-ext 26-bit).
+            let check_bl = |pc: u64, word: u32, expect_tgt: u64| {
+                let imm = word & 0x03ff_ffff;
+                let signed = if imm & 0x200_0000 != 0 { (imm as i64) - 0x400_0000 } else { imm as i64 };
+                let target = pc.wrapping_add_signed(signed << 2);
+                assert_eq!(target, expect_tgt, "sh232 bl target from {pc:#x}");
+            };
+            check_bl(0x102_3f1294, 0x9428ccc1, 0x102_e24598);
+            check_bl(0x102_3cfd68, 0x942951c0, 0x102_e24468);
+            for (guest, name) in [
+                (0x102_3efe2cu64, "StartLuaAppDM entry"), (0x102_3f1294u64, "StartLuaAppDM EC bl"),
+                (0x102_3f11f4u64, "StartLuaAppDM EC-arg helper"), (0x102_3cfd68u64, "V2Init EC bl"),
+                (0x102_3cfafcu64, "V2Init deep-branch"),
+            ] {
+                assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh232 {name} {guest:#x} in window");
+                assert!(guest & 3 == 0, "sh232 {name} {guest:#x} 4-aligned");
+            }
+            eprintln!("sh232 EC callers pinned inside ladder rungs StartLuaAppDM + V2InitWithParams (bl targets 0x102e24598/0x102e24468) on libroblox.so");
+        } else {
+            eprintln!("sh232 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh115_sites_target_lazy_singleton_accessor_windows() {
         // Guest file vaddrs for the three accessor sites with their original
         // slot0 (mov) guard bytes — the patch refuses to write if these shift.
