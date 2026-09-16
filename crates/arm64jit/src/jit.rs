@@ -1841,6 +1841,28 @@ fn routeb_dm_service_resolve_guard(_state: *mut CpuState, pc: u64) {
             );
             return;
         }
+        // SH195: scene-attach readiness — read the LIVE vtable of the self-constructed
+        // PlayerGui instance (reloc-populated at runtime, on-disk zeros) so we can see what
+        // the engine's present-walker would actually dispatch if we attach this genuine
+        // GuiObject as a render-scene node (R+0x180/0x188): vt[+24] = per-item draw,
+        // vt[+64] = dims-query, vt[+8] = first method. Pure read-back, does NOT call any
+        // slot — benign diagnostic for the scene-attach decision (does the engine's own
+        // walk path have live engine fns behind the genuine PlayerGui vptr?).
+        {
+            let vp = unsafe { std::ptr::read_unaligned(inst as *const u64) };
+            let mut slots: Vec<u64> = Vec::with_capacity(16);
+            for i in 0..16usize {
+                let s = vp + (i as u64) * 8;
+                slots.push(if page_is_mapped(s) {
+                    unsafe { std::ptr::read_unaligned(s as *const u64) }
+                } else {
+                    u64::MAX
+                });
+            }
+            eprintln!(
+                "[routeb-dmsvc] SH195: gen PlayerGui {inst:#x} vptr {vp:#x} live vtable slots[0..16] = {slots:?} (draw=vt+24 dims=vt+64)",
+            );
+        }
         // Build the thin service node: [node+8]=instance, [node+16]=refcount, [node+0x18]=classid,
         // [node+0x68]=next. The walker only derefs [node+0x18] and [node+0x68] and the
         // materializer reads [node+8]/[node+16]; [node+0] is unused by this path.
