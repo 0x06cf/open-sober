@@ -93,7 +93,7 @@ EMPIRICAL (real libroblox.so, llvmpipe, 2/2 EXIT 124, 0 SIGSEGV/SIGABRT):
 SH189c: *** CONFIRMED — engine SELF-CONSTRUCTED a real RBX::PlayerGui instance ... (vptr 0x106648950) headlessly ***
 SH190e: *** CONFIRMED — engine SELF-CONSTRUCTED a real RBX::ScreenGui instance ... (vptr 0x106649ce0) headlessly ***
 ```
-Default (NOP-off) + PlayerGui-only paths unregressed (3/3 clean). COMMITS: <SH190ECOMMIT>.
+Default (NOP-off) + PlayerGui-only paths unregressed (3/3 clean). COMMITS: e620aee.
 NEXT (honest): both instances are STANDALONE — PlayerGui still not a service NODE on [dm+0x68]
 ([node+0x18]==0x87e), ScreenGui not parented under it, neither attached to the scene-scan
 (R+0x180/0x188). The scene-attach layer (live-app-shell/vt-dispatched service arming) is the
