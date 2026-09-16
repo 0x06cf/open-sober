@@ -13303,6 +13303,73 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh225_doinit_dm_construction_dispatch_fork_pinned() {
+        // SH225 (Route-B re-attack, single-agent): SH186 recon task-0 mapped the ONE
+        // reachable DM-touching path (StartLuaAppDM 0x1023efe2c -> dispatcher
+        // 0x102baeeec -> GlobalInit do-init 0x102206c40) and JUDGED (not measured)
+        // that the DM is created inside a scheduled app-start reached "through a
+        // captured vtable" — same-difficulty as static-seed, so never built out.
+        // Fresh disasm this cycle resolves that dispatch to a concrete, byte-anchored
+        // contract so a future drive (or a proof-of-dead-end) starts from a pinned
+        // target:
+        //   * do-init (0x102206c40) acquire-loads the once-guard [0x106a68410]
+        //     (ldar w9,[x8] file 0x206c7c / tbz w9,#0 file 0x206c84 -> 0x102206d10).
+        //   * first-call path 0x102206d10 bls 0x10284ce54 (the __call_once SH196 saw
+        //     self-latch to a strcmp intern), then builds registry-key strings.
+        //   * do-init then calls closure-build 0x102206db8 (file 0x206cdc bl).
+        //     Its dispatch reads x0=[x19,#4] (the app-bridge/binder object), x8=[x0]
+        //     (its vtable), x1=[x8,#0x30] (vt+0x30 slot), then `br x1` (file 0x206e24).
+        //     That vt+0x30 slot of the binder object at [x19+4] is the DM-construction
+        //     entry a fabricated binder must satisfy. (SH224 showed the *DM object's*
+        //     own vt+0x30 is only a tiny accessor — this is the binder/app-bridge
+        //     object's vtable, a DIFFERENT class.)
+        //   * a second fork bl 0x10221942c (file 0x206ce4) returns via a short helper.
+        // A drift in any of these sites fails loudly instead of silently re-reading
+        // changed control flow. Skip-if-absent real-image guard family.
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if p.exists() {
+            let el = libloader::elf::load_elf_image(p).expect("load real libroblox.so");
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            let cases: [(u64, u32, &str); 9] = [
+                (0x102_206c40, 0xd10303ff, "do-init prologue (sub sp,sp,#0xc0)"),
+                (0x102_206c7c, 0x08dffd09, "ldar w9,[once-guard x8] (acquire)"),
+                (0x102_206c84, 0x36000469, "tbz w9,#0 -> 0x102206d10 (first-call)"),
+                (0x102_206cdc, 0x94000037, "bl closure-build 0x102206db8"),
+                (0x102_206ce4, 0x940049d2, "bl fork 0x10221942c"),
+                (0x102_206df4, 0xf9401260, "ldr x0,[x19,#4] (binder obj)"),
+                (0x102_206dfc, 0xf9400008, "ldr x8,[x0] (vtable)"),
+                (0x102_206e00, 0xf9401901, "ldr x1,[x8,#0x30] (vt+0x30 slot)"),
+                (0x102_206e24, 0xd61f0020, "br x1 (DM-construction dispatch)"),
+            ];
+            for (guest, want, name) in cases {
+                assert_eq!(word(guest), want, "sh225 {name} @{guest:#x}");
+                assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh225 site {guest:#x} in window");
+                assert!(guest & 3 == 0, "sh225 site {guest:#x} 4-aligned");
+            }
+            // once-guard cell is 8-aligned; the init path's call_once target is a real
+            // in-image address (resolve the bl imm26<<2 from the decoded Inst).
+            assert_eq!(0x106_a68410u64 & 7, 0, "once-guard [0x106a68410] 8-aligned");
+            let bl = word(0x102_206d18);
+            if let arm64jit::decode::Inst::B { imm, link: true } = arm64jit::decode::decode(bl) {
+                let target = (0x102206d18u64 as i64) + imm as i64;
+                assert_eq!(target as u64, 0x10284ce54, "call_once target from init path");
+            } else {
+                panic!("sh225: do-init init-path word not a bl");
+            }
+            // fork 0x10221942c is a real function (stp x29,x30,[sp,#-16]! prologue).
+            assert_eq!(word(0x102_21942c), 0xa9bf7bfd, "fork 0x10221942c prologue");
+            eprintln!("sh225 do-init DM-construction dispatch fork verified on libroblox.so");
+        } else {
+            eprintln!("sh225 real-image guard: no real libroblox.so, skipping do-init fork pins");
+        }
+    }
+
+    #[test]
     fn sh115_sites_target_lazy_singleton_accessor_windows() {
         // Guest file vaddrs for the three accessor sites with their original
         // slot0 (mov) guard bytes — the patch refuses to write if these shift.
