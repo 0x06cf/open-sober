@@ -52,6 +52,19 @@ genuine site is real but unreached — the same Route-B live-DM structural gate 
 the site is `__func`-closure + relocation-populated and only constructible inside a real
 experience/app-launch session).
 
+## Caller-side strengthening (independent confirmation)
+
+The region also has **241 direct `bl`/`b` callers** into [0x102e1c650,0x102e25200) found by a
+static imm26-branch scan — including from the do-init/app-shell region chain that IS on the
+executing ladder (0x1023cfd68/0x1023d0360/0x1023d09d0 -> `bl 0x102e24468`; 0x1023f1294 ->
+`bl 0x102e24598`). Yet the region-watch measured **0 hits** across 4/5 govtail-positive
+completing runs: because a reached caller would translate its `bl` target as a fresh block and
+log a region hit, 0 hits means **none of those callers executes on the completing ladder**
+(they live in deeper engine boot/migration bodies the ladder never reaches). So the region is
+NOT merely vtable-latent — it has direct static callers — but they too are unreached headlessly.
+This converts "unreachable" from an assumed-vtable-latency conclusion into a doubly-measured
+negative (caller-side AND region-side).
+
 ## Honest boundary (do-not-over-claim)
 
 Does NOT manufacture a DataModel and does NOT lift the Route-B live-DM structural gate. It CLOSES
