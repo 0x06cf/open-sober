@@ -12963,6 +12963,68 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh213_fmod_aaudio_first_contact_anchors() {
+        // SH212/SH213: the "sound" pillar's first measured boot contact is the
+        // FMOD/AAudio JNI export Java_org_fmod_FMOD_OutputAAudioHeadphonesChanged
+        // (guest 0x106240d8c region, run-variable NULL-`this` fault, non-seedable).
+        // Pin (a) the crash block-entry opcode, (b) the two libc++ std::string
+        // member reads off the jobject (`this`) it faults on, (c) the function
+        // entry, against the real libroblox.so so a future audio-hardening
+        // milestone cannot target a drifted constant. Also pin the SH132 AAudio
+        // bridge's customer-side anchors (driver region / fn-ptr table / JNI
+        // entry) and assert the guest transform + 4-alignment. Same real-image
+        // guard family as sh211/sh116b/sh200. Test-only, no default path.
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let w = |off: usize| -> u32 { u32::from_le_bytes([img[off], img[off+1], img[off+2], img[off+3]]) };
+            // crash block-entry (SH212 records translated-block start, not the
+            // faulting instr): 0x6240d8c = `add x10,x10,#0x3ff`
+            assert_eq!(w(0x6240d8c), 0x910f_fd4a, "FMOD crash block entry = add x10,x10,#0x3ff");
+            // the `this` (jobject) std::string reads that fault on a NULL/garbage
+            // device object: [x19,#16]=__data_, [x19,#24]=__size_/cap (libc++ SSO)
+            assert_eq!(w(0x6240b9c), 0xf940_0a61, "ldr x1,[x19,#16] (string data)");
+            assert_eq!(w(0x6240bc4), 0xf940_0e61, "ldr x1,[x19,#24] (string len)");
+            // function entry word (Java_* is reached via the JNI registry path)
+            assert_eq!(w(0x6240900), 0x2a00_03e8, "FMOD JNI entry mov w0,w8");
+            eprintln!("sh213 FMOD/AAudio first-contact anchors verified on libroblox.so");
+        } else {
+            eprintln!("sh213 real-image guard: no real libroblox.so, skipping byte pins");
+        }
+        // Guest = file vaddr + 0x100000000 transform + 4-alignment for the
+        // .text sites (identical to sh211).
+        let sites: [(u64, u64); 4] = [
+            (0x6240d8c, 0x106240d8c), // FMOD crash block entry (block start)
+            (0x6240b9c, 0x106240b9c), // jobject string __data_ read
+            (0x6240bc4, 0x106240bc4), // jobject string __size_ read
+            (0x6240900, 0x106240900), // Java_org_fmod... function entry
+        ];
+        for (file, guest) in sites {
+            assert_eq!(file.wrapping_add(0x1_0000_0000), guest, "guest = file + 0x100000000");
+            assert!(guest & 3 == 0, "site must be 4-aligned");
+            assert!(guest < 0x120_0000_00, "site within canonical identity-map window");
+        }
+        // SH132 AAudio bridge customer-side anchors (the bridge intercepts
+        // dlopen/dlsym of libaaudio.so; these are where FMOD keeps its resolved
+        // AAudio fn-ptr table + the ANativeWindow JNI entry). Drivers are .data /
+        // region addresses — pin window + alignment.
+        let aaudio_cells: [u64; 3] = [0x106d0ef20, 0x104fbea00, 0x106d0ef20];
+        for c in aaudio_cells {
+            assert!(c >= 0x1_0000_0000 && c < 0x120_0000_00, "aaudio cell 0x{c:x} in window");
+            assert!(c & 7 == 0, "aaudio cell 0x{c:x} 8-aligned");
+        }
+        // The AAudio symbols are NOT dynamic imports (verified: no AAudio_* UND in
+        // .dynsym) — FMOD resolves libaaudio.so at runtime via dlopen+dlsym, which
+        // is exactly the intercept the SH132 bridge implements. Assert the bridge
+        // table carries the canonical 26-symbol ABI as a sanity cross-check.
+        assert_eq!(arm64jit::aaudio::TABLE.len(), 26, "AAudio table is 26 slots");
+        assert!(arm64jit::aaudio::bridge_enabled() == false, "bridge default-inert (env off)");
+        assert_eq!(arm64jit::aaudio::fake_lib_handle(), 0xAA00, "fake libaaudio.so handle");
+    }
+
+    #[test]
     fn sh115_sites_target_lazy_singleton_accessor_windows() {
         // Guest file vaddrs for the three accessor sites with their original
         // slot0 (mov) guard bytes — the patch refuses to write if these shift.

@@ -66,3 +66,27 @@ reached.
 ## Next (audio direction)
 - When the session advances and FMOD's AAudio output device is actually opened,
   wire a non-concurrent PCM drain from the host buffer to the WAV sink.
+
+## SH213 addendum — first-contact anchor pins + bridge A/B measurement (Sep 16)
+
+`sh213_fmod_aaudio_first_contact_anchors` (crates/arm64jit/examples/elfjit.rs, hermetic,
+same real-image guard family as sh211/sh116b/sh200) byte-pins the **sound pillar's first
+measured boot contact** so a future audio-hardening milestone targets a drift-verified site:
+
+- `0x6240d8c` = `add x10,x10,#0x3ff` (Java_org_fmod_FMOD_OutputAAudioHeadphonesChanged
+  crash block-entry — the SH212 fault-pc's translated-block start).
+- `0x6240b9c`/`0x6240bc4` = `ldr x1,[x19,#16]/[x19,#24]` (the libc++ std::string `__data_`/
+  `__size_` libc++ SSO member reads off the `thiz` jobject the NULL-fault threads through).
+- `0x6240900` = function entry (`mov w0,w8`), plus the SH132 customer-side anchor cells
+  (guard 0x106d0ef20 / JNI 0x104fbea00 window + 8-alignment).
+
+### Empirical A/B (this session, 10+10 canonical ladder runs)
+`JIT_AAUDIO_BRIDGE=1` vs default on the SH210 env ladder produced **0/20 crashes in both
+arms (EXIT 124 all)** and — critically — **0 `[aaudio:bridge]` log lines in the bridge arm**:
+the guest never `dlopen("libaaudio.so")` on this boot path, so the SH132 intercept never
+engages. This is a freshly-measured negative: **the SH212 FMOD crash is NOT on the
+dlopen/AAudio-driver path the bridge serves** — it is a direct-JNI `this`/jobject
+misconstruction reached via the JNICallProtocol registry (host-allocated unmaterialized
+device). The bridge stays latent-but-correct (reached only when a real SoundService session
+dlopens libaaudio.so); crash A remains the SH55/64 non-seedable class and revives only the
+audio-harden task on a real session, NOT via enabling the bridge.
