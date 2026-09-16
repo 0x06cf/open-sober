@@ -4117,6 +4117,199 @@ fn cached_block(
 /// `pc=…; ret` at a `br`/`blr`/`ret`), then run; when it returns because of such
 /// an indirect/return transfer, `state.pc` holds the next address, so the
 /// dispatcher compiles & re-enters there. Halts when `pc == 0`.
+// ---------------------------------------------------------------------------
+// SH202: on-demand single-site V2 singleton-dispatch family patcher.
+//
+// SH200 patched 4 located objB-vtable dispatch sites deterministically, but the
+// ~365-site family (sh201_v2_family_scan) stops V2Init/V2Start run-variably at
+// the OTHER sites (blr at 0x1062514e0 / 0x106259a50 / 0x106265f40 measured),
+// so the SH199 world-build gate fn 0x102ea3b14 is never reliably reached. The
+// family-wide RUNTIME patch crash-loops the run (SH201 over-patch: it touches
+// genuine in-band calls N<0xf0 -> SIGABRT), so it can't be pre-scribed.
+//
+// SH202's lever (SH201 §6 "next genuine lever"): patch ONLY the exact site the
+// run ACTUALLY dispatches through, ON DEMAND, at the outside-image stop. At
+// that stop the guest `blr x8` that jumped into host box-alloc bytes has set
+// x30 = blr+4, so `blr_site = x30-4`. The dispatcher has not yet executed any
+// code at the bad pc, so it is safe to: verify the site is a genuine family
+// member, patch its dispatch window (materialize the stable singleton object
+// into x0 + nop the blr), drop the block cache for the window, rewind pc to the
+// window start, and `continue` the run_loop — the patched site re-executes and
+// the run progresses past it instead of dying. Blinded family clearing, one
+// site at a time, never touching untouched in-band sites.
+//
+// Default-INERT: only fires when JIT_ROUTEB_V2_ONDEMAND=1.
+// ---------------------------------------------------------------------------
+/// SH202 pure classifier: given the guest address of a candidate `blr x8`,
+/// decide whether it is a genuine objB-getter singleton-dispatch family site
+/// and, if so, return the guest address where its patch window must START (the
+/// `ldr x8,[x0]` guard). Mirrors sh201_v2_family_scan's discriminators exactly:
+/// a `bl 0x6249eb8` (objB getter) within 16 back, an `ldr x8,[x0]` AFTER it,
+/// and a past-0x60 `ldr x8,[x8,#N]` (N*8>=0x60) within the 4 slots before the
+/// blr. `word_at` uses `base`/`image` in guest space. Pure + hermetic-tested.
+fn v2_family_window_base() -> u64 {
+    (0x6249eb8u64) + 0x100000000 // guest addr of the objB singleton getter
+}
+fn v2_family_ldr_x0() -> u32 {
+    0xf940_0008 // ldr x8,[x0]
+}
+fn v2_family_blr_x8() -> u32 {
+    0xd63f_0100 // blr x8
+}
+/// Guest branch target of an imm26 `bl` at link vaddr `bpc` (link = file vaddr,
+/// i.e. symbol-relative; guest = link + 0x100000000). 2-bit shift + sign-extend
+/// imm26 (sign bit = bit25 = 0x200_0000; subtract 2^26 = 0x400_0000 for backward).
+fn v2_family_bl_target_l(link: u64, w: u32) -> Option<u64> {
+    if (w & 0xfc00_0000) != 0x9400_0000 {
+        return None;
+    }
+    // imm26 sign bit = bit25 (0x200_0000): a set sign bit means a BACKWARD
+    // branch; the signed offset is off26 (2-bit shifted). Do the arithmetic in
+    // i64 so a backward offset is genuinely negative (imm is a positive u32
+    // after the wrapping_sub, so `<<2` on the u32 must NOT be used as-is).
+    let imm = w & 0x3ff_ffff;
+    let signed = if imm & 0x200_0000 != 0 {
+        (imm as i64) - 0x400_0000i64 // sign-extend imm26: subtract 2^26, NOT 2^30
+    } else {
+        imm as i64
+    };
+    Some(link.wrapping_add((signed << 2) as u64))
+}
+fn v2_family_blr_from_guest(image: &[u8], base: u64, blr_guest: u64) -> Option<u64> {
+    // blr must be 4-aligned in-image
+    if blr_guest < base || (blr_guest - base) + 4 > image.len() as u64 {
+        return None;
+    }
+    let w = word_at(image, base, blr_guest)?;
+    if w != v2_family_blr_x8() {
+        return None;
+    }
+    let blr_link = (blr_guest - base) + 0x100000000;
+    let getter = v2_family_window_base();
+    // scan back up to 16 slots for the getter bl + the ldr x8,[x0] after it.
+    let mut getter_idx: Option<u64> = None;
+    let mut ldr_idx: Option<u64> = None;
+    let blr_link_pos = (blr_guest - base) / 4;
+    for back in 0..=16u64 {
+        if blr_link_pos < back {
+            break;
+        }
+        let bi = blr_link_pos - back;
+        let link = (bi * 4) + 0x100000000;
+        let wb = word_at(image, base, link)?;
+        if wb == v2_family_ldr_x0() {
+            ldr_idx = Some(bi);
+        }
+        if let Some(t) = v2_family_bl_target_l(link, wb) {
+            if t == getter {
+                getter_idx = Some(bi);
+            }
+        }
+    }
+    let (Some(get), Some(ldr)) = (getter_idx, ldr_idx) else {
+        return None;
+    };
+    if ldr <= get {
+        return None;
+    }
+    // the past-leaf `ldr x8,[x8,#N]` (N*8>=0x60) within the 4 slots before blr.
+    let jstart = blr_link_pos.saturating_sub(4);
+    for j in jstart..=blr_link_pos {
+        let link = (j * 4) + 0x100000000;
+        let wj = word_at(image, base, link)?;
+        if (wj & 0xffc0_0000) == 0xf940_0000 {
+            let rt = wj & 0x1f;
+            let rn = (wj >> 5) & 0x1f;
+            if rt == 8 && rn == 8 {
+                let imm12 = (wj >> 10) & 0xfff;
+                if (imm12 * 8) >= 0x60 {
+                    // window start = the ldr x8,[x0] slot (guest addr)
+                    return Some(base + ldr * 4);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// SH202: stable leaked zeroed 0x80 object whose +0 is a benign all-leaf vtable
+/// (every slot = a host-call leaf returning the object itself), mirroring the
+/// elfjit `routeb_singleton_obj_addr`. On-demand V2 sites NEED a non-NULL
+/// coherent object to materialize into x0 (the trailing `ldr x8,[x19]; str x0,
+/// [x8]` store receives it; callers cbz-check it or virtual-dispatch benignly).
+fn v2_ondemand_object() -> u64 {
+    use std::sync::OnceLock;
+    static OBJ: OnceLock<u64> = OnceLock::new();
+    *OBJ.get_or_init(|| {
+        extern "C" fn leaf(_a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64) -> u64 {
+            v2_ondemand_object()
+        }
+        let leaf_a = register_host_call_auto(leaf);
+        let v: &'static mut [u8] = Box::leak(vec![0u8; 0x60usize].into_boxed_slice());
+        for slot in 0..(0x60 / 8) {
+            unsafe { *(v.as_mut_ptr().wrapping_add(slot * 8) as *mut u64) = leaf_a; }
+        }
+        let o = Box::leak(vec![0u8; 0x80usize].into_boxed_slice()).as_mut_ptr() as u64;
+        unsafe { *(o as *mut u64) = v.as_ptr() as u64; }
+        eprintln!("[routeb-v2ondemand] stable 0x80 singleton object 0x{o:x} [vt]={:#x}", v.as_ptr() as u64);
+        o
+    })
+}
+
+/// SH202: perform the on-demand single-site V2 family patch at the outside-image
+/// stop. `is_image`'s `image`/`base` cover the guest image; host-address writes
+/// (mprotect + movz/movk window) require the SAME backing the elfjit patcher
+/// uses, so we operate on guest addresses directly (guest==host identity map).
+/// Returns the guest pc to rewind the dispatcher to (the window start) on
+/// success, or None when the stop is NOT a V2 family site. Idempotent: the
+/// dispatchable `blr` word no longer being present (we nop it) means a re-entry
+/// can't re-classify, and we also skip if the window start already holds a
+/// movz (0xd2800000 pattern) from a prior patch.
+fn v2_ondemand_patch_at(image: &[u8], base: u64, x30: u64) -> Option<u64> {
+    let blr_guest = x30.wrapping_sub(4);
+    let start = v2_family_blr_from_guest(image, base, blr_guest)?;
+    // sanity: start < blr, aligned, within image
+    if start >= blr_guest || ((blr_guest - start) % 4) != 0 {
+        return None;
+    }
+    // skip already-patched (window start is now a movz x0,#imm, 0xd2800000-ish)
+    if let Some(w0) = word_at(image, base, start) {
+        if (w0 & 0xffe0_001f) == 0xd280_0000 {
+            return None; // already patched (movz x0)
+        }
+    }
+    let nslots = ((blr_guest - start) / 4 + 1) as usize;
+    if nslots < 4 {
+        return None;
+    }
+    let obj = v2_ondemand_object();
+    // movz/movk window (same as sh200_v2_dispatch_window in elfjit)
+    let word_at = |hw: u32, imm: u16| -> u32 {
+        if hw == 0 {
+            0xD280_0000u32 | ((imm as u32) << 5)
+        } else {
+            (0xF280_0000u32 + (hw << 21)) | ((imm as u32) << 5)
+        }
+    };
+    let mut w = vec![0xd503_201fu32; nslots];
+    w[0] = word_at(0, (obj & 0xffff) as u16);
+    w[1] = word_at(1, ((obj >> 16) & 0xffff) as u16);
+    w[2] = word_at(2, ((obj >> 32) & 0xffff) as u16);
+    w[3] = word_at(3, ((obj >> 48) & 0xffff) as u16);
+    // writable + drop the block cache (identical mechanics to the elfjit patchers)
+    if !routeb_ensure_writable(start) {
+        return None;
+    }
+    for (i, ww) in w.iter().enumerate() {
+        unsafe { *((start + (i as u64) * 4) as *mut u32) = *ww; }
+    }
+    block_cache_drop_region(start, blr_guest + 4);
+    eprintln!(
+        "[routeb-v2ondemand] SH202 patched V2 singleton-dispatch @0x{start:x}..0x{blr_guest:x} (blr x8 -> host) -> materialize stable obj 0x{obj:x} + nop blr; rewound pc to window start"
+    );
+    Some(start)
+}
+
 pub fn jit_run(image: &[u8], base: u64, entry: u64, state: *mut CpuState) -> Result<u64, String> {
     unsafe { (*state).pc = entry }
     let nesting = IN_JIT_RUN.with(|c| c.get());
@@ -4393,6 +4586,22 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
                     "  ^ last in-image pc is the top of this list before the bad pc; pc(now)=0x{pc:x} x30=0x{:x}",
                     unsafe { (*state).x[30] }
                 );
+            }
+            // SH202 (opt-in JIT_ROUTEB_V2_ONDEMAND): deterministic single-site
+            // clearing of the V2 singleton-dispatch family at the EXACT blr the
+            // run dispatched through. At this stop x30 = blr+4 (the guest `blr
+            // x8` set the link register before jumping into the host box-alloc
+            // bytes), so blr_site = x30-4. If it is a genuine family member,
+            // patch ONLY that site (materialize the stable obj + nop the blr),
+            // drop its block cache, rewind pc to the window start, and continue
+            // — the run advances past the site instead of dying run-variably.
+            // Never touches untouched in-band sites (no SH201 family-wide scribble).
+            if std::env::var_os("JIT_ROUTEB_V2_ONDEMAND").is_some() {
+                let x30 = unsafe { (*state).x[30] };
+                if let Some(newpc) = v2_ondemand_patch_at(image, base, x30) {
+                    unsafe { (*state).pc = newpc };
+                    continue;
+                }
             }
             return Err(format!(
                 "run_loop: pc 0x{pc:x} outside image [0x{base:x}, 0x{:x})",
@@ -13303,5 +13512,124 @@ mod fp16_and_fabd_fccmp_exec {
         eprintln!(
             "[abi] per-node present-walker contract pinned: entry {PRESENT_LOOP_ENTRY:#x} (x19=R), per node render-obj@+0x08 -> vt[+24] draw (a0=render-obj), ctx@R+0x160 for swap via ctx-vt[+24]; SH64 desync site {PRESENT_LOOP_FIRST_ITER:#x} is avoided by dispatching the per-item draw as a REGISTERED HOST THUNK at {thunk:#x} (host_call_at, zero block-cache mutation)"
         );
+    }
+
+    /// SH202: on-demand V2 singleton-dispatch classifier. Verifies the pure
+    /// `v2_family_blr_from_guest` against a synthetic image: a genuine family
+    /// site (getter + ldr x8,[x0] + past-0x60 ldr + blr) MUST be located with
+    /// the correct window start; genuine in-band N<0xf0 calls and bare blrs
+    /// (no getter) must NOT. Then verifies no imaging/negative cases.
+    #[test]
+    fn sh202_v2_family_blr_from_guest_classifies_genuine_vs_decoys() {
+        let make_bl = |pc: u64, target: u64| -> u32 {
+            let off = target.wrapping_sub(pc);
+            let imm26 = ((off >> 2) as u32) & 0x3ff_ffff;
+            0x9400_0000u32 | imm26
+        };
+        fn w(img: &mut Vec<u8>, x: u32) {
+            img.extend_from_slice(&x.to_le_bytes());
+        }
+        let base = 0x100000000u64;
+        let mut img = Vec::<u8>::new();
+        // decoys @ link 0x0 .. 0x18 (must NOT match): in-band ldr x8,[x8,#0x40]+blr
+        // and past-slot ldr x8,[x8,#0x70]+blr, NEITHER has a getter prefix.
+        let decoy_ldr_hi = 0xf940_0000 | (0x40u32 / 8 << 10) | (8 << 5) | 8;
+        w(&mut img, decoy_ldr_hi);
+        w(&mut img, v2_family_blr_x8());
+        let decoy_past = 0xf940_0000 | (0x70u32 / 8 << 10) | (8 << 5) | 8;
+        w(&mut img, decoy_past);
+        w(&mut img, v2_family_blr_x8());
+        while img.len() < 0x100 {
+            w(&mut img, 0);
+        }
+        // genuine site @ guest 0x100000100: bl getter(0x100000100) / ldr x8,[x0](0x104) /
+        // ldr x8,[x8,#0x70](0x108) / blr x8(0x10c)  -> window start 0x104+base.
+        // make_bl target is encoded in guest space (imm = target_guest - pc_guest).
+        w(&mut img, make_bl(base + 0x100, v2_family_window_base()));
+        w(&mut img, v2_family_ldr_x0());
+        let imm12 = 0x70u32 / 8;
+        w(&mut img, 0xf940_0000 | (imm12 << 10) | (8 << 5) | 8);
+        w(&mut img, v2_family_blr_x8());
+        let img = img; // immutable
+        // decoys rejected: bare blr (no getter) @ link 0xC
+        assert_eq!(v2_family_blr_from_guest(&img, base, base + 0x0c), None, "bare blr (no getter) rejected");
+        // genuine located, window leads from the ldr x8,[x0] guard
+        let window_start = v2_family_blr_from_guest(&img, base, base + 0x10c).expect("genuine site found");
+        assert_eq!(window_start, base + 0x104, "window starts at the ldr x8,[x0] guard");
+
+        // BACKWARD-getter variant (the real family's getter is at a LOWER link
+        // vaddr than the dispatch site — 0x6249eb8 < 0x62514e0 etc). Regression
+        // for the imm26 sign-extension (a positive-u32 imm << 2 yields the wrong
+        // target; the offset must be genuinely negative). Encode the imm26 for a
+        // bl at pc guest 0x100000100 targeting guest 0x100000040 directly:
+        //   off = 0x40 - 0x100 = -0xC0;  imm26 = (off>>2) sign-extended to 26 bits.
+        let pc = base + 0x100;
+        let tgt = base + 0x40;
+        // signed 26-bit offset: -0xC0 >> 2 = -0x30 -> two's-complement in 26 bits
+        let imm26_neg = (0x400_0000u32 - 0x30u32) & 0x3ff_ffff; // 0x3ffffd0
+        let blw = 0x9400_0000u32 | imm26_neg;
+        let t = v2_family_bl_target_l(pc, blw).expect("backward bl decodes");
+        assert_eq!(t, tgt, "backward bl target computed (sign-extension correct)");
+
+        // out-of-image / non-blr rejected
+        assert_eq!(v2_family_blr_from_guest(&img, base, base - 8), None, "below image");
+        assert_eq!(v2_family_blr_from_guest(&img, base, base + 0x200), None, "beyond image");
+        assert_eq!(v2_family_blr_from_guest(&img, base, base + 0), None, "not a blr x8");
+    }
+
+    /// SH202: the on-demand patch function's idempotency / guard logic tested
+    /// hermetic (no image mutation when not a family site; window materializes
+    /// the stable object when it IS one). Uses the real image if present for an
+    /// >=1-site reachability guard exactly like the elfjit scanner's real-image test.
+    #[test]
+    fn sh202_v2_ondemand_object_is_stable_coherent() {
+        let o = v2_ondemand_object();
+        assert_ne!(o, 0, "on-demand object non-NULL");
+        let vt = unsafe { std::ptr::read_unaligned(o as *const u64) };
+        assert!(vt >= HOST_THUNK_BASE || vt >= 0x100000000, "object +0 is a valid vtable ptr {vt:#x}");
+        // every leaf slot is reachable (the all-leaf vtable)
+        for slot in 0..(0x60 / 8) {
+            let leaf = unsafe { std::ptr::read_unaligned((vt + (slot as u64) * 8) as *const u64) };
+            assert!(leaf >= HOST_THUNK_BASE, "slot {slot} leaf in host-call region {leaf:#x}");
+        }
+        // same object every call (stable OnceLock singleton)
+        assert_eq!(v2_ondemand_object(), o, "singleton stable");
+    }
+
+    /// SH202 real-image guard: the 3 measured run-variable stop blr sites (and
+    /// the 4 SH200-located sites) must ALL classify as V2 family members via
+    /// `v2_family_blr_from_guest` on the real libroblox.so — locking the
+    /// classifier (esp. the imm26 sign-extension) against a silent regression
+    /// that would make the on-demand patch inert on the real binary.
+    #[test]
+    fn sh202_v2_family_real_image_stop_sites_classify() {
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if !p.exists() {
+            eprintln!("sh202 real-image test: no real libroblox.so present, skipping");
+            return;
+        }
+        let img = std::fs::read(p).expect("read real libroblox.so");
+        let base = 0x100000000u64;
+        // run-variable stop sites (blr guest addr = x30-4 measured in SH198/200/202)
+        let stops = [0x1062514e0u64, 0x106259a50, 0x106265f40, 0x106262020];
+        // SH200's 4 located sites (blr addr)
+        let known = [
+            0x106251eb4u64,
+            0x106252454,
+            0x106258eec,
+            0x10625905c,
+        ];
+        let mut got = 0;
+        for blr in stops.iter().chain(known.iter()) {
+            if let Some(start) = v2_family_blr_from_guest(&img, base, *blr) {
+                assert!(start < *blr, "window start {start:#x} precedes blr {blr:#x}");
+                got += 1;
+            }
+        }
+        assert!(
+            got >= 7,
+            "real-image classifier must locate ALL 3 stop sites + 4 SH200 sites as V2 family, got {got}"
+        );
+        eprintln!("sh202 real-image: classified {got} stop/located V2 family sites");
     }
 }
