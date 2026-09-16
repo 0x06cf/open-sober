@@ -7242,8 +7242,16 @@ fn main() {
                         let once_slot = rd8(0x106a68408);
                         let dm_root = rd8(0x106a68818);
                         let flags_latch = rd1(0x106a683e8);
+                        // SH196b: app-data-model counter (Route-B marker, SH189
+                        // probe wanted [0x106dca000+0xe88] advanced). Page-guarded.
+                        let appdm = rd8(0x106dca0e88);
+                        // SH196b: current-DM holder — if the do-init world-build
+                        // itself constructed a real DM, the genuine owner would
+                        // overwrite our SH156 seed here (never observed in ~30
+                        // recon angles; the holder is relocation/session-built).
+                        let holder = rd8(0x106391908);
                         eprintln!(
-                            "[elfjit:dmcells] SH196 do-init: once-guard[0x106a68410]={once_guard:#x} once-slot[0x106a68408]=0x{once_slot:x} DM-root[0x106a68818]=0x{dm_root:x} flags-latch[0x106a683e8]=0x{flags_latch:x}"
+                            "[elfjit:dmcells] SH196 do-init: once-guard[0x106a68410]={once_guard:#x} once-slot[0x106a68408]=0x{once_slot:x} DM-root[0x106a68818]=0x{dm_root:x} flags-latch[0x106a683e8]=0x{flags_latch:x} app-data-model[0x106dca000+0xe88]=0x{appdm:x} holder[0x106391908]=0x{holder:x}"
                         );
                     }
                     let snaps = arm64jit::jit::snapshot_threads();
