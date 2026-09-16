@@ -2348,9 +2348,14 @@ fn routeb_patch_nativeinit_flagmanager() {
         return;
     }
     // site slots: 0x2320a24 adrp x8,7273000 (f0027a88) ; 0x2320a30 ldr x8,[x8,#2480]
-    // (f944d908) -> movz x8,#hw0 ; movk x8,#hw1 = low page address.
+    // (f944d908) -> movz x8,#hw0 ; movk x8,#hw1 = low page address. NOTE the two
+    // load slots are NOT adjacent — 0x2320a28 `mov x5,x4` + 0x2320a2c `mov x4,x3`
+    // (body arg shuffle) sit between them and must be preserved. So words[0] goes
+    // at +0x00 and words[1] at +0x0C, NOT +0x04 (writing +0x04 would clobber the
+    // arg mov AND leave the `ldr` re-zeroing x8 -> x0 still 0x28 at the lock).
     let start = 0x102320a24u64;
     let words: [u32; 2] = sh116b_flagmanager_words(obj);
+    let slots: [u64; 2] = [start, start + 0xC]; // adrp@+0x00, ldr@+0x0C
     let page = (start & !0xfff) as *mut libc::c_void;
     unsafe {
         if libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_WRITE) != 0 {
@@ -2367,11 +2372,11 @@ fn routeb_patch_nativeinit_flagmanager() {
             return;
         }
         for (i, w) in words.iter().enumerate() {
-            *((start + (i as u64) * 4) as *mut u32) = *w;
+            *((slots[i]) as *mut u32) = *w;
         }
         libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
-        arm64jit::jit::block_cache_drop_region(start, start + 8);
-        eprintln!("[elfjit:routeB] SH116b patched nativeInit flag-manager site @0x{start:x} 8B -> x8=low zeroed 0x{obj:x} (mutex@+0x28 = PTHREAD_MUTEX_INITIALIZER)");
+        arm64jit::jit::block_cache_drop_region(start, start + 0x10);
+        eprintln!("[elfjit:routeB] SH116b patched nativeInit flag-manager site @0x{start:x} 8B(adrp+ldr) -> x8=low zeroed 0x{obj:x} (mutex@+0x28 = PTHREAD_MUTEX_INITIALIZER)");
     }
     ROUTEB_FLAGMANAGER_PATCHED.store(true, std::sync::atomic::Ordering::Relaxed);
 }

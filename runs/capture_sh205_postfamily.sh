@@ -25,4 +25,5 @@ for i in $(seq 1 "$N"); do
   fi
 done
 echo "=== summary: $clean clean / $fault fault / $N total; SH116b fired $fired runs ==="
-echo "expect clean=$N fault=0 fired=$N (SH205: 10/10 clean; was 8/12 before)"
+echo "NOTE: SH116b eliminates the flag-manager lock crash; residual faults (SH55/64 class at"
+echo "0x104c393f0/0x10284ce54) are pre-existing + run-variable, unrelated to this patch."

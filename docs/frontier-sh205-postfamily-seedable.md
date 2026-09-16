@@ -5,7 +5,9 @@ pthread_mutex_lock, x0=0x28, lr 0x102b53a78) as "the same live-world-build migra
 callers" was **wrong on both counts**. A new env-gated guest-stack dump proves the caller is
 `nativeInitializeNativeFlags` (return-address 0x102320a98) locking `[*(0x10672739b0) + 0x28]` where the
 flag-manager global reads 0 — a **fixed `.bss` pointer on the flags page** (the SH116 seedable class),
-not a live-DM world-build. The fix patches that read site; measured 10/10 clean vs 8/12 before.
+not a live-DM world-build. The fix patches that read site; the flag-manager lock crash is eliminated
+(zero faulting runs show its caller). The ladder overall is NOT deterministic-clean — the residual
+SH55/64 run-variable faults are separate, pre-existing sites (see Measurement).
 
 ## Discovery: a guest-stack dump (GSDSP) that identifies a crash's *caller*
 
@@ -57,23 +59,20 @@ zeroed page instead of `&0+0x28`.
 - `sh116b_flagmanager_words(obj)` — pure movz/movk x8 hw0/hw1 encoding, hermetic-tested.
 - `routeb_flagmanager_obj()` — leaks the low mapped zeroed page (MAP_FIXED_NOREPLACE, falls back to MAP_FIXED).
 
-## Measurement
+## Measurement (HONEST — corrected after further runs)
 
-- **Before (SH202/SH203 HEAD):** 8/12 clean, 4/12 fault deterministically at this site (x0=0x28).
-- **After SH116b** (same env chain, JIT_ROUTEB_V2_ONDEMAND=1): **10/10 clean**, full V2 ladder
-  (SendAppEventOnAppReady Ok) each run, SH116b fired 1/1 each.
-- **Default path** (env off, no scale): 3/3 clean Ok(0x10006), SH116b not fired — unregressed.
-- Workspace green (564/0), arm64jit example 65/0 (incl. new `sh116b_flagmanager_words_roundtrip_and_real_site_guard` with real-image word check).
+- **Flag-manager lock site: FIXED.** Before: that exact site (caller ra 0x102320a98, `[*(0x10672739b0)+0x28]`) faulted run-variably. After: **zero** faulting runs show GUEST 0x102320a98 in the GSDSP; the flag-lock crash is gone.
+- **Ladder overall: NOT deterministic-clean.** A corrected 10-run characterization with the slot fix = **8 clean / 2 fault**. The 2 residual faults are **different, pre-existing sites** in the SH55/64 run-variable flake family — `[0x104c393f0]` (system-dialog handler region) and `[0x10284ce54]` (the do-init `__call_once` `blr x2`, SH196/SH55 territory) — NOT the flag-manager site this patch targets. The ladder's post-SH116b clean-through is *higher* than before but still run-variable; earlier "10/10 clean" was a lucky streak, retracted.
+- **Default path** (env off, no scale): clean, SH116b not fired — unregressed.
+- Workspace green (564/0); arm64jit example 65/0 (incl. `sh116b_flagmanager_words_roundtrip_and_real_site_guard`).
 
 ## Why it matters / next
 
 - Corrects the record: the post-family fault is **not** the concluded Route-B migration gate. It is a
-  per-boot `.bss` flag-manager pointer that a code-patch materializes — real forward hardening of the
-  flag-init path (the run now completes the ladder instead of SIGSEGV).
-- Do-not-re-tread hold: this does NOT manufacture a live DataModel. Route-B's live-DM world-build stays
-  the standing structural gate (SH174/196/203/204). SH116b only clears a real client crash on the way.
-- The GSDSP diagnostic is reusable: any future "out-of-image slot crash" can now identify its caller in
-  one run instead of guessing from `guestpc`/`x30`.
+  per-boot `.bss` flag-manager pointer that a code-patch materializes — a real fix for one specific
+  crash the earlier SH116 sibling did not cover. Do NOT overstate it to "ladder deterministic"; the
+  remaining SH55/64 run-variable faults (0x104c393f0 / 0x10284ce54) are separate, pre-existing and
+  outside this patch's scope.
 
 ## Repro
 
