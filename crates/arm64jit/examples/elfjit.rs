@@ -13025,6 +13025,58 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh219_postfamily_frag_and_flagmanager_words_pinned() {
+        // SH219 (Sep 16, 2026): SH203 classified the "post-family fault" (a
+        // NULL-singleton pthread_mutex_lock, x0=0x28, at lr=0x102b53a78 = host-call
+        // slot 0x7f00000022b0) as a deterministic 4/12 live-world-build gate using
+        // the "0 direct bl callers" method that SH205 later PROVED unreliable.
+        // After SH116b (flag-manager lock fix) + SH217 (SH161b window) landed, that
+        // post-family fault did NOT reproduce in 28 fresh ladder runs (16 GSDSP +
+        // 12 under SH203's exact env; only the known FMOD crash-A 0x106240c24 and
+        // SH208 singleton-vtable 0x1021dea94 classes fired). Both SH203's site and
+        // SH116b's site are NULL-singleton mutex-lock x0=0x28 — same family, so the
+        // closure is consistent with SH116b having fixed the shared family.
+        // Regression net (real-image guard family as sh213/sh211): pin the exact
+        // words of (a) the flag-manager load slot SH116b patches (0x2320a24 +
+        // 0x2320a2c) and (b) the post-family fragment (0x2b53a64 bl JNICallProtocol
+        // receiveCall+0x558 / 0x2b53a74 bl pthread_mutex_lock@plt). If either set
+        // drifts, a future session catches it before re-classifying the gate.
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let w = |off: usize| -> u32 { u32::from_le_bytes([img[off], img[off+1], img[off+2], img[off+3]]) };
+            // SH116b flag-manager load slot: adrp x8,7273000 / mov x4,x3 / ldr x8,[x8,#2480]
+            assert_eq!(w(0x2320a24), 0xf002_7a88, "flag-manager adrp x8,7273000");
+            assert_eq!(w(0x2320a2c), 0xaa03_03e4, "flag-manager mov x4,x3");
+            assert_eq!(w(0x2320a30), 0xf944_d908, "flag-manager ldr x8,[x8,#2480] -> [0x10672739b0]");
+            // SH203 post-family fragment: bl JNICallProtocol_receiveCall+0x558 /
+            // stp x29,x30,[sp,#-16]! / bl pthread_mutex_lock@plt
+            assert_eq!(w(0x2b53a64), 0x9401_40e4, "post-family bl receiveCall+0x558");
+            assert_eq!(w(0x2b53a6c), 0xa9bf_7bfd, "post-family stp x29,x30,[sp,#-16]!");
+            assert_eq!(w(0x2b53a74), 0x94de_0a4f, "post-family bl pthread_mutex_lock@plt");
+            eprintln!("sh219 flag-manager + post-family fragment words verified on libroblox.so");
+        } else {
+            eprintln!("sh219 real-image guard: no real libroblox.so, skipping byte pins");
+        }
+        // guest = file vaddr + 0x100000000 transform + 4-alignment for .text sites.
+        let sites: [(u64, u64); 6] = [
+            (0x2320a24, 0x102320a24),
+            (0x2320a2c, 0x102320a2c),
+            (0x2320a30, 0x102320a30),
+            (0x2b53a64, 0x102b53a64),
+            (0x2b53a6c, 0x102b53a6c),
+            (0x2b53a74, 0x102b53a74),
+        ];
+        for (file, guest) in sites {
+            assert_eq!(file.wrapping_add(0x1_0000_0000), guest, "guest = file + 0x100000000");
+            assert!(guest & 3 == 0, "site must be 4-aligned");
+            assert!(guest < 0x120_0000_00, "site within canonical identity-map window");
+        }
+    }
+
+    #[test]
     fn sh115_sites_target_lazy_singleton_accessor_windows() {
         // Guest file vaddrs for the three accessor sites with their original
         // slot0 (mov) guard bytes — the patch refuses to write if these shift.
