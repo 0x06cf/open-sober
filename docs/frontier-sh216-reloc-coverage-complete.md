@@ -69,6 +69,22 @@ load; they are not "left unapplied." (`apply_relatives` skipping them is correct
   introduces a relocation type the loader cannot synthesize. Workspace green.
 - Removed the throwaway `reloc_audit` example (the hermetic test supersedes it).
 
+## RUNTIME VERIFICATION (closes SH216's forward-note with measured evidence)
+One canonical ladder run (debug elfjit, same 9-rung --v2boot env as capture_sh212) at
+HEAD prints the loader's own bind result:
+    `[plt] bound 534 JUMP_SLOT + 77 GLOB_DAT/ABS64 (0 unresolved), 1 unresolved`
+=> **0 JUMP_SLOT + 77/78 GLOB_DAT/ABS64 bound; exactly 1 data import unresolved** —
+its GOT slot stays 0. The 77 include everything the resolver shims
+(glGetShaderInfoLog/glGetProgramInfoLog, AMediaFormat_delete/AMediaCodec_delete,
+AMEDIAFORMAT_KEY_*, __stack_chk_guard via patch_stack_canary) plus dlsym-resolvable
+libc/libm. Host-dlsym misses that the resolver does NOT shim are exactly the two weak
+`__gcov_dump`/`__gcov_flush` — so the lone runtime unresolved is a **WEAK** `__gcov_*`
+reference: per ELF semantics an unresolved weak-undefined binds to 0 and the caller is
+compiled to guard it → **BENIGN**. Conclusion: the run-variable "NULL host-pointer /
+SH55/64-looking" flakes are NOT caused by an unresolved data-import slot; the live-DM
+structural-gate attribution (SH209) stands. No code change warranted (binding gcov to
+anything would be wrong semantics).
+
 ## Verify
 `cargo test --workspace` green (565 + this = 566 passed, 0 failed). The new test
 prints the live census: `sh216 reloc census on <so>: 568272 data relocs {1025: 56,
