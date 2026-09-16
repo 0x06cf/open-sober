@@ -13571,6 +13571,15 @@ mod sh115_tests {
             assert_eq!(word(0x102_bd8d2c), 0xd63f0100, "sh228 dispatcher blr x8 (vt+0xf8 leaf)");
             assert_eq!(word(0x102_bd8d38), 0xf9408508, "sh228 dispatcher ldr x8,[x8,#0x108] (vt+0x108)");
             assert_eq!(word(0x102_bd8d50), 0xd63f0100, "sh228 dispatcher blr x8 (vt+0x108 leaf)");
+            // [3b] SH229b: the fall-through window 0x2bd8d54..0x2bd8d60 is STRAIGHT-LINE
+            //     (ldr x1,[x19,#24]; mov x2,x0; mov x0,x20 -> bl sub) with ZERO conditional
+            //     branches. Pin the two words between the last leaf blr (0x2bd8d50) and the
+            //     unconditional bl sub (0x2bd8d60) so that "the dispatcher diverts at a leaf,
+            //     NOT in the body" (SH228's conclusion) is enforced mechanically — if this
+            //     window ever gains a branch, the 'diverted-bl-skipped-sub' explanation gains a
+            //     second (body) path and must be re-derived.
+            assert_eq!(word(0x102_bd8d54), 0xf9400e61, "sh229b fall-through ldr x1,[x19,#24] (reload mgr flags)");
+            assert_eq!(word(0x102_bd8d58), 0xaa0003e2, "sh229b fall-through mov x2,x0 (leaf result arg)");
             // [4] continueAfterFlagsLoaded_ entry (must stay pinned: its non-appearance as
             //     a block entry is the whole measured negative).
             assert_eq!(word(0x102_bd1d68), 0xa9ba7bfd, "sh228 continueAfterFlagsLoaded_ prologue");
