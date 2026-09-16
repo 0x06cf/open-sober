@@ -7217,10 +7217,35 @@ fn main() {
         // blocks and what it awaits. Runs concurrently with the jit_run.
         if std::env::var_os("JIT_THREADS").is_some() {
             std::thread::spawn(|| {
+                // SH196 (default-inert, JIT_DMCELLS=1): an in-run observable for
+                // the GlobalInit do-init __call_once completion state. StartLuaAppDM's
+                // jit_run never returns (it parks in the engine main-loop idle
+                // nanosleep poll, lr=0x10284d134), so the post-rung SH155 probe
+                // never fires. When the once-lambda runs headlessly it self-latches
+                // once-guard[0x106a68410].bit0 (0->1) and stores the interned string
+                // result into once-slot[0x106a68408] (str x0,[x23,#1032] at file
+                // 0x2206d74) — a small status/hash value (measured 0x400000b from
+                // the strcmp GetOrCreate 0x2173b3c), NOT a live DM (which stays in
+                // our SH156 seed at [0x106a68818]). Polled once per sampler tick so
+                // it captures the transition (the cells are all-zero at spawn,
+                // populated only after the do-init runs); reads are page-guarded so
+                // an unmapped boot can never crash the sampler thread.
+                let dmcells = std::env::var_os("JIT_DMCELLS").is_some();
+                let rd8 = |a: u64| -> u64 { if guest_page_mapped(a) { unsafe { *(a as *const u64) } } else { u64::MAX } };
+                let rd1 = |a: u64| -> u64 { if guest_page_mapped(a) { (unsafe { *(a as *const u8) }) as u64 } else { u64::MAX } };
                 for it in 0..100 {
                     std::thread::sleep(std::time::Duration::from_millis(150));
                     let (c, h) = arm64jit::jit::block_cache_stats();
                     eprintln!("[elfjit:stats] it={it} compiles={c} hits={h}");
+                    if dmcells {
+                        let once_guard = rd1(0x106a68410);
+                        let once_slot = rd8(0x106a68408);
+                        let dm_root = rd8(0x106a68818);
+                        let flags_latch = rd1(0x106a683e8);
+                        eprintln!(
+                            "[elfjit:dmcells] SH196 do-init: once-guard[0x106a68410]={once_guard:#x} once-slot[0x106a68408]=0x{once_slot:x} DM-root[0x106a68818]=0x{dm_root:x} flags-latch[0x106a683e8]=0x{flags_latch:x}"
+                        );
+                    }
                     let snaps = arm64jit::jit::snapshot_threads();
                     for t in &snaps {
                         let at = arm64jit::resolver::name_of_call_addr(t.pc)
