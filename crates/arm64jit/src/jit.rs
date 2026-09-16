@@ -1454,6 +1454,51 @@ fn routeb_dm_service_seed_guard(_state: *mut CpuState, pc: u64) {
     });
 }
 
+/// SH189c: block-entry capture of the RBX::PlayerGui/ScreenGui INSTANCE ctor object pointer.
+/// Fires at the ctor entry pc (0x10255d1dc PlayerGui / 0x10247a984 ScreenGui), where x0==the
+/// object being constructed; the ctor writes the class vptr at [obj+0] mid-body. The
+/// pair-consumer's `ret x0` does NOT point at the object (returns through a non-object value
+/// on the shared_ptr-skip path), so direct observation of the ctor's object is the only way to
+/// CONFIRM self-construction (the handoff's 'walk the op-new'd object' step).
+static ROUTEB_DM_CTOR_OBJ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ROUTEB_DM_CTOR_ENTRY_VPTR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+const PGI_CTOR_ENTRY: u64 = 0x10255d1dc; // PlayerGui INSTANCE ctor entry (x0=object)
+const SGI_CTOR_ENTRY: u64 = 0x10247a984; // ScreenGui INSTANCE ctor entry (x0=object)
+
+fn routeb_dm_instance_ctor_capture(state: *mut CpuState, pc: u64) {
+    if std::env::var_os("JIT_ROUTEB_DM_INSTANCE").is_none() {
+        return;
+    }
+    let obj;
+    if pc == PGI_CTOR_ENTRY {
+        obj = unsafe { (*state).x[0] };
+    } else if pc == SGI_CTOR_ENTRY {
+        obj = unsafe { (*state).x[0] };
+    } else {
+        return;
+    }
+    // Only capture a non-trivial object; never clobber with 0/0x1.
+    if obj > 0x1000 && obj != u64::MAX {
+        // Snapshot the object's vptr AT ctor entry (before the ctor body overwrites it) so we
+        // can trace the inheritance layering: the base instance-ctor 0x2374310 wrote
+        // 0x106796dc0; the PlayerGui-derived ctor 0x255d1dc should then overwrite [obj+0] with
+        // 0x106648950 at 0x255d21c. If the entry-snapshot ALREADY shows 0x106796dc0, the object
+        // reached the derived ctor still carrying the base vptr (derived body didn't run to its
+        // own vptr write). Compare against the post-drive read in the guard.
+        let vp_entry = if page_is_mapped(obj) {
+            unsafe { std::ptr::read_unaligned(obj as *const u64) }
+        } else {
+            0
+        };
+        eprintln!(
+            "[routeb-dmins] SH189c: ctor-entry pc={pc:#x} obj={obj:#x} vptr-at-entry={vp_entry:#x}"
+        );
+        ROUTEB_DM_CTOR_OBJ.store(obj, std::sync::atomic::Ordering::Relaxed);
+        ROUTEB_DM_CTOR_ENTRY_VPTR.store(vp_entry, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// SH189c (Route-B instance construction): with the class-name registry now populated
 /// (PlayerGui+ScreenGui descriptors registered headlessly by `routeb_dm_service_seed_guard`),
 /// the engine's REAL PlayerGui/ScreenGui INSTANCE ctor chain becomes headlessly reachable
@@ -1516,15 +1561,79 @@ fn routeb_dm_instance_guard(_state: *mut CpuState, pc: u64) {
                 let a = unsafe { std::ptr::read_unaligned(out as *const u64) };
                 let b = unsafe { std::ptr::read_unaligned((out + 8) as *const u64) };
                 // If a PlayerGui instance was built, [out]==instance (or its ref wrapper) and
-                // its vptr == 0x106648950.
-                let vp = if a != 0 && page_is_mapped(a) {
+                // its vptr == 0x106648950. The out-buffer usually stays {0,0} because the
+                // pair-consumer's shared_ptr attach path is skipped (`cbz x8` at 0x255d150 on
+                // refcount==0) BEFORE it stps into &out; but the creator's return propagates
+                // to the pair-consumer's `ret` untouched, so ret x0 IS the op-new'd object
+                // whose [obj+0] the PlayerGui ctor 0x255d1dc writes (`adrp x8,0x6648000;
+                // add #0x950; str x8,[x19]` = the vptr). Walk BOTH: the out-buffer vptr AND
+                // the returned-object vptr (the handoff's 'walk the op-new'd object' step).
+                let vp_out = if a != 0 && page_is_mapped(a) {
                     unsafe { std::ptr::read_unaligned(a as *const u64) }
                 } else {
                     0
                 };
+                // Walk the returned object's vptr (host == guest domain here; page_mapped
+                // read is safe). ctor writes the vptr at [obj+0] and the functor returns
+                // obj, so [r] should be 0x106648950 if a real PlayerGui was constructed.
+                let vp_ret = if r != 0 && page_is_mapped(r) {
+                    unsafe { std::ptr::read_unaligned(r as *const u64) }
+                } else {
+                    0
+                };
+                // The pair-consumer's ret/out do NOT surface the instance reliably, so the
+                // authoritative observation is the ctor-entry capture: the nested jit_run
+                // (inside run_guest_callback_x8) executes the PlayerGui ctor 0x10255d1dc
+                // block, where routeb_dm_instance_ctor_capture recorded x0=obj (the op-new'd
+                // object). By the time the drive returns, the ctor has written the class
+                // vptr 0x106648950 at [obj+0]. Walk that captured object to CONFIRM the
+                // engine SELF-CONSTRUCTED a real PlayerGui instance.
+                let captured = ROUTEB_DM_CTOR_OBJ.load(std::sync::atomic::Ordering::Relaxed);
+                let vp_entry_cap = ROUTEB_DM_CTOR_ENTRY_VPTR.load(std::sync::atomic::Ordering::Relaxed);
+                let vp_cap = if captured != 0 && page_is_mapped(captured) {
+                    unsafe { std::ptr::read_unaligned(captured as *const u64) }
+                } else {
+                    0
+                };
+                // Dump the captured object's leading words to make the construction artifact
+                // concrete (and to distinguish the instance-layer vptr 0x106796dc0 = instance
+                // ctor 0x2374310 from the more-derived PlayerGui vptr 0x106648950).
+                let mut words = String::new();
+                if captured != 0 && page_is_mapped(captured) {
+                    for i in 0..8 {
+                        let w = unsafe { std::ptr::read_unaligned((captured + i * 8) as *const u64) };
+                        words.push_str(&format!("[+0x{:x}]={w:#x} ", i * 8));
+                    }
+                } else {
+                    words.push_str("*unmapped*");
+                }
+                let vp = if vp_out != 0 {
+                    vp_out
+                } else if vp_cap != 0 {
+                    vp_cap
+                } else {
+                    vp_ret
+                };
                 eprintln!(
-                    "[routeb-dmins] SH189c: PlayerGui pair-consumer 0x{PGI_CONSUMER:x} DROVE ok ret x0={r:#x}; out={{{a:#x},{b:#x}}} obj vptr={vp:#x} (PlayerGui want 0x106648950 / ScreenGui 0x106649ce0)"
+                    "[routeb-dmins] SH189c: PlayerGui pair-consumer 0x{PGI_CONSUMER:x} DROVE ok ret x0={r:#x}; out={{{a:#x},{b:#x}}} out-vptr={vp_out:#x} ret-obj-vptr={vp_ret:#x} ctor-obj={captured:#x} entry-vptr={vp_entry_cap:#x} post-vptr={vp_cap:#x} => obj vptr={vp:#x} (PlayerGui want 0x106648950 / ScreenGui 0x106649ce0 / instance-base 0x106796dc0); obj {words}"
                 );
+                if captured != 0 && vp_cap == 0x106648950 {
+                    eprintln!(
+                        "[routeb-dmins] SH189c: *** CONFIRMED — engine SELF-CONSTRUCTED a real RBX::PlayerGui instance at {captured:#x} (vptr 0x106648950) headlessly ***"
+                    );
+                } else if captured != 0 && (vp_cap == 0x106796dc0 || vp_entry_cap == 0x106796dc0) {
+                    eprintln!(
+                        "[routeb-dmins] SH189c: engine constructed a real INSTANCE-BASE object at {captured:#x} (vptr 0x106796dc0 = instance-ctor 0x2374310); derived PlayerGui vptr 0x106648950 not yet applied"
+                    );
+                } else if captured != 0 {
+                    eprintln!(
+                        "[routeb-dmins] SH189c: ctor entry fired (obj={captured:#x}) but [obj]=0x{vp_cap:x} != PlayerGui vptr — instance not (yet) recognized"
+                    );
+                } else {
+                    eprintln!(
+                        "[routeb-dmins] SH189c: ctor ENTRY 0x{PGI_CTOR_ENTRY:x} never fired in the nested drive — the instance ctor body was not reached"
+                    );
+                }
             }
             Err(e) => eprintln!("[routeb-dmins] SH189c: PlayerGui pair-consumer drive err: {e} (next gate)"),
         }
@@ -4299,6 +4408,7 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
             routeb_dm_manager_guard(state, pc); // SH165-fwd: re-seed the manager singleton holder on fnB entry (JIT_ROUTEB_DMFORCE)
             routeb_tail_dispatch_guard(state, pc);
             routeb_dm_manufacture_guard(state, pc); // SH180/181: plant manufactured genuine-vptr DM into the current-DM holder (JIT_ROUTEB_DM_MANUFACTURE)
+            routeb_dm_instance_ctor_capture(state, pc); // SH189c: capture the INSTANCE ctor's object pointer at ctor entry (JIT_ROUTEB_DM_INSTANCE)
             routeb_dm_ctor_driver_guard(state, pc); // SH182: host-drive the manufactured DM through its genuine app-shell ctor 0x1057d6ef4 (JIT_ROUTEB_DM_CTOR_DRIVER)
             routeb_dm_real_ctor_drive_guard(state, pc); // SH187: drive the REAL DataModel ctor wrapper 0x1023f5ff8 -> 0x1023f6038 (JIT_ROUTEB_DM_REALCTOR)
             routeb_dm_service_seed_guard(state, pc); // SH189: seed empty DM service container + drive PlayerGui class-registry register (JIT_ROUTEB_DM_SERVICES)

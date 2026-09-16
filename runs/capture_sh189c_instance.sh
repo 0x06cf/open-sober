@@ -1,15 +1,19 @@
 #!/bin/bash
-# SH189c EXPERIMENTAL: the real PlayerGui instance ctor chain headlessly. This is the Route-B
+# SH189c/SH190 EXPERIMENTAL: the real PlayerGui instance ctor chain headlessly. This is the Route-B
 # frontier probe. With the class-name registry populated (PlayerGui+ScreenGui descriptors) +
 # DM planted into the creator's current-DM global 0x107333948, the pair-consumer 0x10255d0e4
 # (driven with x0=dm so the instance ctor gets a non-null owner) drives
 #   core creator 0x102373458 -> operator-new -> blr 0x255d1b4 (ctor functor) -> PlayerGui ctor
 # 0x255d1dc -> instance ctor 0x2374310.
-# VERIFIED (2/2 isolated): the chain EXECUTES TO COMPLETION headlessly (DROVE ok, EXIT 124,
-# 0 crash). The pre-fix x23-owner null-deref (EXIT 134) is gone since x0=dm feeds the owner.
-# HONEST residual: out={0,0} — the instance is allocated (ret x0 host ptr) but not yet surfaced
-# through the out-buffer, so self-construction is not yet OBSERVED (next step: walk the
-# op-new'd object for the PlayerGui vptr 0x106648950).
+# VERIFIED (3/3 isolated): the chain EXECUTES TO COMPLETION headlessly (DROVE ok, EXIT 124,
+# 0 crash), AND the constructed instance object is now OBSERVED vía the ctor-entry capture
+# (routeb_dm_instance_ctor_capture at pc 0x10255d1dc): obj vptr = 0x106796dc0 = the genuine
+# instance-ctor 0x2374310 vtable (in-image), layout readable. This is SH190's observed-instance
+# milestone — the ret/out initial walk pointed at a string (red herring); the authoritative read
+# is the ctor-entry object capture. The derived PlayerGui-class vptr 0x106648950 is NOT yet
+# applied headlessly (the sub-init mounts the instance base; the derived write 0x255d21c doesn't
+# land) = the next structural step (instance-base is self-constructed; full PlayerGui incl.
+# service-node attach + scene-scan on dm+0x68 remains the outer fence).
 set -u
 cd "$(dirname "$0")/.."
 LOG=/home/hermes-worker/runs/open-sober/runs/sh189c-instance.txt

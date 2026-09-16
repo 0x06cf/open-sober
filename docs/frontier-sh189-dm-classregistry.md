@@ -79,8 +79,35 @@ resolver can answer the DM's getService by name.
 3. The PlayerGui SERVICE NODE + ScreenGui INSTANCE stay the migration gate (vt-dispatched ctor /
    live app-shell). Do NOT re-derive the service node (recon-negative). The cone stays armed.
 
-## SH189c addendum (same session, committed): REAL PLAYERGUI INSTANCE CONSTRUCTION reaches completion headlessly — the migration gate MOVED.
-Recon deleg_5d14fcbe (verified vs objdump) + deleg_25bb1ff0: the populated class-name registry made the REAL PlayerGui/ScreenGui INSTANCE ctor chain headlessly REACHABLE. Core creator ServiceProvider::getOrCreate 0x102373458 (class-manager resolve at 0x23736dc -> operator-new 0x1d96768 -> blr ctor-functor 0x255d1b4 -> insert). Pair-consumers 0x10255d0e4 (PlayerGui) / 0x10247a88c (ScreenGui). Real NON-virtual ctors 0x255d1dc (PlayerGui vptr 0x106648950) / 0x247a984 (ScreenGui vptr 0x106649ce0); instance-ctor 0x2374310 (vptr 0x106796dc0). Key gates: (a) creator's current-DM global guest 0x107333948 (`adrp x8,0x7333000; add #0x948; ldar x0,[x8]` @0x23737d4-0x23737dc -> bl 0x21daef8), DIFFERENT from the loop's *0x106391908; (b) x23 = instance-ctor's incoming x1 = the owner sourced from the pair-consumer's x0 (`str x0,[sp,16]; add x5,sp,#0x10` -> functor `ldr x1,[x1]`) -> so run the consumer with x0=dm.
+## SH190 addendum (same session, committed): INSTANCE OBJECT OBSERVED — the ctor-entry capture confirms a real, vtable'd engine object constructs headlessly.
+The SH189c residual ("instance allocated but not yet OBSERVED") is CLOSED. The ret/out-buffer walk
+was a RED HERRING: the pair-consumer's `ret x0` points into a string ("Invalid da...") and the
+out-buffer stays {0,0} (shared_ptr attach skipped). The authoritative observation is the ctor-entry
+capture: `routeb_dm_instance_ctor_capture` fires at the PlayerGui ctor block entry 0x10255d1dc
+(x0==the op-new'd object) inside the nested jit_run, snapshots x0 + its vptr, and the guard reads
+the object's post-drive layout. EMPIRICAL (real libroblox.so, 3/3, EXIT 124, 0 crash):
+```
+[routeb-dmins] ctor-entry pc=0x10255d1dc obj=0x7f..599950 vptr-at-entry=0x0
+[routeb-dmins] PlayerGui pair-consumer 0x10255d0e4 DROVE ok ... ctor-obj=0x7f..599950
+  entry-vptr=0x0 post-vptr=0x106796dc0 => obj vptr=0x106796dc0
+  obj [+0x0]=0x106796dc0 [+0x8]=0 [+0x10]=0 [+0x18]=0x106dc0c58 [+0x20]=0
+       [+0x28]=0 [+0x30]=0x100000000 [+0x38]=0
+  engine constructed a real INSTANCE-BASE object (vptr 0x106796dc0 = instance-ctor 0x2374310)
+```
+0x106796dc0 is in-image (filevma 0x6796dc0) and equals the instance-ctor 0x2374310's
+relocated vtable (`adrp x8,0x6796000; add #0xdc0; str x8,[x19]` @0x2374368) — the FIRST genuinely
+OBSERVED engine self-constructed instance object on Route B. The derived PlayerGui-class vptr
+0x106648950 is NOT yet applied headlessly: the ctor's sub-init chain (bl 0x255d2f4 -> getter
+0x201fce0 -> tail 0x23768e8) mounts the instance BASE; the derived vptr write at 0x255d21c
+(`adrp x8,0x6648000; add #0x950`) doesn't land under the shared_ptr-skip path. NEXT (closest
+unblocked): drive the derived layer so [obj+0] becomes 0x106648950 — i.e. force the ctor body past
+the instance-base mount to its own vptr write (inspect why bl 0x255d2f4 returns to a different
+vptr-set path, or NOP/force the branch so 0x255d21c executes) — then a REAL PlayerGui instances
+self-constructs, clearing the derived-class layer before service-node attach ([dm+0x68]) + scene
+scan (R+0x180/0x188). CODE: default-inert (JIT_ROUTEB_DM_INSTANCE), +wiring routeb_dm_instance_ctor_capture
+in the block-entry dispatch + entry-vptr snapshot in the guard. Workspace green.
+
+## SH189c addendum (same session, committed): REAL PLAYERGUI INSTANCE CONSTRUCTION reaches completion headlessly — the migration gate MOVED. Core creator ServiceProvider::getOrCreate 0x102373458 (class-manager resolve at 0x23736dc -> operator-new 0x1d96768 -> blr ctor-functor 0x255d1b4 -> insert). Pair-consumers 0x10255d0e4 (PlayerGui) / 0x10247a88c (ScreenGui). Real NON-virtual ctors 0x255d1dc (PlayerGui vptr 0x106648950) / 0x247a984 (ScreenGui vptr 0x106649ce0); instance-ctor 0x2374310 (vptr 0x106796dc0). Key gates: (a) creator's current-DM global guest 0x107333948 (`adrp x8,0x7333000; add #0x948; ldar x0,[x8]` @0x23737d4-0x23737dc -> bl 0x21daef8), DIFFERENT from the loop's *0x106391908; (b) x23 = instance-ctor's incoming x1 = the owner sourced from the pair-consumer's x0 (`str x0,[sp,16]; add x5,sp,#0x10` -> functor `ldr x1,[x1]`) -> so run the consumer with x0=dm.
 CODE: `run_guest_callback_x8` (adds x8 out-reg; args array only covers x0-7) + `routeb_dm_instance_guard` (env JIT_ROUTEB_DM_INSTANCE, StartLuaAppDM-scoped, OnceLock): plant *(0x107333948)=dm, drive pair-consumer 0x10255d0e4 with x0=dm + x8=&out. +1 hermetic test (377/0).
 EMPIRICAL (real binary, capture_sh189c_instance.sh, 2/2 EXIT 124, 0 crash): `planted DM ... into creator current-DM global 0x107333948` + `PlayerGui pair-consumer 0x10255d0e4 DROVE ok ret x0=0x7f9ffa567361` — the REAL PlayerGui instance ctor chain now EXECUTES TO COMPLETION headlessly (previously the x23=0 null-deref EXIT 134; passing x0=dm fixed the owner). HONEST: out={0x0,0x0}, obj vptr=0 — the drive returns Ok but does NOT yet surface the constructed instance through the out-buffer (its shared-ptr out path isn't populated on this return branch), so the instance object isn't yet OBSERVED; the ctor chain completing is the boundary reached. The lone EXIT-139/nativeInitialize crash was the SH55/64 clone-worker flake (before this guard). Strand: the instance is allocated (ret x0 host ptr) but we don't yet read it back — next: walk the operator-new'd object for the PlayerGui vptr 0x106648950 to CONFIRM self-construction.
 STANDING: this is the furthest Route-B instance-construction has reached headlessly. The PlayerGui/ScreenGui service NODE on [dm+0x68] + scene-scan attach (R+0x180/0x188) remain the outermost gate, but they now sit BEHIND a reachable, completing ctor chain rather than an unreachable vt-dispatched factory. Do NOT conflate with the migration gate — the instance ctor is now demonstrably driveable; only the observed-instance + scene-attach layers remain.
