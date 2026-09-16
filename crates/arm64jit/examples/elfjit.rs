@@ -13251,6 +13251,58 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh224_dm_vtable_corrected_slots_pinned() {
+        // SH224 (Route-B, corrected-base re-derivation): SH187 corrected the genuine
+        // RBX::DataModel vptr base to 0x1067162e8 (vs the +8-slipped 0x1067162f0 used by
+        // the SH179-186 closures) and left an explicit open NEXT: "re-derive ... against
+        // the corrected base". This reads the loader-relocated .data.rel.ro vtable slots
+        // fresh at the corrected base (via load_elf_image + host_addr_of, so the
+        // R_AARCH64_RELATIVE addends are applied exactly as the runtime would) and pins
+        // the load-bearing slots:
+        //   * corrected primary slot-2  @0x1067162f8 = 0x1057d19bc — a REAL method body
+        //     (stack frame), NOT the null-stub 0x10229c2a4 that SH186c (+8 slip) placed
+        //     at primary slot-2. The null-stub is actually corrected primary slot-3.
+        //   * corrected primary slot-6  @0x106716318 = 0x1057d1b9c = vt+0x30 (tiny accessor)
+        //   * corrected primary slot-7  @0x106716320 = 0x1057d6ef4 = the SH182/187 "app-shell
+        //     ctor" — it sits at vt+0x38, NOT vt+0x30 (SH187's own doc carried a residual +8
+        //     slot-index slip).
+        //   * corrected secondary slot-1 @0x1067163a8 = 0x10240a8b8 = the SH186c "real
+        //     DM consumer" thunk (add x0,x0,#0x758; b deep-body).
+        //   * tertiary slot-1 @0x106716400 = 0x1057d07f8 (destructor).
+        // A drift in any of these fails loudly instead of silently re-reading wrong rows.
+        // Skip-if-absent real-image guard family as sh223/sh222/sh219/sh213.
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if p.exists() {
+            let el = libloader::elf::load_elf_image(p).expect("load real libroblox.so");
+            let slot = |guestslot: u64| -> u64 {
+                let host = el.host_addr_of(guestslot).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u64).read_unaligned() } }
+            };
+            let cases: [(u64, u64, &str); 6] = [
+                (0x106_7162f8, 0x105_7d19bc, "corrected primary slot-2 (cb dispatch)"),
+                (0x106_716300, 0x102_29c2a4, "corrected primary slot-3 (null-stub)"),
+                (0x106_716318, 0x105_7d1b9c, "corrected primary slot-6 (vt+0x30 accessor)"),
+                (0x106_716320, 0x105_7d6ef4, "corrected primary slot-7 (app-shell ctor, vt+0x38)"),
+                (0x106_7163a8, 0x102_40a8b8, "corrected secondary slot-1 (real DM consumer)"),
+                (0x106_716400, 0x105_7d07f8, "tertiary slot-1 (destructor)"),
+            ];
+            for (guestslot, want, name) in cases {
+                assert_eq!(slot(guestslot), want, "sh224 {name} @{guestslot:#x}");
+            }
+            // corrected-base row vptr values are genuine relocated .data.rel.ro pointers.
+            for base in [0x106_7162e8u64, 0x106_7163a0, 0x106_7163f8] {
+                assert!(base >= 0x1_0000_0000 && base < 0x120_0000_00, "sh224 row 0x{base:x} in window");
+                assert!(base & 7 == 0, "sh224 row 0x{base:x} 8-aligned");
+            }
+            eprintln!("sh224 corrected-base DM vtable slots verified on libroblox.so");
+        } else {
+            eprintln!("sh224 real-image guard: no real libroblox.so, skipping vtable-slot pins");
+        }
+    }
+
+    #[test]
     fn sh115_sites_target_lazy_singleton_accessor_windows() {
         // Guest file vaddrs for the three accessor sites with their original
         // slot0 (mov) guard bytes — the patch refuses to write if these shift.
