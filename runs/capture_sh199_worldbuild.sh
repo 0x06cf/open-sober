@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# SH199: cross the V2InitWithParams gate byte [0x106a70568] so the world-build fn
-# 0x102ea3b14 (nativeAppBridgeAppStart__) executes. Region-watch the fn + its body.
+# SH199: cross the V2InitWithParams world-build gate byte [0x106a70568] (env
+# JIT_ROUTEB_SETWORLDBUILD) so fn 0x102ea3b14 (operator-new(0x18)+ctor 0x2eacce4+
+# nativeAppBridgeAppStart__ 0x2365960) can execute. Region-watch that fn + body.
+# NOTE: the V2Init rung may stop at the SH198 run-variable outside-image flake
+# before reaching the gate block (pre-existing; baseline env-OFF identical).
 # default-inert (JIT_ROUTEB_SETWORLDBUILD=1), single jit_run ladder, EXIT 124 expected.
 set -u
 LOG="${1:-/tmp/sh199-worldbuild.txt}"
