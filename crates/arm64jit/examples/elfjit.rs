@@ -2430,6 +2430,107 @@ fn routeb_patch_singleton_dispatch() {
     ROUTEB_DISPATCH_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
+static ROUTEB_V2_DISPATCH_PATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// SH200: the V2InitWithParams / V2StartAppWithParams run-variable "outside
+/// image" stop (SH198's pin: flake pcs 0x41/0xb848c300000100, x30=0x106251eb8) is
+/// actually a SCOPED-SEEDABLE singleton-dispatch site, NOT the "non-seedable
+/// host-pointer class" SH198 concluded. fn file 0x6251e0c (guest 0x106251e0c,
+/// the V2Init/Start app-params accessor) dispatch tail:
+///   `bl 0x6249eg8`(objA) / `bl 0x6249eb8`(objB) getters -> `ldr x8,[x0]`
+///   (x0=objB=self singleton, *objB = the harness-seeded 0x60 leaf vtable) ->
+///   `ldr x8,[x8,#280]` (vtable slot +0x118, PAST the 0x60 vtable, into host
+///   box-alloc bytes that happen to be x86-mcode-looking) -> `blr x8` jumps
+///   outside the image -> V2Init "soft-returns" BEFORE reaching the SH199
+///   world-build gate block 0x102368100 (so fn 0x102ea3b14 never executes).
+///   SH115/119 patch the SIBLING accessor dispatch sites (0x62517c4/+0xf8,
+///   0x6251aa8/+0x108, 0x6260948/+0x548); THIS fn 0x6251e0c@+0x118 is a 4th,
+///   unpatched site.
+///
+/// Fix (scoped, differential, same philosophy as SH115/119): patch the
+/// 9-slot dispatch window [0x6251e94..0x6251eb4) to materialize the STABLE
+/// zeroed singleton object (routeb_singleton_obj_addr) into x0 and NOP the
+/// remainder (killing the `blr`). Post-window the accessor does
+/// `ldr x8,[x19]; str x0,[x8]` (stores the dispatch result into *[x19]) then
+/// returns 0 — so [x19] receives the stable object, exactly what the caller
+/// (-reads-store) expects; the fn return path stays `mov x0,xzr` (unchanged).
+/// Leaves the shared 0x60 vtable + nativeInit's own +0xf8/+0x108/+0x548 reads
+/// untouched (their dedicated sites/SH115 windows already cover them).
+/// SH200: build the window words that materialize `obj` into x0 (movz+3 movk)
+/// followed by nops up to the `blr` slot, for a V2 singleton-dispatch accessor
+/// site. Pure + unit-testable (the runtime `routeb_patch_v2_dispatch` calls it).
+pub fn sh200_v2_dispatch_window(obj: u64, nslots: usize) -> Vec<u32> {
+    assert!(nslots >= 4, "window must hold movz+3 movk");
+    let word_at = |hw: u32, imm: u16| -> u32 {
+        if hw == 0 {
+            0xD280_0000u32 | ((imm as u32) << 5) // movz x0,#imm (hw0)
+        } else {
+            (0xF280_0000u32 + (hw << 21)) | ((imm as u32) << 5) // movk x0 hwN
+        }
+    };
+    let mut w = vec![0xd503_201fu32; nslots]; // nops
+    w[0] = word_at(0, (obj & 0xffff) as u16);
+    w[1] = word_at(1, ((obj >> 16) & 0xffff) as u16);
+    w[2] = word_at(2, ((obj >> 32) & 0xffff) as u16);
+    w[3] = word_at(3, ((obj >> 48) & 0xffff) as u16);
+    w
+}
+
+fn routeb_patch_v2_dispatch() {
+    if ROUTEB_V2_DISPATCH_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let obj = routeb_singleton_obj_addr();
+    // Each site is a uniform objB-vtable accessor body: `bl 0x6249eb8` (objB
+    // singleton getter) -> `ldr x8,[x0]` (objB vtable) -> setup args ->
+    // `ldr x8,[x8,#N]` (slot PAST the harness-seeded 0x60 vtable, into host-alloc
+    // bytes) -> `blr x8` (outside image). The patch window is from the `ldr
+    // x8,[x0]` guard to the `blr` INCLUSIVE (kills the dispatch); the trailing
+    // `ldr x8,[x19]; str x0,[x8]` store (or `strb w0,[x8]`) is preserved and
+    // receives the materialized stable object. Window length per site is
+    // (blr-start)/4 + 1 slots: 4 movz/movk load x0 = obj, rest are nops.
+    //   site 1 fn 0x6251e0c slot +0x118 (V2Init/V2Start params accessor)
+    //   site 2 fn 0x62523ac slot +0x130 (V2Init-appendix helper)
+    //   site 3 fn 0x6258e88 slot +0x2f0 (V2Init-appendix helper)
+    //   site 4 fn 0x6258ffc slot +0x2f8 (V2Init-appendix helper)
+    let sites: [(u64, u64); 4] = [
+        (0x106251e94u64, 0x106251eb4u64),
+        (0x106252434u64, 0x106252454u64),
+        (0x106258ed4u64, 0x106258eecu64),
+        (0x106259048u64, 0x10625905cu64),
+    ];
+    for (start, blr) in sites {
+        let w = sh200_v2_dispatch_window(obj, ((blr - start) / 4 + 1) as usize);
+        let page = (start & !0xfff) as *mut libc::c_void;
+        unsafe {
+            if libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_WRITE) != 0 {
+                eprintln!(
+                    "[elfjit:routeB] WARN mprotect RW failed for V2 dispatch @0x{start:x} errno={}",
+                    std::io::Error::last_os_error()
+                );
+                continue;
+            }
+            let before = *(start as *const u32);
+            if before != 0xf940_0008u32 {
+                // word0 = `ldr x8,[x0]` (objB vtable load)
+                eprintln!(
+                    "[elfjit:routeB] WARN V2 dispatch @0x{start:x} unexpected word0 {before:08x} (want f9400008), not patched"
+                );
+                libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+                continue;
+            }
+            for (i, ww) in w.iter().enumerate() {
+                *((start + (i as u64) * 4) as *mut u32) = *ww;
+            }
+            libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+            arm64jit::jit::block_cache_drop_region(start, blr + 4);
+            eprintln!(
+                "[elfjit:routeB] SH200 patched V2 dispatch @0x{start:x} {}B -> materialize stable singleton obj 0x{obj:x} into x0 + nop blr (V2Init/V2Start stop past the 0x60 vtable slot quashed; reaches the SH199 world-build gate)",
+                blr + 4 - start
+            );
+        }
+    }
+    ROUTEB_V2_DISPATCH_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
 /// Drive the engine's REAL per-node PRESENT walker so a populated 0x28-stride
 /// scene node actually DRAWS (closing SH63's "present side" gap). Entry is the
 /// mid-function present-loop region `0x105b2eec0` (x19=R preset via CpuState —
@@ -6424,6 +6525,12 @@ fn main() {
                 // materialize the stable object into x0 at both so the body
                 // completes towards the app-data-model / GuiObjects.
                 routeb_patch_sendapp_singleton_lambdas();
+                // SH200: the V2Init/V2Start run-variable "outside image" stop is
+                // a 4th singleton-dispatch site (fn 0x6251e0c reads objB vtable
+                // slot +0x118 past the 0x60 seed -> blr into host bytes). Patch
+                // it like SH115/119 so V2Init/V2Start reach the SH199 world-build
+                // gate block 0x102368100 instead of soft-returning first.
+                routeb_patch_v2_dispatch();
                 // SH120: the app-bridge event dispatch reads the shared dispatcher-
                 // node .bss global (0x10683a460) with an unseeded self-link; seed
                 // the DATA (NOT the generic shared leaf) to the benign empty state.
@@ -12378,6 +12485,38 @@ mod sh115_tests {
         let _48 = (w[3] >> 5) & 0xffff;
         let rebuilt = (lo as u64) | ((_16 as u64) << 16) | ((_32 as u64) << 32) | ((_48 as u64) << 48);
         assert_eq!(rebuilt, oj);
+    }
+    #[test]
+    fn sh200_v2_dispatch_window_materializes_obj_and_nops_to_blr() {
+        // SH200 V2-init dispatch window (fn 0x6251e0c etc.): the first 4 slots
+        // load the stable object into x0, the rest are nops (killing the
+        // past-0x60-vtable `blr`); the length is (blr-start)/4+1. Round-trip the
+        // object from the immediates (note: x0 movz/movk, no `|8` GPR suffix).
+        let obj: u64 = 0x5a_b3c4_d5e6_f708;
+        let w = sh200_v2_dispatch_window(obj, 9);
+        assert_eq!(w.len(), 9);
+        // slot0 movz x0,#0xf708 (hw0, x0 rd=0)
+        assert_eq!(w[0], 0xD280_0000u32 | ((0xf708u32) << 5));
+        // slot1-3 movk x0 hw1/2/3 (obj = 0x5a:b3c4:d5e6:f708)
+        assert_eq!(w[1], 0xF2A0_0000u32 | ((0xd5e6u32) << 5));
+        assert_eq!(w[2], 0xF2C0_0000u32 | ((0xb3c4u32) << 5));
+        assert_eq!(w[3], 0xF2E0_0000u32 | ((0x5au32) << 5));
+        // slots 4..8 are nops
+        for i in 4..9 {
+            assert_eq!(w[i], 0xd503_201fu32, "slot {i} must be nop");
+        }
+        let lo = (w[0] >> 5) & 0xffff;
+        let _16 = (w[1] >> 5) & 0xffff;
+        let _32 = (w[2] >> 5) & 0xffff;
+        let _48 = (w[3] >> 5) & 0xffff;
+        let rebuilt = (lo as u64) | ((_16 as u64) << 16) | ((_32 as u64) << 32) | ((_48 as u64) << 48);
+        assert_eq!(rebuilt, obj, "movz/movk round-trip must reconstruct obj");
+        // a site with only 4 slots (= exactly movz+3 movk, blr immediately after)
+        let w4 = sh200_v2_dispatch_window(obj, 4);
+        assert_eq!(w4.len(), 4);
+        for i in 0..4 {
+            assert_eq!(w4[i], w[i], "first 4 slots identical regardless of length");
+        }
     }
     #[test]
     fn sh115_sites_target_lazy_singleton_accessor_windows() {
