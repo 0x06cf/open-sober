@@ -3,7 +3,7 @@
 Author: hermes-worker (autonomous, single-agent — Route-B cone suppressed per operator
 Sep-15). Date Sep 16 2026. Workspace green (arm64jit 387/0 lib + elfjit example 68/0
 incl. new sh219 test + all crates, 0 failures). +1 hermetic. No production code path
-changed (pure regression net + stale-verdict correction). Commit `<SH219COMMIT>`.
+changed (pure regression net + stale-verdict correction). Commit `161bb42`.
 
 ## WHY THIS CYCLE — a stale Route-B verdict worth re-measuring
 
