@@ -2475,6 +2475,43 @@ fn routeb_manager_mgr30_leaf() -> u64 {
     }
 }
 
+/// Static slot holding the continuation-manager M's guest address (installed once by
+/// `routeb_dm_manager_cont` for the SH248c continuation guards, which must re-seed
+/// fields of M after the engine's serializer-assign overwrites them).
+static CONT_MANAGED_M: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+pub fn routeb_cont_managed_m() -> u64 {
+    CONT_MANAGED_M.get().copied().unwrap_or(0)
+}
+fn store_cont_managed_m(m: u64) {
+    CONT_MANAGED_M.set(m).ok();
+}
+
+/// SH248c (opt-in JIT_ROUTEB_CONT_APPNAME_SEED): continueAfterFlagsLoaded_'s app-name
+/// guard at 0x2bd1f64 reads [M+0x50] (the long-form size of M+0x48) and `cbnz`s PAST a
+/// deliberate NULL-store fault (0x2bd1f78->0x2bd1fd4, SIGSEGV writing 0x61 to [0]) only
+/// when that size is nonzero. The engine's own serializer-assign at 0x2bd1dfc OVERWRITES
+/// M+0x48 with EMPTY (F flags-holder is zeroed headlessly) -> size=0 -> guard falls to the
+/// fault. This fires at the guard's block-entry and re-seeds [M+0x50]=5 so the cbnz takes
+/// the skip to 0x2bd1fe0 (M+0x58 still holds the leaked "Home\0" data ptr, so M+0x48 reads
+/// back as a valid size-5 "Home" long string). Lets the continuation reach its first
+/// headless `bl nativeAppBridgeAppStart` (0x2bd2058). Default-inert; idempotent.
+fn routeb_cont_appname_seed_guard(_state: *mut CpuState, pc: u64) {
+    if std::env::var("JIT_ROUTEB_CONT_APPNAME_SEED").ok().as_deref() != Some("1") {
+        return;
+    }
+    if pc != 0x102bd1f64 {
+        return;
+    }
+    let m = routeb_cont_managed_m();
+    if m == 0 {
+        return;
+    }
+    unsafe {
+        std::ptr::write_unaligned((m + 0x50) as *mut u64, 5u64); // long-form size -> guard cbnz skips fault
+    }
+    eprintln!("[routeb-sh248c] continueAfterFlagsLoaded_ app-name guard re-seeded M+0x50 size=5 at pc=0x102bd1f64");
+}
+
 /// SH165-fwd-cone (deleg_7e5b7101 task-0, authoritative): the CONTINUATION-routed manager.
 /// Same fabricated all-leaf vtable as `routeb_dm_manager_fabricated`, EXCEPT vt[+0x1f0] is
 /// routed to the REAL continueAfterFlagsLoaded_ (guest 0x102bd1d68), and M is sized to hold the
@@ -2523,13 +2560,23 @@ pub fn routeb_dm_manager_cont() -> u64 {
             // M+0x58=len) so the guard's `cbnz x8` takes `x8=word[M+0x50]!=0` and the continuation
             // proceeds past the fault into its post-app-name path. Default-inert; idempotent.
             if std::env::var("JIT_ROUTEB_DM_CONT_M48_SEED").ok().as_deref() == Some("1") {
-                let home = Box::leak(b"Home\0".to_vec().into_boxed_slice()).as_mut_ptr() as u64;
-                std::ptr::write_unaligned((m + 0x48) as *mut u64, 1u64); // long flag (bit0=1)
-                std::ptr::write_unaligned((m + 0x50) as *mut u64, home); // data ptr
-                std::ptr::write_unaligned((m + 0x58) as *mut u64, 5u64); // len (+ null)
+                // SH248b (cap fix): the pre-SH248b seed wrote cap=1 (long-flag bit0 set but
+                // ZERO capacity). continueAfterFlagsLoaded_'s serialize-assign at 0x2bd1dfc
+                // then reads dest M+0x48 as a LONG string with cap=[this]&~1=0 -> not enough
+                // room -> grow path -> oldcap-1 underflows to 0xffff..ff > max_size ->
+                // b.hi 0x2b50690 -> x23=-9 -> op_new(-9)->NULL->std::bad_alloc. Give M+0x48 a
+                // VALID long capacity (cap=0x10, bit0=1 long) so the assign takes a normal
+                // grow path instead of the -9 sentinel. Long-form layout: [0]=cap, [8]=size,
+                // [16]=data ptr.
+                let home = Box::leak(vec![0u8; 64usize].into_boxed_slice()).as_mut_ptr() as u64;
+                std::ptr::copy_nonoverlapping(b"Home\0".as_ptr(), home as *mut u8, 5);
+                std::ptr::write_unaligned((m + 0x48) as *mut u64, 0x11u64); // long cap 0x10
+                std::ptr::write_unaligned((m + 0x50) as *mut u64, 5u64); // size 5
+                std::ptr::write_unaligned((m + 0x58) as *mut u64, home); // data ptr
                 eprintln!("[routeb] SH245 seeded cont-manager M+0x48 long-string (ptr {home:#x}, len 5) so continueAfterFlagsLoaded_ passes its app-name guard");
             }
         }
+        store_cont_managed_m(m);
         m
     })
 }
@@ -5422,6 +5469,9 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // size-class free-list state at 0x10623fe1c so the 0x70c "<=0xa works / 0x28
         // fails" gap is a measured mechanism, not an ROI judgment.
         routeb_alloc_probe_guard(state, pc);
+        // SH248c (opt-in JIT_ROUTEB_CONT_APPNAME_SEED): re-seed the continuation's
+        // M+0x48 size so continueAfterFlagsLoaded_'s app-name guard skips the NULL-store fault.
+        routeb_cont_appname_seed_guard(state, pc);
         unsafe { run(&block, state) };
         if step_trace {
             let s = unsafe { &*state };
@@ -6749,23 +6799,32 @@ mod tests {
         // (0x102bd1fd4) only when that string is non-empty. Its decode (measured disasm 0x2bd1f64-78):
         //   ldrb w8,[x19,#72] ; ldr x9,[x19,#80] ; lsr x10,w8,#1 ; tst w8,#1 ;
         //   csel x8,x10,x9,eq ; cbnz x8,skip   (eq=bit0 clear=SSO -> size=x10; else -> x8=word[+8])
-        // A LONG-string seed {M+0x48 bit0=1, M+0x50=home, M+0x58=len} makes x8=word[M+0x50]!=0
+        // A LONG-string seed {M+0x48 cap=0x10(bit0=1), M+0x50=size=5, M+0x58=data="Home"} makes
+        // x8=word[M+0x50]=5 != 0
         // -> cbnz taken -> the fault block is skipped. This pins that ABI contract (so a drifted
         // seed or decode fails loudly instead of silently re-faulting at the 'a'-to-NULL store).
-        // Build the seed exactly as routeb_dm_manager_cont does under JIT_ROUTEB_DM_CONT_M48_SEED.
+        // Build the seed exactly as routeb_dm_manager_cont does under JIT_ROUTEB_DM_CONT_M48_SEED,
+        // with the SH248c-corrected LONG-form layout: [0]=cap, [8]=size, [16]=data ptr.
         let m48 = Box::leak(vec![0u8; 0x40].into_boxed_slice()).as_mut_ptr() as u64;
-        let home = Box::leak(b"Home\0".to_vec().into_boxed_slice()).as_mut_ptr() as u64;
+        let home = Box::leak(vec![0u8; 64].into_boxed_slice()).as_mut_ptr() as u64;
         unsafe {
-            std::ptr::write_unaligned((m48 + 0x00) as *mut u64, 1u64); // long flag bit0
-            std::ptr::write_unaligned((m48 + 0x08) as *mut u64, home);
-            std::ptr::write_unaligned((m48 + 0x10) as *mut u64, 5u64);
+            std::ptr::copy_nonoverlapping(b"Home\0".as_ptr(), home as *mut u8, 5);
+            std::ptr::write_unaligned((m48 + 0x00) as *mut u64, 0x11u64); // long cap 0x10 (bit0=1 long)
+            std::ptr::write_unaligned((m48 + 0x08) as *mut u64, 5u64); // size 5
+            std::ptr::write_unaligned((m48 + 0x10) as *mut u64, home); // data ptr
             // The continuation's decode on the SEEDED field:
             let b0: u8 = std::ptr::read_unaligned((m48 + 0x00) as *const u8);
             let w8: u64 = std::ptr::read_unaligned((m48 + 0x08) as *const u64);
             let x10: u64 = (b0 as u64) >> 1;
             let x8: u64 = if (b0 & 1) == 0 { x10 } else { w8 };
-            assert_ne!(x8, 0, "seeded long-string must make `cbnz x8` NON-zero (skip the fault block)");
-            assert_eq!(x8, home, "long-string decode must yield the data pointer");
+            // bit0 set => long => x8 = word[+8]=size=5, which is NONZERO -> `cbnz x8` skips the fault.
+            assert_ne!(x8, 0, "seeded long-string (cap 0x11, size 5) must make `cbnz x8` NON-zero (skip the fault block)");
+            assert_eq!(x8, 5, "long-string decode must yield the size field (word[+8])");
+            assert_eq!(
+                std::ptr::read_unaligned((m48 + 0x10) as *const u64),
+                home,
+                "long-form [16]=data ptr must be the 'Home' buffer (the downstream 0x2bd2008 x1)"
+            );
             // A ZEROED field (the unseeded baseline) must decode to EMPTY -> the guard faults:
             let m48z = Box::leak(vec![0u8; 0x40].into_boxed_slice()).as_mut_ptr() as u64;
             let b0z: u8 = std::ptr::read_unaligned((m48z + 0x00) as *const u8);
