@@ -15255,6 +15255,73 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh268_lsm_freelist_terminal_mechanism_pinned() {
+        // SH268 (single-agent, cone suppressed): pin the NEW terminal reached AFTER the
+        // SH267 insert-leaf crossing. With JIT_ROUTEB_APPSART_LSM_NODES=1 the app-start
+        // lane crosses the insert-leaf (fault=0x0 at 0x101db1d04) but advances exactly one
+        // fencepost deeper into the LSM FREE-LIST/pop path and terminates:
+        //   SIGSEGV fault=0x101d968e4 guestpc=0x101d9a528 (fn sub_1d9a4e0 tail 0x1d9a528)
+        //   x19=host heap, x20=x1=0x101d968e4, lr=0x101d9a6b8, lsm_map_global=host
+        // Mechanism (fresh disasm): fn 0x1d9a528 (the free-list/pop, reached via
+        //   `mov x0,x19; bl 0x1d9a528` at 0x1d9a6b4/0x1d9a6b0, x19 = held key) computes
+        //   bucket=*[0x726f8c0] via adrp 726f000 + ldr [x8,#2240], bucket[]=sub, then the
+        //   pop tail `ldr x8,[x0,#24]; str x1,[x0,#24]; str x8,[x1] @0x1d9a568` writes the
+        //   free-list link into *x1 where x1 == the map key. The key (0x101d968e4 = file
+        //   0x1d968e4) sits INSIDE the R-E exec segment [file 0x0,0x62d8190) prot write:off
+        //   -> the str faults (the SH249/SH258 proven-unwritable live-object class, one
+        //   full fencepost past the insert leaf). No seed/repair/count-clamp lever reaches
+        //   it (SH249 segment proof). These words pin the terminal mechanism so a drift
+        //   fails loudly; this is a REGRESSION pin of the CURRENT known frontier, not a
+        //   forward gate (do NOT re-drive single-object seeds into it — SH249 class).
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            // free-list/pop fn 0x1d9a528 entry + bucket/sub decode
+            assert_eq!(word(0x101_d9a528), 0xb002a6a8, "sh268 freelist adrp x8,726f000");
+            assert_eq!(word(0x101_d9a52c), 0xd35dfc09, "sh268 freelist lsr x9,x0,#29");
+            assert_eq!(word(0x101_d9a534), 0xf9446108, "sh268 freelist ldr x8,[x8,#2240] (=map base)");
+            assert_eq!(word(0x101_d9a540), 0xc8dffd08, "sh268 freelist ldar x8,[x8] (bucket)");
+            assert_eq!(word(0x101_d9a544), 0xf8697900, "sh268 freelist ldr x0,[x8,x9,lsl#3] (sub)");
+            // the fatal tail: link-store into the key
+            assert_eq!(word(0x101_d9a55c), 0xf9400c08, "sh268 freelist ldr x8,[x0,#24]");
+            assert_eq!(word(0x101_d9a564), 0xf9000c01, "sh268 freelist str x1,[x0,#24]");
+            assert_eq!(word(0x101_d9a568), 0xf9000028, "sh268 freelist str x8,[x1]  <-- fault writes link into *key");
+            // caller: holder + tail bl (hold key in x19, free-list pop on it)
+            assert_eq!(word(0x101_d9a6b0), 0xaa1303e0, "sh268 caller mov x0,x19");
+            assert_eq!(word(0x101_d9a6b4), 0x97ffff9d, "sh268 caller bl 0x1d9a528 (tail pop)");
+            // fatal write target 0x101d968e4 sits inside the R-E exec LOAD segment
+            // (file 0x1d968e4, exec seg = file [0x0,0x62d8190) prot write:off) = the
+            // SH249/SH258 proven-unwritable live-object class. host_addr_of resolves it
+            // (in-image); the file offset must land within the exec segment — NOT writable data.
+            let wall = 0x101d968e4u64;
+            assert!(el.host_addr_of(wall).is_some(), "sh268 write target 0x101d968e4 in-image");
+            let wall_off = (wall - 0x1_0000_0000) & 0xffff_ffff; // file vaddr (this image guest=file+0x100000000)
+            assert!(wall_off < 0x62d8190, "sh268 write target file 0x{wall_off:x} inside R-E exec seg [0x0,0x62d8190) (write:off)");
+            let base = unsafe { *(0x10726f8c0u64 as *const u64) };
+            if base != 0 {
+                assert!(base & 7 == 0, "sh268 seeded map base 4-aligned");
+            }
+            for (guest, name) in [
+                (0x101_d9a528u64, "freelist-entry"),
+                (0x101_d9a568u64, "freelist-str-link"),
+                (0x101_d9a6b4u64, "freelist-caller-bl"),
+            ] {
+                assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh268 {name} {guest:#x} in window");
+                assert!(guest & 3 == 0, "sh268 {name} {guest:#x} 4-aligned");
+            }
+            eprintln!("sh268 LSM free-list/pop terminal mechanism (link-store into R-E key) pinned on libroblox.so");
+        } else {
+            eprintln!("sh268 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh260_lsm_insert_wall_anchored() {
         // SH260 (single-agent, cone suppressed): pin the NEW terminal reached by the
         // SH259-cleared app-start orchestrator. After settings-once clears the standing
