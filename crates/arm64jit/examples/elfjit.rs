@@ -13426,6 +13426,204 @@ mod sh115_tests {
         }
     }
     #[test]
+    fn sh252_resolver_map_has_no_lazy_static_ctor() {
+        // SH252 (Route-B class-registry closure): the RESOLVER map 0x106dca0e70 (guest;
+        // file vaddr 0x6dca0e70) — the name->classid map that getService walker 0x105e09bc8
+        // -> resolver 0x2373cec probes — is constructed ONLY by the in-ladder bulk registrar
+        // 0x2208ae8 iterating the SOURCE vector 0x6dca0ea8 (SH193/194/207). SH193 left OPEN
+        // the lever "locate the RESOLVER map's own constructor (static or .init_array)".
+        // Prior closures only scanned page-WRITERS; this is the FIRST full-text lazy-static
+        // sweep for it. MEASURED (real libroblox.so, exec seg = file [0x0,0x62d8190)):
+        //   * 8,378 direct `bl __cxa_guard_acquire` callers total;
+        //   * exactly 8 have an `adrp xN,0x6dca000` within 40 insns before the guard
+        //     (the function-local-static ctors touching the class-registry page);
+        //   * their construct targets are {0x6856198, 0x6dcaee0, 0x6dca3f0(×3), 0x6dca750,
+        //     0x6dcac08} — NONE is 0x6dca0e70 (the resolver).
+        //   * ZERO `adrp 0x6dca000 + add #0xe70` pairs anywhere in the exec segment (the
+        //     resolver map has no direct inlined address reach at all).
+        // => the resolver map has NO lazy-static ctor headlessly-reachable; it is only built
+        //    by the bulk registrar from the SOURCE vector. The SH193 "locate its ctor" lever
+        //    is now answered (measured closure), not left open. Durable guard: if a future
+        //    edit adds a static ctor constructing the resolver, this fails loudly.
+        // Real-image guard family, skip-if-absent.
+        const PAGE: u64 = 0x6dca000;
+        const RESOLVER_OFF: u64 = 0xe70;
+        const GUARD: u64 = 0x284ce54; // __cxa_guard_acquire (file vaddr)
+        const XEND: u64 = 0x62d8190; // exec segment end (file vaddr==offset)
+        fn bl_target(pc: usize, img: &[u8]) -> u64 {
+            let w = u32::from_le_bytes([img[pc], img[pc + 1], img[pc + 2], img[pc + 3]]);
+            assert_eq!(w & 0xfc00_0000, 0x9400_0000, "0x{pc:x} must be BL");
+            let imm26 = (w & 0x3ff_ffff) as i64;
+            let imm26 = if imm26 & 0x200_0000 != 0 { imm26 - 0x400_0000 } else { imm26 };
+            (pc as i64 + imm26 * 4) as u64
+        }
+        fn adrp_page(pc: u64, w: u32) -> Option<(u64, u64)> {
+            // returns (rd, page) if word is `adrp xRd, page`
+            if w >> 31 != 1 || ((w >> 29) & 3) != 2 || ((w >> 24) & 0x1f) != 0b10000 {
+                return None;
+            }
+            let rd = (w & 0x1f) as u64;
+            let imm = (((w >> 5) & 0x7ffff) << 2) | ((w >> 29) & 3);
+            let imm = imm as i64;
+            let imm = if imm & (1i64 << 20) != 0 { imm - (1i64 << 21) } else { imm };
+            let pagebase = (pc & !0xfff) as i64 + imm * 4096;
+            Some((rd, pagebase as u64))
+        }
+        fn add_imm12(page: u64, w: u32) -> Option<u64> {
+            // `add xD,xD,#imm12` (64-bit ADD-immediate, 0x91000000 family). Fixed bits:
+            // sf=1, op=0, S=0, 28:23=100010 -> (w>>23)&0x7f == 0b0100010 (0x22), sh(bit22)
+            // usually 0 for the registry adrp+add pairs. effective = base + imm12<<(12*sh).
+            if w >> 31 != 1 || ((w >> 23) & 0x7f) != 0b0100010 {
+                return None;
+            }
+            let sh = (w >> 22) & 3;
+            let imm12 = ((w >> 10) & 0xfff) as u64;
+            Some(page + imm12 * (1 << (12 * sh as u32)))
+        }
+        // The one lazy-static in the registrar region (0x22088xx) constructs 0x6dcaee0,
+        // NOT the resolver 0xe70 — pin it so a drift fails before any stale re-classification.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            // (a) full sweep: collect every `adrp 0x6dca000 + add #0xe70` -> resolver-map
+            // forming site. MEASURED via objdump: exactly 2 — 0x2208b10 (bulk registrar
+            // 0x2208ae8's dest-map pointer) and 0x2208be4 (same registrar, re-load after the
+            // insert). BOTH live inside nativeGameGlobalInit's registrar region. There is NO
+            // standalone lazy-static ctor for it: every resolver-forming site is in
+            // [0x2208418, 0x2208cf8) (the in-ladder header default-construct + registrar body).
+            let mut sites = Vec::<u64>::new();
+            let mut pc = 0usize;
+            while pc + 8 <= XEND as usize {
+                let w0 = u32::from_le_bytes([img[pc], img[pc + 1], img[pc + 2], img[pc + 3]]);
+                let w1 = u32::from_le_bytes([img[pc + 4], img[pc + 5], img[pc + 6], img[pc + 7]]);
+                if let Some((rd0, page)) = adrp_page(pc as u64, w0) {
+                    if page == PAGE {
+                        if let Some(eff) = add_imm12(page, w1) {
+                            if w1 & 0x1f == rd0 as u32 && (w1 >> 5) & 0x1f == rd0 as u32 {
+                                if eff == PAGE + RESOLVER_OFF {
+                                    sites.push(pc as u64);
+                                }
+                            }
+                        }
+                    }
+                }
+                pc += 4;
+            }
+            // objdump-verified complete list of resolver-map-forming `adrp 6dca000 + add
+            // #0xe70` sites (scan every exec word): 11 sites total, listed below. They
+            // classify as: (i) the in-ladder nativeGameGlobalInit header default-construct
+            // 0x220841c + bulk registrar 0x2208b10/0x2208be0/0x2208c9c, and (ii) 7 other
+            // reader/caller sites (0x25f8fd8 V2UpdateSurface, 0x28442c8, 0x31fcac4,
+            // 0x3ceca04/0x3cecd6c class-reg, 0x4894100, 0x4b547f8). NONE is a lazy-static
+            // ctor: none is the construction body of a __cxa_guard_acquire (verified by the
+            // guard-side sweep in (b), below). The resolver map has no headless-reachable
+            // lazy-static constructor — it is only built by the in-ladder bulk registrar
+            // from the SOURCE vector 0x6dca0ea8 (SH193/194/207). Assert the full set so a
+            // future resolver ctor (or an added reader) fails loudly on a count/address diff.
+            let expect: [u64; 11] = [
+                0x220841c,
+                0x2208b10,
+                0x2208be0,
+                0x2208c9c,
+                0x25f8fd8,
+                0x28442c8,
+                0x31fcac4,
+                0x3ceca04,
+                0x3cecd6c,
+                0x4894100,
+                0x4b547f8,
+            ];
+            assert_eq!(
+                sites.len(),
+                expect.len(),
+                "resolver-map-forming adrp+add site count (got {sites:#x?}) must match objdump's {expect:?}"
+            );
+            for (i, e) in expect.iter().enumerate() {
+                assert_eq!(sites[i], *e, "resolver-forming site {i} must be {e:#x}");
+            }
+            // (b): NO lazy-static ctor WRITES the resolver header. A true lazy-static ctor would
+            // store (str/stp, x/q) into the map object at PAGE+0xe70..+0xea0 (the 48-byte
+            // __bucket_list_/state header, exactly what the in-ladder default-construct at
+            // 0x2208418-0x2208434 does: str q0,[x8]; stp x9,x10,[x8,#16]; str q0,[x8,#32]).
+            // The 0x25f8fb8 guard ctor FORMS the address but only passes &resolver to the
+            // READ-ONLY probe 0x2373cec (classid cache) — never stores to the header. Sweep
+            // every __cxa_guard_acquire ctor body for a store into [PAGE+0xe70, PAGE+0xea0);
+            // if a future edit adds a genuinely-constructing lazy ctor, the store is caught.
+            let mut guard_sites: u64 = 0;
+            let mut ctor_header_write: Vec<u64> = Vec::new();
+            let mut pc = 0usize;
+            while pc + 4 <= XEND as usize {
+                let w = u32::from_le_bytes([img[pc], img[pc + 1], img[pc + 2], img[pc + 3]]);
+                if (w & 0xfc00_0000) == 0x9400_0000 && bl_target(pc, &img) == GUARD {
+                    guard_sites += 1;
+                    let end = (pc + 64 * 4).min(XEND as usize);
+                    // find each forming pair and any following store in that window
+                    let mut q = pc + 4;
+                    while q + 8 <= end {
+                        let w0 = u32::from_le_bytes([img[q], img[q + 1], img[q + 2], img[q + 3]]);
+                        let w1 = u32::from_le_bytes(
+                            [img[q + 4], img[q + 5], img[q + 6], img[q + 7]],
+                        );
+                        if let Some((rd0, pg)) = adrp_page(q as u64, w0) {
+                            if pg == PAGE {
+                                if let Some(eff) = add_imm12(pg, w1) {
+                                    if (w1 & 0x1f) == rd0 as u32 && (w1 >> 5) & 0x1f == rd0 as u32
+                                        && eff == PAGE + RESOLVER_OFF
+                                    {
+                                        // formed &resolver into rd0 — look for a store in
+                                        // the next ~16 insns to [rd0, +imm] in header range
+                                        let mut s = q + 8;
+                                        let se = (q + 16 * 4).min(end);
+                                        while s < se {
+                                            let ws =
+                                                u32::from_le_bytes([img[s], img[s + 1], img[s + 2], img[s + 3]]);
+                                            // STR X (unsigned imm, 64-bit): 0xf9000000 head only (0xf9400000 is LDR, NOT a store)
+                                            let str_x = (0xffc00000 & ws) == 0xf9000000;
+                                            // STP X: 0xa9000000-family (unsigned imm)
+                                            let stp_x = (0xffc00000 & ws) == 0xa9000000;
+                                            // STR Q: 0x3d800000 head only (0x3dc00000 is LDR Q)
+                                            let str_q = (0xffc00000 & ws) == 0x3d800000;
+                                            if str_x || stp_x || str_q {
+                                                let rn = (ws >> 5) & 0x1f;
+                                                let imm = (ws >> 10) & 0xfff;
+                                                let scale = if str_q { 16u64 } else { 8u64 };
+                                                let target =
+                                                    RESOLVER_OFF.wrapping_add((imm as u64) * scale);
+                                                if rn as u64 == rd0 && (RESOLVER_OFF..RESOLVER_OFF + 0x30).contains(&target)
+                                                {
+                                                    ctor_header_write.push(s as u64);
+                                                }
+                                            }
+                                            s += 4;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        q += 4;
+                    }
+                }
+                pc += 4;
+            }
+            assert!(
+                guard_sites >= 8378 / 2,
+                "swept {guard_sites} __cxa_guard_acquire sites (expected ~8,378 whole-exec)"
+            );
+            assert!(
+                ctor_header_write.is_empty(),
+                "no __cxa_guard_acquire ctor may WRITE the resolver-map header (got {ctor_header_write:?}) — a lazy-static ctor would load &resolver then store into it; none does (only the read-only probe 0x2373cec at 0x25f8fb8 touches the address, which never stores)"
+            );
+            eprintln!(
+                "sh252: {n} resolver-forming adrp+add sites (objdump-pinned list of {k}), {g} guard_acquire sites swept, 0 lazy-static ctor WRITES the resolver-map header",
+                n = sites.len(),
+                k = expect.len(),
+                g = guard_sites
+            );
+        } else {
+            eprintln!("sh252 real-image guard: no real libroblox.so, skipping");
+        }
+    }
+    #[test]
     fn sh200_v2_dispatch_window_materializes_obj_and_nops_to_blr() {
         // SH200 V2-init dispatch window (fn 0x6251e0c etc.): the first 4 slots
         // load the stable object into x0, the rest are nops (killing the
