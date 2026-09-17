@@ -86,3 +86,28 @@ lock acquires the contended session mutex). Region-watch on the item-processor.
 - `crates/arm64jit/examples/elfjit.rs` (+ `--v2boot-session-consumer` rung).
 - `runs/capture_sh288_consumer_drive.sh` (new A/B repro).
 - Run captures runs/sh288-a1.txt, sh288-b1.txt, sh288-b2.txt (gitignored).
+## Addendum SH289 (Sep 17, 2026): cell-attribution correction + "GlobalInit sub" refuted
+
+SH288 logged "exact cell attribution under investigation" for its work-flag probe AND
+labeled the item-proc's `bl 0x221942c` a "GlobalInit sub" world-build. Fresh disasm of
+the worker consume loop 0x10220778c + item-proc 0x102207950 assigns THREE DISTINCT
+fixed cells (real libroblox.so):
+
+- consume-loop cond-wait **predicate** = [queue 0x106863a70 + 0xa98] = **[0x106864508]**
+  (0x2207824 `ldr x8,[x25,#2712]`, x25=0x106863a70 via adrp 0x2207810);
+- item-proc **once-guard gate** = **[0x106a63b08]** (adrp 6a63000 + #0xb08 @0x2207978/7c
+  -> `ldarb` @0x2207980), guarding the [0x106a63b00] build;
+- the SH288 rung's probed **[0x106863b08]** is NEITHER (0x200000 apart from the guard).
+
+So reading [0x106863b08]==0 is meaningless — exactly why SH288 measured "work-flag read 0
+yet the consumer proceeded". The --v2boot-session-consumer rung now probes the correct
+once-guard [0x106a63b08].
+
+Also: the item-proc tail `bl 0x221942c` (0x22079e8) is a **CLOCK/timestamp helper**
+(0x221942c: `stp x29,x30` 0xa9bf7bfd; `mov w1,#-1`; `mov w2,#0`; `bl 0x6201fc8`
+clock_gettime family), NOT a DM world-build. The item-proc's real state helper call is
+0x22193a0 (-> 0x22076e8).
+
++hermetic **sh289** (12 real-image word-pins + assert_ne on the 3 cells) — see example
+elfjit.rs. Workspace green (580/0), examples 118/0, recon-v3 green. No production path
+edited; the fix is the probe cell in the default-inert rung. Route-B live-DM gate UNCHANGED.
