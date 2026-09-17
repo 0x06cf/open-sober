@@ -2380,6 +2380,64 @@ fn routeb_patch_nativeinit_flagmanager() {
     }
     ROUTEB_FLAGMANAGER_PATCHED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
+static ROUTEB_GETTER_FMOD_TAIL_PATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Pure: the expected `b 0x624e6c0` word at the engine-init getter tail 0x2174c80 and
+/// the `ret` we replace it with. Round-trippable so a hermetic test can pin both
+/// encodings (so a silently drifted binary fails loudly instead of the patch silently
+/// no-op'ing and the Run-B "does it resume" measurement reading a false negative).
+fn sh245_getter_tail_words(ret: bool) -> u32 {
+    if ret {
+        0xd65f_03c0u32 // ret
+    } else {
+        0x1503_6690u32 // b 0x624e6c0 (tail into the FMOD/AAudio distractor)
+    }
+}
+/// SH245 (Route-B, opt-in JIT_ROUTEB_GETTER_TAIL_RET): the engine-init getter
+/// 0x102174c04 (JNI_OnLoad+0xc10) ends with an UNCONDITIONAL tail `b 0x624e6c0`
+/// (file 0x2174c80, word 0x15036690) into `Java_org_fmod_FMOD_OutputAAudioHeadphonesChanged`
+/// — REGARDLESS of which vt[+0x30] verb ran. That tail never returns to the dispatcher
+/// (0x2bd8d18 stays 0 region-hits: dispatcher block 1 [0x2bd8ce8,0x2bd8d14] -> call
+/// getter -> getter tails into FMOD which diverts into its audio body or a NULL
+/// vt[+0x720] blr; control never comes back). The getter already restored x30 =
+/// dispatcher return (0x2bd8d18) at 0x2174c7c (`ldp x29,x30,[sp],#32`), so patching the
+/// tail `b` -> `ret` makes the getter return STRAIGHT to 0x2bd8d18. Then the dispatcher
+/// runs its two benign vt[+0xf8]/vt[+0x108] leaves (our fabricated manager's leaves)
+/// and reaches `bl sub_2bd8dac` -> vt[+0x1f0] dispatch: with DMCONT that is the REAL
+/// continueAfterFlagsLoaded_ (0x102bd1d68) — the first headless execution of the real
+/// continuation = the concrete SH244 "does the FMOD tail return" answer + forward motion.
+/// The getter is shared by ~3 callers in this area (0x2bd8d14/0x2bd8e84/0x2bd8f80); all
+/// currently tail into the same FMOD distractor, so making it return benignly is a
+/// strict robustness improvement for each (each resumes at its own reset pc). Default
+/// INERT: only fires under JIT_ROUTEB_GETTER_TAIL_RET=1. Idempotent, non-vtable-widening.
+fn routeb_patch_getter_fmod_tail_ret() {
+    if ROUTEB_GETTER_FMOD_TAIL_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    if std::env::var("JIT_ROUTEB_GETTER_TAIL_RET").ok().as_deref() != Some("1") {
+        return;
+    }
+    let start = 0x102174c80u64; // guest = file(0x2174c80) + 0x100000000
+    let page = (start & !0xfff) as *mut libc::c_void;
+    unsafe {
+        if libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_WRITE) != 0 {
+            eprintln!("[elfjit:routeB] WARN mprotect RW failed for SH245 getter tail @0x{start:x} errno={}", std::io::Error::last_os_error());
+            ROUTEB_GETTER_FMOD_TAIL_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        let before = *(start as *const u32);
+        if before != sh245_getter_tail_words(false) {
+            eprintln!("[elfjit:routeB] WARN SH245 getter tail @0x{start:x} unexpected word {before:08x}, not patched (binary drifted?)");
+            libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+            ROUTEB_GETTER_FMOD_TAIL_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        *(start as *mut u32) = sh245_getter_tail_words(true);
+        libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+        arm64jit::jit::block_cache_drop_region(start, start + 4);
+        eprintln!("[elfjit:routeB] SH245 patched getter tail @0x{start:x} b 0x624e6c0 -> ret (engine-init returns to dispatcher 0x2bd8d18, skips FMOD tail)");
+    }
+    ROUTEB_GETTER_FMOD_TAIL_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
 static ROUTEB_RUNG0_DISPATCH_PATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// SH126-followup (recon deleg_fcd65c31): with JIT_SERIALIZE_RENDER the drain
 /// overlap is gone, but the residual run-variable rung-0 crash is a null-store in
@@ -6765,6 +6823,11 @@ fn main() {
             // the singletons 0x624f4f0 reaches directly (cbz x1) that the gate
             // force does NOT cover (would otherwise null-vtable crash at 0x624f500).
             routeb_seed_task_singletons();
+            // SH245 (Route-B, opt-in JIT_ROUTEB_GETTER_TAIL_RET): patch the engine-init
+            // getter's unconditional FMOD/AAudio tail `b 0x624e6c0` -> `ret` so the getter
+            // returns to the dispatcher (0x2bd8d18) instead of diving into a tail that
+            // never returns. Self-guards on its own env (inert by default).
+            routeb_patch_getter_fmod_tail_ret();
             // SH115: the three nullable-singleton dispatch accessors (V2Init/
             // V2Start/V1AppStart/SendAppEventOnAppReady) soft-return because
             // their `blr` reads past the 0x60 vtable. Scoped-patch each site to
@@ -12850,6 +12913,36 @@ mod sh115_tests {
         }
         // A wide (>=2^32) object must be rejected by the caller's width guard.
         assert!(0x1_0000_0000u64 > 0xffff_ffffu64, "caller's obj <= 0xffff_ffff gate");
+    }
+    #[test]
+    fn sh245_getter_fmod_tail_word_roundtrip_and_real_site_guard() {
+        // SH245: the engine-init getter 0x102174c04 tail `b 0x624e6c0` (file vaddr
+        // 0x2174c80, word 0x15036690) is patched to `ret` (0xd65f03c0) so the getter
+        // returns to the dispatcher (0x2bd8d18) instead of diving into the FMOD/AAudio
+        // distractor that never returns. Pin both encodings + the real-image site word.
+        assert_eq!(sh245_getter_tail_words(false), 0x1503_6690, "b 0x624e6c0 (tail)");
+        assert_eq!(sh245_getter_tail_words(true), 0xd65f_03c0, "ret");
+        assert_ne!(
+            sh245_getter_tail_words(false),
+            sh245_getter_tail_words(true),
+            "the two words must differ (a silent no-op patch is a false negative)"
+        );
+        // ret must be read/write x29-free (it just returns) — bit 31 must be set (raw A64
+        // class 0xd65f03c0 is the RET opcode); sanity that it is NOT a branch word.
+        assert_eq!(sh245_getter_tail_words(true) >> 26, 0b110101 & 0x3f, "opcode class RET (0b110101)");
+        // Real-image site guard: file vaddr 0x2174c80 must hold the `b 0x624e6c0` word.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let off = 0x2174c80usize;
+            let w0 = u32::from_le_bytes([img[off], img[off + 1], img[off + 2], img[off + 3]]);
+            assert_eq!(
+                w0, 0x1503_6690,
+                "SH245 getter tail file vaddr 0x2174c80 is `b 0x624e6c0` (0x15036690)"
+            );
+        } else {
+            eprintln!("sh245 real-image guard: no real libroblox.so, skipping");
+        }
     }
     #[test]
     fn sh200_v2_dispatch_window_materializes_obj_and_nops_to_blr() {

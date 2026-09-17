@@ -2512,6 +2512,23 @@ pub fn routeb_dm_manager_cont() -> u64 {
             // M[+0]=vt, M[+8]=0 (getter tail cbz-cleans), M[+0x40]=F (flags-holder).
             std::ptr::write_unaligned(m as *mut u64, v);
             std::ptr::write_unaligned((m + 0x40) as *mut u64, f);
+            // SH245 (next gate, opt-in JIT_ROUTEB_DM_CONT_M48_SEED): continueAfterFlagsLoaded_
+            // (vt[+0x1f0]=real 0x102bd1d68) executes with x0=M (x19=M). Its body serializes the
+            // flags blob, then reads `[x19,#72]` = M+0x48 as a std::string app-name and
+            // `cbnz`s PAST a deliberate NULL-store fault (0x2bd1f78 -> 0x2bd1fd4 `mov x8,xzr;
+            // strb w9,[x8]`) ONLY when that string is non-empty. With an empty flags-holder F the
+            // serialized M+0x48 stays 0, so the guard logs via __android_log_print then faults by
+            // writing 0x61 ('a') to [0] — measured crash at guest 0x102bd1fd4. Seed M+0x48 as a
+            // LONG std::string pointing at a leaked "Home\0" (bit(M+0x48)#0=1 -> long; M+0x50=ptr,
+            // M+0x58=len) so the guard's `cbnz x8` takes `x8=word[M+0x50]!=0` and the continuation
+            // proceeds past the fault into its post-app-name path. Default-inert; idempotent.
+            if std::env::var("JIT_ROUTEB_DM_CONT_M48_SEED").ok().as_deref() == Some("1") {
+                let home = Box::leak(b"Home\0".to_vec().into_boxed_slice()).as_mut_ptr() as u64;
+                std::ptr::write_unaligned((m + 0x48) as *mut u64, 1u64); // long flag (bit0=1)
+                std::ptr::write_unaligned((m + 0x50) as *mut u64, home); // data ptr
+                std::ptr::write_unaligned((m + 0x58) as *mut u64, 5u64); // len (+ null)
+                eprintln!("[routeb] SH245 seeded cont-manager M+0x48 long-string (ptr {home:#x}, len 5) so continueAfterFlagsLoaded_ passes its app-name guard");
+            }
         }
         m
     })
@@ -6663,6 +6680,39 @@ mod tests {
         // behavioral distinction the getter branch senses). Bound: both must be != 0.
         assert_ne!(default_leaf, 0, "default vt[+0x30] verb must be a registered host-call addr");
         assert_ne!(minus2_leaf, 0, "minus2 vt[+0x30] verb must be a registered host-call addr");
+    }
+
+    #[test]
+    fn sh245_m48_long_string_seed_passes_continuation_appname_guard() {
+        // SH245: continueAfterFlagsLoaded_ (real vt[+0x1f0]=0x102bd1d68) reads `[x19,#72]` = the
+        // cont-manager M+0x48 app-name std::string and `cbnz`s PAST a deliberate NULL-store fault
+        // (0x102bd1fd4) only when that string is non-empty. Its decode (measured disasm 0x2bd1f64-78):
+        //   ldrb w8,[x19,#72] ; ldr x9,[x19,#80] ; lsr x10,w8,#1 ; tst w8,#1 ;
+        //   csel x8,x10,x9,eq ; cbnz x8,skip   (eq=bit0 clear=SSO -> size=x10; else -> x8=word[+8])
+        // A LONG-string seed {M+0x48 bit0=1, M+0x50=home, M+0x58=len} makes x8=word[M+0x50]!=0
+        // -> cbnz taken -> the fault block is skipped. This pins that ABI contract (so a drifted
+        // seed or decode fails loudly instead of silently re-faulting at the 'a'-to-NULL store).
+        // Build the seed exactly as routeb_dm_manager_cont does under JIT_ROUTEB_DM_CONT_M48_SEED.
+        let m48 = Box::leak(vec![0u8; 0x40].into_boxed_slice()).as_mut_ptr() as u64;
+        let home = Box::leak(b"Home\0".to_vec().into_boxed_slice()).as_mut_ptr() as u64;
+        unsafe {
+            std::ptr::write_unaligned((m48 + 0x00) as *mut u64, 1u64); // long flag bit0
+            std::ptr::write_unaligned((m48 + 0x08) as *mut u64, home);
+            std::ptr::write_unaligned((m48 + 0x10) as *mut u64, 5u64);
+            // The continuation's decode on the SEEDED field:
+            let b0: u8 = std::ptr::read_unaligned((m48 + 0x00) as *const u8);
+            let w8: u64 = std::ptr::read_unaligned((m48 + 0x08) as *const u64);
+            let x10: u64 = (b0 as u64) >> 1;
+            let x8: u64 = if (b0 & 1) == 0 { x10 } else { w8 };
+            assert_ne!(x8, 0, "seeded long-string must make `cbnz x8` NON-zero (skip the fault block)");
+            assert_eq!(x8, home, "long-string decode must yield the data pointer");
+            // A ZEROED field (the unseeded baseline) must decode to EMPTY -> the guard faults:
+            let m48z = Box::leak(vec![0u8; 0x40].into_boxed_slice()).as_mut_ptr() as u64;
+            let b0z: u8 = std::ptr::read_unaligned((m48z + 0x00) as *const u8);
+            let w8z: u64 = std::ptr::read_unaligned((m48z + 0x08) as *const u64);
+            let x8z: u64 = if (b0z & 1) == 0 { (b0z as u64) >> 1 } else { w8z };
+            assert_eq!(x8z, 0, "zeroed M+0x48 must decode EMPTY (the pre-seed fault precondition)");
+        }
     }
 
     #[test]
