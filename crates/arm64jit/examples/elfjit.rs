@@ -7554,6 +7554,45 @@ fn main() {
                                         eprintln!("[elfjit:v2boot] SH156 WARN failed to map page for 0x{g:x}");
                                     }
                                 }
+                                // ROUTE-B RECON V3 NEXT-3 do-init seeds (opt-in
+                                // JIT_ROUTEB_DOINIT_NEXT3): the three app-shell/do-init ctor
+                                // SEGVs (thread-init 0x102207ef0, telemetry 2b4cd1c park,
+                                // map-page 0x102212838) are cleared by VALUE seeds. SH156
+                                // maps the pages but never writes these values. The en-crate
+                                // block-entry guard is INERT here (the ctor body blocks were
+                                // already JIT-cached by the prior StartLuaAppDM rung), so
+                                // seed the VALUES directly at the SAME synthesis point that
+                                // maps their pages — the SH269 GOVFLAG direct-seed pattern.
+                                if std::env::var_os("JIT_ROUTEB_DOINIT_NEXT3").is_some() {
+                                    const TI: u64 = 0x1067333aa0; // thread-init singleton (clears 0x102207ef0)
+                                    const TEL: u64 = 0x106dcd380; // telemetry once-cell (clears 2b4cd1c park)
+                                    const MAP: u64 = 0x10673336d8; // map-page spin-flag (clears 0x102212838)
+                                    for a in [TI, TEL, MAP] {
+                                        routeb_map_guest_page(a);
+                                    }
+                                    if arm64jit::jit::routeb_ensure_writable(TI) {
+                                        let cur = unsafe { std::ptr::read_unaligned(TI as *const u64) };
+                                        if cur == 0 {
+                                            let buf = Box::leak(vec![0u8; 0x20usize].into_boxed_slice()).as_mut_ptr() as u64;
+                                            unsafe { std::ptr::write_unaligned(TI as *mut u64, buf) };
+                                            eprintln!("[elfjit:v2boot] ROUTE-B NEXT3 seeded thread-init singleton [0x{TI:x}] = leaked 0x20 buffer {buf:#x} (clears SEGV 0x102207ef0)");
+                                        }
+                                    }
+                                    if arm64jit::jit::routeb_ensure_writable(TEL) {
+                                        let cur = unsafe { std::ptr::read_unaligned(TEL as *const u64) };
+                                        if cur != u64::MAX {
+                                            unsafe { std::ptr::write_unaligned(TEL as *mut u64, u64::MAX) };
+                                            eprintln!("[elfjit:v2boot] ROUTE-B NEXT3 seeded telemetry once-cell [0x{TEL:x}] = -1 (clears the 2b4cd1c cond_wait park)");
+                                        }
+                                    }
+                                    if arm64jit::jit::routeb_ensure_writable(MAP) {
+                                        let cur = unsafe { std::ptr::read_unaligned(MAP as *const u8) };
+                                        if cur & 1 == 0 {
+                                            unsafe { std::ptr::write_unaligned(MAP as *mut u8, cur | 1) };
+                                            eprintln!("[elfjit:v2boot] ROUTE-B NEXT3 seeded map-page [0x{MAP:x}].bit0=1 (clears SEGV 0x102212838)");
+                                        }
+                                    }
+                                }
                                 eprintln!("[elfjit:v2boot] SH156 seeded DM-root [0x106a68818]=0x{dmobj:x} (object[0]=dispatch vtable 0x10635cce0, vtable[+0x30]=0x102207b50 real global-init ctor) -> do-init match brs into REAL construction");
                                 eprintln!("[elfjit:v2boot] SH157 seeded governor router flag [0x106a70880]=1 -> AppBridgeV2 governor takes MODERN path to nativeAppBridgeStartAppWithParams (0x258c6e4)");
                                 unsafe {
@@ -9987,44 +10026,18 @@ fn main() {
                         );
                         // --renderframe-seedgles (opt-in): overwrite the 8 engine
                         // GLES dispatch slots (BSS 0x106d3b2f0..0x106d3b328) with
-                        // OUR host-thunk GLES bridge slots (resolve_gles_mixed) so
-                        // the frame clear path's `br`-stubs dispatch through the
-                        // bridge (float/texture interception) instead of jumping to
-                        // raw Mesa (out-of-image). The engine's real GL-init fills
-                        // these with raw Mesa addresses (SH19); seeding proves the
-                        // bridge takes over. Names are per-slot guesses from the
-                        // clear-path usage; refine by reading which slot the engine
-                        // needs once the drive passes the current stop.
-                        // Slot->function names corrected by disassembly (SH22): the clear
-                        // path dispatches slot0 as glDrawBuffers (builds
-                        // {GL_COLOR_ATTACHMENT0..3} / {GL_BACK} buf arrays) and slot2 as
-                        // glClearBufferfv (per-buffer clear loop uses GL_COLOR=0x1800 /
-                        // GL_DEPTH=0x1801 buffer enums, drawbuffer in w1, value ptr in x2).
-                        // The SH19-21 "glClearColor"+"glClearDepthf" guesses mis-routed
-                        // those dispatches (glClearDepthf bridge ignored the int/ptr args
-                        // and cleared nothing -> black window).
-                        // The engine's GLES dispatch table is 16 slots at BSS
-                        // 0x106d3b2f0 (stub 0x5b3a1c0+0xc*N does adrp 6d3b000; ldr
-                        // xK,[x8,#752+8*N]; br xK). Slots 0-7 are the clear path
-                        // (SH22-corrected names below). Slots 8-15 are the GEOMETRY
-                        // draw path: the draw wrapper 0x5b35288 dispatches slot 9 as
-                        // glDrawElements (indexed draw, 0x5b352f4 bl 0x5b3a22c) and
-                        // slot 10 as glDrawArrays (array draw, 0x5b35368 bl 0x5b3a238)
-                        // after the primitive-setup fn 0x5b353d0 binds buffers +
-                        // sets up vertex attrib pointers (glBindBuffer/
-                        // glEnableVertexAttribArray/glVertexAttribPointer direct @plt).
-                        // Seeding slots 9/10 too means a real geometry draw (reaching
-                        // the RENDERER C++ object reverse) dispatches through the
-                        // bridge instead of jumping to a raw Mesa addr (SH19 class).
-                        // Seed EVERY dispatch slot explicitly by (slot, name). Slots
-                        // 0-7 are the clear path (SH22-corrected names below). The
-                        // real geometry draw dispatches slot 9 as glDrawElements
-                        // (indexed draw, wrapper 0x5b35288 @0x5b352f4 bl 0x5b3a22c)
-                        // and slot 10 as glDrawArrays (array draw @0x5b35368 bl
-                        // 0x5b3a238), after primitive-setup 0x5b353d0 binds buffers +
-                        // sets vertex attrib pointers via direct @plt. Seeding 9/10
-                        // means a real geometry draw dispatches through the bridge
-                        // instead of jumping to a raw Mesa addr (SH19 class).
+                        // our host-thunk GLES bridge slots (resolve_gles_mixed) so the
+                        // frame clear + geometry draw paths dispatch through the bridge
+                        // instead of jumping to raw Mesa (out-of-image). Table is 16
+                        // slots at BSS 0x106d3b2f0 (stub 0x5b3a1c0+0xc*N). Slots 0-7
+                        // are the clear path (SH22: slot0=glDrawBuffers, slot2=
+                        // glClearBufferfv; the SH19 "glClearColor/Depth" guesses
+                        // mis-routed and blacked the window). Slots 8-15 are geometry:
+                        // draw wrapper 0x5b35288 dispatches slot9=glDrawElements
+                        // (0x5b352f4 bl 0x5b3a22c) and slot10=glDrawArrays (0x5b35368
+                        // bl 0x5b3a238) after primitive-setup 0x5b353d0. Seeding slots
+                        // 9/10 too means a real geometry draw dispatches through the
+                        // bridge. Seed EVERY slot explicitly by (slot, name).
                         let seed_slots: [(usize, &str); 10] = [
                             (0, "glDrawBuffers"),
                             (1, "glClearBufferiv"),
@@ -14373,38 +14386,21 @@ mod sh115_tests {
 
     #[test]
     fn sh225_doinit_dm_construction_dispatch_fork_pinned() {
-        // SH225 (Route-B re-attack, single-agent): SH186 recon task-0 mapped the ONE
-        // reachable DM-touching path (StartLuaAppDM 0x1023efe2c -> dispatcher
-        // 0x102baeeec -> GlobalInit do-init 0x102206c40) and JUDGED (not measured)
-        // that the DM is created inside a scheduled app-start reached "through a
-        // captured vtable" — same-difficulty as static-seed, so never built out.
-        // Fresh disasm this cycle resolves that dispatch to a concrete, byte-anchored
-        // contract so a future drive (or a proof-of-dead-end) starts from a pinned
-        // target:
-        //   * do-init (0x102206c40) acquire-loads the once-guard [0x106a68410]
-        //     (ldar w9,[x8] file 0x206c7c / tbz w9,#0 file 0x206c84 -> 0x102206d10).
-        //   * first-call path 0x102206d10 bls 0x10284ce54 (the __call_once SH196 saw
-        //     self-latch to a strcmp intern), then builds registry-key strings.
-        //   * do-init then calls closure-build 0x102206db8 (file 0x206cdc bl).
-        //     Its dispatch reads x0=[x19,#32] (the union's +0x30 slot — SH156's
-        //     original decode; NOTE: the 64-bit LDR scales imm12 by 8, so
-        //     word 0xf9401260 (imm12=4) = offset 4*8=#32, NOT #4 as SH225/226
-        //     mislabeled — SH225's "correction" applied the 32-bit ×4 scale),
-        //     x8=[x0] (the target object's vtable), x1=[x8,#0x30] (vt+0x30 slot),
-        //     then `br x1` (file 0x206e24). That vt+0x30 slot is the
-        //     DM-construction entry a live object would dispatch through.
-        //     (SH224 showed the *DM object's* own vt+0x30 is only a tiny
-        //     accessor — this is the object at [union+32]'s vtable, a DIFFERENT
-        //     class.) CRITICAL MEASURED GATE: on the ladder the `b.ne`
-        //     (pthread_self-vs-stored-main-id) at 0x206df0 is TAKEN -> jumps to
-        //     0x206e28 (LocalStorageManager path), so the binder-dispatch block
-        //     0x206df4..0x206e24 NEVER executes (region-watch, 3/3 runs) —
-        //     the SH225/226 "fabricate a binder at [union+4]" target is a
-        //     MEASURED dead-end both on decode (offset is #32 not #4) and on
-        //     reachability (b.ne bypass). See sh227.
-        //   * a second fork bl 0x10221942c (file 0x206ce4) returns via a short helper.
-        // A drift in any of these sites fails loudly instead of silently re-reading
-        // changed control flow. Skip-if-absent real-image guard family.
+        // SH225: pin the ONE reachable DM-touching path (StartLuaAppDM 0x1023efe2c ->
+        // dispatcher 0x102baeeec -> GlobalInit do-init 0x102206c40) so a future drive / 
+        // proof-of-dead-end starts from a byte-anchored target. do-init (0x102206c40)
+        // acquire-loads once-guard [0x106a68410] (ldar w9,[x8] f206c7c / tbz f206c84 ->
+        // 0x102206d10); first-call bls 0x10284ce54 (__call_once), builds registry keys,
+        // then bl closure-build 0x102206db8 (f206cdc). Its dispatch reads x0=[x19,#32]
+        // (union +0x30 slot; 64-bit LDR scales imm12 by 8 -> word 0xf9401260 imm12=4 =
+        // #32, NOT #4 as SH225/226 mislabeled), x8=[x0] vtable, x1=[x8,#0x30] vt+0x30
+        // slot, `br x1` (f206e24) = the DM-construction entry a live object dispatches
+        // through. MEASURED GATE: on the ladder the `b.ne` (pthread_self-vs-main-id) at
+        // 0x206df0 is TAKEN -> 0x206e28 (LocalStorageManager path), so the binder-dispatch
+        // block 0x206df4..0x206e24 NEVER runs (3/3) — the SH225/226 "fabricate a binder
+        // at [union+4]" target is a MEASURED dead-end (decode #32 not #4 + b.ne bypass).
+        // A second fork bl 0x10221942c (f206ce4) returns via a short helper.
+        // A drift in any of these sites fails loudly.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );

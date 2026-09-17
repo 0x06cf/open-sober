@@ -1050,6 +1050,70 @@ fn routeb_govflag_seed_guard(_state: *mut CpuState, pc: u64) {
     }
 }
 
+/// ROUTE-B RECON V3 NEXT-3 do-init seeds (authoritative deleg_8d5648cf). The do-init
+/// / app-shell world-build ctor (GlobalInit 0x102207b50 body) faults at THREE concrete
+/// sites that a value-seed clears. SH156 already MAPS the containing pages; these
+/// specific VALUE writes (never done until now) make the ctor advance:
+///   #1 thread-init singleton [0x1067333aa0] = ptr to a 0x20 zeroed buffer
+///      (clears SEGV 0x102207ef0: `ldr x0,[x0,#16]; cbz x0,ret` — a NULL *global
+///      deref below the app-shell ctor).
+///   #2 telemetry once-cell  [0x106dcd380]  = -1
+///      (clears the 2b4cd1c pthread_cond_wait park / async gate; the ---1 flag is the
+///      "already done" once sentinel SH248e uses).
+///   #3 map page 0x1067333000 + set [0x10673336d8].bit0 = 1
+///      (clears SEGV 0x102212838: `ldarb w8,[x0]; tbz w8,#0` — a spin-on-flag gate
+///      that dead-locks/faults when bit0 stays 0).
+/// Fires on ANY entry into the do-init/app-shell world-build region
+/// [0x102206c40, 0x102213000) (the deep "clear the ONE-NEXT-UNSYNTHESIZED-OBJECT
+/// loop" band the SESSION-CTOR directive keeps grinding); idempotent; default-inert
+/// (env JIT_ROUTEB_DOINIT_NEXT3). routeb_ensure_writable maps the precise page each
+/// address sits on, so #3's [0x10673336d8] page (0x1067333000) is handled correctly.
+fn routeb_doinit_next3_seed_guard(_state: *mut CpuState, pc: u64) {
+    if std::env::var_os("JIT_ROUTEB_DOINIT_NEXT3").is_none() {
+        return;
+    }
+    if !(0x102206c40..0x102213000).contains(&pc) {
+        return;
+    }
+    // #1 thread-init singleton -> leaked 0x20 zeroed buffer.
+    const THREAD_INIT: u64 = 0x1067333aa0;
+    if routeb_ensure_writable(THREAD_INIT) {
+        let cur = unsafe { std::ptr::read_unaligned(THREAD_INIT as *const u64) };
+        if cur == 0 {
+            static TIBUF: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let buf = *TIBUF.get_or_init(|| {
+                Box::leak(vec![0u8; 0x20usize].into_boxed_slice()).as_mut_ptr() as u64
+            });
+            unsafe { std::ptr::write_unaligned(THREAD_INIT as *mut u64, buf) };
+            eprintln!(
+                "[routeb-doinit-next3] seeded thread-init singleton [0x{THREAD_INIT:x}] = leaked 0x20 buffer {buf:#x} at pc=0x{pc:x} (clears SEGV 0x102207ef0)"
+            );
+        }
+    }
+    // #2 telemetry once-cell -> -1.
+    const TELEM_ONCE: u64 = 0x106dcd380;
+    if routeb_ensure_writable(TELEM_ONCE) {
+        let cur = unsafe { std::ptr::read_unaligned(TELEM_ONCE as *const u64) };
+        if cur != u64::MAX {
+            unsafe { std::ptr::write_unaligned(TELEM_ONCE as *mut u64, u64::MAX) };
+            eprintln!(
+                "[routeb-doinit-next3] seeded telemetry once-cell [0x{TELEM_ONCE:x}] = -1 at pc=0x{pc:x} (clears the 2b4cd1c cond_wait park)"
+            );
+        }
+    }
+    // #3 map page + set bit0=1 (spin-on-flag gate).
+    const MAP_BIT0: u64 = 0x10673336d8;
+    if routeb_ensure_writable(MAP_BIT0) {
+        let cur = unsafe { std::ptr::read_unaligned(MAP_BIT0 as *const u8) };
+        if cur & 1 == 0 {
+            unsafe { std::ptr::write_unaligned(MAP_BIT0 as *mut u8, cur | 1) };
+            eprintln!(
+                "[routeb-doinit-next3] seeded map-page [0x{MAP_BIT0:x}].bit0=1 at pc=0x{pc:x} (clears SEGV 0x102212838 spin-on-flag)"
+            );
+        }
+    }
+}
+
 /// SH253 (Route-B, opt-in JIT_ROUTEB_SOURCE_SEED): seed the bulk-registrar SOURCE
 /// vector so the engine's OWN in-ladder registrar loop populates the RESOLVER map.
 /// SH252 measured (full exec-text sweep) that the resolver 0x106dca0e70 — the
@@ -5837,6 +5901,12 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // SH248c (opt-in JIT_ROUTEB_CONT_APPNAME_SEED): re-seed the continuation's
         // M+0x48 size so continueAfterFlagsLoaded_'s app-name guard skips the NULL-store fault.
         routeb_cont_appname_seed_guard(state, pc);
+        // ROUTE-B RECON V3 NEXT-3 do-init seeds (opt-in JIT_ROUTEB_DOINIT_NEXT3):
+        // clear the three app-shell/do-init ctor SEGVs (0x102207ef0 thread-init,
+        // 2b4cd1c cond_wait park, 0x102212838 map-page bit0) whose VALUES (not just
+        // SH156's page maps) were never written. Fires in the do-init world-build
+        // band. Default-inert.
+        routeb_doinit_next3_seed_guard(state, pc);
         unsafe { run(&block, state) };
         if step_trace {
             let s = unsafe { &*state };
@@ -7504,6 +7574,58 @@ mod tests {
 
             std::env::remove_var("JIT_ROUTEB_SOURCE_SEED");
             zero_slots(slots);
+        }
+    }
+
+    #[test]
+    fn routeb_doinit_next3_guard_env_pc_gated_and_seeds_values() {
+        // ROUTE-B RECON V3 NEXT-3 do-init seeds: routeb_doinit_next3_seed_guard must
+        // (a) be inert without JIT_ROUTEB_DOINIT_NEXT3, (b) fire ONLY within the
+        // do-init/app-shell world-build band [0x102206c40, 0x102213000), (c) write the
+        // three documented values — thread-init singleton [0x1067333aa0] -> a leaked
+        // 0x20 zeroed buffer, telemetry once-cell [0x106dcd380] -> -1, map-page
+        // [0x10673336d8].bit0 -> 1 — and (d) be idempotent. Serialized on the shared
+        // fixed-.bss TEST_LOCK (telem page shared with SH156-style ctor globals).
+        let _g = CONT_MGR_TEST_LOCK.lock().unwrap();
+        const TI: u64 = 0x1067333aa0;
+        const TEL: u64 = 0x106dcd380;
+        const MAP: u64 = 0x10673336d8;
+        for a in [TI, TEL, MAP] {
+            unsafe {
+                assert!(routeb_ensure_writable(a), "0x{a:x} page must be writable");
+            }
+        }
+        unsafe {
+            // (a) env unset, in-range pc -> inert.
+            std::env::remove_var("JIT_ROUTEB_DOINIT_NEXT3");
+            std::ptr::write_unaligned(TI as *mut u64, 0);
+            std::ptr::write_unaligned(TEL as *mut u64, 0);
+            std::ptr::write_unaligned(MAP as *mut u8, 0);
+            routeb_doinit_next3_seed_guard(std::ptr::null_mut(), 0x102206c40);
+            assert_eq!(std::ptr::read_unaligned(TI as *const u64), 0, "env-gated: inert without env");
+            assert_eq!(std::ptr::read_unaligned(TEL as *const u64), 0, "env-gated: telemetry untouched");
+
+            // (b) env set, wrong pc -> inert.
+            std::env::set_var("JIT_ROUTEB_DOINIT_NEXT3", "1");
+            routeb_doinit_next3_seed_guard(std::ptr::null_mut(), 0x102213000);
+            assert_eq!(std::ptr::read_unaligned(TI as *const u64), 0, "pc-gated: must not fire outside band");
+
+            // (c) env set + in-band entry -> seeds the three values.
+            routeb_doinit_next3_seed_guard(std::ptr::null_mut(), 0x102207b50);
+            let ti = std::ptr::read_unaligned(TI as *const u64);
+            assert_ne!(ti, 0, "thread-init singleton must be a non-NULL leaked buffer");
+            assert_eq!(std::ptr::read_unaligned(ti as *const u64), 0, "thread-init buffer must be zeroed");
+            assert_eq!(std::ptr::read_unaligned(TEL as *const u64), u64::MAX, "telemetry once-cell = -1");
+            assert_eq!(std::ptr::read_unaligned(MAP as *const u8) & 1, 1, "map-page bit0 set");
+
+            // (d) idempotent: a pre-seeded thread-init is left untouched (distinct ptr).
+            let ti_keep = std::ptr::read_unaligned(TI as *const u64);
+            routeb_doinit_next3_seed_guard(std::ptr::null_mut(), 0x102206f00);
+            assert_eq!(std::ptr::read_unaligned(TI as *const u64), ti_keep, "idempotent: thread-init not re-seeded");
+
+            std::env::remove_var("JIT_ROUTEB_DOINIT_NEXT3");
+            std::ptr::write_unaligned(TI as *mut u64, 0);
+            std::ptr::write_unaligned(MAP as *mut u8, 0);
         }
     }
 
