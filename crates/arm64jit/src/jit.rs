@@ -668,6 +668,61 @@ fn routeb_tail_trace(state: *mut CpuState, pc: u64) {
     }
 }
 
+/// Leaked 8-byte guest box holding the StartLuaAppDM union-table pointer 0x10635dd68,
+/// used by routeb_startluaapp_invoke_guard to cross the receiveCall dispatch select.
+/// Stable for the whole process (identity-mapped guest view); the dispatch reads
+/// `x9=[boxp]` -> 0x10635dd68 then `x8=[0x10635dd68+0x28]` -> the EC lambda-world invoke.
+fn routeb_startluaapp_invoke_box() -> u64 {
+    use std::sync::OnceLock;
+    static BOX: OnceLock<u64> = OnceLock::new();
+    *BOX.get_or_init(|| {
+        let b = Box::leak(vec![0u8; 0x10usize].into_boxed_slice()).as_mut_ptr() as u64;
+        unsafe { std::ptr::write_unaligned(b as *mut u64, 0x10635dd68u64) };
+        b
+    })
+}
+
+/// SH238 (this cycle): StartLuaAppDM's receiveCall entry-dispatch SELECT (the SH235-237
+/// forward lever). The entry dispatch block at pc 0x1023efeb0 picks its handler:
+///   `ldr x0,[sp,#32]; cmp x0,x20; b.eq -> w8=0x20; cbz x0,ret; mov w8,#0x28; ldr x9,[x0];
+///    ldr x8,[x9,x8]; blr x8`
+/// where x20 == sp and [sp+32] is the union self-ref field (init =sp at 0x1023efea0).
+/// Equal (the default) -> select [union+0x20] = std::function __clone 0x101db2cf0, which
+/// bends into helper 0x1023f00f8 (completes a V2Init struct-copy+FMOD tail) then
+/// StartLuaAppDM soft-returns Ok — SH236 measured the flow stops at 0x1023f01e4 and the
+/// marshaler-call block 0x1023f075c (bl 0x1023f1210 -> EC world 0x102e24598) is NEVER entered.
+/// Non-equal-nonzero -> select [union+0x28] = invoke 0x1021e96f8 (SH237: the EC lambda-world
+/// std::function invoke). This guard CROSSES the select: seed guest [sp+32] = a leaked box
+/// holding 0x10635dd68 so the dispatch takes the INVOKE slot instead of the benign __clone,
+/// then MEASURE whether StartLuaAppDM falls through to the marshaler 0x1023f075c -> EC world
+/// or faults at a specific live-object deref (either outcome = forward data on this lever).
+/// Idempotent (preserves a real [sp+32]); default-inert (only fires under JIT_ROUTEB_SETFIX).
+fn routeb_startluaapp_invoke_guard(state: *mut CpuState, pc: u64) {
+    if std::env::var_os("JIT_ROUTEB_SLADM_INVOKE").is_none() {
+        return;
+    }
+    if pc != 0x1023efeb0 {
+        return;
+    }
+    let s = unsafe { &mut *state };
+    let sp = s.x[31];
+    if sp == 0 {
+        return;
+    }
+    let slot = sp + 32;
+    let cur = unsafe { std::ptr::read_unaligned(slot as *const u64) };
+    // Preserve a real session value / idempotent: cross only while [sp+32] is the default
+    // self-ref (== sp) or 0. A real non-self pointer means the session already progressed.
+    if cur != sp && cur != 0 {
+        return;
+    }
+    let boxp = routeb_startluaapp_invoke_box();
+    unsafe { std::ptr::write_unaligned(slot as *mut u64, boxp) };
+    eprintln!(
+        "[routeb-sladm] SH238 StartLuaAppDM receiveCall select CROSSED -> [sp+32]={boxp:#x} ([box]=0x10635dd68) so dispatch takes INVOKE [union+0x28] instead of __clone (was {cur:#x}) at pc={pc:#x}; MEASURE marshaler 0x1023f075c / EC world 0x102e24598 reach"
+    );
+}
+
 /// SH123: the leaked coherent EMPTY String-hash-set substituted for a dangling host
 /// container at the generic `.find()` leaf. Zeroed 0x30 bytes: +0x08 count=0 (canonical
 /// empty -> `cbz` returns NULL), +0x18/+0x20 = Roblox SSO empty String (flags 0, len 0).
@@ -5172,6 +5227,7 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
             routeb_dm_service_resolve_guard(state, pc); // SH191: host-link the constructed PlayerGui as a service node on [dm+0x68] + drive getService walker (JIT_ROUTEB_DM_SERVICE_NODE)
             routeb_tail_eq_guard(state, pc); // SH161b: seed impl[+0x2b8]=2 (governor-tail epilogue b.eq)
             routeb_worldbuild_gate_seed(state, pc); // SH198-surface: seed [0x106a70568]=1 so V2Init falls through to the world-build fn 0x102ea3b14 (JIT_ROUTEB_SETWORLDBUILD)
+            routeb_startluaapp_invoke_guard(state, pc); // SH238: cross StartLuaAppDM receiveCall select to the EC invoke slot (JIT_ROUTEB_SLADM_INVOKE)
             routeb_tail_trace(state, pc);
         }
         routeb_cookie_jar_guard(state, pc); // SH175: seed cookie-jar container + gates at worker 0x102203148 (JIT_ROUTEB_COOKIE)
@@ -13784,5 +13840,68 @@ mod fp16_and_fabd_fccmp_exec {
             "real-image classifier must locate ALL 3 stop sites + 4 SH200 sites as V2 family, got {got}"
         );
         eprintln!("sh202 real-image: classified {got} stop/located V2 family sites");
+    }
+
+    #[test]
+    fn sh238_sladm_invoke_select_cross_is_env_gated_idempotent_and_union_boxed() {
+        // SH238: routeb_startluaapp_invoke_guard crosses StartLuaAppDM's receiveCall
+        // dispatch-select (pc 0x1023efeb0) from the benign __clone slot to the EC invoke
+        // slot when JIT_ROUTEB_SLADM_INVOKE=1. Contract:
+        //   (a) env unset -> no-op (never touches the guest [sp+32] slot, no crash);
+        //   (b) env set at the right pc -> writes a leaked box whose [box]=0x10635dd68;
+        //   (c) idempotent: a real non-self [sp+32] is preserved (session already advanced);
+        //   (d) wrong pc -> no write; sp==0 -> no deref.
+        let mkst = |inel_slot: u64| {
+            // sp = a leaked 0x40 guest buffer; [sp+32] is the union self-ref field.
+            let sp = Box::leak(vec![0x0u8; 0x40usize].into_boxed_slice()).as_mut_ptr() as u64;
+            unsafe { std::ptr::write_unaligned((sp + 32) as *mut u64, inel_slot) };
+            let mut st = CpuState::new();
+            st.x[31] = sp;
+            st
+        };
+        let read = |sp: u64| unsafe { std::ptr::read_unaligned((sp + 32) as *const u64) };
+
+        // (a) env unset: no change.
+        unsafe { std::env::remove_var("JIT_ROUTEB_SLADM_INVOKE") };
+        let mut st = mkst(0x0); // [sp+32]==0 (a candidate: crossing allowed)
+        let before = read(st.x[31]);
+        routeb_startluaapp_invoke_guard(&mut st as *mut CpuState, 0x1023efeb0);
+        assert_eq!(read(st.x[31]), before, "env-off must not write the slot");
+
+        // (c) env set, but a REAL non-self pointer already present -> preserved.
+        unsafe { std::env::set_var("JIT_ROUTEB_SLADM_INVOKE", "1") };
+        let real = 0x55aa00000001u64;
+        let mut st2 = mkst(real);
+        routeb_startluaapp_invoke_guard(&mut st2 as *mut CpuState, 0x1023efeb0);
+        assert_eq!(read(st2.x[31]), real, "real session pointer must be preserved");
+
+        // (d) wrong pc -> no write.
+        let mut st3 = mkst(0x0);
+        routeb_startluaapp_invoke_guard(&mut st3 as *mut CpuState, 0x1023efeb4);
+        assert_eq!(read(st3.x[31]), 0x0, "wrong-pc must not write");
+
+        // sp==0 -> no deref (must not crash on stub state).
+        let mut st4 = CpuState::new(); // sp default 0
+        routeb_startluaapp_invoke_guard(&mut st4 as *mut CpuState, 0x1023efeb0);
+
+        // (b) env set + default self-ref [sp+32]==sp -> crossed to the leaked union box.
+        let sp5 = Box::leak(vec![0x0u8; 0x40usize].into_boxed_slice()).as_mut_ptr() as u64;
+        unsafe { std::ptr::write_unaligned((sp5 + 32) as *mut u64, sp5) }; // default self-ref
+        let mut st5 = CpuState::new();
+        st5.x[31] = sp5;
+        routeb_startluaapp_invoke_guard(&mut st5 as *mut CpuState, 0x1023efeb0);
+        let boxp = read(sp5);
+        assert_ne!(boxp, sp5, "self-ref must be replaced by the leaked box");
+        assert_ne!(boxp, 0, "must be a nonzero leaked box");
+        let first_word = unsafe { std::ptr::read_unaligned(boxp as *const u64) };
+        assert_eq!(
+            first_word, 0x10635dd68,
+            "box[0] must be the union table so dispatch resolves [box]+[0x28]=EC invoke"
+        );
+        // Stable idemptotent: a second pass sees boxp (non-self, nonzero) and preserves it.
+        let second = read(sp5);
+        routeb_startluaapp_invoke_guard(&mut st5 as *mut CpuState, 0x1023efeb0);
+        assert_eq!(read(sp5), second, "second crossing of a boxed slot must be idempotent (no rewrite)");
+        unsafe { std::env::remove_var("JIT_ROUTEB_SLADM_INVOKE") };
     }
 }
