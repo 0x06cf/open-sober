@@ -15131,6 +15131,68 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh270_preload_wall_is_canary_cell_pinned() {
+        // SH270 (single-agent, correction of SH269's label): SH269 parked the
+        // SendAppEventOnAppReady drive at guestpc=0x102bb803c (`ldr x8,[x20]`) and
+        // attributed x20=0 to a "preload-overrides object [0x106a64d98]" judged a
+        // never-constructed live object. FRESH disasm + a decisive A/B on the real
+        // binary shows that attribution is WRONG: the enclosing fn (entry
+        // 0x102bb785c) loads x20 at prologue via
+        //   adrp x20, 0x67d1000` (d001e0d4 @0x102bb786c)
+        //   ldr  x20,[x20,#0x6f0] (f9437a94 @0x102bb7878) => x20 = [0x1067d16f0]
+        // then later `ldr x8,[x20]` @0x102bb803c derefs it. [0x1067d16f0] is the
+        // SH182/SH256 STACK-CANARY pointer global (SH256's maproot-false-positive
+        // cell: fn prologues load x20=[0x1067d16f0] as the canary pointer and the
+        // epilogue re-reads [x20] vs the saved canary -> writing it trips
+        // __stack_chk_fail). Headlessly [0x1067d16f0]=0, so x20=0 -> the 0x102bb803c
+        // SIGSEGV fault=0x0 is the NULL canary-pointer deref, NOT a preload-overrides
+        // object. Driving the real preload-overrides lazy-singleton getter
+        // (0x2dae5f0) + its OWN ctor (0x101df8ff8) IS constructs a real object
+        // (Ok(0x106d2dd20)) but wiring it into [0x106a64d78/0x106a64d98] did NOT move
+        // the wall (identical 0x102bb803c fault) — proving x20 does not come from
+        // those cells, closing the SH270 tangent. Pin the TRUE x20-source chain so a
+        // future cycle does not re-drive a preload-overrides seed into a canary wall.
+        // Route-B gate UNCHANGED; no make_shared<DataModel>; SH174 latch stays the
+        // single forward hook.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            // Enclosing fn prologue + x20 load chain feeding the wall.
+            assert_eq!(word(0x102_bb785c), 0xd10143ff, "sh270 wall-window sub sp,#0x50");
+            assert_eq!(word(0x102_bb786c), 0xd001e0d4, "sh270 x20 adrp -> 0x67d1000 region (canary page)");
+            assert_eq!(word(0x102_bb7878), 0xf9437a94, "sh270 x20 ldr [x20,#0x6f0] => [0x1067d16f0]");
+            assert_eq!(word(0x102_bb803c), 0xf9400288, "sh270 wall ldr x8,[x20] (derefs [0x1067d16f0]=canary ptr)");
+            assert_eq!(word(0x102_bb8044), 0xf9405108, "sh270 post-wall ldr x8,[x8,#20]");
+            // The getter/ctor the SH270 tangent drove: getter entry 0x2dae5f0 prologue,
+            // its guard-acquire bl, the construct-path ctor call, the in-place object base.
+            assert_eq!(word(0x102_dae5f0), 0xa9bf7bfd, "sh270 getter nativePreloadFlagOverrides stp x29,x30,#-16");
+            assert_eq!(word(0x102_dae5fc), 0x36000140, "sh270 getter tbz w0,#0 (guard-acquire branch)");
+            assert_eq!(word(0x102_dae624), 0x97c12a75, "sh270 getter construct path bl 0x101df8ff8");
+            assert_eq!(word(0x101_df8ff8), 0xa9be7bfd, "sh270 preload-overrides ctor prologue stp x29,x30,#-32");
+            for (guest, name) in [
+                (0x102_bb785cu64, "wall-window-subsp"), (0x102_bb786cu64, "x20-adrp"),
+                (0x102_bb7878u64, "x20-ldr-canary"), (0x102_bb803cu64, "wall-ldr-x20"),
+                (0x102dae5f0u64, "preload-getter"), (0x101df8ff8u64, "preload-ctor"),
+            ] {
+                assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh270 {name} {guest:#x} in window");
+                assert!(guest & 3 == 0, "sh270 {name} {guest:#x} 4-aligned");
+            }
+            // The canary cell [0x1067d16f0] must exist in a writable LOAD (host addr resolvable,
+            // not R-X) — it is fixed-.bss, writable, but ZERO headlessly (the value lives only
+            // when a real session initializes the canary).
+            let canary_cell = el.host_addr_of(0x106_7d16f0).unwrap_or(0);
+            assert_ne!(canary_cell, 0, "sh270 [0x1067d16f0] host-resolvable (.bss)");
+            eprintln!("sh270 preload wall = SH182/SH256 stack-canary pointer [0x1067d16f0] (x20-source @0x102bb786c/78) pinned on libroblox.so");
+        } else {
+            eprintln!("sh270 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh265_gameloaded_binder_receive_pinned() {
         // SH265 (single-agent): pin the dataModel-bindings live-binder receive
         // nativeAppBridgeV2SendAppEventOnGameLoaded (guest 0x102bb429c) — the sibling of
