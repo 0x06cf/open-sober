@@ -7036,6 +7036,9 @@ mod tests {
         // [0x1021f47f0,0x1021f4840), (c) seed BOTH cookie-jar globals
         // [0x106ed7a20]+[0x106ed7a28] with a valid empty SSO string when NULL, and
         // (d) be idempotent (no clobber of an already-seeded slot).
+        // Serialized with CONT_MGR_TEST_LOCK: shares the fixed-.bss cookie-jar cell
+        // [0x106ed7a20] + process-global env with sh175/ADAPTER/ONCE.
+        let _mgr_guard = CONT_MGR_TEST_LOCK.lock().unwrap();
         let empty = routeb_empty_sso_string();
         assert_ne!(empty, 0, "empty SSO string helper must return a leaked non-NULL buffer");
         unsafe {
@@ -7780,6 +7783,9 @@ mod tests {
         // must, ONLY with JIT_ROUTEB_COOKIE set and at the worker's entry pc, seed that
         // global with a valid EMPTY libc++ std::string (a zeroed 0x20 SSO buffer) and
         // clear both boot-latch gate bits. Idempotent; env-off and wrong-pc inert.
+        // Serialized with CONT_MGR_TEST_LOCK: this test and sh248d/ADAPTER/ONCE all write
+        // the shared fixed-.bss cookie-jar/adapter cells + process-global env vars.
+        let _mgr_guard = CONT_MGR_TEST_LOCK.lock().unwrap();
         unsafe { std::env::remove_var("JIT_ROUTEB_COOKIE") };
         const JAR: u64 = 0x106ed7a20;
         const GATE_FLAGS: u64 = 0x1072739d4;
