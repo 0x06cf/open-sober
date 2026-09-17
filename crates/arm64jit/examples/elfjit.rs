@@ -15193,6 +15193,75 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh272_preload_getter_both_branches_structurally_dead_pinned() {
+        // SH272: mechanize SH270's open residual ("the getter's load path ignores
+        // [0x106a64d78]/[0x106a64d98] / re-reads elsewhere") — WHY the
+        // nativePreloadFlagOverrides getter (0x2dae5f0) returns 0 on BOTH its
+        // branches, pinning the exact store/load terminal words so a future cycle
+        // does NOT re-attack either branch as a seed lever. This is the standing
+        // SendAppEventOnAppReady terminal (new frontier at/after SH269).
+        //   Value-cell branch (guard-acquire returned bit0 SET, falls through
+        //   0x2dae5fc `tbz w0,#0`):
+        //     0x2dae600 adrp x8,0x6a64000; 0x2dae604 ldr x0,[x8,#3448]=[0x106a64d78]
+        //     0x2dae608 cbz x0 -> ret (returns 0 when cell empty)
+        //     0x2dae60c ldr x8,[x0]; 0x2dae610 ldr x2,[x8,#16]; 0x2dae620 br x2
+        //       -> a VTABLE dispatch: needs a REAL preload-overrides object whose
+        //       vt[+16] is a functioning method, not a wired pointer. A host wire
+        //       of the object base would br into garbage (or cbz if the cell's
+        //       first word is null). NOT a soft-return cell.
+        //   Construct branch (tbz taken -> 0x2dae624 bl ctor 0x101df8ff8, b to
+        //   helper 0x2daf5c8):
+        //     ctor zero-INITS the object: 0x1df9058 `stp x0,xzr,[x19,#72]` writes
+        //     zr to [obj+80] (the shared 0x2daf5ec `ldr x0,[x19,#80]` terminal the
+        //     helper uses as its null-flag); 0x2daf5f0 `cbz x0 -> ret` => helper
+        //     returns 0 ALWAYS right after a headless construct, so this branch is
+        //     equally a live-object wall, NOT a one-store seed.
+        //   guard helper 0x57816f0 -> adrp x8,0x6d2d000; add #0xf30 = guard cell
+        //   [0x6d2df30] (its own lazy-Meyers once byte, separate from the 0x106a64d78
+        //   value cell SH270 wired).
+        // VERDICT (do-not-re-tread either branch): SH174/SH204 live-object class —
+        //   the getter needs the REAL session to construct + populate the object
+        //   (its vt[+16] dispatch target + non-null [obj+80]). Route-B gate
+        //   UNCHANGED; SH174 capture-latch stays the single forward hook.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            // Value-cell branch (0x2dae600..0x2dae620).
+            assert_eq!(word(0x102_dae604), 0xf946bd00, "sh272 value-cell ldr [x8,#3448]=[0x106a64d78]");
+            assert_eq!(word(0x102_dae608), 0xb4000180, "sh272 value-cell cbz x0 -> ret 0");
+            assert_eq!(word(0x102_dae60c), 0xf9400008, "sh272 value-cell ldr x8,[x0] (vtable-dispatch, NOT soft-return)");
+            assert_eq!(word(0x102_dae610), 0xf9400902, "sh272 value-cell ldr x2,[x8,#16] (vt[+16])");
+            assert_eq!(word(0x102_dae620), 0xd61f0040, "sh272 value-cell br x2 (dispatches vt[+16])");
+            // Construct branch: ctor zero-inits [obj+80].
+            assert_eq!(word(0x101_df9058), 0xa904fe60, "sh272 ctor stp x0,xzr,[x19,#72] zeroes [obj+80]");
+            assert_eq!(word(0x102_dae624), 0x97c12a75, "sh272 construct bl ctor 0x101df8ff8 (already sh270)");
+            // Helper 0x2daf5c8 terminal: [obj+80] null -> ret 0.
+            assert_eq!(word(0x102_daf5ec), 0xf9402a60, "sh272 helper ldr x0,[x19,#80] (null-flag)");
+            assert_eq!(word(0x102_daf5f0), 0xb40000c0, "sh272 helper cbz x0 -> ret 0 (headless construct yields [obj+80]=0)");
+            // Guard helper cell base (0x57816f0's own Meyers once byte).
+            assert_eq!(word(0x105_7816fc), 0x9000ad68, "sh272 guard helper adrp x8,0x6d2d000");
+            assert_eq!(word(0x105_781700), 0x913cc108, "sh272 guard helper add #0xf30 => [0x6d2df30]");
+            for (guest, name) in [
+                (0x102_dae604u64, "value-ldr"), (0x102_dae608u64, "value-cbz"),
+                (0x102_dae60cu64, "value-lvt"), (0x102_dae610u64, "value-vt16"),
+                (0x102_dae620u64, "value-br"), (0x101_df9058u64, "ctor-zero80"),
+                (0x102_daf5ecu64, "helper-ldr80"), (0x102_daf5f0u64, "helper-cbz"),
+                (0x105_7816fcu64, "guard-adrp"), (0x105_781700u64, "guard-add"),
+            ] {
+                assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh272 {name} {guest:#x} in window");
+                assert!(guest & 3 == 0, "sh272 {name} {guest:#x} 4-aligned");
+            }
+            eprintln!("sh272 pin: nativePreloadFlagOverrides getter BOTH branches structurally dead (value-cell=vtable-dispatch needs live obj; construct ctor zeroes [obj+80]) — live-object wall, not a seed. Route-B gate UNCHANGED.");
+        } else {
+            eprintln!("sh272 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh265_gameloaded_binder_receive_pinned() {
         // SH265 (single-agent): pin the dataModel-bindings live-binder receive
         // nativeAppBridgeV2SendAppEventOnGameLoaded (guest 0x102bb429c) — the sibling of
