@@ -7237,6 +7237,25 @@ fn main() {
                         ("setActive",            0x1021f5de4, [env_ptr, thiz, 0, 0, 0, 0, 0, 0]),
                         ("SetInitParams",        0x102bcc814, [env_ptr, thiz, init_params, 0, 0, 0, 0, 0]),
                     ];
+                    // nativeInitClientSettings (guest 0x1022265fc) is the client-settings
+                    // receive entry that feeds initEngine_'s "Engine settings is null"
+                    // hard-assert (SH184). Its string args (x2/x3/x4 = CLEAR XML/settings
+                    // jstrings per the Java receive contract) are resolved by 0x21e1fec —
+                    // the jstring->RBX-string helper that ISA the JNIEnv vtbl GetStringUTFChars
+                    // (SH186 step-2 ABI correction: slot 169 is the identity shim in this
+                    // harness, so FABRICATED empty jstrings DO resolve). It gates on a version
+                    // word at [0x10683cff8] (adrp 683c000 + #4088=0xff8: low byte==6 && byte1==3 -> the
+                    // readLocalFlags path / empty-early else). Opt-in under --v2boot-session-set;
+                    // a live measurement of whether feeding real client-settings advances the
+                    // initEngine_ gate (nil-milestone either way — it's a consumer).
+                    if std::env::args().any(|a| a == "--v2boot-session-set") {
+                        // version gate for the readLocalFlags path (SH109/121-style; clear bits)
+                        unsafe { *(0x10683cff8u64 as *mut u64) = 0; }
+                        let s1 = arm64jit::jni::new_string_utf_handle(b"");
+                        let s2 = arm64jit::jni::new_string_utf_handle(b"");
+                        let s3 = arm64jit::jni::new_string_utf_handle(b"");
+                        lifecycle.push(("InitClientSettings", 0x1022265fc, [env_ptr, thiz, s1, s2, s3, 0, 0, 0]));
+                    }
                     // nativeOnResumed (0x1021f5db8) tail-branches into the SHARED Activity
                     // lifecycle-notifier dispatcher 0x21f15a4 whose body derefs a real
                     // lifecycle-callback registry object at +0x50 (fault=0x50 @ 0x1021f3748)
@@ -14925,10 +14944,16 @@ mod sh115_tests {
             assert_eq!(word(0x102bcc818), 0xa9016ffc, "sh264 SetInitParams stp x28,x27");
             assert_eq!(word(0x102_1f5f80), 0xd00248a9, "sh264 setActive core adrp 6b0b000 (adapter triplet)");
             assert_eq!(word(0x102_1f5f88), 0xa940252a, "sh264 setActive core ldp triplet (SH248f [0x106b0bde0])");
+            // nativeInitClientSettings (client-settings receive, feeds initEngine_'s
+            // "Engine settings is null"); gates on version word [0x10683cff8] and resolves
+            // string args via 0x21e1fec (SH186 identity shim).
+            assert_eq!(word(0x102_2265fc), 0xd102c3ff, "sh264 nativeInitClientSettings prologue sub sp,#0xb0");
+            assert_eq!(word(0x102_2265fc + 4), 0xa9077bfd, "sh264 nativeInitClientSettings stp x29,x30,#112");
             for (guest, name) in [
                 (0x102_1f5db8u64, "nativeOnResumed"), (0x102_1f53b8u64, "initAppShellReporter"),
                 (0x102_1f5de4u64, "setActive"), (0x102bcc814u64, "SetInitParams"),
                 (0x102_1f5f80u64, "setActive-core-adrp"), (0x102_1f5f88u64, "setActive-core-ldp"),
+                (0x102_2265fcu64, "nativeInitClientSettings"),
             ] {
                 assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh264 {name} {guest:#x} in window");
                 assert!(guest & 3 == 0, "sh264 {name} {guest:#x} 4-aligned");
