@@ -13317,6 +13317,20 @@ mod sh115_tests {
                 let w = u32::from_le_bytes([img[site], img[site + 1], img[site + 2], img[site + 3]]);
                 assert_eq!(w, exp, "SH248g appstart hash-find site vaddr 0x{site:x} must be {exp:08x}");
             }
+            // SH249 (this session): the FATAL 4th-iteration map `this` observed at the
+            // wall (x21 = 0x100548ca9 / 0x1004a0373 across runs) has top-16-bits 0, and a
+            // segment-level host_addr_of() probe shows it lands inside the R-X EXECUTE
+            // segment [0x100000000, 0x1062d8190) (prot read|execute, write=OFF) — NOT
+            // host-heap ASLR and NOT a writable .bss/.data cell. That is exactly why neither
+            // the static seed (SH248g) nor the runtime in-place header repair (SH248h) could
+            // ever fire on it: it is a garbage element read from an under-allocated live
+            // collection (stride 0x2a0) whose 4th stride falls into image text, walked via a
+            // blr into mid-function (no fixed-.bss holder). Pin the segment-membership fact
+            // so a future session does NOT re-derive a ".bss seed at 0x100548ca9" lever.
+            for addr in [0x100548ca9u64, 0x1004a0373u64] {
+                assert!(addr >= 0x100000000 && addr < 0x1062d8190,
+                    "SH249 observed fatal map-this 0x{addr:x} must be in the R-X text segment");
+            }
         } else {
             eprintln!("sh248g real-image guard: no real libroblox.so, skipping");
         }
