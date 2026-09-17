@@ -12740,6 +12740,24 @@ mod sh111_tests {
 #[cfg(test)]
 mod sh115_tests {
     use super::*;
+    // Real-image guard family: load_elf_image maps the REAL libroblox.so at a
+    // FIXED guest base (0x100000000, so guest==host for the identity-addressing
+    // translator) and deliberately LEAKS that mapping for the one-shot run. Two
+    // loads in ONE process therefore collide — only one mmap can hold the base;
+    // the rest read zero / EFAULT ("Failed to read segment ... Bad address"),
+    // which is why sh224/225/226/227/228/231/232's real-image guards failed only
+    // under the parallel `cargo test --examples` batch while each passed when
+    // run filtered (fresh process, single load). Cache ONE load per process so
+    // the whole batch stays green. Test-harness only: the production jit_run
+    // still loads exactly once (elfjit.rs main, unchanged).
+    fn load_real_image() -> &'static libloader::elf::LoadedElf {
+        static IMG: std::sync::OnceLock<libloader::elf::LoadedElf> = std::sync::OnceLock::new();
+        IMG.get_or_init(|| {
+            let p =
+                std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+            libloader::elf::load_elf_image(p).expect("load real libroblox.so")
+        })
+    }
     // SH115: the differential scoped-site patch for the three nullable-singleton
     // dispatch accessors. Pins the ARM64 encodings (movz/movk/materialize) and
     // the per-site 28-byte window layout + expected original slot0 guard bytes.
@@ -13120,8 +13138,7 @@ mod sh115_tests {
         }
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
-            use libloader::elf::load_elf_image;
-            let el = load_elf_image(p).expect("load real libroblox.so");
+            let el = load_real_image();
             // Mirror scandecode's reproducible full-image route but restrict the
             // count to the REAL code window (guest [0x102d95980, 0x1072d5a84),
             // the .text span the fp16 doc + commit 88db5be measured 0 over).
@@ -13284,7 +13301,7 @@ mod sh115_tests {
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
         if p.exists() {
-            let el = libloader::elf::load_elf_image(p).expect("load real libroblox.so");
+            let el = load_real_image();
             let slot = |guestslot: u64| -> u64 {
                 let host = el.host_addr_of(guestslot).unwrap_or(0);
                 if host == 0 { 0 } else { unsafe { (host as *const u64).read_unaligned() } }
@@ -13349,7 +13366,7 @@ mod sh115_tests {
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
         if p.exists() {
-            let el = libloader::elf::load_elf_image(p).expect("load real libroblox.so");
+            let el = load_real_image();
             let word = |guest: u64| -> u32 {
                 let host = el.host_addr_of(guest).unwrap_or(0);
                 if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
@@ -13424,7 +13441,7 @@ mod sh115_tests {
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
         if p.exists() {
-            let el = libloader::elf::load_elf_image(p).expect("load real libroblox.so");
+            let el = load_real_image();
             let word = |guest: u64| -> u32 {
                 let host = el.host_addr_of(guest).unwrap_or(0);
                 if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
@@ -13507,7 +13524,7 @@ mod sh115_tests {
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
         if p.exists() {
-            let el = libloader::elf::load_elf_image(p).expect("load real libroblox.so");
+            let el = load_real_image();
             let word = |guest: u64| -> u32 {
                 let host = el.host_addr_of(guest).unwrap_or(0);
                 if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
@@ -13559,7 +13576,7 @@ mod sh115_tests {
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
         if p.exists() {
-            let el = libloader::elf::load_elf_image(p).expect("load real libroblox.so");
+            let el = load_real_image();
             let word = |guest: u64| -> u32 {
                 let host = el.host_addr_of(guest).unwrap_or(0);
                 if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
@@ -13627,7 +13644,7 @@ mod sh115_tests {
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
         if p.exists() {
-            let el = libloader::elf::load_elf_image(p).expect("load real libroblox.so");
+            let el = load_real_image();
             let word = |guest: u64| -> u32 {
                 let host = el.host_addr_of(guest).unwrap_or(0);
                 if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
@@ -13687,7 +13704,7 @@ mod sh115_tests {
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
         if p.exists() {
-            let el = libloader::elf::load_elf_image(p).expect("load real libroblox.so");
+            let el = load_real_image();
             let word = |guest: u64| -> u32 {
                 let host = el.host_addr_of(guest).unwrap_or(0);
                 if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
