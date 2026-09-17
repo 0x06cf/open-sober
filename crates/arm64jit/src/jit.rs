@@ -2521,12 +2521,12 @@ fn routeb_manager_mgr30_leaf() -> u64 {
 /// Static slot holding the continuation-manager M's guest address (installed once by
 /// `routeb_dm_manager_cont` for the SH248c continuation guards, which must re-seed
 /// fields of M after the engine's serializer-assign overwrites them).
-static CONT_MANAGED_M: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static CONT_MANAGED_M: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub fn routeb_cont_managed_m() -> u64 {
-    CONT_MANAGED_M.get().copied().unwrap_or(0)
+    CONT_MANAGED_M.load(std::sync::atomic::Ordering::Relaxed)
 }
 fn store_cont_managed_m(m: u64) {
-    CONT_MANAGED_M.set(m).ok();
+    CONT_MANAGED_M.store(m, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// SH248c (opt-in JIT_ROUTEB_CONT_APPNAME_SEED): continueAfterFlagsLoaded_'s app-name
@@ -6443,6 +6443,12 @@ mod tests {
     /// otherwise the parallel harness makes sh190's "env-off must be inert" premies run-variable.
     static DM_INSTANCE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// SH248c: the continuation-manager M is recorded in the shared CONT_MANAGED_M static,
+    /// written by routeb_dm_manager_cont (the sh165fwd test) and read/written by my
+    /// sh248c_appname_seed_guard test. Serialize the two so a parallel sh165fwd run cannot
+    /// overwrite the slot my test pointed the guard at.
+    static CONT_MGR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn worker_gate_park_bounded_wait_unparks_promptly() {
         // (a) Gate clear (default) -> park returns immediately, no spin/hang.
@@ -6881,6 +6887,108 @@ mod tests {
     }
 
     #[test]
+    fn sh248c_appname_seed_guard_is_env_and_pc_gated_and_reseeds_m50() {
+        // SH248c: routeb_cont_appname_seed_guard must be (a) inert without
+        // JIT_ROUTEB_CONT_APPNAME_SEED, (b) fire only at the app-name guard block-entry
+        // pc 0x102bd1f64, (c) re-seed M+0x50 = size 5 (so the continuation's `cbnz [M+0x50]`
+        // skips the NULL-store fault). CONT_MANAGED_M must record the manager address.
+        // The shared CONT_MANAGED_M static is also written by routeb_dm_manager_cont (the
+        // sh165fwd test) — hold the test lock so a parallel run cannot overwrite `slot`.
+        let _mgr_guard = CONT_MGR_TEST_LOCK.lock().unwrap();
+        unsafe {
+            // (a) env unset AND pc in-range -> inert (no seed).
+            std::env::remove_var("JIT_ROUTEB_CONT_APPNAME_SEED");
+            let slot = Box::leak(vec![0u8; 0x60].into_boxed_slice()).as_mut_ptr() as u64;
+            unsafe { std::ptr::write_unaligned((slot + 0x50) as *mut u64, 0) };
+            store_cont_managed_m(slot);
+            // M is recorded, pc in-range but env unset -> must NOT write.
+            routeb_cont_appname_seed_guard(std::ptr::null_mut(), 0x102bd1f64);
+            assert_eq!(
+                unsafe { std::ptr::read_unaligned((slot + 0x50) as *const u64) },
+                0,
+                "env-gated: without JIT_ROUTEB_CONT_APPNAME_SEED the guard must stay inert"
+            );
+
+            // (b) env set but WRONG pc -> inert.
+            std::env::set_var("JIT_ROUTEB_CONT_APPNAME_SEED", "1");
+            routeb_cont_appname_seed_guard(std::ptr::null_mut(), 0x102bd2014);
+            assert_eq!(
+                unsafe { std::ptr::read_unaligned((slot + 0x50) as *const u64) },
+                0,
+                "pc-gated: must fire only at 0x102bd1f64"
+            );
+
+            // (c) env set + exact pc -> re-seed M+0x50 = 5.
+            routeb_cont_appname_seed_guard(std::ptr::null_mut(), 0x102bd1f64);
+            assert_eq!(
+                unsafe { std::ptr::read_unaligned((slot + 0x50) as *const u64) },
+                5,
+                "guard must re-seed M+0x50 = size 5 so the continuation's cbnz skips the NULL-store"
+            );
+            std::env::remove_var("JIT_ROUTEB_CONT_APPNAME_SEED");
+        }
+    }
+
+    #[test]
+    fn sh248d_appstart_jar_guard_is_env_pc_gated_and_seeds_both_slots_idempotent() {
+        // SH248d: routeb_appstart_jar_seed_guard must be (a) inert without
+        // JIT_ROUTEB_APPSART_JAR_SEED, (b) fire only in the enclosing fn range
+        // [0x1021f47f0,0x1021f4840), (c) seed BOTH cookie-jar globals
+        // [0x106ed7a20]+[0x106ed7a28] with a valid empty SSO string when NULL, and
+        // (d) be idempotent (no clobber of an already-seeded slot).
+        let empty = routeb_empty_sso_string();
+        assert_ne!(empty, 0, "empty SSO string helper must return a leaked non-NULL buffer");
+        unsafe {
+            // Byte 0 = size/cap 0 -> a VALID empty (short) std::string.
+            std::ptr::write_unaligned(empty as *mut u8, 0);
+            assert_eq!(
+                std::ptr::read_unaligned(empty as *const u8),
+                0,
+                "the leaked empty SSO string must be zeroed (valid empty short std::string)"
+            );
+        }
+        const A: u64 = 0x106ed7a20;
+        const B: u64 = 0x106ed7a28;
+        unsafe {
+            // Ensure both target pages are writable (they are fixed .bss, unmapped in a
+            // unit test -> routeb_ensure_writable maps them anon RW).
+            assert!(routeb_ensure_writable(A));
+            assert!(routeb_ensure_writable(B));
+        }
+        // (a) env unset, pc in-range -> inert.
+        unsafe { std::env::remove_var("JIT_ROUTEB_APPSART_JAR_SEED") };
+        unsafe { std::ptr::write_unaligned(A as *mut u64, 0) };
+        unsafe { std::ptr::write_unaligned(B as *mut u64, 0) };
+        routeb_appstart_jar_seed_guard(std::ptr::null_mut(), 0x1021f4830);
+        assert_eq!(unsafe { std::ptr::read_unaligned(A as *const u64) }, 0, "env-gated: no seed without the env var");
+
+        // (b) env set, wrong pc -> inert.
+        unsafe { std::env::set_var("JIT_ROUTEB_APPSART_JAR_SEED", "1") };
+        routeb_appstart_jar_seed_guard(std::ptr::null_mut(), 0x1021f4000);
+        assert_eq!(unsafe { std::ptr::read_unaligned(A as *const u64) }, 0, "pc-gated: must fire only in the appstart fn range");
+
+        // (c) env set + in-range pc -> seed both slots.
+        routeb_appstart_jar_seed_guard(std::ptr::null_mut(), 0x1021f47fc);
+        let sa = unsafe { std::ptr::read_unaligned(A as *const u64) };
+        let sb = unsafe { std::ptr::read_unaligned(B as *const u64) };
+        assert_ne!(sa, 0, "cookie-jar slot A must be seeded with a valid string");
+        assert_ne!(sb, 0, "cookie-jar slot B must be seeded with a valid string");
+        assert_eq!(sa, sb, "both slots must get the same shared empty SSO string");
+
+        // (d) idempotent: re-fire does not clobber an already-populated slot.
+        unsafe { std::ptr::write_unaligned(A as *mut u64, 0xDECAFBAD) };
+        routeb_appstart_jar_seed_guard(std::ptr::null_mut(), 0x1021f4830);
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned(A as *const u64) },
+            0xDECAFBAD,
+            "idempotent: a non-NULL slot must be left untouched"
+        );
+        unsafe { std::env::remove_var("JIT_ROUTEB_APPSART_JAR_SEED") };
+        unsafe { std::ptr::write_unaligned(A as *mut u64, 0) };
+        unsafe { std::ptr::write_unaligned(B as *mut u64, 0) };
+    }
+
+    #[test]
     fn sh165_dm_manager_guard_is_scoped_leaf_vtable_and_env_gated() {
         // SH165-fwd (recon deleg_62a86bcd task-0): routeb_dm_manager_guard must (a) be
         // inert without JIT_ROUTEB_DMFORCE, (b) fire ONLY in the fnB engine-init region
@@ -6967,6 +7075,8 @@ mod tests {
         // engine code to nativeAppBridgeAppStart; (b) still keep vt[+0x30]=write-leaf (not fnB);
         // (c) leave the DEFAULT all-leaf routeb_dm_manager_fabricated (M=0x20, +0x1f0=leaf)
         // unchanged so SH165-fwd's verified benign-complete is preserved.
+        // Serialize against the sh248c test (shared CONT_MANAGED_M static).
+        let _mgr_guard = CONT_MGR_TEST_LOCK.lock().unwrap();
         let m_cont = routeb_dm_manager_cont();
         let vt = unsafe { std::ptr::read_unaligned(m_cont as *const u64) };
         // +0x1f0 routed to the REAL continuation (NOT a leaf / NOT 0).
