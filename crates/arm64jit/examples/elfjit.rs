@@ -13277,6 +13277,51 @@ mod sh115_tests {
         }
     }
     #[test]
+    fn sh248g_appstart_hashfind_wall_anchored() {
+        // SH248g (Route-B DMCONT continuation, after SH248f): the app-click
+        // continuation enters nativeAppBridgeAppStart and, once past the once-cell
+        // (SH248e) + app-lifecycle adapter (SH248f) gates, runs a live host-heap
+        // hash-map INSERT loop that faults at guestpc=0x1021dde34. Register-level
+        // capture (JIT_DUMP_PC on the block entry, repro runs/batch_sh248f_adapter_seed.sh):
+        // x1=0x1072757e0 CONSTANT fixed .bss across every iteration (SH243-style holder
+        // tell), but the dereferenced map `this` (x21/x24) is per-run ASLR host-heap
+        // (~0x559c...) and the container's count/bucket fields are ctor-uninitialized
+        // (SH174/SH204 live-object class, NOT a fixed-.bss seed). This pin anchors the
+        // exact wall fn so a silent drift fails loudly instead of re-deriving.
+        //   hash-find visitor entry  0x21dde00 = 0xd10006e8 (sub x8,x23,#1, robin-hood grow)
+        //   bl 0x21ddf3c (capacity)  0x21dde30 = 0x94000043
+        //   fault insn ldr x23,[x21,#8] 0x21dde34 = 0xf94006b7
+        //   bucket-index branch      0x21ddea8 = 0xeb17011f
+        //   enclosing fn tail        0x21dd800 = 0xaa0003f5 (mov x21,x0)
+        let sites: [(usize, u32); 5] = [
+            (0x21dde00, 0xd10006e8),
+            (0x21dde30, 0x94000043),
+            (0x21dde34, 0xf94006b7),
+            (0x21ddea8, 0xeb17011f),
+            (0x21dd800, 0xaa0003f5),
+        ];
+        for &(site, exp) in &sites {
+            let guest = 0x100000000u64 + site as u64;
+            assert_eq!(site & 3, 0, "appstart hash-find site 0x{site:x} must be 4-aligned");
+            assert!(guest >= 0x100000000, "guest addr must be in-image");
+        }
+        let mut addr = sites.map(|(s, _)| s);
+        addr.sort_unstable();
+        for w in addr.windows(2) {
+            assert_ne!(w[0], w[1], "appstart hash-find pin sites must be distinct");
+        }
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            for &(site, exp) in &sites {
+                let w = u32::from_le_bytes([img[site], img[site + 1], img[site + 2], img[site + 3]]);
+                assert_eq!(w, exp, "SH248g appstart hash-find site vaddr 0x{site:x} must be {exp:08x}");
+            }
+        } else {
+            eprintln!("sh248g real-image guard: no real libroblox.so, skipping");
+        }
+    }
+    #[test]
     fn sh200_v2_dispatch_window_materializes_obj_and_nops_to_blr() {
         // SH200 V2-init dispatch window (fn 0x6251e0c etc.): the first 4 slots
         // load the stable object into x0, the rest are nops (killing the
