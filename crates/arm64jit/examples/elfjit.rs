@@ -7746,6 +7746,51 @@ fn main() {
                     );
                     dump("SendAppEventOnAppReady");
                 }
+                // SEP-17 session-drive (dataModel-bindings live binder): drive the REAL
+                // nativeAppBridgeV2SendAppEventOnGameLoaded receive (guest 0x102bb429c) as a
+                // sequential post-ladder rung (same single thread; SH55/64). This is the
+                // sibling of OnAppReady — SH264's honest note leaves it "still un-driven".
+                // It marshals 3 jstrings (x2/x3/x4) into a 0x50 AppEvent, then via
+                // `bl 0x2baeeec` dispatches into the SAME app-bridge pipe/do-init the ladder
+                // drives from StartLuaAppDM — but from the REAL dataModel-bindings receive
+                // path (the Lifecycle/LiveObject binder the SEP-17 directive names), not the
+                // fabricated StartLuaAppDM frame. ABI-correction (SH186 identity shim): the
+                // jstring->RBX-string helper 0x21e1fec resolves fabricated jstrings, so the 3
+                // args read as the event payload cleanly. MEASURED (SH265): the event vtable
+                // guest 0x10635dfe8 is LOADER-POPULATED with real teardown (0x102bb782c/0x28),
+                // NOT the all-zero SH126 class — no vtable materialization needed. Seed only
+                // the pipe sync-gate [0x10683d010]=-1 so the do-init dispatch takes the sync
+                // path (as SH126 seeded for OnAppReady).
+                if std::env::args().any(|a| a == "--v2boot-send-game-loaded") {
+                    if std::env::var("JIT_SH115_SINGLETON_PATCH").ok().as_deref() == Some("1") {
+                        unsafe { *(0x10683d010u64 as *mut u64) = u64::MAX; }
+                        eprintln!("[elfjit:v2boot] SH265 seeded pipe sync-gate [0x10683d010]=-1 -> OnGameLoaded pipe takes the synchronous do-init path (bl 0x2206c40)");
+                    }
+                    let g1 = arm64jit::jni::new_string_utf_handle(b"");
+                    let g2 = arm64jit::jni::new_string_utf_handle(b"");
+                    let g3 = arm64jit::jni::new_string_utf_handle(b"");
+                    eprintln!(
+                        "[elfjit:v2boot] driving SendAppEventOnGameLoaded @ guest 0x102bb429c (3 jstrings g1={g1:#x} g2={g2:#x} g3={g3:#x})"
+                    );
+                    let mut sg = arm64jit::jit::CpuState::new();
+                    sg.tpidr = tpidr;
+                    sg.x[31] = boot_sp;
+                    sg.x[0] = env_ptr;
+                    sg.x[1] = thiz;
+                    sg.x[2] = g1;
+                    sg.x[3] = g2;
+                    sg.x[4] = g3;
+                    match arm64jit::jit::jit_run(iimg, ib, 0x102bb429c, &mut sg as *mut CpuState) {
+                        Err(e) => eprintln!("[elfjit:v2boot] SendAppEventOnGameLoaded stopped: {e}"),
+                        Ok(r) => eprintln!("[elfjit:v2boot] SendAppEventOnGameLoaded returned Ok({r:#x})"),
+                    }
+                    let nf3 = arm64jit::jni::nativehelper_flags_loaded();
+                    let ar3 = arm64jit::jni::nativehelper_app_ready();
+                    eprintln!(
+                        "[elfjit:v2boot] OnGameLoaded post: MH_FLAGS_LOADED={nf3} MH_APP_READY={ar3}"
+                    );
+                    dump("SendAppEventOnGameLoaded");
+                }
                 // SH131 (deleg_fbb8faf7, disasm 21f7654): seed the engine's OWN
                 // data-path global before it ever builds an app-data-model. The
                 // real client stores its files dir via nativeSetFilesDirectory
@@ -14961,6 +15006,73 @@ mod sh115_tests {
             eprintln!("sh264 Activity-lifecycle natives (nativeOnResumed/initAppShellReporter/setActive/SetInitParams + setActive core adapter-triplet read) pinned on libroblox.so");
         } else {
             eprintln!("sh264 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
+    fn sh265_gameloaded_binder_receive_pinned() {
+        // SH265 (single-agent): pin the dataModel-bindings live-binder receive
+        // nativeAppBridgeV2SendAppEventOnGameLoaded (guest 0x102bb429c) — the sibling of
+        // OnAppReady that SH264's honest note leaves "still un-driven". The new
+        // --v2boot-send-game-loaded rung drives it as a real guest entry. Pin:
+        //   entry 0x102bb429c = sub sp,#0x110 (0xd10443ff)
+        //   its 3 jstring marshals all bl 0x21e1fec (identity shim) at 0x2bb4330/0x2bb4340/0x2bb4350
+        //   AppEvent vtable base add adrp 635d000/#0xfe8 @0x2bb43ec = 0x913fa129 (-> guest 0x10635dfe8)
+        //   the @0x2bb43f4 str vtable store = 0xf80086a9
+        //   synchronous do-init pipe bl 0x2baeeec @0x2bb447c = 0x97ffea9c (w1=0 -> do-init 0x2206c40)
+        //   terminal teardown ldr x8,[x9,x8] @0x2bb44a4 = 0xf8686928 + blr @0x2bb44a8 = 0xd63f0100
+        //   the event vtable slots [+0x20/+0x28] — MEASURED loader-populated with REAL
+        //   teardown code (0x102bb782c / 0x102bb7834), NOT the all-zero SH126 class (readelf
+        //   can't decode packed-RELA; on-disk zeros, but load_elf_image applies RELATIVE
+        //   addends -> real destructor/tail leaves at load time). Read via host_addr_of on the
+        //   RW LOAD so a silent drop to empty (i.e. a future drift into the SH126 soft-return
+        //   class) fails loudly. Route-B gate UNCHANGED; SH174 capture-latch stays the single
+        //   forward hook.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            assert_eq!(word(0x102_bb429c), 0xd10443ff, "sh265 OnGameLoaded prologue sub sp,#0x110");
+            assert_eq!(word(0x102_bb42b8), 0xaa0403f3, "sh265 OnGameLoaded mov x19,x4 (3rd jstring)");
+            assert_eq!(word(0x102_bb4330), 0x97d8b72f, "sh265 OnGameLoaded bl 0x21e1fec (jstring marshal)");
+            assert_eq!(word(0x102_bb43ec), 0x913fa129, "sh265 OnGameLoaded event vtable add adrp 635d000/#fe8");
+            assert_eq!(word(0x102_bb43f4), 0xf80086a9, "sh265 OnGameLoaded str vtable base (0x10635dfe8)");
+            assert_eq!(word(0x102_bb447c), 0x97ffea9c, "sh265 OnGameLoaded bl 0x2baeeec (do-init pipe)");
+            assert_eq!(word(0x102_bb44a4), 0xf8686928, "sh265 OnGameLoaded terminal ldr x8,[x9,x8]");
+            assert_eq!(word(0x102_bb44a8), 0xd63f0100, "sh265 OnGameLoaded terminal blr");
+            // The event vtable guest 0x10635dfe8 sits in the RW LOAD; fresh load = all-zero
+            // (RELATIVE-addend-empty, the exact slot the SH126b materializer fills at runtime).
+            let vt20 = el.host_addr_of(0x106_35e008); // +0x20
+            let vt28 = el.host_addr_of(0x106_35e010); // +0x28
+            if let (Some(a), Some(b)) = (vt20, vt28) {
+                let s20 = unsafe { (a as *const u64).read_unaligned() };
+                let s28 = unsafe { (b as *const u64).read_unaligned() };
+                // MEASURED real loaded teardown leaves (loader applied packed-RELA; on-disk
+                // zeros). Pin them so a silent empty-class drift (-> SH126 soft-return bug)
+                // fails loudly. 0x102bb782c = add x0,x0,#8; b 0x26f43d0 (delete leaf),
+                // 0x102bb7834 = stp x29,x30 (string-teardown), both real in-image code.
+                assert_eq!(s20, 0x102_bb782c, "sh265 OnGameLoaded vtable +0x20 real teardown");
+                assert_eq!(s28, 0x102_bb7834, "sh265 OnGameLoaded vtable +0x28 real teardown");
+            }
+            for (guest, name) in [
+                (0x102_bb429cu64, "OnGameLoaded-entry"),
+                (0x102_bb42b8u64, "OnGameLoaded-mov-x19"),
+                (0x102_bb4330u64, "OnGameLoaded-jstr1"),
+                (0x102_bb43ecu64, "OnGameLoaded-vt-base"),
+                (0x102_bb43f4u64, "OnGameLoaded-vt-store"),
+                (0x102_bb447cu64, "OnGameLoaded-bl-pipe"),
+                (0x102_bb44a4u64, "OnGameLoaded-term-ldr"),
+                (0x102_bb44a8u64, "OnGameLoaded-term-blr"),
+            ] {
+                assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh265 {name} {guest:#x} in window");
+                assert!(guest & 3 == 0, "sh265 {name} {guest:#x} 4-aligned");
+            }
+            eprintln!("sh265 dataModel-bindings live-binder receive (nativeAppBridgeV2SendAppEventOnGameLoaded + 0x10635dfe8 vtable real-teardown) pinned on libroblox.so");
+        } else {
+            eprintln!("sh265 real-image guard: no real libroblox.so, skipping anchors");
         }
     }
 
