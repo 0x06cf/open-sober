@@ -95,6 +95,14 @@ This is a **measured attempt**, not a shipped Route-B unlock. Expected outcomes,
    that never executes headlessly), not by the select slots.** Closing this lever with evidence,
    not judgment (operator's proof-of-dead-end standard for the specific SH235-237 select lever).
 
+**Line-closing caller scan (authoritative):** full-.text probe (SH235 method) shows the big
+sub-body 0x23f03b4 (which contains the marshaler-call block 0x1023f075c -> bl 0x1023f1210 -> EC
+world) has **ZERO direct `bl` callers** across the whole image. It is reached ONLY via indirect
+receiveCall message dispatch (an app-bridge registry handler invoked by `blr`), so there is NO
+static call-site to seed into it — the marshaler sits behind the same live-DM / app-bridge
+world-build wall SH174/SH204/SH206 mapped, not a headless seed lever. This closes the SH235-238
+receiveCall line end-to-end with measured negatives at every step of it.
+
 Does not manufacture a DataModel; Route-B live-DM structural gate (SH209/218/223/224/228/231/232/
 235/236/237) UNCHANGED. The next Route-B lever on this line (do-not-implement-now, the
 fabricatable-object-graph class SH204/SH174 already mapped) would be forcing the flow into the big
