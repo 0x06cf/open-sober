@@ -1768,28 +1768,21 @@ fn routeb_seed_task_singletons() {
         eprintln!("[elfjit:routeB] benign singleton virtual registered at {a:#x}");
         a
     });
-    // SH111: differential 0x580 vtable. SH110 showed the blanketed 0x580
-    // identity-widening regressed nativeInitializeNativeFlags: a high-slot
-    // virtual returned identity a0 (== `this`, possibly NULL/low) and the caller
-    // deref'd x0+0x28 -> NULL+0x28 SIGSEGV before StartLuaAppDM. Instead:
-    //   - slots 0..0x60: keep the proven identity leaf (current clean baseline).
-    //   - [0x60,0x580) default: stable-zeroed 0x40 guest-resident object leaf
-    //     (any caller's [ret+off] read is a valid zeroed field, never NULL+0x28).
-    //   - +0xf8/+0x108/+0x548 (soft-return gate sites A/A2/B): identity leaf
-    //     (subagent-verified store-only: `ldr x8,[x19]; str x0,[x8]; mov x0,xzr`,
-    //     the virtual's return value is never deref'd), so V2Init/V2Start/V1
-    //     AppStart resolve their dispatch instead of leaking host bytes.
-    //   - +0x558 (nativeInit count) / +0x568 (ptr arg): NULL leaf — identity
-    //     there would make the flags-init loop iterate a huge low-32 count.
-    // Keep 0x580 (< the +0x720 bool-gate read), so non-gate deep slots keep the
-    // same benign soft-return as the 0x60 baseline.
+    // SH111: differential 0x580 vtable (blanketed identity-widening regressed
+    // nativeInitializeNativeFlags — SH110 — so widen selectively):
+    //   slots 0..0x60 = proven identity leaf (current clean baseline);
+    //   [0x60,0x580)  = stable-zeroed 0x40 guest-resident object leaf
+    //                   (caller [ret+off] read is a valid zeroed field, not NULL+0x28);
+    //   +0xf8/+0x108/+0x548 (soft-return gate sites): identity leaf (store-only,
+    //                   never deref'd) so V2Init/V2Start/V1 resolve their dispatch;
+    //   +0x558/+0x568 (nativeInit count/ptr): NULL leaf (identity would loop a huge
+    //                   low-32 count);
+    //   keep 0x580 (< +0x720 bool-gate read) so deep slots keep the benign
+    //   soft-return.
     // SH111: differential 0x580 vtable tried + REVERTED — ANY widening past 0x60
     // (identity or stable-zeroed leaf) makes nativeInitializeNativeFlags hard-crash
-    // before StartLuaAppDM, because the vtable is SHARED with nativeInit which stays
-    // clean ONLY via 0x60 slots read-past->benign soft-return. Keep the 0x60 baseline
-    // (StartLuaAppDM returned Ok); the V2Start/V2Init soft-return is benign. NEXT:
-    // patch the 3 dispatch blr sites (0x62517c4/0x6251aa8/0x6260948) to a fixed
-    // guest-resident leaf directly, leaving the shared vtable 0x60.
+    // before StartLuaAppDM (vtable SHARED with nativeInit; stays clean only via the
+    // 0x60 baseline). Keep the 0x60 baseline; V2Start/V2Init soft-return is benign.
     let vtable: &'static mut [u8] = Box::leak(vec![0u8; 0x60].into_boxed_slice());
     {
         let mut fill = |i: u64, v: u64| unsafe {
@@ -1902,24 +1895,18 @@ fn routeb_patch_taskscheduler_flags_gate() {
 // ---- SH115: scoped singleton-dispatch patch (make V2Init/V2Start/V1AppStart/  ----
 // ---- SendAppEventOnAppReady bodies complete instead of soft-returning)     ----
 //
-// The three nullable-singleton accessors (V2Init site A, V2Start site A2,
-// V1AppStart site B) each end a virtual dispatch through the seeded 0x60 vtable:
-// `ldr x8,[x8,#off]; blr x8` reads +0xf8/+0x108/+0x548 PAST the 0x60 vtable into
-// host bytes, blr's outside the image, and the enclosing fn body 'soft-returns'
-// without ever completing. SH114 showed a flat `blr->mov x0,xzr` (return 0)
-// regresses nativeInitializeNativeFlags to NULL+0x28, because the accessor's
-// return IS deref'd at '+0x28' by a downstream caller. The differential fix:
-// patch each site's 28B window to MATERIALIZE the stable zeroed singleton object
-// (routeb_singleton_obj_addr) directly into x0, store it into objA[0]=[x19], and
-// RETURN it — so both the stored slot AND any `[ret+off]` read resolve to a valid
-// zeroed guest object (never NULL+0x28). This is site-scoped (leaves the shared
-// 0x60 vtable + nativeInit's own reads untouched), the exact differential remedy
-// SH110/SH111 mandate. Encodings verified against aarch64-linux-gnu-assembler.
-// Window layout (7 instr, file vaddr):
+// The three nullable-singleton accessors (V2Init site A, V2Start site A2, V1 AppStart
+// site B) each end a virtual dispatch through the seeded 0x60 vtable: `ldr x8,[x8,#off];
+// blr x8` reads past 0x60 into host bytes and soft-returns without completing. SH114
+// showed a flat `blr->mov x0,xzr` regresses nativeInitializeNativeFlags (the accessor's
+// return IS deref'd at '+0x28'). Differential fix: patch each 28B window to MATERIALIZE
+// routeb_singleton_obj_addr into x0, store it into objA[0]=[x19], and RETURN it — both
+// the stored slot and any [ret+off] read resolve to a valid zeroed guest object. Encodings
+// verified vs aarch64-linux-gnu-assembler. Window layout (7 instr, file vaddr):
 //   slot0 movz x8,#OBJlo      slot4 mov x0,x8
 //   slot1 movk x8,#OBJ(16)    slot5 ldr x9,[x19]   ; objA
-//   slot2 movk x8,#OBJ(32)    slot6 str x0,[x9]    ; objA[0]=OBJ (MUST overwrite
-//   slot3 movk x8,#OBJ(48)                           the trailing `mov x0,xzr`)
+//   slot2 movk x8,#OBJ(32)    slot6 str x0,[x9]    ; objA[0]=OBJ (overwrite trailing mov x0,xzr)
+//   slot3 movk x8,#OBJ(48)
 fn sh115_movz_x8_imm(imm16: u16) -> u32 {
     0xD280_0000u32 | ((imm16 as u32) << 5) | 8
 }
@@ -2436,26 +2423,13 @@ fn routeb_patch_cont_opnew_box() {
 }
 static ROUTEB_CONT_OPNEW_BOX_PATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static ROUTEB_OPNEW_SIZEGATE_PATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// SH246's measured conclusion is that the activated continuation
-/// (continueAfterFlagsLoaded_ 0x102bd1d68) pervasively NULL-allocs: EVERY interior
-/// operator_new — BOTH variants 0x1db1a38 and 0x1d96768 — returns NULL for size>0xa
-/// whenever the global allocator-activation byte [0x10727570c].bit0 is clear
-/// (headlessly clear): the fast-path `b.ls SMALL` (taken ⇔ unsigned size<=0xa) falls
-/// through to `mov x19,xzr` for larger sizes and std::bad_alloc throws. The broad
-/// fix (bit0=1 -> ALL op_new real-alloc) is a MEASURED regression (SH245 #4, 3/3 early
-/// SIGABRT on a secondary thread before the continuation). SH247's lever (the one
-/// untried, cheap, in-image door): route EVERY size through the SAME ≤0xa "small
-/// path" (0x1db1ab4/0x1d96824) that demonstrably WORKS headlessly — it builds an
-/// allocator size-class descriptor (scudo 0x1d969cc/0x1d99bf0 classifier, classes up
-/// to ~2.8KB) and calls the REAL allocator tail 0x1db1c60, which returns real memory
-/// for the tiny sizes that DO run today. So this is a SINGLE-WORD patch per variant:
-/// change the size-gate `b.ls SMALL` (conditional, taken ⇔ size<=0xa) to an
-/// UNCONDITIONAL `b SMALL`, so the continuation's 0x28/0x20 closures + string / JSON
-/// constructions also take the working descriptor path — WITHOUT touching the bit0
-/// flag. Empirical (measured, real binary): does the descriptor path serve size>0xa
-/// headlessly (continuation advances -> next gate) or fall through to the raw
-/// allocator SIGABRT (= the same alloc wall via a 2nd mechanism, proof-of-dead-end)?
-/// Opt-in JIT_ROUTEB_OPNEW_SIZE_GATE, byte-guarded, whole-function block-cache drop.
+/// SH246/247: the activated continuation (0x102bd1d68) NULL-allocs — BOTH op_new
+/// variants (0x1db1a38/0x1d96768) return NULL for size>0xa when [0x10727570c].bit0 is
+/// clear (headless). Broad fix (bit0=1) is a MEASURED regression (SH245 #4). This
+/// routes EVERY size through the SAME ≤0xa "small path" (0x1db1ab4/0x1d96824) that
+/// builds a scudo size-class descriptor and calls the real allocator 0x1db1c60. Single
+/// word per variant: size-gate `b.ls SMALL` -> UNCONDITIONAL `b SMALL`, no bit0 touch.
+/// Opt-in JIT_ROUTEB_OPNEW_SIZE_GATE, byte-guarded, whole-fn block-cache drop.
 fn routeb_patch_opnew_size_gate() {
     if ROUTEB_OPNEW_SIZEGATE_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
         return;
@@ -6858,26 +6832,18 @@ fn main() {
         eprintln!("[elfjit] driving StartApp @ guest {start_app:#x} after JNI_OnLoad (env={env_ptr:#x} jobject={activity:#x} params={params:#x}){}",
             if use_v1 { " [V1 6-jstring AppStart__]" } else { "" });
 
-        // --v2boot: drive the REAL engine boot ladder IN ORDER (the SH53-open
-        // runtime test + the recon's corrective for the bare/out-of-order
-        // StartApp-with-JSON json-abort). The recon (docs/recon-framework-
-        // boot-order.md) reframes the type-4 producer vector [0x106829ea8] as
-        // installed by TaskScheduler init reached only through this exact
-        // order: nativeGameGlobalInit -> setTaskSchedulerBackgroundMode(false)
-        // -> nativeAppBridgeV2InitWithParams -> nativeAppBridgeStartLuaAppDM ->
-        // nativeAppBridgeV2StartAppWithParams. We drive each rung as a fresh
-        // guest entry reusing the boot SP (the JNI natives each prologue
-        // `sub sp` from it), passing AutoValue JNI jobjects (NOT JSON strings)
-        // as the x2 params — serviced by the jni.rs AutoValue getter shim so
-        // StartApp's serialization reads valid empty/default strings — and dump
-        // [0x106829ea8] AFTER EVERY rung. First non-zero vector = the gate
-        // opens (the scheduled producer is live). MUST be spawned BEFORE the
-        // start_app jit_run below (which parks the main thread forever and
-        // never returns), on a detached thread that sleeps its own warmup so
-        // the rungs execute concurrently while StartApp idles. Opt-in.
-        // SH124: the ladder handle is JOINED after the StartApp jit_run returns
-        // so main() no longer tears down the detached ladder mid-do-init (the
-        // pre-SH124 exit-232 race). No-op while StartApp parks (exit 124).
+        // --v2boot: drive the REAL engine boot ladder IN ORDER (SH53 runtime test +
+        // recon's corrective for the out-of-order StartApp json-abort). The type-4
+        // producer vector [0x106829ea8] is installed by TaskScheduler init reached
+        // only in this order: nativeGameGlobalInit -> setTaskSchedulerBackgroundMode
+        // -> V2InitWithParams -> StartLuaAppDM -> V2StartAppWithParams. Each rung is
+        // a fresh guest entry on the boot SP, passing AutoValue jobjects (serviced by
+        // the jni AutoValue shim, so StartApp serialization reads valid empty strings);
+        // the vector is dumped after EVERY rung. MUST spawn BEFORE the start_app
+        // jit_run (which parks main forever) on a detached thread that sleeps its own
+        // warmup so rungs run concurrently while StartApp idles. SH124: the ladder
+        // handle is JOINED after StartApp returns so main doesn't tear down mid-do-init
+        // (pre-SH124 exit-232 race). Opt-in.
         let mut v2boot_join: Option<std::thread::JoinHandle<()>> = None;
         if std::env::args().any(|a| a == "--v2boot") {
             const BSS_TASKV4: u64 = 0x106829ea8;
@@ -7795,22 +7761,36 @@ fn main() {
                     }
                     dump("EngSettingsReceived");
                 }
-                // SH278 (single-agent): cross the SH277-pinned initEngine_ state gate. SH277
-                // proved a fabricated/zeroed manager has state [this+16]=0, so initEngine_'
-                // state-dispatch (0x2bd1cf0: ldr w8,[x19,#16]; else benign tail) never enters a
-                // settings body. BUT the engine-settings receive (0x2bd1c38, SH276) sets state->3
-                // ITSELF when [this+649]!=0 (0x2bd1cac ldrb w8,[x19,#649]; 0x2bd1cb8 cbz w8,skip;
-                // mov w8,#3; str w8,[x19,#16] @0x2bd1cbc/0x2bd1cc0). Seeding the ONE byte
-                // [this+649]=1 makes the ENGINE's own receive set state=3, then driving the
-                // initEngine_ dispatch entry 0x2bd1cf0 takes its ==3 branch -> first session-state
-                // entry into the settings-serializer 0x2bd1d68. Opt-in --v2boot-session-engine3
-                // (default-inert). Honest: a session-state transition to the settings path, NOT a
-                // DM ctor; SH174 latch stays single forward hook.
+                // SH278: cross the SH277 state gate via the engine's own receive. SH277 proved a
+                // fabricated manager mono-tails (state [this+16]=0 -> benign tail). The
+                // engine-settings receive (0x2bd1c38) sets state->3 ITSELF when [this+649]!=0,
+                // so seeding that ONE byte lets the ENGINE set state=3; then driving initEngine_
+                // dispatch 0x2bd1cf0 takes its ==3 branch into the settings-serializer. Opt-in
+                // --v2boot-session-engine3. Honest: session-state transition, NOT a DM ctor.
                 if std::env::args().any(|a| a == "--v2boot-session-engine3") {
                     unsafe { *(0x10683d8f8u64 as *mut u64) = 6u64; }
                     let mgr3 = Box::leak(vec![0x0u8; 0x800usize].into_boxed_slice()).as_mut_ptr() as u64;
                     // Seed the ONE byte the receive's state->3 transition keys on.
                     unsafe { *((mgr3 + 649u64) as *mut u8) = 1u8; }
+                    let scfg = Box::leak(vec![0x0u8; 0xc00usize].into_boxed_slice()).as_mut_ptr() as u64;
+                    unsafe { *( (mgr3 + 0x40u64) as *mut u64) = scfg; }
+                    eprintln!(
+                        "[elfjit:v2boot] SH279 seeded [this+0x40]=settings-config 0x{scfg:x} (static-init mutex at +0x300) so the state=3 config-lock helper 0x2bcdfc4 does not fault at [0x300]"
+                    );
+                    // SH279 part-2: serializer-assign at 0x2bd1dfc writes app-name into [this+0x48];
+                    // fresh zeroed mgr3 -> empty SSO (bit0=0) -> app-name guard reads SSO len 0
+                    // -> NULL-store fault at 0x2bd1fd4. Pre-seed as LONG (cap 0x11,[8]=size,[16]=data)
+                    // so the assign keeps the long bit and the guard's [this+0x50]=5 re-seed skips it.
+                    let mhome = Box::leak(vec![0u8; 64usize].into_boxed_slice()).as_mut_ptr() as u64;
+                    unsafe { std::ptr::copy_nonoverlapping(b"Home\0".as_ptr(), mhome as *mut u8, 5); }
+                    unsafe {
+                        std::ptr::write_unaligned((mgr3 + 0x48) as *mut u64, 0x11u64); // long cap
+                        std::ptr::write_unaligned((mgr3 + 0x50) as *mut u64, 5u64); // size
+                        std::ptr::write_unaligned((mgr3 + 0x58) as *mut u64, mhome); // data ptr
+                    }
+                    eprintln!(
+                        "[elfjit:v2boot] SH279 pre-seeded [this+0x48] long app-name 'Home' (cap 0x11, size 5) so the app-name guard skips the 0x2bd1fd4 NULL-store"
+                    );
                     eprintln!(
                         "[elfjit:v2boot] SH278 driving engine-settings receive @ 0x102bd1c38 with mgr[+649]=1 (engine transitions state->3 itself); then initEngine_ dispatch @ 0x102bd1cf0"
                     );
@@ -7851,20 +7831,11 @@ fn main() {
                     dump("SH278");
                 }
                 // SEP-17 session-drive (dataModel-bindings live binder): drive the REAL
-                // nativeAppBridgeV2SendAppEventOnGameLoaded receive (guest 0x102bb429c) as a
-                // sequential post-ladder rung (same single thread; SH55/64). This is the
-                // sibling of OnAppReady — SH264's honest note leaves it "still un-driven".
-                // It marshals 3 jstrings (x2/x3/x4) into a 0x50 AppEvent, then via
-                // `bl 0x2baeeec` dispatches into the SAME app-bridge pipe/do-init the ladder
-                // drives from StartLuaAppDM — but from the REAL dataModel-bindings receive
-                // path (the Lifecycle/LiveObject binder the SEP-17 directive names), not the
-                // fabricated StartLuaAppDM frame. ABI-correction (SH186 identity shim): the
-                // jstring->RBX-string helper 0x21e1fec resolves fabricated jstrings, so the 3
-                // args read as the event payload cleanly. MEASURED (SH265): the event vtable
-                // guest 0x10635dfe8 is LOADER-POPULATED with real teardown (0x102bb782c/0x28),
-                // NOT the all-zero SH126 class — no vtable materialization needed. Seed only
-                // the pipe sync-gate [0x10683d010]=-1 so the do-init dispatch takes the sync
-                // path (as SH126 seeded for OnAppReady).
+                // nativeAppBridgeV2SendAppEventOnGameLoaded receive (0x102bb429c) as a
+                // post-ladder rung (single thread). Marshals 3 jstrings into a 0x50 AppEvent,
+                // then bl 0x2baeeec -> the do-init pipe. SH186 identity shim resolves the
+                // jstrings; event vtable 0x10635dfe8 is LOADER-populated (SH265). Seed only
+                // the pipe sync-gate [0x10683d010]=-1 so do-init takes the sync path.
                 if std::env::args().any(|a| a == "--v2boot-send-game-loaded") {
                     if std::env::var("JIT_SH115_SINGLETON_PATCH").ok().as_deref() == Some("1") {
                         unsafe { *(0x10683d010u64 as *mut u64) = u64::MAX; }
@@ -7895,22 +7866,11 @@ fn main() {
                     );
                     dump("SendAppEventOnGameLoaded");
                 }
-                // SEP-17 messageBus receive (0x2ba5bb8 = the only genuinely-NEVER-driven
-                // Route-B candidate SH185 closed by STATIC judgment only: "subscribe
-                // registered only inside the migration-gated initializeLuaApp_"). Driving
-                // it as a real guest entry converts that judgment into a runtime result.
-                // It is a JNI-RECEIVE export (Java_com_roblox_universalapp_messagebus_
-                // MessageBus_subscribe): its body (a) dispatches a JNI table slot near the
-                // top (blr [env]+248 = the vtable/telemetry slot), then telemetry-logs,
-                // allocates subscription boxes (operator_new 0x1d96768 mksize 0x28/0x20),
-                // and (b) DIRECTLY bl's nativeAppBridgeAppStart (0x2343c10, the
-                // String,..,String,Z,..,Z marshaller) — a REAL app-start route the ladder
-                // drives via the fabricated StartLuaAppDM frame instead. If subscribe
-                // completes, it registers a 'experience-launch' subscription AND drives a
-                // genuine app-start. Opt-in --v2boot-session-bus; single ladder thread.
-                // The initial `ldr x8,[x0]; ldr x8,[x8,#248]; blr x8` is a JNI table slot
-                // dispatch on env (x0); our fabricated env's function table resolves it
-                // (identity shim family, SH186). ABI: x0=env x1=thiz x2/x3/x4/x5 jstrings.
+                // SEP-17 messageBus receive (0x2ba5bb8): the only never-driven Route-B candidate SH185
+                // closed by STATIC judgment. JNI-RECEIVE export; body dispatches a JNI table
+                // slot, allocates subscription boxes (op_new 0x1d96768 0x28/0x20), and directly
+                // bl's nativeAppBridgeAppStart (0x2343c10) — a REAL app-start route. Opt-in
+                // --v2boot-session-bus; single ladder thread. ABI: x0=env x1=thiz x2/x3/x4/x5.
                 if std::env::args().any(|a| a == "--v2boot-session-bus") {
                     let b1 = arm64jit::jni::new_string_utf_handle(b"experience-launch");
                     let b2 = arm64jit::jni::new_string_utf_handle(b"");
@@ -15200,6 +15160,47 @@ mod sh115_tests {
             eprintln!("sh278 engine state->3 transition gate + initEngine_ ==3 serializer branch pinned on libroblox.so");
         } else {
             eprintln!("sh278 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
+    fn sh279_settings_serializer_worldbuild_gates_pinned() {
+        // SH279: cross the SH278 settings-serializer (continueAfterFlagsLoaded_ 0x2bd1d68)
+        // internal world-build gates. Gate 1: serializer reads [this+0x40]=0 -> 0x2bcdfc4
+        // `add x0,#0x300; bl mutex_lock` = lock(0x300) -> SIGSEGV fault=0x300. Seeded
+        // [this+0x40]=zeroed 0xc00 config obj. Gate 2: app-name guard 0x2bd1f64 reads [x19+0x48];
+        // empty -> NULL-store @0x2bd1fd4. Fixed: pre-seed [this+0x48] LONG "Home" + appname-guard
+        // re-seeds live x19 [this+0x50]=5. MEASURED 3/3: serializer runs WHOLE body and self-drives
+        // into app-start, reaching LSM wall 0x101db1d04 (SH260) — first engine-OWN session-state
+        // path to app-start depth. Guest = file vaddr + 0x1_0000_0000.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            let in_win = |g: u64| g >= 0x1_0000_0000 && g < 0x120_0000_00 && g & 3 == 0;
+            // Gate 1: serializer reads [this+0x40] and dispatches the settings-config helper.
+            assert_eq!(word(0x102bd1de8), 0xf9402260, "sh279 ldr x0,[x19,#64] (this+0x40 settings-config ptr)");
+            assert_eq!(word(0x102bd1df8), 0x97fff073, "sh279 bl 0x2bcdfc4 (settings-config lock+field-copy helper)");
+            // settings-config helper 0x2bcdfc4: `add x0,x0,#0x300; mov x20,x8; bl 0x2b53a68` (mutex_lock on obj+0x300)
+            assert_eq!(word(0x102bcdfd4), 0x910c0000, "sh279 helper add x0,x0,#0x300 (mutex at [obj+0x300])");
+            assert_eq!(word(0x102bcdfdc), 0x97fe16a3, "sh279 helper bl 0x2b53a68 (pthread_mutex_lock)");
+            // field-copy helper 0x2bce010 the settings-config writes into obj+0xf0..
+            assert_eq!(word(0x102bce010), 0xa9be7bfd, "sh279 0x2bce010 field-copy prologue stp x29,x30,[sp,#-32]!");
+            // Gate 2: app-name guard reads [x19+0x48] string; the NULL-store that was the fault when empty.
+            assert_eq!(word(0x102bd1f64), 0x39412268, "sh279 app-name guard ldrb w8,[x19,#72] ([this+0x48] SSO flag/length)");
+            assert_eq!(word(0x102bd1f68), 0xf9402a69, "sh279 app-name guard ldr x9,[x19,#80] ([this+0x50] long size)");
+            assert_eq!(word(0x102bd1f78), 0xb5000348, "sh279 app-name guard cbnz x8 skips NULL-store when non-empty");
+            assert_eq!(word(0x102bd1fd4), 0xaa1f03e8, "sh279 NULL-store mov x8,xzr (the empty-app-name fault, now crossed)");
+            assert_eq!(word(0x102bd1fd8), 0x52800c29, "sh279 NULL-store mov w9,#0x61 ('a')");
+            for g in [0x102bd1de8u64, 0x102bcdfd4u64, 0x102bce010u64, 0x102bd1f64u64, 0x102bd1fd4u64] {
+                assert!(in_win(g), "sh279 site {g:#x} in-window+aligned");
+            }
+            eprintln!("sh279 settings-serializer world-build gates (config-lock + app-name) pinned on libroblox.so");
+        } else {
+            eprintln!("sh279 real-image guard: no real libroblox.so, skipping anchors");
         }
     }
 

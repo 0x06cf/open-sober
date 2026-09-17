@@ -2896,21 +2896,32 @@ fn store_cont_managed_m(m: u64) {
 /// the skip to 0x2bd1fe0 (M+0x58 still holds the leaked "Home\0" data ptr, so M+0x48 reads
 /// back as a valid size-5 "Home" long string). Lets the continuation reach its first
 /// headless `bl nativeAppBridgeAppStart` (0x2bd2058). Default-inert; idempotent.
-fn routeb_cont_appname_seed_guard(_state: *mut CpuState, pc: u64) {
+fn routeb_cont_appname_seed_guard(state: *mut CpuState, pc: u64) {
     if std::env::var("JIT_ROUTEB_CONT_APPNAME_SEED").ok().as_deref() != Some("1") {
         return;
     }
     if pc != 0x102bd1f64 {
         return;
     }
-    let m = routeb_cont_managed_m();
+    // SH279: re-seed the LIVE `this` (x19) at the guard — covers the SH278 rung's
+    // freshly fabricated manager (mgr3) that `routeb_cont_managed_m()` never knows
+    // about, as well as the DMCONT continuation M. The serializer-assign at 0x2bd1dfc
+    // overwrites mgr3+0x48 with an empty long string (cap 0x11, bit0=1 -> cbnz reads
+    // word[mgr3+0x50]=size), so re-seeding [this+0x50]=5 makes the guard skip the
+    // NULL-store fault at 0x2bd1fd4.
+    let m = if !state.is_null() {
+        let this = (unsafe { &*state }).x[19];
+        if this != 0 { this } else { routeb_cont_managed_m() }
+    } else {
+        routeb_cont_managed_m()
+    };
     if m == 0 {
         return;
     }
     unsafe {
         std::ptr::write_unaligned((m + 0x50) as *mut u64, 5u64); // long-form size -> guard cbnz skips fault
     }
-    eprintln!("[routeb-sh248c] continueAfterFlagsLoaded_ app-name guard re-seeded M+0x50 size=5 at pc=0x102bd1f64");
+    eprintln!("[routeb-sh248c/sh279] continueAfterFlagsLoaded_ app-name guard re-seeded [this+0x50] size=5 at pc=0x102bd1f64 (this={m:#x})");
 }
 
 /// SH165-fwd-cone (deleg_7e5b7101 task-0, authoritative): the CONTINUATION-routed manager.
