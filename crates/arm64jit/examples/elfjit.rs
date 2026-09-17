@@ -14795,6 +14795,49 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh259_settings_factory_once_guard_endpoint() {
+        // SH259 (Route-B, single-agent): pin the once-guarded settings/registry singleton
+        // factory 0x21dac2c — the DEEPEST app-start reach 0x102339d44 (`bl 0x21dac2c`).
+        // Its prologue reads the once-guard byte at [0x106a6f430]:
+        //   0x21dac2c = stp x29,x30,[sp,#-16]!   (0xa9bf7bfd)  [entry]
+        //   0x21dac34 = adrp x8,6a6f000          (0xb00244a8)  [guard base]
+        //   0x21dac38 = add x8,x8,#0x430         (0x9110c108)  [guard addr 0x6a6f430]
+        //   0x21dac3c = ldar w8,[x8]             (0x08dffd08)  [acquire read]
+        //   0x21dac40 = tbz w8,#0,0x21dac54      (0x360000a8)  [bit0 clear -> builder]
+        //   0x21dac44 = adrp x0,6a6f000          (0xb00244a0)  [early-path: registry base]
+        //   0x21dac48 = add x0,x0,#0x3f0         (0x910fc000)  [registry object 0x6a6f3f0]
+        // The SH259 guard ORs bit0 of [0x106a6f430]=1 so this factory returns 0x6a6f3f0
+        // (zeroed .bss registry) without running builder 0x21dac80 -> avoids the standing
+        // map wall 0x1021dde34 and lets the orchestrator walk its own app-start body
+        // (0x233a804..0x233d2bc) — a fresh Path-B surface. These words pin the endpoint so
+        // a drift (opcode move) fails loudly. guarded by env+pc, default-inert.
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            assert_eq!(word(0x102_1dac2c), 0xa9bf7bfd, "sh259 settings factory entry stp x29,x30,[sp,#-16]!");
+            assert_eq!(word(0x102_1dac34), 0xb00244a8, "sh259 settings factory adrp x8,6a6f000");
+            assert_eq!(word(0x102_1dac38), 0x9110c108, "sh259 settings factory add x8,x8,#0x430 (guard addr 0x6a6f430)");
+            assert_eq!(word(0x102_1dac3c), 0x08dffd08, "sh259 settings factory ldar w8,[x8] acquire-read guard");
+            assert_eq!(word(0x102_1dac40), 0x360000a8, "sh259 settings factory tbz w8,#0 -> builder path");
+            assert_eq!(word(0x102_1dac44), 0xb00244a0, "sh259 settings factory early-path adrp x0,6a6f000");
+            assert_eq!(word(0x102_1dac48), 0x910fc000, "sh259 settings factory add x0,x0,#0x3f0 (registry 0x6a6f3f0)");
+            let guard_host = el.host_addr_of(0x106_a6f430).unwrap_or(0);
+            assert_ne!(guard_host, 0, "sh259 once-guard [0x106a6f430] maps into the image");
+            for a in [0x102_1dac2cu64, 0x102_1dac34u64, 0x102_1dac44u64] {
+                assert!(a & 3 == 0, "sh259 {a:#x} 4-aligned");
+            }
+        } else {
+            eprintln!("sh259 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh236_startluaappdm_receivecall_dispatch_softreturns_before_marshaler() {
         // SH236 (Route-B re-attack, single-agent): SH235 statically concluded the EC world
         // 0x102e24598's only headless front-door (StartLuaAppDM -> bl 0x1023f1210 @0x1023f075c) is

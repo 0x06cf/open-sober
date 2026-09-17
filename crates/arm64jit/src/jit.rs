@@ -971,6 +971,46 @@ fn routeb_appstart_adapter_object() -> u64 {
     })
 }
 
+/// SH259 (Route-B, opt-in JIT_ROUTEB_APPSART_SETTINGS_ONCE): seed the once-guard
+/// of the settings/registry singleton factory the deepest app-start reach bl's.
+/// SH258 measured nativeAppBridgeAppStart's deep orchestrator 0x2339d0c reaching
+/// its DEEPEST point 0x102339d44 = `bl 0x21dac2c` (a once-guarded settings/registry
+/// singleton factory), then EXIT 134 at the standing live-object map wall
+/// 0x1021dde34. Disasm of 0x21dac2c: prologue `adrp x8,6a6f000; add x8,#0x430;
+/// ldar w8,[x8]; tbz w8,#0, 0x21dac54` reads the once-guard byte [0x106a6f430].
+/// When bit0 CLEAR (headless: first call) it falls into the builder path:
+/// `bl 0x284ce54` (__call_once) then `bl 0x21dac80` (0x21dac54..21dac7c) whose
+/// body (registry setters 0x21dad40/0x21e126c/0x21e1470/0x21e1668/0x21e1830/
+/// 0x21e1a34/0x2e88f5c) eventually hands control into the map-construction chain
+/// (0x21ddc44 -> 0x21ddcac, stride-0x2a0 live-object map) = the SH174/SH204 wall.
+/// When bit0 SET, 0x21dac2c takes `adrp x0,6a6f000; add x0,#0x3f0; ret` — it
+/// early-returns the (zeroed .bss) registry object 0x6a6f3f0 WITHOUT running the
+/// builder, so control returns to the orchestrator at 0x2339d48 and it walks its
+/// OWN real app-start body (0x233a804 / 0x233af10 / 0x233bbac / 0x233bf20 /
+/// 0x233d11c / 0x233d2bc...) — a fresh Path-B surface never before reached
+/// headlessly. Unlike SH248e (which seeds the -1 CELL at [0x106b0bdf0]) this seeds
+/// the once-guard FLAG itself, the SH156 "flags-latch" pattern at a NEW cell.
+/// Fires at block-entry [0x102339d40,0x102339d4c) (immediately before the bl);
+/// idempotent (only ORs bit0, never clobbers); default-inert.
+fn routeb_appstart_settings_once_seed_guard(_state: *mut CpuState, pc: u64) {
+    if std::env::var_os("JIT_ROUTEB_APPSART_SETTINGS_ONCE").is_none() {
+        return;
+    }
+    if !(0x102339d0c..0x102339d4c).contains(&pc) {
+        return;
+    }
+    const GUARD: u64 = 0x106a6f430; // settings/registry singleton once-guard byte (6a6f000+#430)
+    if routeb_ensure_writable(GUARD) {
+        let cur = unsafe { std::ptr::read_unaligned(GUARD as *const u8) };
+        if cur & 1 == 0 {
+            unsafe { std::ptr::write_unaligned(GUARD as *mut u8, cur | 1) };
+            eprintln!(
+                "[routeb-sh259] seeded settings/registry once-guard [0x{GUARD:x}] bit0=1 at pc=0x{pc:x} (was cleared -> builder would walk into map wall 0x1021dde34)"
+            );
+        }
+    }
+}
+
 /// SH253 (Route-B, opt-in JIT_ROUTEB_SOURCE_SEED): seed the bulk-registrar SOURCE
 /// vector so the engine's OWN in-ladder registrar loop populates the RESOLVER map.
 /// SH252 measured (full exec-text sweep) that the resolver 0x106dca0e70 — the
@@ -5724,6 +5764,11 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // adapter at [0x106b0bde0] so the continuation's app-start closure dispatch (vt[0]
         // blr @0x233904c) resolves benignly instead of SIGSEGV'ing at 0x102339020.
         routeb_appstart_adapter_seed_guard(state, pc);
+        // SH259 (opt-in JIT_ROUTEB_APPSART_SETTINGS_ONCE): seed the once-guard
+        // [0x106a6f430] of the settings/registry factory 0x21dac2c (deepest reach,
+        // bl @0x102339d44) so it early-returns the registry object without running the
+        // builder that walks into the standing map wall 0x1021dde34.
+        routeb_appstart_settings_once_seed_guard(state, pc);
         // SH253 (opt-in JIT_ROUTEB_SOURCE_SEED): seed the bulk-registrar SOURCE
         // vector at the engine's OWN in-ladder registrar loop block entry 0x1022085c0,
         // so nativeGameGlobalInit's registrar populates the name->classid resolver
