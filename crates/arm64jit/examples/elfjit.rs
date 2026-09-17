@@ -14072,6 +14072,76 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh240_dmcont_dispatch_chain_pinned_fresh_negative() {
+        // SH240 (real-image guard family as sh239/238/237; skip-if-absent). Fresh-at-HEAD
+        // re-measurement of the DMCONT continuation lever (operator's named "keep grinding
+        // the DMCONT continuation" line). The engine-init dispatcher 0x102bd8ce8 is entered
+        // as a block on the completing --v2boot ladder under JIT_ROUTEB_DMFORCE=1 +
+        // JIT_ROUTEB_DMCONT=1 (manager holder 0x102727550 seeded so vt[+0x1f0] -> the REAL
+        // continueAfterFlagsLoaded_ 0x102bd1d68), yet the guest NEVER resumes past the
+        // dispatcher's first call-boundary: JIT_REGION_WATCH on the interior resumption pcs
+        // (0x2bd8d30 after `blr vt+0xf8`, 0x2bd8d54 after `blr vt+0x108`) AND sub_2bd8dac
+        // AND continueAfterFlagsLoaded_ all = 0 hits across 3/3 clean EXIT 124 runs; a
+        // JIT_DUMP_REGION shot fired exactly once at block-entry 0x102bd8ce8 only. So the
+        // `bl sub_2bd8dac` -> vt+0x1f0 -> continueAfterFlagsLoaded_ -> nativeAppBridgeAppStart
+        // chain is still block-entry-unreached headlessly (SH228's "dispatcher completes
+        // through the resolve/leaf paths before the unconditional bl sub" holds fresh at the
+        // newest state). The DMCONT manufactured-manager continuation is WIRED + ARMED but
+        // LATENT — it fires only if a real flags-loaded engine state materializes the leaves
+        // (network feature-flag fetch), the standing live-session gate; an all-leaf fabricated
+        // manager supplies no such state. Pin the chain so a future drive/fix starts from
+        // drift-verified anchors. Guest = file + 0x100000000.
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            // fnB entry (the real engine-init driven by the SH165 shell at governor tail).
+            //     0x2bd1b98 sub sp,#0x40 ; 0x2bd1c10 bl 0x2bd8ce8 (dispatcher call).
+            assert_eq!(word(0x102_bd1b98), 0xd10103ff, "sh240 fnB 0x102bd1b98 prologue sub sp,#0x40");
+            // The dispatcher call-site bl (sign-extended imm26 -> 0x2bd8ce8). objdump: 0x94001c36.
+            assert_eq!(word(0x102_bd1c10), 0x94001c36, "sh240 fnB bl dispatcher 0x2bd8ce8");
+            // Dispatcher 0x102bd8ce8: entry sub sp,#0x50 ; 0x2bd8d14 bl getter 0x2174c04.
+            assert_eq!(word(0x102_bd8ce8), 0xd10143ff, "sh240 dispatcher 0x102bd8ce8 prologue sub sp,#0x50");
+            // Getter 0x2174c04 reads the manager holder via ldar at 0x2174c28 (adrp x8,7275000
+            // -> +0x550; base 0x2174c18 = adrp 7275000 0xb0028808).
+            assert_eq!(word(0x102_174c18), 0xb0028808, "sh240 getter adrp x8,7275000 (manager holder page)");
+            assert_eq!(word(0x102_174c28), 0xc8dffd00, "sh240 getter ldar x0,[0x102727550] (seeded manager holder)");
+            // The two leaf dispatches in the dispatcher body: 0x2bd8d2c blr x8 (vt+0xf8),
+            // 0x2bd8d50 blr x8 (vt+0x108), then the UNCONDITIONAL bl sub_2bd8dac at 0x2bd8d60.
+            assert_eq!(word(0x102_bd8d2c), 0xd63f0100, "sh240 dispatcher blr vt+0xf8 (first leaf)");
+            assert_eq!(word(0x102_bd8d50), 0xd63f0100, "sh240 dispatcher blr vt+0x108 (second leaf)");
+            assert_eq!(word(0x102_bd8d60), 0x94000013, "sh240 dispatcher bl sub_2bd8dac (0x2bd8d60)");
+            // sub_2bd8dac entry (dispatches vt+0x1f0) and its blr target slot read:
+            //     0x2bd8dac sub sp,#0x130 ; at 0x2bd8e20 ldr x8,[x8,#496]=vt+0x1f0, 0x2bd8e28 blr x8.
+            assert_eq!(word(0x102_bd8dac), 0xd104c3ff, "sh240 sub_2bd8dac prologue sub sp,#0x130 (vt+0x1f0 dispatch)");
+            assert_eq!(word(0x102_bd8e20), 0xf940f908, "sh240 sub_2bd8dac ldr x8,[x8,#496] = vt+0x1f0 (continueAfterFlagsLoaded_)");
+            assert_eq!(word(0x102_bd8e28), 0xd63f0100, "sh240 sub_2bd8dac blr x8 (dispatch continueAfterFlagsLoaded_)");
+            // continueAfterFlagsLoaded_ 0x102bd1d68 entry: stp x29,x30,[sp,#-96]! (0xa9ba7bfd).
+            assert_eq!(word(0x102_bd1d68), 0xa9ba7bfd, "sh240 continueAfterFlagsLoaded_ 0x102bd1d68 prologue stp [sp,#-96]!");
+            // Alignment + in-window for all pinned .text sites.
+            for (guest, name) in [
+                (0x102_bd1b98u64, "fnB entry"), (0x102_bd1c10u64, "fnB bl dispatcher"),
+                (0x102_bd8ce8u64, "dispatcher entry"), (0x102_174c18u64, "getter adrp"),
+                (0x102_174c28u64, "getter ldar"), (0x102_bd8d2cu64, "leaf1 blr"),
+                (0x102_bd8d50u64, "leaf2 blr"), (0x102_bd8d60u64, "bl sub_2bd8dac"),
+                (0x102_bd8dacu64, "sub_2bd8dac entry"), (0x102_bd8e20u64, "sub ldr vt+0x1f0"),
+                (0x102_bd8e28u64, "sub blr vt+0x1f0"), (0x102_bd1d68u64, "continueAfterFlagsLoaded_ entry"),
+            ] {
+                assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh240 {name} {guest:#x} in window");
+                assert!(guest & 3 == 0, "sh240 {name} {guest:#x} 4-aligned");
+            }
+            eprintln!("sh240 DMCONT dispatch chain pinned fresh-at-HEAD: fnB 0x102bd1b98 -> bl 0x2bd8ce8 dispatcher -> getter 0x2174c04 (ldar manager holder) -> leaf blrs vt+0xf8/vt+0x108 -> bl sub_2bd8dac (vt+0x1f0) -> continueAfterFlagsLoaded_ 0x102bd1d68. MEASURED fresh 3/3 (EXIT 124, 0 signals): the dispatcher is entered at block-entry 0x102bd8ce8 but the guest NEVER resumes past its first call-boundary (interior pcs + sub + continueAfterFlagsLoaded_ all 0 hits), so the DMCONT manufactured-manager continuation stays LATENT — SH228's negative re-confirmed at the newest HEAD; live engine-init session = the standing structural gate");
+        } else {
+            eprintln!("sh240 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh238_real_image_receivecall_dispatchband_select_slots_relocated() {
         // Real-image guard: the receiveCall dispatch-table band [0x635d970,0x635e700) must
         // carry RELATIVE relocs (loader-synthesized .data.rel.ro) covering the two select
