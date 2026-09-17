@@ -2740,6 +2740,107 @@ fn routeb_dm_alloc_capture_guard(_state: *mut CpuState, pc: u64) {
     );
 }
 
+/// SH248 (Route-B allocator-enabler line, opt-in JIT_ROUTEB_ALLOC_PROBE=1):
+/// The DMCONT continuation / StartLuaAppDM construction / operator_new ALL funnel
+/// through the real allocator (operator_new 0x1db1a38/0x1d96768 -> 0x1db1c60 tail
+/// wrapper -> 0x623fe1c free-list allocator). Headlessly sizes <=0xa succeed but
+/// 0x28/0x20 fail (`std::bad_alloc`); SH247 proved the working descriptor path
+/// itself cannot serve >0xa. This probe MEASURES the mechanism instead of treating
+/// it as an ROI judgment (operator doctrine): it logs allocator base (x0 = TLS obj
+/// OR the global fallback [0x67bf4c0]), requested size (x1), the size-class
+/// free-list node (base + round8(size) + 232) and its free-list head [+8] + 16-bit
+/// count [+16], so a follow-up can see whether small classes have pre-populated
+/// free-lists (a real CRT bootstrap) vs the 0x28/0x20 classes empty ("size-class
+/// region not set up") — the direct evidence whether a free-list seed is feasible
+/// (the 0x70c "single enabler for all of Route B") or provably not. Because a
+/// direct `b` tail-jump makes the allocator mid-block (block entered at the caller,
+/// SH217-class), the probe fires on a WINDOW of block-entry pcs across the whole
+/// allocator path, logging the pc + which function entered. Zero guest-byte mutation.
+fn routeb_alloc_probe_guard(state: *mut CpuState, pc: u64) {
+    if std::env::var_os("JIT_ROUTEB_ALLOC_PROBE").is_none() {
+        return;
+    }
+    // Windows (guest addr). block entry can be the op_new variants, the tail wrapper,
+    // or the free-list allocator tail.
+    let op_new_a = (0x101db1a38..0x101db1a44).contains(&pc); // 0x1db1a38
+    let op_new_b = (0x101d96768..0x101d96774).contains(&pc); // 0x1d96768
+    let wrap = (0x101db1c60..0x101db1c6c).contains(&pc); // 0x1db1c60 tail wrapper
+    let tail = (0x10623fe1c..0x10623fe28).contains(&pc); // 0x623fe1c free-list allocator
+    if !(op_new_a || op_new_b || wrap || tail) {
+        // SH248b: the continuation's `std::bad_alloc` is caused by libc++ string::assign
+        // into an object whose capacity word [x0] is garbage-huge (SH248 measured size
+        // 0xfffffffffffffff7 = -9). Probe the assign entry 0x2b50600 to capture the
+        // CALLER (x30) + the destination string object (x0) + src/len (x1/x2).
+        if pc == 0x102b50600 {
+            let s = unsafe { &*state };
+            eprintln!(
+                "[allocprobe] pc={pc:#x} STRING_ASSIGN x0(this)={:#x} [x0]={:#x} x1(src)={:#x} x2(len)={:#x} x30(caller)={:#x} x19={:#x}",
+                s.x[0],
+                if s.x[0] != 0 && s.x[0] < 0x8000_0000_0000 { unsafe { std::ptr::read_unaligned(s.x[0] as *const u64) } } else { 0 },
+                s.x[1], s.x[2], s.x[30], s.x[19],
+            );
+        }
+        return;
+    }
+    let s = unsafe { &*state };
+    let x0 = s.x[0];
+    let x1 = s.x[1];
+    let x2 = s.x[2];
+    // allocator-activation byte [0x10727570c].bit0 (headlessly clear -> NULL for size>0xa)
+    let flag = if (0x10727570cu64) >= 0x1000 {
+        unsafe { std::ptr::read_unaligned(0x10727570c as *const u8) }
+    } else {
+        0
+    };
+    if tail {
+        // free-list allocator: x0=base, x1=size, x2=align
+        let base = x0;
+        let size = x1;
+        let align = x2;
+        let in_class = size != 0 && size <= 0x400 && (align == 0 || size >= align);
+        let r8 = if in_class { (size + 7) & !7 } else { 0 };
+        let node = if in_class && base != 0 && base < 0x8000_0000_0000 {
+            base + r8 + 232
+        } else {
+            0
+        };
+        let freehead = if node != 0 && node >= 0x1000 && node < 0x8000_0000_0000 {
+            unsafe { std::ptr::read_unaligned((node + 8) as *const u64) }
+        } else {
+            0
+        };
+        let count = if node != 0 && node >= 0x1000 && node < 0x8000_0000_0000 {
+            unsafe { std::ptr::read_unaligned((node + 16) as *const u16) }
+        } else {
+            0
+        };
+        eprintln!(
+            "[allocprobe] pc={pc:#x} TAIL base={base:#x} size={size:#x} align={align:#x} flag={flag:02x} round8={r8:#x} node={node:#x} freehead={freehead:#x} count={count}{}{}",
+            if size > 0x400 { " SLOW(size>0x400)" } else { "" },
+            if align != 0 && size < align { " SLOW(align>size)" } else { "" }
+        );
+    } else if op_new_a || op_new_b {
+        // operator_new entry: x0=size, x1=2nd arg, x30=caller ret-addr (identifies the
+        // exact call site so a corrupted size like 0xfffffffffffffff7 can be located).
+        // x20 = usually this/object ptr at the call site (preserved across operator_new).
+        let obj = s.x[20];
+        let objw = if obj != 0 && obj < 0x8000_0000_0000 {
+            unsafe { std::ptr::read_unaligned(obj as *const u64) }
+        } else {
+            0
+        };
+        eprintln!(
+            "[allocprobe] pc={pc:#x} OPERATOR_NEW x0(size)={x0:#x} x1={x1:#x} x30(caller)={:#x} x19={:#x} x2={x2:#x} x20={obj:#x} [x20]={objw:#x} flag={flag:02x}",
+            s.x[30], s.x[19],
+        );
+    } else {
+        // tail wrapper: x0->(size), x1->align
+        eprintln!(
+            "[allocprobe] pc={pc:#x} WRAP x0={x0:#x} x1={x1:#x} x2={x2:#x} flag={flag:02x}",
+        );
+    }
+}
+
 /// SH88: the coherent empty span-hash map seeded by the --v2boot harness for the
 /// OTel/pb_defaults BSS registry slots, used to substitute for a non-zero sub-image
 /// map/this candidate (a `.data.rel.ro` protobuf TAG constant like 0x1800064, which
@@ -5362,6 +5463,10 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // Fires at the CRT operator-new wrapper block entry; self-gated on env, does not disturb
         // the fast/live allocator path when off. Only seeds a zero (never-engine-installed) active hook.
         routeb_dm_alloc_capture_guard(state, pc);
+        // SH248 (opt-in JIT_ROUTEB_ALLOC_PROBE=1): measute the real allocator tail's
+        // size-class free-list state at 0x10623fe1c so the 0x70c "<=0xa works / 0x28
+        // fails" gap is a measured mechanism, not an ROI judgment.
+        routeb_alloc_probe_guard(state, pc);
         unsafe { run(&block, state) };
         if step_trace {
             let s = unsafe { &*state };

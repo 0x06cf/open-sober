@@ -13227,6 +13227,56 @@ mod sh115_tests {
         }
     }
     #[test]
+    fn sh248_allocator_enabler_family_pinned() {
+        // SH248 (Route-B allocator-enabler line): the DMCONT continuation, op_new
+        // (both variants), AND StartLuaAppDM's own construction ALL funnel through
+        // the same allocator-activation byte [0x10727570c].bit0 + size-class free-list
+        // allocator. Headlessly <=0xa sizes work but 0x28/0x20 fail (bad_alloc);
+        // SH247 proved the working descriptor path can't serve >0xa. This is THE
+        // enabler for all of Route B (SH247 corroborating observation), so a drifted
+        // constant on ANY of these sites would silently break the whole forward line.
+        // Pin the real-image words (guest = file vaddr + 0x100000000; first LOAD
+        // segment file offset == vaddr):
+        //   operator_new variant A entry  0x1db1a38 = 0xd10243ff (sub sp,sp,#0x90)
+        //   variant A flag-cell adrp      0x1db1a68 = 0x9002a628 (adrp x8,7275000)
+        //   variant A flag-cell ldrb      0x1db1a6c = 0x395c3108 (ldrb w8,[x8,#1804] -> [0x10727570c])
+        //   operator_new variant B entry  0x1d96768 = 0xa9be7bfd (stp x29,x30,[sp,#-32]!)
+        //   allocator tail wrapper entry  0x1db1c60 = 0xa9be7bfd
+        //   real free-list allocator      0x623fe1c = 0xd100044a (sub x10,x2,#0x1)
+        //   StartLuaAppDM own flag-read   0x23ff31c = 0x395c3108 (ldrb w8,[x8,#1804])
+        let sites: [(usize, u32); 7] = [
+            (0x1db1a38, 0xd10243ff),
+            (0x1db1a68, 0x9002a628),
+            (0x1db1a6c, 0x395c3108),
+            (0x1d96768, 0xa9be7bfd),
+            (0x1db1c60, 0xa9be7bfd),
+            (0x623fe1c, 0xd100044a),
+            (0x23ff31c, 0x395c3108),
+        ];
+        // vaddr-guest transform + 4-alignment invariants.
+        for &(site, exp) in &sites {
+            let guest = 0x100000000u64 + site as u64;
+            assert_eq!(site & 3, 0, "allocator site 0x{site:x} must be 4-aligned");
+            assert!(guest >= 0x100000000, "guest addr must be in-image");
+        }
+        // distinct-address sanity (no two sites collide).
+        let mut addr = sites.map(|(s, _)| s);
+        addr.sort_unstable();
+        for w in addr.windows(2) {
+            assert_ne!(w[0], w[1], "allocator pin sites must be distinct");
+        }
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            for &(site, exp) in &sites {
+                let w = u32::from_le_bytes([img[site], img[site + 1], img[site + 2], img[site + 3]]);
+                assert_eq!(w, exp, "SH248 allocator site file vaddr 0x{site:x} must be {exp:08x}");
+            }
+        } else {
+            eprintln!("sh248 real-image guard: no real libroblox.so, skipping");
+        }
+    }
+    #[test]
     fn sh200_v2_dispatch_window_materializes_obj_and_nops_to_blr() {
         // SH200 V2-init dispatch window (fn 0x6251e0c etc.): the first 4 slots
         // load the stable object into x0, the rest are nops (killing the
