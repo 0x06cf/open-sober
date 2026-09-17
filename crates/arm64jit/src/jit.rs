@@ -913,6 +913,64 @@ fn routeb_appstart_once_seed_guard(_state: *mut CpuState, pc: u64) {
     }
 }
 
+/// SH248f (opt-in JIT_ROUTEB_APPSART_ADAPTER_SEED): fabricate the app-lifecycle
+/// adapter object at fixed global [0x106b0bde0] so the DMCONT continuation's
+/// nativeAppBridgeAppStart path gets past its closure dispatch. After the once-cell
+/// seed (SH248e) clears the 0x102339208 fault, the app-start continues to 0x2339020:
+/// setActive (0x21f5f80, bl'd @0x233901c) copies the adapter triplet
+/// [0x106b0bde0]/[0x106b0bde8] into the frame, then `ldp x0,x19,[sp,#16]` loads
+/// x0=[0x106b0bde0] and `ldr x8,[x0]; ldr x8,[x8]; sub x2,x29,#0x40; mov w1,#3; blr x8`
+/// (0x233903c..0x233904c) virtual-dispatches the adapter's vt[0]. The global is NULL
+/// headlessly -> `ldr x8,[x0]` faults SIGSEGV guestpc=0x102339020 (x0=0,x1=0). Seeding
+/// [0x106b0bde0] = a fabricated object whose vtable is all-leaf (vt[0]=benign host
+/// leaf, every slot leaf) makes the dispatch resolve benignly. [0x106b0bde8] is left 0
+/// (setActive's `cbz x9, ret` skips the refcount when it's 0 — benign). Fires at the
+/// block entry 0x102339020 (inside nativeAppBridgeAppStart); idempotent (only when the
+/// global is 0). Default-inert.
+fn routeb_appstart_adapter_seed_guard(_state: *mut CpuState, pc: u64) {
+    if std::env::var("JIT_ROUTEB_APPSART_ADAPTER_SEED").ok().as_deref() != Some("1") {
+        return;
+    }
+    // Fire at the closure-dispatch block entry. The app-start resumes from the once-fn
+    // `bl 2339208` at 0x2339018 (0x102339018); the setActive call + closure dispatch
+    // (0x2339020..0x233904c) are MID-BLOCK, so the whole run defaults to the 0x102339018
+    // entry. Range [0x102339018,0x102339050) covers it.
+    if !(0x102339018..0x102339050).contains(&pc) {
+        return;
+    }
+    const ADAPTER_GLOBAL: u64 = 0x106b0bde0; // pointer to the app-lifecycle adapter object
+    if routeb_ensure_writable(ADAPTER_GLOBAL)
+        && unsafe { std::ptr::read_unaligned(ADAPTER_GLOBAL as *const u64) } == 0
+    {
+        let obj = routeb_appstart_adapter_object();
+        unsafe { std::ptr::write_unaligned(ADAPTER_GLOBAL as *mut u64, obj) };
+        eprintln!(
+            "[routeb-sh248f] seeded app-lifecycle adapter global [0x{ADAPTER_GLOBAL:x}] = 0x{obj:x} (all-leaf-vt object) at pc=0x{pc:x} (was NULL -> would SIGSEGV 0x102339020)"
+        );
+    }
+}
+
+/// Leaked fabricated app-lifecycle adapter object: all-leaf vtable, so any vt[N]
+/// virtual dispatch resolves to a benign host leaf. Stable per process.
+fn routeb_appstart_adapter_object() -> u64 {
+    use std::sync::OnceLock;
+    static OBJ: OnceLock<u64> = OnceLock::new();
+    *OBJ.get_or_init(|| {
+        extern "C" fn adapter_leaf(_a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64) -> u64 {
+            routeb_appstart_adapter_object()
+        }
+        let leaf = register_host_call_auto(adapter_leaf);
+        let v: &'static mut [u8] = Box::leak(vec![0u8; 0x200usize].into_boxed_slice());
+        for slot in 0..(0x200 / 8) {
+            unsafe { *(v.as_mut_ptr().wrapping_add(slot * 8) as *mut u64) = leaf; }
+        }
+        let o = Box::leak(vec![0u8; 0x100usize].into_boxed_slice()).as_mut_ptr() as u64;
+        unsafe { *(o as *mut u64) = v.as_ptr() as u64; }
+        eprintln!("[routeb-sh248f] fabricated app-lifecycle adapter object 0x{o:x} [vt]={:#x} (all-leaf)", v.as_ptr() as u64);
+        o
+    })
+}
+
 /// SH177 (objective 2b / recon deleg_48e16777 task-0+task-1): write a classified
 /// value into the engine's cookie-jar container as a valid libc++ `std::string`.
 ///
@@ -5539,6 +5597,10 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // global [0x106b0bdf0] -> -1 cell so fn 0x2339208 skips its pthread_mutex_lock
         // branch (NULL once-cell -> SIGSEGV 0x102339208 on the DMCONT continuation).
         routeb_appstart_once_seed_guard(state, pc);
+        // SH248f (opt-in JIT_ROUTEB_APPSART_ADAPTER_SEED): fabricate the NULL app-lifecycle
+        // adapter at [0x106b0bde0] so the continuation's app-start closure dispatch (vt[0]
+        // blr @0x233904c) resolves benignly instead of SIGSEGV'ing at 0x102339020.
+        routeb_appstart_adapter_seed_guard(state, pc);
         // SH164 (recon deleg_94aac9d7): governor-tail dispatch block-entry capture.
         // Fires on EVERY run (self-gated on JIT_ROUTEB_DMTRACE) so a follow-up cycle
         // can observe whether the tail's vt[+0x30] dispatch ever resolves to the
@@ -7028,11 +7090,9 @@ mod tests {
 
     #[test]
     fn sh248e_appstart_once_guard_is_env_pc_gated_and_seeds_minus_one() {
-        // SH248e: routeb_appstart_once_seed_guard must be (a) inert without
-        // JIT_ROUTEB_APPSART_ONCE_SEED, (b) fire only in the app-start once-check fn
-        // range [0x102339208,0x102339244), (c) seed the once-cell POINTER global
-        // [0x106b0bdf0] with a leaked cell holding -1 (so the `cmn x8,#0x1; b.eq`
-        // skip is taken instead of the pthread_mutex_lock branch), idempotently.
+        // SH248e: ... Serialized with CONT_MGR_TEST_LOCK so the parallel test batch does
+        // not re-zero the shared fixed .bss once-cell between this test's asserts.
+        let _mgr_guard = CONT_MGR_TEST_LOCK.lock().unwrap();
         const ONCE_CELL: u64 = 0x106b0bdf0;
         unsafe {
             assert!(
@@ -7079,6 +7139,57 @@ mod tests {
             );
             std::env::remove_var("JIT_ROUTEB_APPSART_ONCE_SEED");
             std::ptr::write_unaligned(ONCE_CELL as *mut u64, 0);
+        }
+    }
+
+    #[test]
+    fn sh248f_appstart_adapter_guard_is_env_pc_gated_and_seeds_leaf_object() {
+        // SH248f: ... Serialized with CONT_MGR_TEST_LOCK (shared fixed .bss cell page).
+        let _mgr_guard = CONT_MGR_TEST_LOCK.lock().unwrap();
+        const ADAPTER_GLOBAL: u64 = 0x106b0bde0;
+        unsafe {
+            assert!(
+                routeb_ensure_writable(ADAPTER_GLOBAL),
+                "adapter page must be writable (fixed .bss in a unit test)"
+            );
+            // (a) env unset, pc in-range -> inert.
+            std::env::remove_var("JIT_ROUTEB_APPSART_ADAPTER_SEED");
+            std::ptr::write_unaligned(ADAPTER_GLOBAL as *mut u64, 0);
+            routeb_appstart_adapter_seed_guard(std::ptr::null_mut(), 0x102339020);
+            assert_eq!(
+                std::ptr::read_unaligned(ADAPTER_GLOBAL as *const u64),
+                0,
+                "env-gated: without JIT_ROUTEB_APPSART_ADAPTER_SEED the guard must stay inert"
+            );
+
+            // (b) env set, wrong pc -> inert.
+            std::env::set_var("JIT_ROUTEB_APPSART_ADAPTER_SEED", "1");
+            routeb_appstart_adapter_seed_guard(std::ptr::null_mut(), 0x102339000);
+            assert_eq!(
+                std::ptr::read_unaligned(ADAPTER_GLOBAL as *const u64),
+                0,
+                "pc-gated: must fire only in [0x102339020,0x102339050)"
+            );
+
+            // (c) env set + in-range pc -> seed a fabricated all-leaf-vt object.
+            routeb_appstart_adapter_seed_guard(std::ptr::null_mut(), 0x102339018);
+            let obj = std::ptr::read_unaligned(ADAPTER_GLOBAL as *const u64);
+            assert_ne!(obj, 0, "adapter object pointer must be seeded non-NULL");
+            let vt = std::ptr::read_unaligned(obj as *const u64);
+            assert_ne!(vt, 0, "adapter vtable pointer must be non-NULL");
+            let leaf = std::ptr::read_unaligned(vt as *const u64);
+            assert!(leaf != 0, "vt[0] must be a non-NULL benign leaf");
+
+            // Idempotent: re-fire leaves the already-populated slot untouched.
+            std::ptr::write_unaligned(ADAPTER_GLOBAL as *mut u64, 0x1234);
+            routeb_appstart_adapter_seed_guard(std::ptr::null_mut(), 0x102339050 - 4);
+            assert_eq!(
+                std::ptr::read_unaligned(ADAPTER_GLOBAL as *const u64),
+                0x1234,
+                "idempotent: a non-NULL slot must be left untouched"
+            );
+            std::env::remove_var("JIT_ROUTEB_APPSART_ADAPTER_SEED");
+            std::ptr::write_unaligned(ADAPTER_GLOBAL as *mut u64, 0);
         }
     }
 
