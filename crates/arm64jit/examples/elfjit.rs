@@ -14895,6 +14895,65 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh261_appstart_drain_surface_advances_past_lsm_wall_pinned() {
+        // SH261 (single-agent, cone suppressed): measure the NEW frontier at THIS HEAD after SH260
+        // parked the LocalStorageManager insert-leaf (persistence detour). Re-running the exact SH259
+        // repro (full SH248c-f + SH259 seed set, real libroblox.so) the app-start body now walks DEEP
+        // into its own self-drive message-loop drain: region-watch [0x10233a000,0x102350000) fires 100+
+        // distinct pcs INCLUDING the app-start drain 0x233bc88..0x233bcf0 which calls the drain
+        // once-check 0x21dae90 (lpp.. the drain spin) and the registry/once builder 0x21daef8, then
+        // reads [[0x6a70c90]+0] and blr vt+48 (0x233bcc4..0x233bccc) — a LIVE heap-object virtual
+        // dispatch. THE TERMINAL IS RUN-VARIABLE live-object class: run-to-run it is either
+        //   (a) the SH260 LSM insert-leaf SIGSEGV 0x101db1d04 (dominant, the parked persistence wall),
+        //   (b) `std::bad_function_call` thrown inside the drain path (0x21daef8 had case: the empty
+        //       std::function target lives in a LIVE heap app-start object, NOT a fixed global), or
+        //   (c) an early-return SIGSEGV at engine-init 0x1021748a4.
+        // There is NO fixed-.bss seed lever here: the empty std::function belongs to a host-heap
+        // app-start object (SH174/SH204 gate), and the blr vt+48 target is heap-resolved. This is the
+        // SAME structural Route-B live-DM gate — the app-start body demonstrably advances past the LSM
+        // line but still terminates at live-object construction, not a seedable cell.
+        // HONEST: does NOT manufacture a DM; Route-B live-DM structural gate UNCHANGED; SH174
+        // capture-latch stays the single forward hook. These words pin the NEWLY-REACHED drain surface
+        // so a drift fails loudly. Default-inert (test only).
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            // app-start self-drive drain (message-loop block 0x233bc88..0x233bcf0)
+            assert_eq!(word(0x102_33_bc88), 0xaa1403e0, "sh261 drain mov x0,x20");
+            assert_eq!(word(0x102_33_bc8c), 0x97fa7c81, "sh261 drain bl 0x21dae90 (once-check)");
+            assert_eq!(word(0x102_33_bcb4), 0x97fa7c91, "sh261 drain bl 0x21daef8 (registry builder)");
+            assert_eq!(word(0x102_33_bcb8), 0xb00239a8, "sh261 drain adrp 6a70000");
+            assert_eq!(word(0x102_33_bcc0), 0xb40001c0, "sh261 drain cbz (live-obj check)");
+            assert_eq!(word(0x102_33_bcc4), 0xf9400008, "sh261 drain ldr x8,[x0] (vtable)");
+            assert_eq!(word(0x102_33_bccc), 0xd63f0100, "sh261 drain blr vt+48 (live dispatch)");
+            assert_eq!(word(0x102_33_bce0), 0xf9400a68, "sh261 drain ldr x8,[x19,#16] (loop ctr)");
+            // the registry/once builder entered by the drain
+            assert_eq!(word(0x102_1d_aef8), 0xd100c3ff, "sh261 registry builder entry sub sp,#0x30");
+            // the map-insert op_new inside the builder region (LocalStorage market: operator_new(0x18))
+            assert_eq!(word(0x102_1d_b07c), 0x97eeedbb, "sh261 map-insert bl operator_new(0x1d96768)");
+            for (guest, name) in [
+                (0x102_33_bc88u64, "drain"), (0x102_33_bc8cu64, "drain bl once"),
+                (0x102_33_bcb4u64, "drain bl registry"), (0x102_33_bcb8u64, "drain adrp"),
+                (0x102_33_bcc0u64, "drain cbz"), (0x102_33_bcc4u64, "drain vtable"),
+                (0x102_33_bcccu64, "drain blr"), (0x102_33_bce0u64, "drain loop"),
+                (0x102_1d_aef8u64, "registry builder"), (0x102_1d_b07cu64, "map-insert op_new"),
+            ] {
+                assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh261 {name} {guest:#x} in window");
+                assert!(guest & 3 == 0, "sh261 {name} {guest:#x} 4-aligned");
+            }
+            eprintln!("sh261 app-start drain surface pinned (drain 0x233bc88..0x233bcf0 + registry builder 0x21daef8), terminal = run-variable live-object (bad_function_call / LSM SIGSEGV / 0x1748a4) on libroblox.so");
+        } else {
+            eprintln!("sh261 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh236_startluaappdm_receivecall_dispatch_softreturns_before_marshaler() {
         // SH236 (Route-B re-attack, single-agent): SH235 statically concluded the EC world
         // 0x102e24598's only headless front-door (StartLuaAppDM -> bl 0x1023f1210 @0x1023f075c) is
