@@ -2438,6 +2438,95 @@ fn routeb_patch_getter_fmod_tail_ret() {
     }
     ROUTEB_GETTER_FMOD_TAIL_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
+static ROUTEB_CONT_OPNEW_BOX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+/// SH245 candidate (1) next gate: now that continueAfterFlagsLoaded_ 0x102bd1d68
+/// runs its full body headlessly (GETTER_TAIL_RET + M48_SEED), it reaches the
+/// `bl operator_new(0x28)` at file 0x2bd2128 (guest 0x102bd2128) with w0=0x28.
+/// operator_new 0x1db1a38's fast path returns NULL for size>0xa whenever the
+/// global allocator-activation byte [0x10727570c].bit0 is clear (headlessly
+/// clear) -> x19=0x0 -> the closure boxes a NULL ptr -> `stp x8,x26,[x0]` at
+/// 0x2bd2140 writes to [0] = std::bad_alloc/libc++abi terminate (SH245 #3).
+/// The broader fix — seeding [0x10727570c].bit0=1 so ALL operator_new calls go
+/// real-alloc — is a MEASURED regression (SH245 #4: 3/3 early SIGABRT, real-alloc
+/// path not headless-producible). So: SCOPE to this exact call site. The 3-slot
+/// window 0x2bd2120..0x2bd212c (`mov w0,#0x28; mov w1,#0x8; bl 1db1a38`) is
+/// replaced with materializing a stable leaked 0x40 zeroed box into x0
+/// (movz hw0 / movk hw1 / movk hw2 = 48-bit host heap pointer, safely < 2^48 on
+/// this box), then control falls through to 0x2bd212c (`adrp x8,...`). The
+/// continuation writes its closure into [x0]+0/0x10/0x20 (writethrough at
+/// 0x2bd2140/0x2bd2154/0x2bd2158), so a zeroed writable leak is exactly right —
+/// it boxes a real 0x40 object instead of NULL. Idempotent, opt-in
+/// JIT_ROUTEB_DM_CONT_OPNEW_BOX, real-image word-guarded.
+fn routeb_patch_cont_opnew_box() {
+    if ROUTEB_CONT_OPNEW_BOX_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    if std::env::var("JIT_ROUTEB_DM_CONT_OPNEW_BOX").ok().as_deref() != Some("1") {
+        return;
+    }
+    let boxp = *ROUTEB_CONT_OPNEW_BOX.get_or_init(|| {
+        let b = Box::leak(vec![0u8; 0x40usize].into_boxed_slice()).as_mut_ptr() as u64;
+        eprintln!("[elfjit:routeB] SH245-closure allocated leaked 0x40 box at {b:#x}");
+        b
+    });
+    if boxp >> 48 != 0 {
+        eprintln!("[elfjit:routeB] WARN SH245-closure box 0x{boxp:x} needs >48 bits (movz hw0-hw2 cannot materialize), not patched");
+        ROUTEB_CONT_OPNEW_BOX_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    // movz x0,#lo16 ; movk x0,#mid16,lsl16 ; movk x0,#hi16,lsl32
+    #[inline]
+    fn word_at(hw: u32, imm: u16) -> u32 {
+        if hw == 0 {
+            0xD280_0000u32 | ((imm as u32) << 5) // movz x0,#imm hw0
+        } else {
+            (0xF280_0000u32 + (hw << 21)) | ((imm as u32) << 5) // movk x0 hwN
+        }
+    }
+    let w = [
+        word_at(0, (boxp & 0xffff) as u16),
+        word_at(1, ((boxp >> 16) & 0xffff) as u16),
+        word_at(2, ((boxp >> 32) & 0xffff) as u16),
+    ];
+    // Real-image word guard for the 3-slot window (file 0x2bd2120/24/28):
+    // 0x52800500 mov w0,#0x28 ; 0x52800101 mov w1,#0x8 ; 0x97c77e44 bl 0x1db1a38.
+    let expected = [0x5280_0500u32, 0x5280_0101u32, 0x97c7_7e44u32];
+    let start = 0x102bd2120u64; // guest = file(0x2bd2120) + 0x100000000
+    let page = (start & !0xfff) as *mut libc::c_void;
+    unsafe {
+        if libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_WRITE) != 0 {
+            eprintln!("[elfjit:routeB] WARN mprotect RW failed for SH245-closure op_new @0x{start:x} errno={}", std::io::Error::last_os_error());
+            ROUTEB_CONT_OPNEW_BOX_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        let ok = (0..3).all(|i| *(start as *const u32).add(i) == expected[i]);
+        let before0 = *(start as *const u32);
+        if !ok {
+            eprintln!("[elfjit:routeB] WARN SH245-closure op_new @0x{start:x} unexpected word0 {before0:08x}, not patched (binary drifted?)");
+            libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+            ROUTEB_CONT_OPNEW_BOX_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        for (i, ww) in w.iter().enumerate() {
+            *((start + (i as u64) * 4) as *mut u32) = *ww;
+        }
+        let r0 = *(start as *const u32);
+        let r1 = *((start + 4) as *const u32);
+        let r2 = *((start + 8) as *const u32);
+        libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+        // The patched call site is MID-straight-line-block: it is cached under the
+        // block's ENTRY pc (0x102bd1d68 or 0x102bd1dfc per region-watch), NOT under
+        // [0x102bd2120,0x102bd212c). block_cache_drop_region matches by entry pc, so
+        // a window-only drop would leave the stale compiled block calling op_new —
+        // measured (boxpatch fires but still bad_alloc). Widen to the whole
+        // continuation region [fnB 0x102bd1d68, 0x102bd2600) so every containing
+        // block re-translates from the patched bytes.
+        arm64jit::jit::block_cache_drop_region(0x102bd1d68, 0x102bd2600);
+        eprintln!("[elfjit:routeB] SH245-closure patched op_new @0x{start:x} 12B -> x0 = leaked 0x40 box 0x{boxp:x} (readback {r0:08x} {r1:08x} {r2:08x})");
+    }
+    ROUTEB_CONT_OPNEW_BOX_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+static ROUTEB_CONT_OPNEW_BOX_PATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static ROUTEB_RUNG0_DISPATCH_PATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// SH126-followup (recon deleg_fcd65c31): with JIT_SERIALIZE_RENDER the drain
 /// overlap is gone, but the residual run-variable rung-0 crash is a null-store in
@@ -6828,6 +6917,11 @@ fn main() {
             // returns to the dispatcher (0x2bd8d18) instead of diving into a tail that
             // never returns. Self-guards on its own env (inert by default).
             routeb_patch_getter_fmod_tail_ret();
+            // SH245-candidate-1 (Route-B, opt-in JIT_ROUTEB_DM_CONT_OPNEW_BOX):
+            // once the continuation runs it reaches `bl op_new(0x28)` which returns
+            // NULL headlessly (allocator-activation gate clear, size>0xa) -> box a
+            // leaked 0x40 object instead. Self-guards on its own env (inert by default).
+            routeb_patch_cont_opnew_box();
             // SH115: the three nullable-singleton dispatch accessors (V2Init/
             // V2Start/V1AppStart/SendAppEventOnAppReady) soft-return because
             // their `blr` reads past the 0x60 vtable. Scoped-patch each site to
@@ -12942,6 +13036,83 @@ mod sh115_tests {
             );
         } else {
             eprintln!("sh245 real-image guard: no real libroblox.so, skipping");
+        }
+    }
+    #[test]
+    fn sh246_cont_opnew_closure_boxes_real_object_not_null() {
+        // SH245-candidate-1: the active continuation reaches `bl operator_new(0x28)`
+        // at file 0x2bd2128 (w0=0x28, w1=0x8). Headlessly operator-new's fast path
+        // returns NULL for size>0xa when the allocator-activation byte
+        // [0x10727570c].bit0 is clear -> the closure `stp x8,x26,[x0]` at 0x2bd2140
+        // boxes NULL -> bad_alloc. The fix materializes a leaked 0x40 box into x0
+        // over the 3-slot window (movz hw0 / movk hw1 / movk hw2 = 48-bit host heap
+        // ptr) and drops the bl. This hermetic pins:
+        //   (a) the exact 3 words of the real-image call-site (the patch target),
+        //   (b) the movz/movk encoding round-trips a 48-bit box ptr back to itself,
+        //   (c) the patch's real-image word guard would FAIL on a drifted window.
+        // Real-image site words (file 0x2bd2120,0x2bd2124,0x2bd2128):
+        //   mov w0,#0x28 (0x52800500) ; mov w1,#0x8 (0x52800101) ; bl 0x1db1a38.
+        let window_file_start = 0x2bd2120usize;
+        let expected = [0x5280_0500u32, 0x5280_0101u32, 0x97c7_7e44u32];
+        let make_word = |hw: u32, imm: u16| -> u32 {
+            if hw == 0 {
+                0xD280_0000u32 | ((imm as u32) << 5)
+            } else {
+                (0xF280_0000u32 + (hw << 21)) | ((imm as u32) << 5)
+            }
+        };
+        // (b) round-trip a 48-bit host heap pointer through movz hw0 + movk hw1 + movk hw2.
+        let boxp: u64 = 0x55a1_b2c3_d4e5_f607 & 0x0000_ffff_ffff_ffff; // <= 2^48-1
+        let words = [
+            make_word(0, (boxp & 0xffff) as u16),
+            make_word(1, ((boxp >> 16) & 0xffff) as u16),
+            make_word(2, ((boxp >> 32) & 0xffff) as u16),
+        ];
+        // each of the 3 materialize words differs from the original site word (a
+        // silent no-op patch would be a false negative) AND from each other.
+        for (i, mw) in words.iter().enumerate() {
+            let mut ex = expected;
+            ex[i] = *mw;
+            // words are distinct (no one-word overwrite collides with another original word)
+            let pairwise = (0..3).all(|x| (0..3).all(|y| x == y || ex[x] != ex[y]));
+            assert!(pairwise, "the NOMINAL window words differ → a one-word overwrite wouldn't collide");
+        }
+        let rebuilt = ((words[0] >> 5) & 0xffff) as u64
+            | ((((words[1] >> 5) & 0xffff) as u64) << 16)
+            | ((((words[2] >> 5) & 0xffff) as u64) << 32);
+        assert_eq!(rebuilt, boxp, "movz/movk hw0-hw2 must reconstruct boxp");
+        // movz must be a movz (opcode class 0b10100101 top byte 0xD2), movk 0xF2.
+        assert_eq!(words[0] & 0xFF00_0000, 0xD200_0000, "hw0 must be movz");
+        assert!(words[1] & 0xFF00_0000 == 0xF200_0000, "hw1 must be movk");
+        assert!(words[2] & 0xFF00_0000 == 0xF200_0000, "hw2 must be movk");
+        // (a) + (c) real-image guard: pin the three original words on disk.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            for (i, exp) in expected.iter().enumerate() {
+                let off = window_file_start + i * 4;
+                let w = u32::from_le_bytes([
+                    img[off],
+                    img[off + 1],
+                    img[off + 2],
+                    img[off + 3],
+                ]);
+                assert_eq!(w, *exp, "SH246 op_new window file vaddr 0x{off:x} word{i} must be {exp:08x}");
+            }
+            // (c) the patch's word guard (all 3 == expected) succeeds on the real image,
+            // and would FAIL if any one word drifted to the box-materialize encoding.
+            let ok_nominal = (0..3).all(|i| {
+                let off = window_file_start + i * 4;
+                u32::from_le_bytes([img[off], img[off + 1], img[off + 2], img[off + 3]]) == expected[i]
+            });
+            assert!(ok_nominal, "real-image word guard must pass on current binary");
+            let drifted = (0..3).any(|i| {
+                let off = window_file_start + i * 4;
+                u32::from_le_bytes([img[off], img[off + 1], img[off + 2], img[off + 3]]) == words[i]
+            });
+            assert!(!drifted, "a drifted site already holding a materialize word would mean the patch is already applied / binary is rebuilt (false negative)");
+        } else {
+            eprintln!("sh246 real-image guard: no real libroblox.so, skipping");
         }
     }
     #[test]
