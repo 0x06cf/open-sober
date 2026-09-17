@@ -412,38 +412,19 @@ extern "C" fn type4_frame_thunk(
 /// drives through the engine's OWN scene renderer (guest 0x105b2ead4).
 ///
 /// The scene-renderer disasm (file 0x5b2ead4) reads, for this=x0=R:
-///   R+0x160 (352) = ctx (derefs [ctx] for its vtable; make-current/[vt+16],
-///                     dims-query/[vt+64], frame-cache-query/[vt+32])
-///   R+0x170 (368) = view pointer (reads W/H at [view+112]/[view+116])
-///   R+0x180/0x188 (384/392) = scene list head/tail (stride 0x28; equal EOF)
-/// It then: bind ctx, query dims, and — UNCONDITIONALLY, before ever checking
-/// the scene array — operator-new(0x98) -> frame-desc ctor 0x5b34de8(this,
-/// R, W, H, 1, 1, 4, w7) -> link 0x5b2d9e0(&R+0x170, frame). Only then does it
-/// walk R+0x180..R+0x188 and, if non-empty, build ONE MORE real 0x98 frame per
-/// 0x28-stride scene node (SH63: disasm at file 0x5b2eb9c — for each node reads
-/// [node+8]=render-obj, [node+0x18]=view, dims-queries via obj-vt[+64], links a
-/// fresh frame at container node+0x18 via 0x5b2d9e0, advancing by 0x28 until
-/// the next-frame == tail). So a populated scene list makes the ENGINE build N
-/// extra real frame-desc items, each registered into its node — the per-node
-/// engine-detail frame plane SH62's empty-scene proof left as the next frontier.
+///   R+0x160=ctx (vt; make-current/[vt+16], dims-query/[vt+64], frame-cache/[vt+32])
+///   R+0x170=view (W/H at +112/+116); R+0x180/0x188=scene head/tail (stride 0x28)
+/// Unconditionally: operator-new(0x98) -> frame-desc ctor 0x5b34de8 -> link 0x5b2d9e0,
+/// then if scene list non-empty builds ONE extra real 0x98 frame per 0x28 node
+/// (reads [node+8]=render-obj + [node+0x18]=view, dims via obj-vt[+64], links at
+/// node+0x18 via 0x5b2d9e0 until next==tail).
 ///
-/// `node_count` scene nodes (default 0 = the legacy empty-scene fast path that
-/// still builds the single base frame-desc) are laid out contiguously from
-/// R+0x210, each 0x28 bytes. Per the per-node loop disasm + the 0x5b2d9e0
-/// linker (writes the frame + a 0x20 link-node into the container):
-///   [node+0x00] = 0            (not read by the renderer/ctor/linker)
-///   [node+0x08] = render-obj   (only obj-vt[+64] dims-query is blr'd — reuse ctx)
-///   [node+0x10] = 0            (not read)
-///   [node+0x18] = view ptr     (read for W/H at +112/+116; MUST be non-NULL —
-///                              the `ldp` derefs it before the null-check; the
-///                              linker overwrites it with the frame)
-///   [node+0x20] = 0            (linker's [container+8] old tail — 0 skips chaining)
-/// The sentinel view guarantees the build branch (forced W/H != surface dims).
+/// `node_count` nodes (default 0 = legacy empty-scene fast path) from R+0x210, each 0x28:
+///   [0]=0, [8]=render-obj, [0x10]=0, [0x18]=view (non-NULL; linker overwrites), [0x20]=0.
+/// Sentinel view forces the build branch.
 ///
-/// Returns the R base (guest==host, engine derefs it directly). R+0x180=head,
-/// R+0x188=tail = head + node_count*0x28 (one-past-end) when node_count>0, so
-/// the engine's `cmp x8,x24; b.eq skip` per-node gate passes and it builds the
-/// per-node frames.
+/// Returns the R base (guest==host). R+0x180=head, R+0x188=tail=head+node_count*0x28
+/// (one-past-end) when node_count>0, so the engine's per-node gate passes and builds them.
 fn render_scene_base(node_count: u64) -> u64 {
     let existing = RENDERSCENE_BASE.load(core::sync::atomic::Ordering::Relaxed);
     let populated = SCENE_NODES.load(core::sync::atomic::Ordering::Relaxed);
@@ -7146,39 +7127,18 @@ fn main() {
                     ("V2StartAppWithParams", 0x10258b144, [env_ptr, thiz, start_params, 0, 0, 0, 0, 0]),
                 ];
                 dump("boot start");
-                // Route-B latch (docs/recon-routeB-globaltinit-unblock.md, verified
-                // file 0x22474e8 `strb w19,[x9,#2516]` with x9=adrp 0x7273000:
-                // nativeGameGlobalInit only leaves its nanosleep park once .bss byte
-                // [0x72739d4] bit0==1 "flags have been loaded"; SH55/62 stalled at
-                // rung 1 because it defaulted 0. Drive nativeInitializeNativeFlags
-                // (0x10232048c) FIRST as rung 0 — it is on the engine's own
-                // flags-loaded write chain (0x2320cec -> 0x2320f2c -> the latch
-                // setter) — so the latch is set through GUEST code (JIT-translated,
-                // safely hits the real RW map) instead of a fragile raw host write.
-                // NativeFlagsInterface getters are stubbed (GetFlagsCount>=1 +
-                // empty jstrings) via the JNI value registry. --v2boot-r246 keeps
-                // the SH58 probe (no GlobalInit); V2BOOT_SEED_LATCH keeps working.
-                // SH82: nativeGameGlobalInit's GameGlobalInitImpl thread-dispatch
-                // (file 0x2206db8, verified) compares pthread_self() (cmp x0,x20)
-                // against the engine's stored main-thread id cell [0x6863a68]
-                // (ldr x20,[x8,#2664], x8=adrp 0x6863000) at 0x2206de4/0x2206dec.
-                // When they MATCH -> the b.ne at 0x2206df0 is not taken -> the
-                // dispatch tail-calls vt[+48] of the [thiz+32] object (~immediate)
-                // and GlobalInit is done. When they DIFFER (the harness's detached
-                // ladder thread IS a non-main thread) -> the b.ne jumps to 0x2206e28
-                // -> the inline do-init chain runs REAL scheduler/TaskScheduler
-                // construction end-to-end then waits at the 0x2207648 completion
-                // spin (ldrb [x19+1]; tbnz #0 -> poll fn 0x22076f0->0x2850520 ->
-                // b 0x2207648) for a posted-job completion flag the headless
-                // main-thread scheduler never sets -> the rung parks FOREVER and
-                // the ladder never prints "after nativeGameGlobalInit" (SH82: the
-                // pre-fix park, exit 124). NOTE: SH82 A/B proved forcing the match
-                // via a .text NOP on the b.ne is a REGRESSION (6/6 json-crash on
-                // the main-thread StartApp serialization vs 8/8 clean baseline) —
-                // it re-routed the MAIN thread's own boot call incorrectly.
-                // Instead, seed [0x6863a68] = THIS rung thread's pthread_self so its
-                // own GlobalInit call takes the vt[+48] match path (no .text patch,
-                // restored after only for rung 1, main-thread id untouched).
+                // Route-B latch (recon-routeB-globaltinit-unblock.md): nativeGameGlobalInit
+                // only leaves its nanosleep park once [0x72739d4].bit0==1 "flags loaded";
+                // SH55/62 stalled at rung1 (defaulted 0). Drive nativeInitializeNativeFlags
+                // (0x10232048c) FIRST as rung 0 — it's on the engine's own flags-loaded write
+                // chain (0x2320cec->0x2320f2c->latch setter) so the latch is set through GUEST
+                // code, not a raw host write. SH82: GlobalInit thread-dispatch (0x2206db8)
+                // compares pthread_self vs stored main-id [0x6863a68] @0x2206de4; matching ->
+                // b.ne not taken -> tail-call vt[+48] (immediate, done); differing (ladder
+                // thread is non-main) -> b.ne to 0x2206e28 -> real scheduler construction then
+                // parks forever at 0x2207648 (posted-job flag headless scheduler never sets).
+                // SH82 A/B: NOP-ing the b.ne is a REGRESSION (routes the MAIN thread's own
+                // boot call wrong). Instead seed [0x6863a68] = THIS rung thread's pthread_self.
                 let main_id_cell: u64 = 0x106863a68;
                 let orig_main_id = unsafe { *(main_id_cell as *const u64) };
                 // SH86: the OTel/pb_defaults registration path (reached deep inside
@@ -7859,6 +7819,46 @@ fn main() {
                         "[elfjit:v2boot] app-event post: MH_FLAGS_LOADED={nf2} MH_APP_READY={ar2}"
                     );
                     dump("SendAppEventOnAppReady");
+                }
+                // SEP-17 SESSION-CTOR client-settings feed: SH264 drove only the plain
+                // nativeInitClientSettings (0x1022265fc) at version=0 (empty-early).
+                // nativeInitClientSettingsSigned (0x102bb070c) — what the real app delivers —
+                // decodes the version word (low byte==6 && byte1==3 -> readLocalFlags path
+                // 0x21e8f4c + parse chain 0x2baf38c, else empty-early), resolves 4 jstrings via
+                // the SH186 identity shim, returns parse result in w0. initEngine_'s "Engine
+                // settings is null" feed (SH184). Measure with the REAL version word (0x0306);
+                // client-settings is a consumer not a DM ctor so nil-milestone either way — the
+                // value is measuring the real parse path. Opt-in --v2boot-session-signed.
+                if std::env::args().any(|a| a == "--v2boot-session-signed") {
+                    unsafe { *(0x10683cff8u64 as *mut u64) = 0x0306u64; } // real version: low byte 6, byte1 3
+                    eprintln!("[elfjit:v2boot] SH275 set client-settings version [0x10683cff8]=0x0306 -> Signed receive takes the readLocalFlags parse path (not the empty-early branch)");
+                    let c1 = arm64jit::jni::new_string_utf_handle(b"");
+                    let c2 = arm64jit::jni::new_string_utf_handle(b"");
+                    let c3 = arm64jit::jni::new_string_utf_handle(b"");
+                    let c4 = arm64jit::jni::new_string_utf_handle(b"");
+                    eprintln!(
+                        "[elfjit:v2boot] driving nativeInitClientSettingsSigned @ guest 0x102bb070c (4 jstrings c1={c1:#x} c2={c2:#x} c3={c3:#x} c4={c4:#x})"
+                    );
+                    let mut cs = arm64jit::jit::CpuState::new();
+                    cs.tpidr = tpidr;
+                    cs.x[31] = boot_sp;
+                    cs.x[0] = env_ptr;
+                    cs.x[1] = thiz;
+                    cs.x[2] = c1;
+                    cs.x[3] = c2;
+                    cs.x[4] = c3;
+                    cs.x[5] = c4;
+                    match arm64jit::jit::jit_run(iimg, ib, 0x102bb070c, &mut cs as *mut CpuState) {
+                        Err(e) => eprintln!("[elfjit:v2boot] InitClientSettingsSigned stopped: {e}"),
+                        Ok(r) => eprintln!(
+                            "[elfjit:v2boot] InitClientSettingsSigned returned Ok({r:#x}) w0(parse_result)={:#x}",
+                            cs.x[0]
+                        ),
+                    }
+                    let nfv = arm64jit::jni::nativehelper_flags_loaded();
+                    let arv = arm64jit::jni::nativehelper_app_ready();
+                    eprintln!("[elfjit:v2boot] InitClientSettingsSigned post: MH_FLAGS_LOADED={nfv} MH_APP_READY={arv}");
+                    dump("InitClientSettingsSigned");
                 }
                 // SEP-17 session-drive (dataModel-bindings live binder): drive the REAL
                 // nativeAppBridgeV2SendAppEventOnGameLoaded receive (guest 0x102bb429c) as a
@@ -15127,6 +15127,35 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh275_client_settings_signed_version_gate_pinned() {
+        // SH275: SH264 drove only the plain nativeInitClientSettings (0x1022265fc) at version=0
+        // (empty-early); the Signed/Cached/CachedCompressed variants (0x102bb070c/a34/c5c) were
+        // never driven. Pins the Signed entry + version-gate decode (ldr [x8,#4088] adrp 683c000
+        // = [0x10683cff8]; low byte==6 && byte1==3 -> readLocalFlags path). Guest=file+0x1_0000_0000.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            let in_win = |g: u64| g >= 0x1_0000_0000 && g < 0x120_0000_00 && g & 3 == 0;
+            // Signed entry (file 0x2bb070c + 0x1_0000_0000) + version-gate words.
+            assert_eq!(word(0x102bb070c), 0xd102c3ff, "sh275 InitClientSettingsSigned prologue sub sp,#0xb0");
+            assert_eq!(word(0x102bb0710), 0xa9077bfd, "sh275 InitClientSettingsSigned stp x29,x30,#112");
+            assert_eq!(word(0x102bb074c), 0x9001e468, "sh275 Signed version-gate adrp 683c000 (vaddr .bss read [0x10683cff8])");
+            assert_eq!(word(0x102bb0750), 0xf947fd08, "sh275 Signed version-gate ldr x8,[x8,#4088] (=0x10683cff8)");
+            assert_eq!(word(0x102bb075c), 0x7100195f, "sh275 Signed version-gate cmp w10,#0x6 (low byte==6)");
+            for (g, n) in [(0x102bb070cu64,"Signed"),(0x102bb0a34u64,"Cached"),(0x102bb0c5cu64,"CachedCompressed")] {
+                assert!(in_win(g), "sh275 {n} {g:#x} in-window+aligned");
+            }
+            eprintln!("sh275 client-settings Signed/Cached/CachedCompressed entries + Signed version-gate decode (readLocalFlags path) pinned on libroblox.so");
+        } else {
+            eprintln!("sh275 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh273_lifecycle_natives_converge_on_shared_dispatcher() {
         // SH273: SEP-17 names JNIActivityLifecycleCallbacks nativeOn* as REAL
         // session primitives; SH264 only measured OnResumed+setActive. All 12 public entries
@@ -15723,39 +15752,13 @@ mod sh115_tests {
 
     #[test]
     fn sh237_startluaappdm_receivecall_dispatch_slot_union_zero_and_helper_realsub() {
-        // SH237 (Route-B re-attack, single-agent): SH236 pinned WHERE StartLuaAppDM's receiveCall
-        // dispatch soft-returns headlessly (last block 0x1023f01e4 in helper 0x1023f00f8) but left the
-        // select mechanism + the helper's real body un-pinned. This cycle closes both:
-        //
-        // (A) DISPATCH SELECT table is LOADER-SYNTHESIZED .data.rel.ro — the slots are the
-        //     std::function lambda-world pair (__clone 0x1db2cf0 / invoke 0x21e96f8), SH231's
-        //     EC-world machinery. StartLuaAppDM entry (0x23efe90: adrp x8,635d000; add x8,x8,#0xd68
-        //     -> 0x10635dd68) stores that address as the union's first word (`str x8,[sp]`
-        //     @0x1023efe9c) + a self-ref (`str x20,[sp,#32]` @0x1023efea0), builds a StartApp-params-
-        //     like union on the stack, then `bl 0x2baeeec` (fill-resolver). The select reads
-        //     `[0x10635dd68 + 0x20/0x28]` and blr's it. Corrects SH235/236's inference that THIS
-        //     select is a "session-gated / fabricatable-live-graph" class: the +0x20/+0x28 slots
-        //     are R_AARCH64_RELATIVE-relocated (readelf -rW fails on the packed-RELA; the loader's
-        //     own read_elf_relocations is authoritative). The real gate for reaching the marshaler
-        //     is DOWNSTREAM of this select (see (B)), not the select slots themselves.
-        //
-        // (B) HELPER 0x1023f00f8 is NOT a "benign soft-return at [sp+8]/[sp+32]": those are the SSO
-        //     length/flag bytes of TWO libc++ std::string LOCALS it constructs via TWO calls to
-        //     string-init 0x2256510 (bl @0x1023f013c + @0x1023f01b0), then it runs the V2Init
-        //     struct-copy 0x23c1574 (bl @0x1023f01e0, same fn the V2Init transition body dispatches
-        //     to) + a conditional FMOD-AAudio tail (bl 0x626b6d0 @0x1023f01f0), then `ret`. So the
-        //     headless "soft return" is really a COMPLETED sub-body (copies V2-init params), not a
-        //     flag-check stub. Corrects SH236's characterization; the classes are identical
-        //     (session-populated graph, not a static seed).
-        //
-        // Pins (real-image guard family as sh235/236; skip-if-absent):
-        //   union first-word store  0x1023efe9c = str x8,[sp]   (0xf90003e8; x8=0x10635dd68)
-        //   union self-ref store    0x1023efea0 = str x20,[sp,#32] (0xf90013f4)
-        //   string-local init #1    0x1023f013c = bl 0x102256510  (0x97f998f5)
-        //   string-local init #2    0x1023f01b0 = bl 0x102256510  (0x97f998d8)
-        //   V2Init struct-copy      0x1023f01e0 = bl 0x1023c1574   (0x97ff44e5)
-        //   FMOD-AAudio tail        0x1023f01f0 = bl 0x10626b6d0  (0x94f9ed38)
-        //   (band zero + zero-reloc for table [0x635dc00,0x6360000))
+        // SH237: StartLuaAppDM's receiveCall select table is LOADER-SYNTHESIZED .data.rel.ro
+        // (slots = std::function pair __clone 0x1db2cf0 / invoke 0x21e96f8 = SH231 EC machinery;
+        // entry 0x23efe90 stacks union 0x10635dd68). helper 0x1023f00f8 builds 2 string locals,
+        // runs V2Init copy 0x23c1574 + FMOD tail 0x626b6d0 then ret (corrects SH236).
+        // Pins: union store 0x1023efe9c=0xf90003e8, self-ref 0x1023efea0=0xf90013f4,
+        // string inits 0x1023f013c/0x1023f01b0=0x97f998f5/0x97f998d8, copy 0x1023f01e0=0x97ff44e5,
+        // FMOD tail 0x1023f01f0=0x94f9ed38, band+reloc-zero [0x635dc00,0x6360000).
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
