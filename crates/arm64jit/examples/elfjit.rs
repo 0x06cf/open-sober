@@ -6696,8 +6696,35 @@ fn main() {
         for s in slots {
             *s = sub;
         }
+        // SH267 (default-inert, opt-in JIT_ROUTEB_APPSART_LSM_NODES=1): the LSM
+        // INSERT leaf (fn 0x1db1cc8, atomic-OR claim bl 0x2b9ea40 at 0x1db1d44)
+        // reads the slot `x1 = sub[idx]` and does `ldset x0,x0,[x1]` (OR bit1)
+        // into *x1. With the empty-map (all sub slots = 0) that is an atomic op
+        // on address 0 -> SIGSEGV fault=0x0 at guestpc=0x101db1d04. SH260 parked
+        // this as "persistence detour live-object"; the SEP-17 relabel makes the
+        // SESSION-DRIVE the PRIMARY lever, and SH264-266 session rungs are ALL
+        // latent precisely because the ladder self-terminates here first. So
+        // fabricate GENUINE per-node cells: point each of the 0x2000 sub-slots
+        // at its own leaked zeroed 0x60-byte node cell. Then the insert's atomic
+        // OR lands in real memory (node[0] bit1 set = key recorded present) and
+        // the reader (0x1d99e50 ldr [x8,idx*8]; cbz -> found-node path) returns
+        // node+40 = 0 (an empty stored value) instead of faulting. Default OFF:
+        // default run keeps the proven all-zero empty-map behavior.
+        let node_cells: bool =
+            std::env::var("JIT_ROUTEB_APPSART_LSM_NODES").ok().as_deref() == Some("1");
+        if node_cells {
+            const NSUBSLOTS: usize = 0x2000; // (key>>16)&0x1fff max index + 1
+            const NODESZ: usize = 0x60; // node+40/+48 read by claimed-path; pad to 0x60
+            let cellbuf = Box::leak(vec![0u8; NSUBSLOTS * NODESZ].into_boxed_slice());
+            let cellbase = cellbuf.as_mut_ptr() as u64;
+            let subs = std::slice::from_raw_parts_mut(sub as *mut u64, NSUBSLOTS);
+            for i in 0..NSUBSLOTS {
+                subs[i] = cellbase + (i * NODESZ) as u64;
+            }
+            println!("[lsm-map] SH267 per-node cells: filled {} sub-slots @0x{sub:x} with real zeroed node cells (insert OR-claim lands in real memory, not addr 0)", NSUBSLOTS);
+        }
         *(map_global_guest as *mut u64) = base;
-        println!("[lsm-map] seeded static empty LocalStorageManager map: global 0x{map_global_guest:x} -> bucket array 0x{base:x} ({} buckets, shared zero sub @0x{sub:x})", BUCKETS);
+        println!("[lsm-map] seeded static empty LocalStorageManager map: global 0x{map_global_guest:x} -> bucket array 0x{base:x} ({} buckets, shared zero sub @0x{sub:x}, node_cells={node_cells})", BUCKETS);
     }
     fn link_to_guest(el0: &libloader::elf::LoadedElf, link: u64) -> u64 {
         el0.guest_of(link)
@@ -15169,6 +15196,61 @@ mod sh115_tests {
             eprintln!("sh266 messageBus MessageBus.subscribe (entry/JNI-slot dispatch/jstring marshal/op_new + real app-start bl 0x2343c10) pinned on libroblox.so");
         } else {
             eprintln!("sh266 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
+    fn sh267_lsm_insert_leaf_mechanism_pinned() {
+        // SH267 (single-agent, cone suppressed): pin the LSM INSERT-leaf mechanism SH260
+        // parked and that gates the SEP-17 PRIMARY lever (session-drive). Insert path fn
+        // 0x1db1cc8 reads `x1 = sub[idx]` (the map's per-key node slot, idx=(key>>16)&0x1fff)
+        // then `bl 0x2b9ea40` does an atomic-OR (bit1, the "present" flag) into *x1:
+        //    0x2b9ea40 bti c (0xd503245f) / 0x2b9ea44 adrp x16,683b000 (0xb001e4f0)
+        //    0x2b9ea48 ldrb w16,[x16,#2648] (0x39696210)   -- atomic-or flag byte
+        //    0x2b9ea4c cbz w16,0x2b9ea58 (0x34000070)      -- ldset vs ldxr/stxr
+        //    0x2b9ea50 ldset x0,x0,[x1] (0xf8203020)       -> OR bit1 into *x1
+        // With the seeded empty map every sub-slot is 0 -> x1=0 -> atomic op on addr 0
+        // -> SIGSEGV fault=0x0 at guestpc 0x101db1d04. The SH267 default-inert fix
+        // (JIT_ROUTEB_APPSART_LSM_NODES=1) fills each 0x2000 sub-slot with a real leaked
+        // zeroed node cell so the OR lands in real memory; the reader (0x1d99e50) then
+        // returns node+40=0 (found-empty) instead of faulting. These words pin the
+        // mechanism so a drift fails loudly; default-inert (seed only under env).
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            assert_eq!(word(0x102_b9ea40), 0xd503245f, "sh267 insert-leaf bti c");
+            assert_eq!(word(0x102_b9ea44), 0xb001e4f0, "sh267 insert-leaf adrp x16,683b000");
+            assert_eq!(word(0x102_b9ea48), 0x39696210, "sh267 insert-leaf ldrb w16,[x16,#2648]");
+            assert_eq!(word(0x102_b9ea4c), 0x34000070, "sh267 insert-leaf cbz w16 -> ldxr/stxr");
+            assert_eq!(word(0x102_b9ea50), 0xf8203020, "sh267 insert-leaf ldset x0,x0,[x1]");
+            assert_eq!(word(0x101_db1_d40), 0xf86a7921, "sh267 ldr x1,[x9,x10,lsl#3] (sub[idx])");
+            assert_eq!(word(0x101_db1_d44), 0x9437b33f, "sh267 bl 0x2b9ea40 (insert leaf)");
+            assert_eq!(word(0x101_db1_d48), 0xaa1303e0, "sh267 mov x0,x19 (return node)");
+            assert_eq!(word(0x101_d99e50), 0xf8697900, "sh267 reader ldr x0,[x8,x9,lsl#3]");
+            assert_eq!(word(0x101_d99e54), 0xb4000080, "sh267 reader cbz x0");
+            let base = unsafe { *(0x10726f8c0u64 as *const u64) };
+            if base != 0 {
+                assert!(base & 7 == 0, "sh267 seeded map base 4-aligned (writable bucket array)");
+            }
+            for (guest, name) in [
+                (0x102_b9ea40u64, "insert-leaf-entry"),
+                (0x102_b9ea50u64, "insert-leaf-ldset"),
+                (0x101_db1_d40u64, "insert-sub-slot-read"),
+                (0x101_db1_d44u64, "insert-bl-leaf"),
+                (0x101_d99e50u64, "reader-sub-slot-read"),
+            ] {
+                assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh267 {name} {guest:#x} in window");
+                assert!(guest & 3 == 0, "sh267 {name} {guest:#x} 4-aligned");
+            }
+            eprintln!("sh267 LSM insert-leaf atomic-OR mechanism (sub[idx]->*x1) pinned on libroblox.so");
+        } else {
+            eprintln!("sh267 real-image guard: no real libroblox.so, skipping anchors");
         }
     }
 
