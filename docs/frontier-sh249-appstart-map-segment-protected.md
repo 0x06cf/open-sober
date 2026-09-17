@@ -95,3 +95,19 @@ Standing forward hook unchanged: SH174 capture-latch arming *(0x106391908) at a
 real make_shared<DataModel>. recon-v3 deliverables stay shipped + verified (fresh
 green at HEAD this session: 90/0 examples, cargo build + cargo test --workspace
 exit 0).
+## SH254 addendum (Sep 17, 2026): the live-array SOURCE is headless-unreached too.
+
+Fresh 3-run batch on the real libroblox.so (canonical completing --v2boot ladder, full
+DMCONT env) region-watches the three 0x2a0-byte live-object array allocator clusters
+{0x101df48c0-0x101df4b80 (IPC message-buffer ctor, op_new(0x2a0) @0x1df4938),
+ 0x101eb9af4 (object-array ctor), 0x101eba550 (object-array ctor)} — the candidate
+SOURCE of the under-allocated live-array whose iter-4 read faults at 0x1021dde34
+(SH248g/h). MEASURED: **0 hits in all three regions across all 3 runs; EXIT 134 stable
+at guestpc=0x1021dde34 every run.** The array backing the faulting map is allocated
+by code that never executes headlessly — the live-object graph's ctor (and hence its
+array) is upstream of any headless-reachable block, consistent with SH248g's
+"under-allocated stride-0x2a0 array, its own ctor never ran headlessly." 7th adjacent
+closure at 0x1021dde34 (static-seed SH248g / runtime-repair SH248h / segment-protected
+SH249 / count-clamp SH250 / dynamic-ctor-trace SH251 / resolver-source SH253 /
+2a0-array-source SH254). Does NOT manufacture a DM; Route-B live-DM structural gate
+UNCHANGED; SH174 capture-latch stays the single forward hook.
