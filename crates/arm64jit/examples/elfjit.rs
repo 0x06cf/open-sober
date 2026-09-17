@@ -13884,6 +13884,104 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh237_startluaappdm_receivecall_dispatch_slot_union_zero_and_helper_realsub() {
+        // SH237 (Route-B re-attack, single-agent): SH236 pinned WHERE StartLuaAppDM's receiveCall
+        // dispatch soft-returns headlessly (last block 0x1023f01e4 in helper 0x1023f00f8) but left the
+        // select mechanism + the helper's real body un-pinned. This cycle closes both:
+        //
+        // (A) DISPATCH SELECT table is LOADER-SYNTHESIZED .data.rel.ro — the slots are the
+        //     std::function lambda-world pair (__clone 0x1db2cf0 / invoke 0x21e96f8), SH231's
+        //     EC-world machinery. StartLuaAppDM entry (0x23efe90: adrp x8,635d000; add x8,x8,#0xd68
+        //     -> 0x10635dd68) stores that address as the union's first word (`str x8,[sp]`
+        //     @0x1023efe9c) + a self-ref (`str x20,[sp,#32]` @0x1023efea0), builds a StartApp-params-
+        //     like union on the stack, then `bl 0x2baeeec` (fill-resolver). The select reads
+        //     `[0x10635dd68 + 0x20/0x28]` and blr's it. Corrects SH235/236's inference that THIS
+        //     select is a "session-gated / fabricatable-live-graph" class: the +0x20/+0x28 slots
+        //     are R_AARCH64_RELATIVE-relocated (readelf -rW fails on the packed-RELA; the loader's
+        //     own read_elf_relocations is authoritative). The real gate for reaching the marshaler
+        //     is DOWNSTREAM of this select (see (B)), not the select slots themselves.
+        //
+        // (B) HELPER 0x1023f00f8 is NOT a "benign soft-return at [sp+8]/[sp+32]": those are the SSO
+        //     length/flag bytes of TWO libc++ std::string LOCALS it constructs via TWO calls to
+        //     string-init 0x2256510 (bl @0x1023f013c + @0x1023f01b0), then it runs the V2Init
+        //     struct-copy 0x23c1574 (bl @0x1023f01e0, same fn the V2Init transition body dispatches
+        //     to) + a conditional FMOD-AAudio tail (bl 0x626b6d0 @0x1023f01f0), then `ret`. So the
+        //     headless "soft return" is really a COMPLETED sub-body (copies V2-init params), not a
+        //     flag-check stub. Corrects SH236's characterization; the classes are identical
+        //     (session-populated graph, not a static seed).
+        //
+        // Pins (real-image guard family as sh235/236; skip-if-absent):
+        //   union first-word store  0x1023efe9c = str x8,[sp]   (0xf90003e8; x8=0x10635dd68)
+        //   union self-ref store    0x1023efea0 = str x20,[sp,#32] (0xf90013f4)
+        //   string-local init #1    0x1023f013c = bl 0x102256510  (0x97f998f5)
+        //   string-local init #2    0x1023f01b0 = bl 0x102256510  (0x97f998d8)
+        //   V2Init struct-copy      0x1023f01e0 = bl 0x1023c1574   (0x97ff44e5)
+        //   FMOD-AAudio tail        0x1023f01f0 = bl 0x10626b6d0  (0x94f9ed38)
+        //   (band zero + zero-reloc for table [0x635dc00,0x6360000))
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            assert_eq!(word(0x102_3efe9c), 0xf90003e8, "sh237 union first-word store str x8,[sp]");
+            assert_eq!(word(0x102_3efea0), 0xf90013f4, "sh237 union self-ref store str x20,[sp,#32]");
+            assert_eq!(word(0x102_3f013c), 0x97f998f5, "sh237 string-local init #1 bl 0x2256510");
+            assert_eq!(word(0x102_3f01b0), 0x97f998d8, "sh237 string-local init #2 bl 0x2256510");
+            assert_eq!(word(0x102_3f01e0), 0x97ff44e5, "sh237 V2Init struct-copy bl 0x23c1574");
+            assert_eq!(word(0x102_3f01f0), 0x94f9ed38, "sh237 FMOD-AAudio tail bl 0x626b6d0");
+            for (guest, name) in [
+                (0x102_3efe9cu64, "union first-word store"), (0x102_3efea0u64, "union self-ref"),
+                (0x102_3f013cu64, "string-local init #1"), (0x102_3f01b0u64, "string-local init #2"),
+                (0x102_3f01e0u64, "V2Init struct-copy"), (0x102_3f01f0u64, "FMOD-AAudio tail"),
+            ] {
+                assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh237 {name} {guest:#x} in window");
+                assert!(guest & 3 == 0, "sh237 {name} {guest:#x} 4-aligned");
+            }
+            // (A) the union-table band around the select slots: the loader's OWN relocation
+            // decoder (read_elf_relocations) is authoritative for this .so (readelf -rW fails on
+            // the packed-RELA). The band carries R_AARCH64_RELATIVE relocs that the loader
+            // synthesizes at load (they show as self-referential guest pointers in the loaded
+            // image), so the slots are LOADER-SYNTHESIZABLE .data.rel.ro — NOT session-written.
+            // Measured zero extent on RAW FILE bytes = [file 0x635d970, 0x635e700) (all zero on
+            // disk); the loaded band is nonzero purely because the loader applies those RELATIVE
+            // addends. Pin: the specific select slots [0x10635dd68+0x20=0x10635dd88] and
+            // [+0x28=0x10635dd90] must be RELATIVE-relocated (loader-populated), so they are
+            // NOT arbitrary-session; assert the loader's reloc list covers them.
+            let (band_lo, band_hi) = (0x635d970u64, 0x635e700u64);
+            use libloader::android_relocs::{read_elf_relocations, R_AARCH64_RELATIVE};
+            let mut band_relocs: Vec<(u64, i64)> = Vec::new();
+            if let Ok(Some(rels)) = read_elf_relocations(p) {
+                for r in &rels {
+                    if r.r_type() == R_AARCH64_RELATIVE && r.r_offset >= band_lo && r.r_offset < band_hi {
+                        band_relocs.push((r.r_offset, r.r_addend));
+                    }
+                }
+            }
+            assert!(!band_relocs.is_empty(), "sh237 receiveCall dispatch-table band has RELATIVE relocs (loader-synthesizable .data.rel.ro)");
+            // the two select handler slots are among those relocs
+            let has_slot = |slot: u64| band_relocs.iter().any(|(o, _)| *o == slot);
+            assert!(has_slot(0x635dd88), "sh237 select slot +0x20 (guest 0x10635dd88) is RELATIVE-relocated");
+            assert!(has_slot(0x635dd90), "sh237 select slot +0x28 (guest 0x10635dd90) is RELATIVE-relocated");
+            // report the RELATIVE addends (the real loader-synthesized dispatch targets after load)
+            let addend_of = |slot: u64| band_relocs.iter().find(|(o, _)| *o == slot).map(|(_, a)| *a).unwrap_or(0);
+            let loaded_val = |off: u64| -> u64 {
+                let g = off + 0x100_0000_00;
+                match el.host_addr_of(g) { Some(h) => unsafe{ (h as *const u64).read_unaligned() }, None => 0 }
+            };
+            eprintln!("sh237 select slots: +0x20 addend={:#x} -> loaded guest {:#x} (__clone stub 0x1db2cf0); +0x28 addend={:#x} -> loaded guest {:#x} (invoke 0x21e96f8) — the std::function lambda-world pair (SH231's EC-world machinery), loader-synthesized RELATIVE pointers, NOT session-written",
+                addend_of(0x635dd88), loaded_val(0x635dd88),
+                addend_of(0x635dd90), loaded_val(0x635dd90));
+            eprintln!("sh237 StartLuaAppDM receiveCall dispatch-select union table [0x10635dd68+0x20/+0x28] is LOADER-SYNTHESIZED .data.rel.ro — slots = the std::function lambda-world __clone 0x1db2cf0 (ret) / invoke 0x21e96f8 = SH231's EC-world machinery, NOT session-gated. Corrects SH235/236's 'fabricatable-live-graph' framing for THIS select: the route to the marshaler 0x1023f075c is gated downstream (helper 0x1023f00f8 completes a real V2Init struct-copy + FMOD tail) on libroblox.so");
+        } else {
+            eprintln!("sh237 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh115_sites_target_lazy_singleton_accessor_windows() {
         // Guest file vaddrs for the three accessor sites with their original
         // slot0 (mov) guard bytes — the patch refuses to write if these shift.
