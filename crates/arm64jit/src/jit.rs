@@ -971,6 +971,129 @@ fn routeb_appstart_adapter_object() -> u64 {
     })
 }
 
+/// SH253 (Route-B, opt-in JIT_ROUTEB_SOURCE_SEED): seed the bulk-registrar SOURCE
+/// vector so the engine's OWN in-ladder registrar loop populates the RESOLVER map.
+/// SH252 measured (full exec-text sweep) that the resolver 0x106dca0e70 — the
+/// name->classid map the getService walker 0x105e09bc8 resolves through
+/// (resolver 0x2373cec) — is constructed ONLY inside nativeGameGlobalInit:
+/// (a) the 48-byte header default-construct copy at 0x2208418, and (b) the bulk
+/// registrar 0x2208ae8. The registrar is DRIVEN by the in-ladder SOURCE loop at
+/// 0x22085c4: `adrp x19,6dca000; add x19,#0xea8; ldp x21,x22,[x19]` reads the
+/// SOURCE vector {begin@0x6dca0ea8, end@0x6dca0ea8+8}, `cmp x21,x22; b.eq skip`
+/// early-outs when EMPTY (headless: begin==end==0), then per element
+/// `ldr x23,[x21],#8` (x23=8-byte element -> descriptor), `ldr x8,[x23,#8]`
+/// (x8=descriptor->name SSO string ptr) -> decode {data,len} -> `bl 0x2208ae8`
+/// (bulk registrar insert). So seeding the SOURCE vector with valid class-name
+/// descriptors lets the engine's OWN registrar loop build the resolver map — the
+/// SH193/194/252 "missing bridge" (SH192/194 drove 0x2208ae8 STANDALONE against a
+/// zeroed header -> corrupted; nobody seeded the source and let the in-ladder loop
+/// drive it). Element = descriptor; [desc+8] = name string ptr; the registrar's
+/// value-copy reads [x25]=resolver header + copies the descriptor element, so the
+/// map's value row gets the descriptor whose [desc+16-read] yields the classid the
+/// walker returns ([resolver-element+16] = classid, walker 0x5e09c24). Fire at the
+/// SOURCE-loop block entry 0x1022085c0 BEFORE the `ldp` (so the seeded begin/end
+/// are read); idempotent; default-inert.
+fn routeb_source_vector_seed_guard(_state: *mut CpuState, pc: u64) {
+    if std::env::var_os("JIT_ROUTEB_SOURCE_SEED").is_none() {
+        return;
+    }
+    // Source vector(s) the registrar consumes. Fire at nativeGameGlobalInit ENTRY
+    // (0x102206404 — the rung-1 jit_run target) so the seed is installed before ANY
+    // of the function body (incl. the registrar block 0x22085c4 that does
+    // `adrp x19,6dca000; add x19,#0xea8; ldp x21,x22,[x19]`) executes. Also accept the
+    // mid-function block entry 0x1022085c0 (shadow-fallback) and the deep region
+    // [0x1022084xx,0x10220861c] so whichever block-entry the JIT reaches first seeds.
+    if !(0x102206404..0x10220881c).contains(&pc) {
+        return;
+    }
+    const SRC_VEC: u64 = 0x106dca0ea8; // SOURCE vector {begin,end} (guest), loop reads at 0x22085c8
+    const SRC_VEC2: u64 = 0x106dca0e08; // sibling source vector read at 0x2208490 (same registrar family)
+    // Sibling source map 0x106dca0e90 (registrar 0x2208b20/0x2208b84 reads {begin,end} there).
+    const SRC_MAP: u64 = 0x106dca0e90;
+    use std::sync::OnceLock;
+    static SEEDED: OnceLock<()> = OnceLock::new();
+    SEEDED.get_or_init(|| {
+        let mut seeded_any = false;
+        // Only seed when the source is empty (never clobber a real populated vector).
+        for sv in [SRC_VEC, SRC_VEC2, SRC_MAP] {
+            if !routeb_ensure_writable(sv) {
+                continue;
+            }
+            let begin = unsafe { std::ptr::read_unaligned(sv as *const u64) };
+            let end = unsafe { std::ptr::read_unaligned((sv + 8) as *const u64) };
+            if begin != 0 || end != 0 {
+                eprintln!(
+                    "[routeb-sh253] SOURCE vector 0x{sv:x} already non-empty (begin={begin:#x} end={end:#x}), skip seed"
+                );
+                continue;
+            }
+        }
+        // Build a leaked array of descriptors once (shared across the empty slots).
+        // Each descriptor: [desc+8] = ptr to an SSO class-name std::string.
+        #[derive(Clone, Copy)]
+        struct Desc {
+            classid: u32,
+            name: &'static [u8],
+        }
+        const CLASSES: [Desc; 3] = [
+            Desc { classid: 0x87e, name: b"PlayerGui" }, // SH189: classid 0x87e
+            Desc { classid: 0x892, name: b"ScreenGui" }, // ScreenGui (SH189b, inferred sampler)
+            Desc { classid: 0x77f, name: b"CoreGui" },   // CoreGui (SH189 family)
+        ];
+        // Array of descriptor PTRS (the source vector's elements are 8-byte ptrs).
+        let arr = Box::leak(vec![0u64; CLASSES.len()].into_boxed_slice()).as_mut_ptr() as u64;
+        for i in 0..CLASSES.len() {
+            let c = &CLASSES[i];
+            // SSO string object: byte0 = cap (LONG: bit0=1 | (len<<1)), [8]=size, [16]=data.
+            let data = Box::leak(c.name.to_vec().into_boxed_slice()).as_mut_ptr() as u64;
+            let sso = Box::leak(vec![0u8; 0x20usize].into_boxed_slice()).as_mut_ptr() as u64;
+            // guard ASLR: direct ptr write into guest-visible leaked heap (host addresses
+            // are guest==host in this JIT). Write the class-name string.
+            unsafe {
+                std::ptr::write_unaligned(sso as *mut u64, (c.name.len() as u64) << 1 | 1); // LONG cap
+                std::ptr::write_unaligned((sso + 8) as *mut u64, c.name.len() as u64); // size
+                std::ptr::write_unaligned((sso + 16) as *mut u64, data); // data ptr
+            }
+            // Descriptor: [+8] = &sso string; [+16] = classid (walker reads [element+16]).
+            let desc = Box::leak(vec![0u8; 0x20usize].into_boxed_slice()).as_mut_ptr() as u64;
+            unsafe {
+                std::ptr::write_unaligned((desc + 8) as *mut u64, sso);
+                std::ptr::write_unaligned((desc + 16) as *mut u64, c.classid as u64);
+            }
+            unsafe { std::ptr::write_unaligned((arr + (i as u64) * 8) as *mut u64, desc) };
+            eprintln!(
+                "[routeb-sh253] source descriptor[{i}] '{name}' classid=0x{classid:x} desc=0x{desc:x} sso=0x{sso:x} data=0x{data:x}",
+                name = String::from_utf8_lossy(c.name),
+                classid = c.classid
+            );
+        }
+        // Write the SOURCE vector(s) {begin,end} = arr .. arr+len*8 to every empty slot.
+        let arr_end = arr + (CLASSES.len() as u64) * 8;
+        for sv in [SRC_VEC, SRC_VEC2, SRC_MAP] {
+            if !routeb_ensure_writable(sv) {
+                continue;
+            }
+            let b = unsafe { std::ptr::read_unaligned(sv as *const u64) };
+            let e_ = unsafe { std::ptr::read_unaligned((sv + 8) as *const u64) };
+            if b != 0 || e_ != 0 {
+                continue; // already populated
+            }
+            unsafe {
+                std::ptr::write_unaligned(sv as *mut u64, arr);
+                std::ptr::write_unaligned((sv + 8) as *mut u64, arr_end);
+            }
+            seeded_any = true;
+            eprintln!(
+                "[routeb-sh253] seeded registrar SOURCE container 0x{sv:x} = {{0x{arr:x},0x{arr_end:x}}} ({} descriptors) at pc=0x{pc:x}",
+                CLASSES.len()
+            );
+        }
+        if !seeded_any {
+            eprintln!("[routeb-sh253] no registrar SOURCE container was empty — resolver population left to the engine");
+        }
+    });
+}
+
 /// SH177 (objective 2b / recon deleg_48e16777 task-0+task-1): write a classified
 /// value into the engine's cookie-jar container as a valid libc++ `std::string`.
 ///
@@ -5601,6 +5724,11 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // adapter at [0x106b0bde0] so the continuation's app-start closure dispatch (vt[0]
         // blr @0x233904c) resolves benignly instead of SIGSEGV'ing at 0x102339020.
         routeb_appstart_adapter_seed_guard(state, pc);
+        // SH253 (opt-in JIT_ROUTEB_SOURCE_SEED): seed the bulk-registrar SOURCE
+        // vector at the engine's OWN in-ladder registrar loop block entry 0x1022085c0,
+        // so nativeGameGlobalInit's registrar populates the name->classid resolver
+        // 0x106dca0e70 via the engine's loop (the SH193/194/252 missing bridge).
+        routeb_source_vector_seed_guard(state, pc);
         // SH164 (recon deleg_94aac9d7): governor-tail dispatch block-entry capture.
         // Fires on EVERY run (self-gated on JIT_ROUTEB_DMTRACE) so a follow-up cycle
         // can observe whether the tail's vt[+0x30] dispatch ever resolves to the
@@ -7193,6 +7321,98 @@ mod tests {
             );
             std::env::remove_var("JIT_ROUTEB_APPSART_ADAPTER_SEED");
             std::ptr::write_unaligned(ADAPTER_GLOBAL as *mut u64, 0);
+        }
+    }
+
+    #[test]
+    fn sh253_source_vector_guard_is_env_pc_gated_and_seeds_registrar_source() {
+        // SH253: routeb_source_vector_seed_guard must (a) be inert without
+        // JIT_ROUTEB_SOURCE_SEED, (b) fire ONLY within nativeGameGlobalInit
+        // [0x102206404,0x10220881c), (c) seed the bulk-registrar SOURCE containers
+        // 0x106dca0ea8 / 0x106dca0e08 / 0x106dca0e90 = {begin,end} pointing at an
+        // array of 3 class-name descriptors (the engine's own in-ladder registrar
+        // loop 0x22085c4 consumes it), and (d) be idempotent (no clobber of a
+        // non-empty vector). Serialized with CONT_MGR_TEST_LOCK (shares the
+        // fixed-.bss source-vector page).
+        let _mgr_guard = CONT_MGR_TEST_LOCK.lock().unwrap();
+        const SRC_VEC: u64 = 0x106dca0ea8;
+        const SRC_VEC2: u64 = 0x106dca0e08;
+        const SRC_MAP: u64 = 0x106dca0e90;
+        let slots = [SRC_VEC, SRC_VEC2, SRC_MAP];
+        fn zero_slots(slots: [u64; 3]) {
+            for sv in slots {
+                unsafe {
+                    std::ptr::write_unaligned(sv as *mut u64, 0);
+                    std::ptr::write_unaligned((sv + 8) as *mut u64, 0);
+                }
+            }
+        }
+        // (0) make pages writable
+        for sv in slots {
+            unsafe {
+                assert!(routeb_ensure_writable(sv), "source page must be writable");
+            }
+        }
+        unsafe {
+            // (a) env unset, pc in-range -> inert.
+            std::env::remove_var("JIT_ROUTEB_SOURCE_SEED");
+            zero_slots(slots);
+            routeb_source_vector_seed_guard(std::ptr::null_mut(), 0x102206404);
+            assert_eq!(
+                std::ptr::read_unaligned(SRC_VEC as *const u64),
+                0,
+                "env-gated: without JIT_ROUTEB_SOURCE_SEED the guard must stay inert"
+            );
+
+            // (b) env set, wrong pc -> inert.
+            std::env::set_var("JIT_ROUTEB_SOURCE_SEED", "1");
+            routeb_source_vector_seed_guard(std::ptr::null_mut(), 0x10220881c);
+            assert_eq!(
+                std::ptr::read_unaligned(SRC_VEC as *const u64),
+                0,
+                "pc-gated: must fire only within nativeGameGlobalInit [0x102206404,0x10220881c)"
+            );
+
+            // (c) env set + in-range entry pc -> seed the source containers.
+            routeb_source_vector_seed_guard(std::ptr::null_mut(), 0x102206404);
+            for sv in slots {
+                let begin = std::ptr::read_unaligned(sv as *const u64);
+                let end = std::ptr::read_unaligned((sv + 8) as *const u64);
+                assert_ne!(begin, 0, "0x{sv:x} begin must be seeded non-NULL");
+                assert_ne!(end, 0, "0x{sv:x} end must be seeded non-NULL");
+                assert!(end > begin, "0x{sv:x} end must be past begin");
+                let n = (end - begin) / 8;
+                assert_eq!(n, 3, "0x{sv:x} source must hold exactly 3 descriptors");
+                // Each element is a ptr to a descriptor whose [desc+8] is an SSO string
+                // and [desc+16] holds the classid (walker 0x5e09c24 reads [element+16]).
+                for i in 0..n {
+                    let desc = std::ptr::read_unaligned((begin + i * 8) as *const u64);
+                    assert!(desc > 0x1000, "descriptor[{i}] must be a valid guest ptr");
+                    let sso = std::ptr::read_unaligned((desc + 8) as *const u64);
+                    let classid = std::ptr::read_unaligned((desc + 16) as *const u64);
+                    // SSO cap = LONG (bit0=1) | (len<<1); len read from [sso+8].
+                    let cap = std::ptr::read_unaligned(sso as *const u64);
+                    assert_eq!(cap & 1, 1, "descriptor[{i}] name must be LONG-form SSO");
+                    let len = std::ptr::read_unaligned((sso + 8) as *const u64);
+                    assert!(len >= 6 && len <= 10, "descriptor[{i}] name len {len} out of range");
+                    assert_eq!(cap >> 1, len, "LONG cap>>1 must equal the size field");
+                    let data = std::ptr::read_unaligned((sso + 16) as *const u64);
+                    assert!(data > 0x1000, "descriptor[{i}] string data ptr must be valid");
+                    assert!(classid != 0, "descriptor[{i}] classid must be non-zero");
+                }
+            }
+
+            // (d) idempotent: a non-empty vector is left untouched.
+            std::ptr::write_unaligned(SRC_VEC as *mut u64, 0x1234);
+            routeb_source_vector_seed_guard(std::ptr::null_mut(), 0x1022085c0);
+            assert_eq!(
+                std::ptr::read_unaligned(SRC_VEC as *const u64),
+                0x1234,
+                "idempotent: a non-empty source vector must be left untouched"
+            );
+
+            std::env::remove_var("JIT_ROUTEB_SOURCE_SEED");
+            zero_slots(slots);
         }
     }
 
