@@ -48,6 +48,23 @@ with BOTH the static-seed (SH248g) and runtime-repair (SH248h) levers closed.
 Route-B live-DM structural gate UNCHANGED. SH174 capture-latch (arm
 *(0x106391908) at a real make_shared<DataModel>) stays the single forward hook.
 
+## Forward note appended this session
+Re-verified the recon's (deleg_39d9b453, Sep 16) do-init NEXT-3 seeds against this
+HEAD's completing ladder and found them SUPERSEDED — do NOT implement:
+  #1 thread-init singleton [0x1067333aa0] (clears SEGV 0x102207ef0),
+  #2 telemetry once-cell [0x106dcd380]=-1 (2b4cd1c cond_wait),
+  #3 map page 0x10673336000 + [0x10673336d8].bit0=1 (SEGV 0x102212838).
+MEASURED (full DMCONT env, region-watch on the app-shell ctor body
+[0x102207b50,0x102209000)): the ctor body executes THROUGH seed #1's site
+(region hits 0x102207eec -> 0x102207f08, no fault at 0x102207ef0 — the
+thread-init singleton read itself is satisfied), and every run terminates at the
+SAME 0x1021dde34 live-object map wall (SH248g/h), not at any of the three seed
+sites (0 count across the batch). The do-init continuation and the app-start
+(DMCONT) continuation converge on one structural gate: the SH174/SH204
+live-object class needing a real DataModel ctor. The NEXT-3 were derived when
+those SEGVs were reachable; the app-shell ctor now runs past all three (SH239
+deep-run) and the line stops at the shared live-object wall instead.
+
 ## What is new + measured this cycle
 - Closes the residual SH248g deliberately left open ("only static seed ruled
   out"): runtime in-place header repair is also a dead-end at this wall.
