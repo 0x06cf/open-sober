@@ -13938,6 +13938,68 @@ mod sh115_tests {
             assert_eq!(*((empty.wrapping_add(0x20)) as *const u64), 0, "empty set +0x20 String zero");
         }
     }
+
+    #[test]
+    fn sh234_recon_v3_render_side_engine_contract_pinned() {
+        // SH234: the recon-v3 SELF-DRIVEN FRAMES deliverable (docs/recon-selfdrive-seed-jsonfix.md)
+        // rides an ENGINE render-side contract: type4_frame_thunk recovers RENDERCTX (real 0x48 ctx,
+        // vtable 0x106731ae0), then via ctx-vt[+16] calls engine make-current 0x105b3b358, drives
+        // frame-fn 0x105b32c00, and via ctx-vt[+24] calls swap 0x105b3b408; RENDERINIT enters at
+        // 0x105b3a280. SH230 pinned the type-4 DISPATCH site (adrp/ldr/cbz/br into the vector) but
+        // NOT these render-side engine fns — a silent drift there breaks the 24-frame plane with no
+        // loud failure (the thunk would call a moved function / wrong vtable slot). Real-image guard
+        // family as sh230/sh231/sh232; skip-if-absent.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            // renderinit entry
+            assert_eq!(word(0x105_b3a280), 0xa9bd_7bfd, "sh234 renderinit 0x105b3a280 stp x29,x30,[sp,#-0x30]!");
+            assert_eq!(word(0x105_b3a284), 0xf900_0bf5, "sh234 renderinit 0x105b3a284 str x21,[sp,#0x10]");
+            // engine make-current (ctx vt[+16])
+            assert_eq!(word(0x105_b3b358), 0xa9bd_7bfd, "sh234 make-current 0x105b3b358 stp x29,x30,[sp,#-0x30]!");
+            assert_eq!(word(0x105_b3b35c), 0xf900_0bf5, "sh234 make-current 0x105b3b35c str x21,[sp,#0x10]");
+            // engine swap / eglSwapBuffers (ctx vt[+24])
+            assert_eq!(word(0x105_b3b408), 0xa942_0408, "sh234 swap 0x105b3b408 ldp x8,x1,[x0,#0x20]");
+            assert_eq!(word(0x105_b3b40c), 0xaa08_03e0, "sh234 swap 0x105b3b40c mov x0,x8");
+            // frame-fn (the clear-path frame the thunk drives with the fabricated renderer)
+            assert_eq!(word(0x105_b32c00), 0xd103_03ff, "sh234 frame-fn 0x105b32c00 sub sp,sp,#0xc0");
+            assert_eq!(word(0x105_b32c04), 0xa906_7bfd, "sh234 frame-fn 0x105b32c04 stp x29,x30,[sp,#-0xc0]!");
+            for (guest, name) in [
+                (0x105_b3a280u64, "renderinit"), (0x105_b3b358u64, "make-current"),
+                (0x105_b3b408u64, "swap"), (0x105_b32c00u64, "frame-fn"),
+                (0x106_731ae0u64, "RENDERCTX vtable"), (0x105_b32c10u64, "frame-fn body"),
+            ] {
+                assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh234 {name} {guest:#x} in window");
+                assert!(guest & 3 == 0, "sh234 {name} {guest:#x} 4-aligned");
+            }
+            // The ctx vtable band (file offsets = guest - 0x100000000) stores the make-current
+            // (+16) and swap (+24) pointers via RELATIVE relocations at load (on-disk zeros).
+            // Verify via the loader's OWN packed-RELA decode that the vtable band holds both
+            // exact addends — the two pointers type4_frame_thunk derefs through RENDERCTX.
+            use libloader::android_relocs::{read_elf_relocations, R_AARCH64_RELATIVE};
+            if let Ok(Some(rels)) = read_elf_relocations(p) {
+                // vtable band file [0x6731000,0x6732000)
+                let band = (0x6731000u64, 0x6732000u64);
+                let mut mc = 0usize; // make-current addend present
+                let mut sw = 0usize; // swap addend present
+                for r in &rels {
+                    if r.r_type() == R_AARCH64_RELATIVE && r.r_offset >= band.0 && r.r_offset < band.1 {
+                        if r.r_addend == 0x5b3b358 { mc += 1; }
+                        if r.r_addend == 0x5b3b408 { sw += 1; }
+                    }
+                }
+                assert!(mc >= 1, "sh234 ctx vtable band must store make-current addend 0x5b3b358 (found {mc})");
+                assert!(sw >= 1, "sh234 ctx vtable band must store swap addend 0x5b3b408 (found {sw})");
+            }
+            eprintln!("sh234 recon-v3 render-side engine contract (make-current 0x105b3b358 / frame-fn 0x105b32c00 / swap 0x105b3b408 / RENDERCTX vt 0x106731ae0 / renderinit 0x105b3a280) pinned on libroblox.so");
+        } else {
+            eprintln!("sh234 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
 }
 
 #[cfg(test)]
