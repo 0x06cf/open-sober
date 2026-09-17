@@ -7802,6 +7802,28 @@ fn main() {
                         eprintln!("[elfjit:v2boot] SH284 post state=9 direct: [this+16](state)={st9}");
                         dump("SH284-engine9");
                     }
+                                        // SH288 (opt-in --v2boot-session-consumer): drive the NEVER-RUN worker's
+                    // consume loop (guest 0x10220778c) — the CONSUMER half of the producer-only
+                    // SESSION-CTOR pump SH283/284 measured. It locks session mutex 0x106863aa0
+                    // (JIT_ROUTEB_ENG5_QMUTEX_FREE steal fires at its 0x2b53a68 call), pops the
+                    // queue item and runs item-proc 0x102207950 (builds [0x106a63b00] + sub 0x221942c).
+if std::env::args().any(|a| a == "--v2boot-session-consumer") {
+                        let wf = unsafe { *(0x106863b08u64 as *const u64) };
+                        eprintln!("[elfjit:v2boot] SH288 consumer-drive: work-flag [0x106863b08]={wf:#x} driving worker consume loop @ guest 0x10220778c");
+                        let mut cc = arm64jit::jit::CpuState::new();
+                        cc.tpidr = tpidr;
+                        cc.x[31] = boot_sp;
+                        cc.x[0] = 0;
+                        match arm64jit::jit::jit_run(iimg, ib, 0x10220778c, &mut cc as *mut CpuState) {
+                            Err(e) => eprintln!("[elfjit:v2boot] SH288 consumer stopped: {e}"),
+                            Ok(r) => eprintln!("[elfjit:v2boot] SH288 consumer returned Ok({r:#x})"),
+                        }
+                        let built = unsafe { *(0x106a63b00u64 as *const u64) };
+                        let nf = arm64jit::jni::nativehelper_flags_loaded();
+                        let ar = arm64jit::jni::nativehelper_app_ready();
+                        eprintln!("[elfjit:v2boot] SH288 consumer post: work-flag={wf:#x} [0x106a63b00](once-built)={built:#x} MH_FLAGS_LOADED={nf} MH_APP_READY={ar}");
+                        dump("SH288-consumer");
+                    }
                     let mut e3 = arm64jit::jit::CpuState::new();
                     e3.tpidr = tpidr;
                     e3.x[31] = boot_sp;
@@ -14246,20 +14268,13 @@ mod sh115_tests {
     #[test]
     fn sh225_doinit_dm_construction_dispatch_fork_pinned() {
         // SH225: pin the ONE reachable DM-touching path (StartLuaAppDM 0x1023efe2c ->
-        // dispatcher 0x102baeeec -> GlobalInit do-init 0x102206c40) so a future drive / 
-        // proof-of-dead-end starts from a byte-anchored target. do-init (0x102206c40)
-        // acquire-loads once-guard [0x106a68410] (ldar w9,[x8] f206c7c / tbz f206c84 ->
-        // 0x102206d10); first-call bls 0x10284ce54 (__call_once), builds registry keys,
-        // then bl closure-build 0x102206db8 (f206cdc). Its dispatch reads x0=[x19,#32]
-        // (union +0x30 slot; 64-bit LDR scales imm12 by 8 -> word 0xf9401260 imm12=4 =
-        // #32, NOT #4 as SH225/226 mislabeled), x8=[x0] vtable, x1=[x8,#0x30] vt+0x30
-        // slot, `br x1` (f206e24) = the DM-construction entry a live object dispatches
-        // through. MEASURED GATE: on the ladder the `b.ne` (pthread_self-vs-main-id) at
-        // 0x206df0 is TAKEN -> 0x206e28 (LocalStorageManager path), so the binder-dispatch
-        // block 0x206df4..0x206e24 NEVER runs (3/3) — the SH225/226 "fabricate a binder
-        // at [union+4]" target is a MEASURED dead-end (decode #32 not #4 + b.ne bypass).
-        // A second fork bl 0x10221942c (f206ce4) returns via a short helper.
-        // A drift in any of these sites fails loudly.
+        // 0x102baeeec -> do-init 0x102206c40). do-init acquire-loads once-guard
+        // [0x106a68410] (ldar 0x2206c7c / tbz -> 0x102206d10), __call_once 0x284ce54,
+        // closure-build 0x102206db8; dispatch reads x0=[x19,#32] (union+0x30 slot, LDR
+        // word 0xf9401260 imm12=4 = #32, NOT #4), x8=[x0], x1=[x8,#0x30], br x1 = DM
+        // ctor entry. MEASURED GATE: b.ne (pthread_self-vs-main-id) @0x206df0 TAKEN ->
+        // 0x206e28 (LSM path), so binder-dispatch 0x206df4..0x206e24 NEVER runs (3/3) —
+        // "fabricate a binder at [union+4]" is a dead-end. Second fork bl 0x10221942c.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
@@ -15492,20 +15507,13 @@ mod sh115_tests {
 
     #[test]
     fn sh267_lsm_insert_leaf_mechanism_pinned() {
-        // SH267 (single-agent, cone suppressed): pin the LSM INSERT-leaf mechanism SH260
-        // parked and that gates the SEP-17 PRIMARY lever (session-drive). Insert path fn
-        // 0x1db1cc8 reads `x1 = sub[idx]` (the map's per-key node slot, idx=(key>>16)&0x1fff)
-        // then `bl 0x2b9ea40` does an atomic-OR (bit1, the "present" flag) into *x1:
-        //    0x2b9ea40 bti c (0xd503245f) / 0x2b9ea44 adrp x16,683b000 (0xb001e4f0)
-        //    0x2b9ea48 ldrb w16,[x16,#2648] (0x39696210)   -- atomic-or flag byte
-        //    0x2b9ea4c cbz w16,0x2b9ea58 (0x34000070)      -- ldset vs ldxr/stxr
-        //    0x2b9ea50 ldset x0,x0,[x1] (0xf8203020)       -> OR bit1 into *x1
-        // With the seeded empty map every sub-slot is 0 -> x1=0 -> atomic op on addr 0
-        // -> SIGSEGV fault=0x0 at guestpc 0x101db1d04. The SH267 default-inert fix
-        // (JIT_ROUTEB_APPSART_LSM_NODES=1) fills each 0x2000 sub-slot with a real leaked
-        // zeroed node cell so the OR lands in real memory; the reader (0x1d99e50) then
-        // returns node+40=0 (found-empty) instead of faulting. These words pin the
-        // mechanism so a drift fails loudly; default-inert (seed only under env).
+        // SH267 (single-agent): pin the LSM INSERT-leaf gating the SEP-17 session-drive.
+        // Insert 0x1db1cc8 reads x1=sub[idx] ((key>>16)&0x1fff) then bl 0x2b9ea40 does
+        // atomic-OR bit1 into *x1 (0x2b9ea40 bti 0xd503245f / 0x2b9ea44 adrp 0xb001e4f0 /
+        // 0x2b9ea48 ldrb [x16,#2648] 0x39696210 / 0x2b9ea4c cbz 0x34000070 / 0x2b9ea50
+        // ldset 0xf8203020). Empty-map seed -> sub slot 0 -> OR on addr 0 -> SIGSEGV
+        // fault=0x0 @0x101db1d04. Fix JIT_ROUTEB_APPSART_LSM_NODES=1 fills the 0x2000
+        // slots with a leaked node cell; reader 0x1d99e50 then returns found-empty.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
@@ -15869,19 +15877,15 @@ mod sh115_tests {
 
     #[test]
     fn sh239_doinit_oncelambda_intern_store_and_ctor_deep_body_pinned() {
-        // SH239 (real-image guard; skip-if-absent). Two measured Route-B facts QUALIFY the
-        // "StartLuaAppDM's do-init never completes app-shell construction" label (guest=file+0x100000000).
-        // (1) do-init once-lambda STORES the __call_once result via `str x0,[x23,#1032]` at file 0x2206d74
-        //     (x23=adrp 6a68000 => guest [0x106a68408]). Measured live that result is intern 0x400000b
-        //     (once-slot), NOT an in-image DM => the operator's "LET the once-lambda populate
-        //     [0x106a68818]" premise is FALSIFIED headlessly: A/B WITHOUT the SH156 fabricated DM-root
-        //     seed leaves [0x106a68818]==0 even though the once-lambda runs and self-latches oncel-guard
-        //     bit0. The gen DM-root seed is necessary-but-insufficient; the wall is not seed-caused.
-        // (2) With the SH156 seed present, the app-shell/global-init ctor 0x102207b50 (entry `b +4`,
-        //     0x2207b54 a9be7bfd) RUNS DEEP: measured 61+ distinct block-entry pcs to 0x102208eac, and its
-        //     terminal tail targets FMOD/AAudio iterate 0x5fb30b4 (sound pillar first contact, SH212/213-
-        //     class), not a soft-return at the ctor head. So "do-init never completes construction" is too
-        //     coarse: the ctor body executes far; what never happens is a make_shared<DataModel>.
+        // SH239 (real-image guard). Two Route-B facts qualify "StartLuaAppDM do-init
+        // never completes app-shell construction": (1) once-lambda stores __call_once
+        // result at file 0x2206d74 `str x0,[x23,#1032]` (x23=adrp 6a68000 => [0x106a68408]);
+        // live result is intern 0x400000b (once-slot), NOT a DM => "LET once-lambda
+        // populate [0x106a68818]" is FALSIFIED headlessly (A/B: no seed ->
+        // [0x106a68818]==0 even though once-lambda runs + self-latches guard). (2) With
+        // the SH156 seed, app-shell ctor 0x102207b50 runs 61+ blocks to 0x102208eac and
+        // tails to FMOD iterate 0x5fb30b4 (sound first-contact), NOT a head soft-return;
+        // the DM never make_shared.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
