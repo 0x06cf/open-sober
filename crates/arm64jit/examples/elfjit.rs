@@ -14108,9 +14108,13 @@ mod sh115_tests {
             // Dispatcher 0x102bd8ce8: entry sub sp,#0x50 ; 0x2bd8d14 bl getter 0x2174c04.
             assert_eq!(word(0x102_bd8ce8), 0xd10143ff, "sh240 dispatcher 0x102bd8ce8 prologue sub sp,#0x50");
             // Getter 0x2174c04 reads the manager holder via ldar at 0x2174c28 (adrp x8,7275000
-            // -> +0x550; base 0x2174c18 = adrp 7275000 0xb0028808).
+            // -> GUEST 0x107275550 (+0x550) — NOT 0x102727550. SH243: 0x102727550 is vaddr
+            // 0x2727550 inside the R-E CODE seg; the getter's true read cell 0x107275550 is
+            // vaddr 0x7275550 in the RW data seg [0x67d67c0,0x7333c3c). The prior 8 cycles
+            // (SH165-240) seeded the wrong cell; the SH243 A/B (4/4) showed StartLuaAppDM
+            // returns Ok(M) with the true cell seeded vs Ok(0x3e8) baseline.
             assert_eq!(word(0x102_174c18), 0xb0028808, "sh240 getter adrp x8,7275000 (manager holder page)");
-            assert_eq!(word(0x102_174c28), 0xc8dffd00, "sh240 getter ldar x0,[0x102727550] (seeded manager holder)");
+            assert_eq!(word(0x102_174c28), 0xc8dffd00, "sh240 getter ldar x0,[0x107275550] (seeded manager holder, SH243-corrected)");
             // The two leaf dispatches in the dispatcher body: 0x2bd8d2c blr x8 (vt+0xf8),
             // 0x2bd8d50 blr x8 (vt+0x108), then the UNCONDITIONAL bl sub_2bd8dac at 0x2bd8d60.
             assert_eq!(word(0x102_bd8d2c), 0xd63f0100, "sh240 dispatcher blr vt+0xf8 (first leaf)");

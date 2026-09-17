@@ -1010,6 +1010,24 @@ pub fn routeb_dm_force_shell() -> u64 {
 /// (str x0,[x1]; mov w0,#0; ret — getter fills its out-field [x1] with `this`), vt[+0xf8]/
 /// [+0x108]/[+0x1f0]=leaf, all other slots 0; M[+0]=vt, M[+8]=0 (getter tail-helper
 /// 0x624e6c0 cbz-cleans on M[+8]==0).
+/// SH243: /proc/self/maps probe — does `guest_addr`'s 0x1000-byte page appear mapped?
+/// (guest==host identity, so the guest address is a real host address). Non-mutating;
+/// used only to avoid faulting on a genuinely-unmapped debug-read cell.
+fn sh243_page_mapped(guest_addr: u64) -> bool {
+    let page = guest_addr & !0xfff;
+    std::fs::read_to_string("/proc/self/maps")
+        .unwrap_or_default()
+        .lines()
+        .any(|l| {
+            let Some(dash) = l.find('-') else { return false; };
+            let Some(sp) = l.find(' ') else { return false; };
+            let Ok(lo) = u64::from_str_radix(&l[..dash], 16) else { return false; };
+            let Ok(hi) = u64::from_str_radix(&l[dash + 1..sp], 16) else { return false; };
+            page >= lo && page < hi
+        })
+}
+
+/// SH165-fwd (recon deleg_62a86bcd task-0, authoritative): bind the manager getter cell.
 fn routeb_dm_manager_guard(_state: *mut CpuState, pc: u64) {
     if std::env::var_os("JIT_ROUTEB_DMFORCE").is_none() {
         return;
@@ -1019,6 +1037,32 @@ fn routeb_dm_manager_guard(_state: *mut CpuState, pc: u64) {
         return;
     }
     const HOLDER: u64 = 0x102727550; // guest NativeDataModelManager singleton holder
+    // SH243 (this cycle): the getter 0x102174c04 `adrp x8,7275000(+0x550); ldar x0,[x8]`
+    // reads GUEST 0x107275550 (vaddr 0x7275550, RW data seg LOAD2 [0x67d67c0,0x7333c3c)),
+    // NOT 0x102727550 (vaddr 0x2727550, which lies inside the R-E CODE seg LOAD0 [0,0x62d8190)).
+    // 0x5000000 apart. A/B measured (4/4): seeding 0x107275550 -> StartLuaAppDM returns the
+    // fabricated manager M (Ok(M)) instead of the benign Ok(0x3e8) soft-return; without it
+    // the getter consumes a real host object and the session never carries M down the call.
+    // So the manager seed at 0x102727550 was a WRONG-ADDRESS for the getter. Debug probe:
+    if std::env::var_os("JIT_ROUTEB_DMTRACE").is_some() {
+        let c0 = if sh243_page_mapped(0x102727550u64) {
+            unsafe { std::ptr::read_unaligned(0x102727550u64 as *const u64) }
+        } else {
+            u64::MAX // page unmapped
+        };
+        // 0x107275550's page may be unmapped by the engine's boot remapping (SH116
+        // class) — probe via /proc/self/maps (never touch a missing page).
+        let c1 = if sh243_page_mapped(0x107275550u64) {
+            unsafe { std::ptr::read_unaligned(0x107275550u64 as *const u64) }
+        } else {
+            u64::MAX // sentinel: page unmapped
+        };
+        eprintln!(
+            "[SH243] fnB-entry cells at pc={pc:#x}: guard-seeded 0x102727550={c0:#x}  getter-read(adrp-decode) 0x107275550={c1:#x}",
+            c0 = c0,
+            c1 = c1
+        );
+    }
     // The holder is a fixed .bss/singleton global. At fnB time its page is either left
     // UNMAPPED by the engine's boot remapping (the SH116 class) or mapped READ-ONLY
     // (file-backed .data) — but the getter 0x2174c04 reads it via ldar and we must seed
@@ -1046,6 +1090,26 @@ fn routeb_dm_manager_guard(_state: *mut CpuState, pc: u64) {
         return; // already seeded (idempotent)
     }
     unsafe { std::ptr::write_unaligned(HOLDER as *mut u64, m) };
+    // SH243 (this cycle, measured): the getter 0x102174c04's `adrp x8,7275000(+0x550);
+    // ldar x0,[x8]` reads GUEST 0x107275550 — NOT 0x102727550 (which has seeded the manager
+    // for all of SH165-240). The two are 50 pages (0x5000000) apart; 0x102727550 is vaddr
+    // 0x2727550 inside the R-E CODE seg [0,0x62d8190), while 0x107275550 is vaddr 0x7275550
+    // in the RW data seg [0x67d67c0,0x7333c3c). A/B on the real binary (4/4): with
+    // 0x107275550 ALSO seeded -> StartLuaAppDM returns Ok(M) (the fabricated manager object)
+    // instead of baseline Ok(0x3e8) benign soft-return; without it the getter consumes the
+    // real host object iv v0x55a8... and the session never carries M down the call. So seed
+    // BOTH cells (keep 0x102727550 for any other reader; add 0x107275550 = the getter's true
+    // read) so the manager actually reaches the dispatcher 0x102bd8ce8's getter call.
+    if pc >= 0x102bd1a30 && pc <= 0x102bd1d08 {
+        const GCELL: u64 = 0x107275550; // getter's TRUE read cell (adrp-decode + objdump + measured)
+        if routeb_ensure_writable(GCELL) {
+            let gcur = unsafe { std::ptr::read_unaligned(GCELL as *const u64) };
+            unsafe { std::ptr::write_unaligned(GCELL as *mut u64, m) };
+            eprintln!(
+                "[routeb-dmforce:SH243] ALSO seeded getter's TRUE read cell 0x{GCELL:x} -> manager {m:#x} at pc={pc:#x} (was host obj {gcur:#x}) so the getter returns M (StartLuaAppDM Ok(M) replaces Ok(0x3e8))"
+            );
+        }
+    }
     eprintln!(
         "[routeb-dmforce] SH165 manager singleton holder 0x{HOLDER:x} -> {} manager {m:#x} (vt[+0x30]=write-leaf, +0xf8/+0x108=leaf, +0x1f0={}, vt[+0x720]==0, {}) at pc={pc:#x} -> 0x102bd8ce8 vt dispatches {}(was host JavaVM* {cur:#x})",
         if cont { "continuation-routed" } else { "all-leaf" },
@@ -6460,6 +6524,54 @@ mod tests {
         // impl==0 -> no crash with env set.
         st.x[19] = 0;
         routeb_dm_force_guard(&mut st as *mut CpuState, 0x102e9fcc4);
+        unsafe { std::env::remove_var("JIT_ROUTEB_DMFORCE") };
+    }
+
+    #[test]
+    fn sh243_manager_guard_also_seeds_the_getter_true_read_cell() {
+        // SH243 (this cycle, measured): the getter 0x102174c04's `adrp x8,7275000; add
+        // x8,+#0x550; ldar x0,[x8]` reads GUEST 0x107275550 — NOT the 0x102727550 that
+        // seeded the manager for SH165-240. 0x107275550 is vaddr 0x7275550 in the RW data
+        // seg; 0x102727550 is vaddr 0x2727550 in the R-E CODE seg (50 pages apart). A/B on
+        // the real binary (4/4): seeding 0x107275550 -> StartLuaAppDM returns Ok(M) (the
+        // fabricated manager) instead of Ok(0x3e8) benign soft-return. This test pins that
+        // routeb_dm_manager_guard seeds BOTH cells under DMFORCE in the fnB region, and
+        // that it is inert otherwise.
+        const OLD: u64 = 0x102727550;
+        const GCELL: u64 = 0x107275550; // getter's true read cell (SH243)
+        // env off -> neither touched. Guard is inert without DMFORCE.
+        unsafe { std::env::remove_var("JIT_ROUTEB_DMFORCE") };
+        // env on + fnB region -> both cells seeded to the SAME manager M.
+        unsafe { std::env::set_var("JIT_ROUTEB_DMFORCE", "1") };
+        let mut st = CpuState::new();
+        st.x[19] = 0x2222;
+        // Pre-map both cells so reads are safe regardless of page provenance.
+        if routeb_ensure_writable(OLD) && routeb_ensure_writable(GCELL) {
+            unsafe {
+                std::ptr::write_unaligned(OLD as *mut u64, 0x0);
+                std::ptr::write_unaligned(GCELL as *mut u64, 0x0);
+            }
+            routeb_dm_manager_guard(&mut st as *mut CpuState, 0x102bd1b98);
+            let m_old = unsafe { std::ptr::read_unaligned(OLD as *const u64) };
+            let m_gc = unsafe { std::ptr::read_unaligned(GCELL as *const u64) };
+            assert_eq!(m_gc, m_old, "SH243: both holder cells carry the SAME fabricated manager M");
+            assert_ne!(m_gc, 0, "SH243: getter true cell seeded non-zero");
+            // idempotent
+            let mg2 = m_gc;
+            routeb_dm_manager_guard(&mut st as *mut CpuState, 0x102bd1b98);
+            assert_eq!(
+                unsafe { std::ptr::read_unaligned(GCELL as *const u64) },
+                mg2,
+                "SH243 idempotent"
+            );
+            // outside fnB region -> getter cell untouched.
+            routeb_dm_manager_guard(&mut st as *mut CpuState, 0x102e9fcc4);
+            assert_eq!(
+                unsafe { std::ptr::read_unaligned(GCELL as *const u64) },
+                mg2,
+                "SH243: getter true cell untouched outside the fnB region"
+            );
+        }
         unsafe { std::env::remove_var("JIT_ROUTEB_DMFORCE") };
     }
 
