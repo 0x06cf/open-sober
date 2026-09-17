@@ -13336,6 +13336,49 @@ mod sh115_tests {
         }
     }
     #[test]
+    fn sh251b_classdesc_register_advances_into_ctor_fencepost() {
+        // SH251b (Route-B re-attack, fresh single-agent): under the class-desc-REGISTERED +
+        // genuine-DM CONSUMER+DISPATCH path (JIT_ROUTEB_DM_SERVICES=1 with REALCTOR_CONSUMER+DISPATCH),
+        // the SH189 guard drives the REAL PlayerGui + ScreenGui class-register getters headlessly
+        // (docs/frontier-sh189-dm-servicecontainer-playergui-recon.md's "next unsynthesized object"),
+        // then the register continuation ADVANCES into a large ctor 0x102b9eca0 (sub sp,#0x480) whose
+        // `ldr x3,[x19,#16]` faults with this=x19=NULL (fault=0x10) — a stable NEW downstream fencepost
+        // (repro calls/batch_sh251b_fencepost_repro.sh, 3/3 EXIT 134/139 at guestpc=0x102b9ecbc after
+        // the PlayerGui+ScreenGui getters drove OK). Reachable ONLY through the class-desc-registered
+        // path; a silent drift of these anchors would false-negative the new reachability. Pin them
+        // (real-image guard family, skip-if-absent, guest=file+0x100000000 + 4-align + distinct).
+        let sites: [(usize, u32); 8] = [
+            (0x201fce0, 0xd10103ff), // PlayerGui class-register getter entry (sub sp,#64)
+            (0x201fce8, 0xf9001bf3), // PlayerGui getter +8 (stp x29,x30 / str x19,[sp,#24])
+            (0x201f42c, 0xd10103ff), // ScreenGui class-register getter entry (sub sp,#64)
+            (0x201fda4, 0xd10203ff), // PlayerGui register once-body entry (sub sp,#128)
+            (0x2b9eca0, 0xa9be7bfd), // new downstream ctor entry (stp x29,x30,[sp,#-32]!)
+            (0x2b9ecac, 0xd11203ff), // ctor prologue (sub sp,#1152 -> 0x480-byte frame)
+            (0x2b9ecb0, 0xaa0003f3), // ctor mov x19,x0 (save this/x0)
+            (0x2b9ecbc, 0xf9400a63), // fault insn: ldr x3,[x19,#16] (this=NULL -> fault 0x10)
+        ];
+        for &(site, _exp) in &sites {
+            let guest = 0x100000000u64 + site as u64;
+            assert_eq!(site & 3, 0, "sh251b fencepost site 0x{site:x} must be 4-aligned");
+            assert!(guest >= 0x100000000, "guest addr must be in-image");
+        }
+        let mut addr = sites.map(|(s, _)| s);
+        addr.sort_unstable();
+        for w in addr.windows(2) {
+            assert_ne!(w[0], w[1], "sh251b fencepost pin sites must be distinct");
+        }
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            for &(site, exp) in &sites {
+                let w = u32::from_le_bytes([img[site], img[site + 1], img[site + 2], img[site + 3]]);
+                assert_eq!(w, exp, "sh251b fencepost site vaddr 0x{site:x} must be {exp:08x}");
+            }
+        } else {
+            eprintln!("sh251b real-image guard: no real libroblox.so, skipping");
+        }
+    }
+    #[test]
     fn sh200_v2_dispatch_window_materializes_obj_and_nops_to_blr() {
         // SH200 V2-init dispatch window (fn 0x6251e0c etc.): the first 4 slots
         // load the stable object into x0, the rest are nops (killing the
