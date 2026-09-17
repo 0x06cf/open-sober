@@ -7791,6 +7791,52 @@ fn main() {
                     );
                     dump("SendAppEventOnGameLoaded");
                 }
+                // SEP-17 messageBus receive (0x2ba5bb8 = the only genuinely-NEVER-driven
+                // Route-B candidate SH185 closed by STATIC judgment only: "subscribe
+                // registered only inside the migration-gated initializeLuaApp_"). Driving
+                // it as a real guest entry converts that judgment into a runtime result.
+                // It is a JNI-RECEIVE export (Java_com_roblox_universalapp_messagebus_
+                // MessageBus_subscribe): its body (a) dispatches a JNI table slot near the
+                // top (blr [env]+248 = the vtable/telemetry slot), then telemetry-logs,
+                // allocates subscription boxes (operator_new 0x1d96768 mksize 0x28/0x20),
+                // and (b) DIRECTLY bl's nativeAppBridgeAppStart (0x2343c10, the
+                // String,..,String,Z,..,Z marshaller) — a REAL app-start route the ladder
+                // drives via the fabricated StartLuaAppDM frame instead. If subscribe
+                // completes, it registers a 'experience-launch' subscription AND drives a
+                // genuine app-start. Opt-in --v2boot-session-bus; single ladder thread.
+                // The initial `ldr x8,[x0]; ldr x8,[x8,#248]; blr x8` is a JNI table slot
+                // dispatch on env (x0); our fabricated env's function table resolves it
+                // (identity shim family, SH186). ABI: x0=env x1=thiz x2/x3/x4/x5 jstrings.
+                if std::env::args().any(|a| a == "--v2boot-session-bus") {
+                    let b1 = arm64jit::jni::new_string_utf_handle(b"experience-launch");
+                    let b2 = arm64jit::jni::new_string_utf_handle(b"");
+                    let b3 = arm64jit::jni::new_string_utf_handle(b"");
+                    let b4 = arm64jit::jni::new_string_utf_handle(b"");
+                    eprintln!(
+                        "[elfjit:v2boot] driving MessageBus.subscribe @ guest 0x102ba5bb8 (jh={b1:#x} b2={b2:#x} b3={b3:#x} b4={b4:#x})"
+                    );
+                    let mut sb = arm64jit::jit::CpuState::new();
+                    sb.tpidr = tpidr;
+                    sb.x[31] = boot_sp;
+                    sb.x[0] = env_ptr;
+                    sb.x[1] = thiz;
+                    sb.x[2] = b1;
+                    sb.x[3] = b2;
+                    sb.x[4] = b3;
+                    sb.x[5] = b4;
+                    match arm64jit::jit::jit_run(iimg, ib, 0x102ba5bb8, &mut sb as *mut CpuState) {
+                        Err(e) => eprintln!("[elfjit:v2boot] MessageBus.subscribe stopped: {e}"),
+                        Ok(r) => eprintln!(
+                            "[elfjit:v2boot] MessageBus.subscribe returned Ok({r:#x}) — subscription registered + app-start driven iff it finished"
+                        ),
+                    }
+                    let nf4 = arm64jit::jni::nativehelper_flags_loaded();
+                    let ar4 = arm64jit::jni::nativehelper_app_ready();
+                    eprintln!(
+                        "[elfjit:v2boot] MessageBus.subscribe post: MH_FLAGS_LOADED={nf4} MH_APP_READY={ar4}"
+                    );
+                    dump("MessageBus.subscribe");
+                }
                 // SH131 (deleg_fbb8faf7, disasm 21f7654): seed the engine's OWN
                 // data-path global before it ever builds an app-data-model. The
                 // real client stores its files dir via nativeSetFilesDirectory
@@ -15073,6 +15119,56 @@ mod sh115_tests {
             eprintln!("sh265 dataModel-bindings live-binder receive (nativeAppBridgeV2SendAppEventOnGameLoaded + 0x10635dfe8 vtable real-teardown) pinned on libroblox.so");
         } else {
             eprintln!("sh265 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
+    fn sh266_messagebus_subscribe_jni_receive_pinned() {
+        // SH266 (single-agent, cone suppressed): drive the SEP-17 messageBus receive
+        // Java_com_roblox_universalapp_messagebus_MessageBus_subscribe (guest 0x102ba5bb8) —
+        // the ONLY Route-B candidate SH185 closed by STATIC judgment alone (its doc says
+        // "subscribe registered only inside the migration-gated initializeLuaApp_", never
+        // driven). New --v2boot-session-bus rung drives it as a real guest entry. Pin its
+        // real-image ABI so a silent drift breaks loudly:
+        //   entry 0x102ba5bb8 = sub sp,#0x190 (0xd10643ff)
+        //   JNI table slot dispatch ldr x8,[x0]/ldr x8,[x8,#248]/blr  @0x2ba5bf4/0x2ba5bf8/0x2ba5bfc
+        //   jstring marshal bl 0x21e1fec @0x2ba5c7c = 0x97d8f0dc (identity shim, SH186)
+        //   subscription vtable-base adrp 635c000/#388 @0x2ba5cfc = 0xf001bda8
+        //   operator_new sizes (0x28 box @0x2ba5d34 bl 0x1d96768; 0x28 @0x2ba5e2c) — the
+        //     headless-alloc wall class SH245-248 (returns NULL for >0xa; the leak is the
+        //     same live-object gate the ladder hits, NOT a new seed)
+        //   REAL app-start driver bl 0x2343c10 @0x2ba5e14 = 0x97de777f (nativeAppBridgeAppStart
+        //     String,..,String,Z,..,Z marshaller) — the genuine app-start route via messageBus
+        // Route-B live-DM structural gate UNCHANGED; SH174 capture-latch stays single forward hook.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            assert_eq!(word(0x102_ba5bb8), 0xd10643ff, "sh266 MessageBus.subscribe prologue sub sp,#0x190");
+            assert_eq!(word(0x102_ba5bf4), 0xf9400008, "sh266 subscribe JNI-table dispatch ldr x8,[x0]");
+            assert_eq!(word(0x102_ba5bf8), 0xf9407d08, "sh266 subscribe JNI-table dispatch ldr x8,[x8,#248]");
+            assert_eq!(word(0x102_ba5bfc), 0xd63f0100, "sh266 subscribe JNI-table dispatch blr");
+            assert_eq!(word(0x102_ba5c7c), 0x97d8f0dc, "sh266 subscribe jstring marshal bl 0x21e1fec");
+            assert_eq!(word(0x102_ba5cfc), 0xf001bda8, "sh266 subscribe subscription vtable adrp 635c000");
+            assert_eq!(word(0x102_ba5e14), 0x97de777f, "sh266 subscribe REAL app-start bl 0x2343c10");
+            assert_eq!(word(0x102_ba5d34), 0x97c7c28d, "sh266 subscribe operator_new bl 0x1d96768 (0x28 box)");
+            for (guest, name) in [
+                (0x102_ba5bb8u64, "subscribe-entry"),
+                (0x102_ba5bf4u64, "subscribe-jni-dispatch"),
+                (0x102_ba5c7cu64, "subscribe-jstr-marshal"),
+                (0x102_ba5cfcu64, "subscribe-vt-adrp"),
+                (0x102_ba5e14u64, "subscribe-appstart-bl"),
+                (0x102_ba5d34u64, "subscribe-opnew"),
+            ] {
+                assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh266 {name} {guest:#x} in window");
+                assert!(guest & 3 == 0, "sh266 {name} {guest:#x} 4-aligned");
+            }
+            eprintln!("sh266 messageBus MessageBus.subscribe (entry/JNI-slot dispatch/jstring marshal/op_new + real app-start bl 0x2343c10) pinned on libroblox.so");
+        } else {
+            eprintln!("sh266 real-image guard: no real libroblox.so, skipping anchors");
         }
     }
 
