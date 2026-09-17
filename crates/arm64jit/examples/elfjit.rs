@@ -13739,6 +13739,94 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh235_ec_world_sole_direct_entry_via_9arg_marshaler_pinned() {
+        // SH235 (Route-B re-attack, single-agent, fresh recon cone aimed at the ExperienceController
+        // line the operator named): SH231 located the genuine DM-creation lambda world (bodies guest
+        // [0x102e1c650, 0x102e25200)) and SH232 proved its in-rung callers never translate. THIS cycle
+        // locates the ONE entry instruction into that world and the ONE marshaler that reaches it:
+        //   EC world entry   guest 0x102e24598 = stp x29,x30,[sp,#-96]! (0xa9ba7bfd), a big start-app
+        //                    params marshaller (reads ~24 this/param fields at +48/+72/+8/+145/+156/+164,
+        //                    flags globals 0x6a69000+0x358 / 0x6d31000+0xe28, dispatches blr [this]+0x30
+        //                    -> vt+0x10, then bl 0x23c5538 / bl 0x23f1654).
+        //   Sole marshaler   guest 0x1023f1210 = sub sp,#0xb0 (0xd102c3ff); its ONLY bl is 0x1023f1294
+        //                    -> 0x2e24598 (SH232 pinned the word; this test pins the enclosing fn too).
+        // Fresh measured fact: the marshaler 0x1023f1210 has EXACTLY 3 direct callers — inside
+        // StartLuaAppDM (0x1023f075c) and two EC-region self-sites (0x102e15bf0, 0x102e33494) — and
+        // the EC world 0x102e24598 has EXACTLY 2 direct callers (the marshaler's bl at 0x1023f1294
+        // and an in-EC-world self-call at 0x102e18408 = 0x94003064). Full-.text scan is authoritative
+        // (objdump's per-symbol grep under-reported the second; this test scans every exec word).
+        // Corrects SH232's label "EC-arg helper 0x1023f11f4" (that is a different tiny cleanup fn at
+        // 0x1023f11f4, prologue 0xa9bf7bfd, which does NOT call the EC world); the true EC caller fn is
+        // 0x1023f1210. Route-B doctrine: the gate is live-state, NOT a headless seed (x0=x19=this is
+        // threaded from StartLuaAppDM's receiveCall dispatch switch, and 0x2e24598 immediately derefs a
+        // live this + ~24-field StartApp params + flags globals = the fabricatable-object-graph class).
+        // This pins the EXACT spot the next drive must satisfy, so a drifted constant fails loudly.
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            // pin EC world entry + the marshaler that reaches it
+            assert_eq!(word(0x102_e24598), 0xa9ba7bfd, "sh235 EC world entry stp x29,x30,[sp,#-96]!");
+            assert_eq!(word(0x102_3f1210), 0xd102c3ff, "sh235 marshaler entry sub sp,#0xb0");
+            // the 4 bl words resolve to their targets
+            let check_bl = |pc: u64, w: u32, expect: u64| {
+                let imm = w & 0x03ff_ffff;
+                let signed = if imm & 0x200_0000 != 0 { (imm as i64) - 0x400_0000 } else { imm as i64 };
+                assert_eq!(pc.wrapping_add_signed(signed << 2), expect, "sh235 bl {pc:#x}");
+            };
+            check_bl(0x102_3f1294, word(0x102_3f1294), 0x102_e24598); // marshaler -> EC world (SH232 pin)
+            check_bl(0x102_e18408, word(0x102_e18408), 0x102_e24598); // EC-world self-call -> EC world
+            check_bl(0x102_3f075c, word(0x102_3f075c), 0x102_3f1210); // StartLuaAppDM -> marshaler
+            check_bl(0x102_e15bf0, word(0x102_e15bf0), 0x102_3f1210); // EC-region -> marshaler
+            check_bl(0x102_e33494, word(0x102_e33494), 0x102_3f1210); // EC-region -> marshaler
+            // alignment/window for the pinned sites
+            for (g, name) in [
+                (0x102_e24598u64, "EC world entry"), (0x102_3f1210u64, "marshaler entry"),
+                (0x102_3f1294u64, "marshaler bl"), (0x102_e18408u64, "EC-world self-call"),
+                (0x102_3f075cu64, "StartLuaAppDM call"),
+                (0x102_e15bf0u64, "EC-region call 1"), (0x102_e33494u64, "EC-region call 2"),
+            ] {
+                assert!(g >= 0x1_0000_0000 && g < 0x120_0000_00, "sh235 {name} {g:#x} in window");
+                assert!(g & 3 == 0, "sh235 {name} {g:#x} 4-aligned");
+            }
+            // SOLE-DIRECT-ENTRY PROOF: scan every word of the executable .text for direct bl/b whose
+            // target is the marshaler or the EC world, and assert the exact caller sets.
+            let (tea, teb) = el.text_segment().expect("sh235 text segment");
+            let host_base = el.host_addr_of(0x1_0000_0000).expect("sh235 host base");
+            let guest_of = |h: u64| 0x1_0000_0000 + (h - host_base);
+            let mut marshaler_callers: Vec<u64> = Vec::new();
+            let mut ecworld_callers: Vec<u64> = Vec::new();
+            let mut gaddr = tea;
+            while gaddr + 4 <= teb {
+                let w = unsafe { (gaddr as *const u32).read_unaligned() };
+                if w & 0xfc00_0000 == 0x9400_0000 || w & 0xfc00_0000 == 0x1400_0000 {
+                    let imm = w & 0x03ff_ffff;
+                    let signed = if imm & 0x200_0000 != 0 { (imm as i64) - 0x400_0000 } else { imm as i64 };
+                    let pc = guest_of(gaddr);
+                    let tgt = pc.wrapping_add_signed(signed << 2);
+                    if tgt == 0x102_3f1210 { marshaler_callers.push(pc); }
+                    if tgt == 0x102_e24598 { ecworld_callers.push(pc); }
+                }
+                gaddr += 4;
+            }
+            marshaler_callers.sort_unstable();
+            ecworld_callers.sort_unstable();
+            assert_eq!(marshaler_callers, vec![0x102_3f075cu64, 0x102_e15bf0u64, 0x102_e33494u64],
+                "sh235 marshaler 0x1023f1210 has EXACTLY these 3 direct callers");
+            assert_eq!(ecworld_callers, vec![0x102_3f1294u64, 0x102_e18408u64],
+                "sh235 EC world 0x102e24598 has EXACTLY these 2 direct callers");
+            eprintln!("sh235 EC world 0x102e24598 direct entries = marshaler 0x1023f1210 (callers {:x?}) + EC self-call 0x102e18408 on libroblox.so", marshaler_callers);
+        } else {
+            eprintln!("sh235 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh115_sites_target_lazy_singleton_accessor_windows() {
         // Guest file vaddrs for the three accessor sites with their original
         // slot0 (mov) guard bytes — the patch refuses to write if these shift.
