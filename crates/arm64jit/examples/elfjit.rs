@@ -13982,8 +13982,94 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh239_doinit_oncelambda_intern_store_and_ctor_deep_body_pinned() {
+        // SH239 (real-image guard family as sh237/236/235; skip-if-absent):
+        // two measured Route-B facts at HEAD that QUALIFY the "StartLuaAppDM's do-init
+        // never completes app-shell construction" label. Real libroblox.so, guest =
+        // file + 0x100000000.
+        // (1) The do-init once-lambda completion STORES the __call_once result into the
+        //     once-slot via `str x0,[x23,#1032]` at file 0x2206d74 (x23=adrp 6a68000 =>
+        //     guest [0x106a68408]). Measured live that result is the intern 0x400000b
+        //     (once-slot), NOT an in-image DM controller => the operator's "LET the
+        //     once-lambda populate [0x106a68818]" premise is FALSIFIED headlessly: A/B
+        //     WITHOUT the SH156 fabricated DM-root seed leaves [0x106a68818]==0 even
+        //     though the once-lambda runs and self-latches oncel-guard bit0. The gen
+        //     DM-root seed is necessary-but-insufficient; the wall is not seed-caused.
+        // (2) When the SH156 seed IS present, the app-shell / global-init ctor
+        //     0x102207b50 (entry `b +4` then 0x2207b54 a9be7bfd stp) RUNS DEEP: measured
+        //     61+ distinct block-entry pcs through the body to 0x102208eac, and its
+        //     terminal tail targets the FMOD/AAudio iterate region 0x5fb30b4 (sub sp,#0x60)
+        //     — the sound pillar first contact (SH212/213-class), not a soft-return at the
+        //     ctor head. So "do-init never completes construction" is too coarse: the ctor
+        //     body executes far; what never happens is a make_shared<DataModel>.
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            // (1) once-lambda completion store + the oncel-guard base.
+            //     0x102206d74 = str x0,[x23,#1032]  -> writes __call_once result to [0x106a68408]
+            //     0x102206d78 = adrp x0,6a68000    (rd-base)
+            assert_eq!(word(0x102_206d74), 0xf90206e0, "sh239 once-lambda completion store str x0,[x23,#1032] -> [0x106a68408] (once-slot)");
+            assert_eq!(word(0x102_206d78), 0xd0024300, "sh239 once-lambda adrp x0,6a68000 (once-guard base)");
+            //     0x102206e24 = br x1  (do-init match dispatch terminal -> ctor via vt[+0x30])
+            assert_eq!(word(0x102_206e24), 0xd61f0020, "sh239 do-init match dispatch br x1 (vt[+0x30] -> app-shell ctor)");
+            // (2) app-shell / global-init ctor 0x102207b50: entry `b +4` (0x14000001),
+            //     0x102207b54 = stp x29,x30,[sp,#-32]!  (prologue), 0x102207b68 = ldar [0x6a64d70]
+            //     oncel-guard, FMOD tail 0x5fb30b4 = sub sp,#0x60.
+            assert_eq!(word(0x102_207b50), 0x14000001, "sh239 app-shell ctor 0x102207b50 entry b +4");
+            assert_eq!(word(0x102_207b54), 0xa9be7bfd, "sh239 app-shell ctor 0x102207b54 stp x29,x30,[sp,#-32]!");
+            assert_eq!(word(0x102_207b68), 0x08dffd08, "sh239 app-shell ctor oncel-guard ldar w8,[x8] (reads [0x106a64d70], self-sets via __call_once)");
+            assert_eq!(word(0x105_fb30b4), 0xd10183ff, "sh239 ctor terminal-tail FMOD/AAudio iterate 0x5fb30b4 sub sp,#0x60 (sound-pillar first contact)");
+            // 4-alignment + in-window for all pinned .text sites.
+            for (guest, name) in [
+                (0x102_206d74u64, "once-lambda store"), (0x102_206d78u64, "once-lambda adrp"),
+                (0x102_206e24u64, "do-init br x1"), (0x102_207b50u64, "ctor entry"),
+                (0x102_207b54u64, "ctor prologue"), (0x102_207b68u64, "ctor oncel-guard"),
+                (0x105_fb30b4u64, "FMOD tail"),
+            ] {
+                assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh239 {name} {guest:#x} in window");
+                assert!(guest & 3 == 0, "sh239 {name} {guest:#x} 4-aligned");
+            }
+            eprintln!("sh239 qualified Route-B do-init facts on libroblox.so: once-lambda completion store 0x102206d74 writes the __call_once result (live = intern 0x400000b, NOT an in-image DM) into once-slot [0x106a68408]; the app-shell ctor 0x102207b50 body runs DEEP (measured 61+ blocks to 0x102208eac, terminal tail FMOD 0x5fb30b4) when the SH156 gen DM-root seed is present — 'never completes' is too coarse; no make_shared<DataModel> ever runs (capture latch silent, all FIRST allocs 0x18 bytes), so Route-B live-DM structural gate UNCHANGED");
+        } else {
+            eprintln!("sh239 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
+    fn sh238_real_image_receivecall_dispatchband_select_slots_relocated() {
+        // Real-image guard: the receiveCall dispatch-table band [0x635d970,0x635e700) must
+        // carry RELATIVE relocs (loader-synthesized .data.rel.ro) covering the two select
+        // handler slots — a drift to a non-relocated band would break the SH237 conclusion
+        // silently. Shared-helper extracted so both sh237 and this test can assert it.
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if p.exists() {
+            let _ = load_real_image();
+            use libloader::android_relocs::{read_elf_relocations, R_AARCH64_RELATIVE};
+            let mut band_relocs: Vec<u64> = Vec::new();
+            if let Ok(Some(rels)) = read_elf_relocations(p) {
+                for r in &rels {
+                    if r.r_type() == R_AARCH64_RELATIVE
+                        && r.r_offset >= 0x635d970 && r.r_offset < 0x635e700 {
+                        band_relocs.push(r.r_offset);
+                    }
+                }
+            }
+            assert!(!band_relocs.is_empty(), "sh238 receiveCall dispatch band has RELATIVE relocs");
+            assert!(band_relocs.contains(&0x635dd88), "sh238 select slot +0x20 is RELATIVE-relocated");
+            assert!(band_relocs.contains(&0x635dd90), "sh238 select slot +0x28 is RELATIVE-relocated");
+        }
+    }
+
+    #[test]
     fn sh115_sites_target_lazy_singleton_accessor_windows() {
-        // Guest file vaddrs for the three accessor sites with their original
         // slot0 (mov) guard bytes — the patch refuses to write if these shift.
         let sites: [(u64, u32); 3] = [
             (0x62517b8, 0xAA15_03E0), // V2Init A: mov x0,x21
