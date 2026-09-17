@@ -13827,6 +13827,63 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh236_startluaappdm_receivecall_dispatch_softreturns_before_marshaler() {
+        // SH236 (Route-B re-attack, single-agent): SH235 statically concluded the EC world
+        // 0x102e24598's only headless front-door (StartLuaAppDM -> bl 0x1023f1210 @0x1023f075c) is
+        // "gated by StartLuaAppDM's receiveCall dispatch switch on live controller state." THIS cycle
+        // measures the mechanism + pins the dispatch-helper prologues so the gate stays fail-loud.
+        // Measured (real libroblox.so, canonical completing --v2boot ladder, EXIT 124, 0 crash):
+        // region-watch on the FULL StartLuaAppDM body [0x1023efe2c,0x1023f0800) fires only 14 distinct
+        // block-entry pcs — the LAST being 0x1023f01e4 — then StartLuaAppDM benign-soft-returns Ok.
+        // The marshaler-call block at 0x1023f075c (bl 0x1023f1210) is NEVER entered, and the marshaler
+        // region [0x1023f1210,0x1023f1300) gets 0 hits. The receiveCall dispatch terminates headlessly
+        // inside helper fn 0x1023f00f8 (sub sp,#0x70; reads stack flags [sp+8]/[sp+32], benign-returns),
+        // which is reachable from the entry dispatch tail, BEFORE the code that builds StartAppParams
+        // and reaches 0x1023f075c. Pins (real-image guard family as sh235; skip-if-absent):
+        //   StartLuaAppDM entry       0x1023efe2c = sub sp,#0x60  (0xd10183ff, SH232 re-pin)
+        //   entry dispatch tail       0x1023efed8 = blr x8        (0xd63f0100, the vt dispatch)
+        //   helper fn prologue #1     0x1023eff4c = sub sp,#0x180 (0xd10603ff)
+        //   helper fn prologue #2     0x1023f00f8 = sub sp,#0x70  (0xd101c3ff)
+        //   last-entered block entry  0x1023f01e4 = ldrb w8,[sp,#8] (0x394023e8)
+        //   marshaler-call block      0x1023f075c = bl 0x1023f1210 (0x940002ad, SH235 re-check)
+        // This leaves the next drive with the exact location where StartLuaAppDM's dispatch
+        // soft-returns headlessly (helper 0x1023f00f8), i.e. the precise spot to satisfy to fall
+        // through to the marshaler + EC world. Route-B live-DM structural gate UNCHANGED.
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            assert_eq!(word(0x102_3efe2c), 0xd10183ff, "sh236 StartLuaAppDM entry sub sp,#0x60");
+            assert_eq!(word(0x102_3efed8), 0xd63f0100, "sh236 StartLuaAppDM entry dispatch blr x8");
+            assert_eq!(word(0x102_3eff4c), 0xd10603ff, "sh236 helper fn prologue sub sp,#0x180");
+            assert_eq!(word(0x102_3f00f8), 0xd101c3ff, "sh236 receiveCall dispatch helper sub sp,#0x70");
+            assert_eq!(word(0x102_3f01e4), 0x394023e8, "sh236 last-entered block ldrb w8,[sp,#8]");
+            // marshaler-call block: bl -> 0x1023f1210 (SH235 re-check: the sole headless EC front-door)
+            let w = word(0x102_3f075c);
+            let imm = w & 0x03ff_ffff;
+            let signed = if imm & 0x200_0000 != 0 { (imm as i64) - 0x400_0000 } else { imm as i64 };
+            assert_eq!(0x102_3f075cu64.wrapping_add_signed(signed << 2), 0x102_3f1210,
+                "sh236 marshaler-call bl target");
+            for (guest, name) in [
+                (0x102_3efe2cu64, "StartLuaAppDM entry"), (0x102_3efed8u64, "entry dispatch"),
+                (0x102_3eff4cu64, "helper#1"), (0x102_3f00f8u64, "dispatch helper"),
+                (0x102_3f01e4u64, "last-entered block"), (0x102_3f075cu64, "marshaler-call block"),
+            ] {
+                assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh236 {name} {guest:#x} in window");
+                assert!(guest & 3 == 0, "sh236 {name} {guest:#x} 4-aligned");
+            }
+            eprintln!("sh236 StartLuaAppDM receiveCall-dispatch soft-return location pinned (last block 0x1023f01e4 inside helper 0x1023f00f8; marshaler-call 0x1023f075c unreached headlessly) on libroblox.so");
+        } else {
+            eprintln!("sh236 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh115_sites_target_lazy_singleton_accessor_windows() {
         // Guest file vaddrs for the three accessor sites with their original
         // slot0 (mov) guard bytes — the patch refuses to write if these shift.
