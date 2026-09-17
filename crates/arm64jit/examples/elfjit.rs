@@ -7053,6 +7053,35 @@ fn main() {
                             // ctor 0x102207b50), so the match brs into real
                             // construction instead of soft-returning. Opt-in.
                             if std::env::var("JIT_ROUTEB_DM_SEED").ok().as_deref() == Some("1") {
+                                // SH239 (this cycle): two DM-root-layout options for the do-init
+                                // match. The match reads [[0x106a68818]+0x20] then vt+0x30
+                                // (operator EXECUTE-DO-INIT-GATES marker). DEFAULT (JIT_ROUTEB_DM_SEED
+                                // only): the 0x10-byte box with only [0x00]=vtable, so +0x20 reads
+                                // heap garbage (vt+0x30=0 per SH158 — the fake box never dispatches
+                                // a real DM). OPT-IN JIT_ROUTEB_DM_ROOT_GENUINE=1: instead place the
+                                // MANUFACTURED genuine-vptr RBX::DataModel (vt=0x1067162e8, SH187)
+                                // at [0x106a68818]+0x20 and pin its vtable+0x30 -> app-shell ctor
+                                // 0x1057d6ef4, so the do-init match dispatches through a REAL DM
+                                // vtable. A/B measure whether the ctor 0x1057d6ef4 body fires.
+                                use arm64jit::jit::routeb_manufactured_dm;
+                                let genuine_root = std::env::var("JIT_ROUTEB_DM_ROOT_GENUINE")
+                                    .ok().as_deref() == Some("1");
+                                if genuine_root {
+                                    let dm = routeb_manufactured_dm();
+                                    // OBJ at [0x106a68818]; [OBJ+0x20] = &genuine DM; the DM's primary
+                                    // vtable 0x1067162e8 [+0x30] = real app-shell ctor 0x1057d6ef4.
+                                    let holder = Box::leak(vec![0u8; 0x40usize].into_boxed_slice()).as_mut_ptr() as u64;
+                                    unsafe {
+                                        *(holder as *mut u64) = 0x10671_62e8u64; // genuine DM primary vptr
+                                        *(0x106a68818u64 as *mut u64) = holder;
+                                        *(0x1067162e8u64.wrapping_add(0x30) as *mut u64) = 0x1057d6ef4u64;
+                                        *(holder.wrapping_add(0x20) as *mut u64) = dm;
+                                    }
+                                    // also keep the GlobalInit dispatch vtable pin so app-shell/global
+                                    // init ctor remains reachable via the other path.
+                                    *(0x10635cd10u64 as *mut u64) = 0x102207b50;
+                                    eprintln!("[elfjit:v2boot] SH239 GENUINE DM-root: [0x106a68818]+0x20 = manufactured genuine-vptr DM {dm:#x} (vt 0x1067162e8, vt[+0x30]=0x1057d6ef4 real app-shell ctor); holder [0x106a68818]=0x{holder:x}");
+                                } else {
                                 // 0x10-byte object: only [0x00]=vtable is live (the
                                 // ctor 0x102207b50 never derefs `this`).
                                 let dmobj = Box::leak(vec![0u8; 0x10usize].into_boxed_slice()).as_mut_ptr() as u64;
@@ -7186,6 +7215,7 @@ fn main() {
                                         *(0x106a70880u64 as *const u8)
                                     );
                                 }
+                                } // close the SH239 `else` (JIT_ROUTEB_DM_ROOT_GENUINE off -> original fake-box branch)
                             }
                         }
                         eprintln!("[elfjit:v2boot] GATE-FIX seeded main-id cell 0x{me:x} + flags-latch for StartLuaAppDM -> GlobalInit once-guard LEFT CLEAR so __call_once runs and populates DM-root [0x106a68818]");

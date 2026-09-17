@@ -92,7 +92,30 @@ timeout 115 env JIT_DRIVE_LIFECYCLE=1 JIT_ROUTEB_HASHFIX=1 JIT_JSON_ZERO_FIX=1 \
 # expected: ... DM-root[0x106a68818]=0x0 ... once-slot ... =0x400000b
 ```
 
-## Honest boundary
+## Measured result 3 — the do-init match does NOT dispatch through the DM-root cell (closes the "surface the genuine DM into the match" lever)
+
+Fresh A/B with an opt-in `JIT_ROUTEB_DM_ROOT_GENUINE=1` (SH156 seed-site variant):
+instead of the fake 0x10-byte box (vt 0x10635cce0), plant the **manufactured
+genuine-vptr RBX::DataModel** (vt 0x1067162e8, SH187) at `[0x106a68818]+0x20` and
+pin its primary vtable `+0x30` -> the real DM app-shell ctor **0x1057d6ef4**.
+Region-watch [0x1057d6ef4,0x1057d7100) + the GlobalInit ctor [0x102207b50,0x102209000):
+
+| DM-root variant | app-shell ctor 0x1057d6ef4 hits | GlobalInit ctor body pcs |
+|---|---|---|
+| fake box (SH156 default) | **0** | ~79 blocks |
+| genuine-vptr DM (SH239 opt-in) | **0** | ~79 blocks |
+
+**Conclusion:** the two DM-root layouts dispatch IDENTICALLY — the do-init match
+does NOT read `[0x106a68818]+0x20` for its dispatch target; it selects through the
+StartLuaAppDM stack-union table (0x635dd68 [+0x30] -> 0x1023eff4c, SH156/237) and
+the GlobalInit vtable path, never through the DM's own vtable. `[0x106a68818]` is a
+sink for the once-lambda result (the intern 0x400000b), not the source of the
+dispatch. Both runs EXIT 124, 0 crash. So the carefully-planted genuine DataModel
+vtable in the DM root changes nothing — the match was never going to reach
+0x1057d6ef4 this way. This closes the "surface the manufactured DM into the do-init
+match" lever with a clean A/B (single-agent, no fabricatable-object-graph required).
+The DM's own app-shell ctor 0x1057d6ef4 remains reachable only via its owner
+dispatch (BPATH / a live engine session), the standing live-DM gate.
 
 This cycle is forward recon + a measured A/B falsification + regression pins —
 it does NOT manufacture a DataModel and does NOT lift the Route-B live-DM
