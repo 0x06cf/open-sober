@@ -119,3 +119,27 @@ own app-start registration (0x233a804..0x233ae38, 0x102346f2..) it never reached
 in 9 prior cycles — and dies instead at LocalStorageManager's map (a seedable
 fixed-.bss-global-shaped expression at [0x106a6f8c0], next CANDIDATE to try:
 seed a coherent empty lsm map there, same family as SH248d's jar seed).
+
+## Post-measurement classification of the NEW wall (doc addendum)
+
+The next angle "seed LocalStorageManager's map global [0x106a6f8c0]" was examined
+and CLASSIFIED, not chased free-form:
+- fn 0x1db1cc8 (crash fp) is INDIRECT-DISPATCH ONLY — 0 direct `bl 0x1db1cc8`
+  callers over the whole .text (the fn the app-start body reaches via a
+  loader-relocated/function-pointer slot). Its crash is the map-insert at
+  `1db1d08 adrp x8,726f000 / 1db1d14 ldr x8,[x8,#2240]` reading the map base
+  global [0x10726f8c0] (vaddr 0x726f8c0, in the RW seg [0x67d67c0,0x7333c3c),
+  so it IS a writable fixed-.bss cell — seedable-by-fixed-global in principle).
+- BUT the crash register snapshot shows the deref'd map base x9 =
+  0x7fe2eb8f9010 = a HOST-HEAP pointer (top 16 bits 0x7fe2), NOT 0 — i.e. the
+  LocalStorageManager map HEADER has already been constructed (host-heap) and its
+  backing bucket array is garbage/never-built. That is the SH174/SH204/248g
+  live-object family (a real session DM ctor must build the backing), NOT a
+  NULL-fixed-global that a fixed-.bss seed can satisfy. A seed would have to
+  fabricate the whole host-heap map + buckets at an address the engine later
+  reads — the same live-object structural gate, now at the persistence layer.
+- HONEST conclusion: LocalStorageManager init is the NEW terminal face of the
+  SAME live-DM gate (SH174 latch = real make_shared<DataModel> still the single
+  forward hook). The SH259 VALUE is upstream: the settings-once seed cleared the
+  deepest app-start gate and proved the orchestrator+app-registration body
+  (0x233a804..0x233ae38) executes headlessly — a measure, not a dead-end.
