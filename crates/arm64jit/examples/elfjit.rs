@@ -595,22 +595,16 @@ fn render_engine_scene(ctx: u64, n: u64, node_count: u64) -> u64 {
 
 // ---------------------------------------------------------------------------
 // SH64 — engine's REAL per-node PRESENT walker, desync-proof.
-//
-// Frontier (SH63 doc, next try list): drive the engine's real per-node PRESENT
-// walker (0x5b2ed48) so a populated 0x28-stride scene node actually DRAWS.
-// Full-body drive aborts at entry (TLS stack-canary + nativeOnDestroyed teardown
-// tail). The SH64 empirical note proved the mid-function present-loop region
-// 0x105b2eec0 (x19=R preset) runs the engine's REAL per-node loop and blr's the
-// per-item draw, but SIGSEGVs on iteration 2 (0x105b2eedc) because the item draw
-// thunk's NESTED jit_run recompiled/replaced the very present-loop block the
-// outer jit_run was executing (SH44/49 drain recompile-desync class).
-//
-// Fix: make the per-item draw a REGISTERED HOST THUNK (register_host_call_auto,
-// addr in the 0x7f00_0000_0000 region the JIT dispatches via host_call_at with
-// ZERO compilation / ZERO block-cache mutation) that draws by calling real Mesa
-// GLES directly. The present-loop block stays intact → no desync. And patch the
-// walker's parked nativeGameGlobalInit bl (0x5b2ee54)→ret + teardown tail
-// (0x5b2eef8)→ret so its full body runs natively to the present loop + real swap.
+// Drive the engine's real per-node PRESENT walker (0x5b2ed48) so a populated
+// 0x28-stride scene node actually DRAWS. Full-body drive aborts at entry (TLS
+// stack-canary + nativeOnDestroyed teardown tail). SH64 empirical note proved
+// the mid-loop region 0x105b2eec0 runs the engine's REAL per-node loop + blr's
+// the per-item draw, but SIGSEGVs on iteration 2 (0x105b2eedc) because the item
+// draw thunk's NESTED jit_run recompiled the present-loop block (SH44/49 class).
+// Fix: per-item draw = REGISTERED HOST THUNK (register_host_call_auto, addr in
+// 0x7f00_0000_0000, ZERO compilation / ZERO block-cache mutation) drawing real
+// GLES directly; patch walker bl (0x5b2ee54)->ret + tail (0x5b2eef8)->ret so the
+// full body runs natively to present + swap.
 // ---------------------------------------------------------------------------
 
 /// Per-item draw dispatch counter (each node's vt[+24] draw fires once per
@@ -7125,24 +7119,16 @@ fn main() {
                 }
                 eprintln!("[elfjit:v2boot] SH109 seeded version-gate [0x10683d350]=6 so V2Init/V2Start keep the clean main path");
                 let _ = (iimg, ib);
-                // SEP-17 SESSION DRIVE (--v2boot-session, opt-in):
-                // The operator's hard directive identifies the missing surface as the
-                // REAL Android Activity/AppBridge session life-cycle natives the engine
-                // asserts on (SH184 lifecycle map): JNIAppLifecycleNativeAdapter_setActive,
-                // initAppShellReporter, nativeActivity_onEngineSettingsReceived
-                // (client-settings), nativeAppBridgeSetInitParams. All are JNI-RECEIVE
-                // entries (verified: ZERO in-image bl callers — only the Java side of a
-                // real Activity invokes them), so the harness MUST drive them as real
-                // guest entries; nothing does today. This stage drives the four lifecycle
-                // natives as fresh guest jit_runs ON THE SAME single ladder thread
-                // (SH55/64: concurrent top-level jit_runs corrupt the shared block cache —
-                // must stay serialized), reusing boot_sp/tpidr + the fabricated
-                // Activity/thiz + AutoValue init-params jobject, in the order the real
-                // Android activity asserts them (pre-GlobalInit, before the app-start
-                // orchestration SH259-263 walked). setActive's core (0x21f5f80) reads the
-                // app-lifecycle adapter triplet [0x106b0bde0] that SH248f fabricates, so
-                // it resolves a benign path instead of NULL-faulting. Reference:
-                // docs/recon-routeB-globaltinit-unblock.md + frontier-sh184-routeb.
+                // SEP-17 SESSION DRIVE (--v2boot-session, opt-in): drives the REAL
+                // Android Activity/AppBridge lifecycle natives the engine asserts on
+                // (SH184): setActive, initAppShellReporter, nativeAppBridgeSetInitParams
+                // (+client-settings). All are JNI-RECEIVE entries (ZERO in-image bl
+                // callers — only a real Activity's Java invokes them), so the harness MUST
+                // drive them; nothing did. Fresh guest jit_runs on ONE ladder thread
+                // (SH55/64 serialized), reusing boot_sp/tpidr + fabricated thiz + init-params
+                // jobject, in the real Activity's order (pre-GlobalInit). setActive reads
+                // the adapter triplet [0x106b0bde0] SH248f fabricates (benign path, no NULL).
+                // Ref: docs/recon-routeB-globaltinit-unblock.md + frontier-sh184-routeb.
                 if std::env::args().any(|a| a == "--v2boot-session") {
                     let mut lifecycle: Vec<(&str, u64, [u64; 8])> = vec![
                         ("initAppShellReporter", 0x1021f53b8, [env_ptr, thiz, 0, 0, 0, 0, 0, 0]),
@@ -7201,22 +7187,14 @@ fn main() {
                     );
                 }
                 // rung index 1 == nativeGameGlobalInit in the rungs array below.
-                // SH269-lever (opt-in --v2boot-skip-appstart): the two ladder rungs that
-                // self-drive DEEP into app-start (StartLuaAppDM 0x1023efe2c via the
-                // DMCONT continuation, and V2StartAppWithParams 0x10258b144) terminate
-                // the PROCESS (SIGABRT after the LSM free-list/map SIGSEGV, SH268/267)
-                // before the loop reaches the POST-LADDER session-ctor rungs
-                // (--v2boot-send-appevent / --v2boot-send-game-loaded / --v2boot-session-bus).
-                // Those post-ladder rungs are the SEP-17 SESSION-CTOR PRIMARY lever, but have
-                // NEVER executed headlessly (SH264-267 all measured them "latent" precisely
-                // because the ladder self-terminates first). The flag skips the two
-                // app-start self-driver rungs so the loop COMPLETES and the session rungs run
-                // for the FIRST time — a genuine new measurement of the session-ctor drive,
-                // not another seed into the app-start wall. Default (flag absent) = exact
-                // prior behavior; this is the A/B side-lever that isolates whether the
-                // session rungs can advance independent of the app-start crash. Also skips
-                // the V1 AppStart__ fallback + surface-handoff block below (both drive
-                // app-start) so the session rungs are reached on a clean non-crashing path.
+                // SH269-lever (opt-in --v2boot-skip-appstart): the two app-start
+                // self-driver rungs (StartLuaAppDM 0x1023efe2c via DMCONT, V2StartAppWithParams
+                // 0x10258b144) terminate the PROCESS (SIGABRT after LSM SIGSEGV, SH268/267)
+                // before the POST-LADDER session-ctor rungs run. Skipping them lets the loop
+                // COMPLETE and the session rungs (SEP-17 SESSION-CTOR PRIMARY lever) run for
+                // the FIRST time. Default (flag absent) = exact prior behavior; the A/B
+                // isolates whether the session rungs advance independent of the app-start
+                // crash. Also skips the V1 AppStart__ fallback + surface-handoff block below.
                 for (name, guest, args) in rungs.iter() {
                     if std::env::args().any(|a| a == "--v2boot-skip-appstart")
                         && (*guest == 0x1023efe2c || *guest == 0x10258b144)
@@ -8371,12 +8349,11 @@ fn main() {
                 }
             });
         }
-        // Synthetic app-command feed (JIT_DRIVE_LIFECYCLE): a host thread pushes
-        // Android lifecycle commands into the ALooper app-command queue, so a
-        // GameActivity main loop that reaches `ALooper_pollOnce` dispatches
-        // APP_CMD_START then APP_CMD_RESUME (the two commands that precede a real
-        // EGL context / first frame on Android) instead of spinning on the empty
-        // queue. `post_app_command` is the same channel the ALooper shim drains.
+        // Synthetic app-command feed (JIT_DRIVE_LIFECYCLE): pushes Android
+        // lifecycle commands (APP_CMD_START/RESUME/INIT_WINDOW) into the ALooper
+        // queue so a GameActivity main loop reaching ALooper_pollOnce dispatches
+        // them (the commands preceding a real EGL context / first frame) instead
+        // of spinning on the empty queue.
         if std::env::var_os("JIT_DRIVE_LIFECYCLE").is_some() {
             use arm64jit::shims::post_app_command;
             std::thread::spawn(|| {
@@ -8395,28 +8372,20 @@ fn main() {
             });
         }
         // Real desktop X11 window for the ANativeWindow layer (GRAPHICS_-
-        // RECOMMENDATION §5.3). Under JIT_DRIVE_LIFECYCLE bring up an Xvfb X
-        // server, open a 1280x720 window, and register its XID as the guest's
-        // ANativeWindow handle — SYNCHRONOUSLY before StartApp runs, so the
-        // window is wired before the boot reaches the window/EGL surface path
-        // (a racing spawned thread loses and hands the guest the sentinel).
-        // Then eglCreateWindowSurface(dpy, config, win, ...) builds on a real
-        // X11 window, not a fake address.
+        // RECOMMENDATION §5.3): Xvfb X server, 1280x720 window, its XID registered
+        // as the guest's ANativeWindow handle SYNCHRONOUSLY before StartApp runs,
+        // so eglCreateWindowSurface builds on a real X11 window, not a fake address.
         if std::env::var_os("JIT_DRIVE_LIFECYCLE").is_some() {
             wire_real_window();
         }
         // Per-thread futex latch kicker (--futex-kick <period-ms>). The engine
-        // main-loop idle barrier (cycle L) is a REAL per-thread futex: each
-        // guest thread parks in guest_svc's FUTEX_WAIT_BITSET on its OWN latch
-        // (uaddr = x1 = x19+4, awaited val 0xF4240) at call-site lr=0x10284d134
-        // — a wait-until-changed tick/frame barrier. A host-side producer must
-        // CHANGE the latch value and FUTEX_WAKE it to release the wait, else
-        // the loop re-parks (a plain WAKE is a spurious wake; the value is
-        // still the awaited one, so the futex immediately re-blocks). This was
-        // unreachable by the static --kicker (which only writes fixed guest
-        // globals). The sampler already exposes each parked thread's x1, so we
-        // locate the per-thread latch live and write a value != awaited before
-        // waking — advancing the loop one tick per kick into egl*/gl*.
+        // main-loop idle barrier (cycle L) is a REAL per-thread futex: each guest
+        // thread parks in FUTEX_WAIT_BITSET on its OWN latch (uaddr = x1 = x19+4,
+        // awaited 0xF4240) at lr=0x10284d134 — a wait-until-changed tick barrier.
+        // A host producer must CHANGE the latch value and FUTEX_WAKE it (a plain
+        // WAKE is spurious; value still awaited so it re-blocks). Unreachable by
+        // the static --kicker (fixed globals); the sampler exposes each parked
+        // thread's x1, so write a value != awaited before waking -> one tick/kick.
         if let Some(hex) = {
             let args: Vec<String> = std::env::args().collect();
             args.iter()
@@ -8440,15 +8409,11 @@ fn main() {
                     .map(|v| i32::from_str_radix(v.trim_start_matches("0x"), 16).expect("--futex-set needs hex i32"))
             };
             const IDLE_FUTEX_CALLSITE: u64 = 0x10284d134; // guest lr when parked in the idle barrier
-            // --futex-bump: the engine idle barrier is a wait on a VERSIONED
-            // object. The parked consumer (wait-with-timeout 0x10284d018,
-            // reached via blr — vtable-dispatched) gates on
-            //   ldar x8,[Q]; cmp x21, x8 lsr#32   (0x2856ef4/efc)
-            // where Q = t.x19 (arg0), and [Q+4] (== t.x1) is the futex latch.
-            // It only PROCEEDS past the park when the version word [Q] high-32
-            // CHANGES — a bare latch poke (--futex-kick/--futex-set) is not a
-            // producer. --futex-bump also increments [Q] high-32 (version) so
-            // the consumer's proceed-gate opens.
+            // --futex-bump: the engine idle barrier waits on a VERSIONED object;
+            // the parked consumer gates on `ldar x8,[Q]; cmp x21, x8 lsr#32`
+            // (0x2856ef4/efc), Q=t.x19, [Q+4](==t.x1)=futex latch. It only proceeds
+            // when [Q] high-32 CHANGES — a bare latch poke is not a producer.
+            // --futex-bump also increments [Q] high-32 so the proceed-gate opens.
             let bump = {
                 let args: Vec<String> = std::env::args().collect();
                 args.iter().any(|a| a == "--futex-bump")
@@ -8468,12 +8433,11 @@ fn main() {
                             continue;
                         }
                         let latch = t.x1; // per-thread futex uaddr (== x19+4)
-                        // The latch must be host-addressable (guest==host map).
+                        // Latch must be host-addressable (guest==host); futex uaddr is a
+                        // 4-byte int (4-aligned) — read as c_int, never u64.
                         if latch < 0x100000000 || latch >> 56 != 0 {
                             continue;
                         }
-                        // A futex uaddr is a 4-byte `int` (4-aligned) — read as a
-                        // c_int, never as a u64 (the 4-aligned address misaligns).
                         let old = unsafe { *(latch as *const libc::c_int) };
                         // Version-counter futex: the waiter captures *latch as
                         // its "expected" value and blocks WHILE *latch is
@@ -15150,6 +15114,49 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh277_init_engine_state_dispatch_gate_pinned() {
+        // SH277: the SEP-17 directive names initEngine_/getFlagsFromEngine_ (region
+        // [0x102bd1a30,0x102bd1d08)) whose "Engine settings is null" hard-assert the drive
+        // is meant to feed. Fresh region-watch at the SH275+SH276 feed state (client-settings
+        // + engine-settings-signed both latched) measured the do-init app-shell ctor running
+        // 78 distinct blocks and nativeGameGlobalInit returning Ok clean — but the
+        // initEngine_ dispatch itself got 0 region hits. This guard pins WHY a fabricated
+        // manager can never enter a settings body: initEngine_ dispatches on the state word
+        // [this+16]; only state==3 (0x2bd1d68 serializer), ==5 (0x2bd24b4), ==9 (0x2bd2668)
+        // enter a body, and a fabricated/zeroed manager (state 0) falls through to the
+        // benign tail `mov x0,x19,#0x14; b pthread_mutex_unlock` at 0x2bd1d44. That is the
+        // monotonic tail ANY headless-constructed manager takes until a real session
+        // transitions [this+16] to a nonzero state. Guest = file vaddr + 0x1_0000_0000.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            let in_win = |g: u64| g >= 0x1_0000_0000 && g < 0x120_0000_00 && g & 3 == 0;
+            // state-dispatch: ldr w8,[x19,#16] + the three state compare/branch gates.
+            assert_eq!(word(0x102bd1d08), 0xb9401268, "sh277 state-word ldr w8,[x19,#16] (initEngine_ dispatch)");
+            assert_eq!(word(0x102bd1d1c), 0x71000d1f, "sh277 cmp w8,#0x3 (==3 -> settings serializer)");
+            assert_eq!(word(0x102bd1d20), 0x54000121, "sh277 b.ne 0x2bd1d44 benign tail (state != 3)");
+            assert_eq!(word(0x102bd1d28), 0x94000010, "sh277 bl 0x102bd1d68 settings-serializer body (w8==3)");
+            assert_eq!(word(0x102bd1d34), 0x940001e0, "sh277 bl 0x102bd24b4 body (w8==5)");
+            assert_eq!(word(0x102bd1d40), 0x9400024a, "sh277 bl 0x102bd2668 body (w8==9)");
+            // benign tail a fabricated (state 0) manager always takes:
+            assert_eq!(word(0x102bd1d44), 0x91005260, "sh277 benign tail mov x0,x19,#0x14 (mutex unlock)");
+            assert_eq!(word(0x102bd1d50), 0x17fe075b, "sh277 benign tail b 0x102b53abc (pthread_mutex_unlock)");
+            // settings-serializer body entry = the settings path (needs the engine state==3)
+            assert_eq!(word(0x102bd1d68), 0xa9ba7bfd, "sh277 settings-serializer body prologue stp x29,x30,[sp,#-96]!");
+            for g in [0x102bd1d08u64, 0x102bd1d44u64, 0x102bd1d68u64, 0x102bd2668u64] {
+                assert!(in_win(g), "sh277 site {g:#x} in-window+aligned");
+            }
+            eprintln!("sh277 initEngine_ state-dispatch gate + benign tail + settings-serializer pinned on libroblox.so");
+        } else {
+            eprintln!("sh277 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh273_lifecycle_natives_converge_on_shared_dispatcher() {
         // SH273: SEP-17 names JNIActivityLifecycleCallbacks nativeOn* as REAL
         // session primitives; SH264 only measured OnResumed+setActive. All 12 public entries
@@ -15265,35 +15272,21 @@ mod sh115_tests {
 
     #[test]
     fn sh272_preload_getter_both_branches_structurally_dead_pinned() {
-        // SH272: mechanize SH270's open residual ("the getter's load path ignores
-        // [0x106a64d78]/[0x106a64d98] / re-reads elsewhere") — WHY the
-        // nativePreloadFlagOverrides getter (0x2dae5f0) returns 0 on BOTH its
-        // branches, pinning the exact store/load terminal words so a future cycle
-        // does NOT re-attack either branch as a seed lever. This is the standing
-        // SendAppEventOnAppReady terminal (new frontier at/after SH269).
-        //   Value-cell branch (guard-acquire returned bit0 SET, falls through
-        //   0x2dae5fc `tbz w0,#0`):
-        //     0x2dae600 adrp x8,0x6a64000; 0x2dae604 ldr x0,[x8,#3448]=[0x106a64d78]
-        //     0x2dae608 cbz x0 -> ret (returns 0 when cell empty)
-        //     0x2dae60c ldr x8,[x0]; 0x2dae610 ldr x2,[x8,#16]; 0x2dae620 br x2
-        //       -> a VTABLE dispatch: needs a REAL preload-overrides object whose
-        //       vt[+16] is a functioning method, not a wired pointer. A host wire
-        //       of the object base would br into garbage (or cbz if the cell's
-        //       first word is null). NOT a soft-return cell.
-        //   Construct branch (tbz taken -> 0x2dae624 bl ctor 0x101df8ff8, b to
-        //   helper 0x2daf5c8):
-        //     ctor zero-INITS the object: 0x1df9058 `stp x0,xzr,[x19,#72]` writes
-        //     zr to [obj+80] (the shared 0x2daf5ec `ldr x0,[x19,#80]` terminal the
-        //     helper uses as its null-flag); 0x2daf5f0 `cbz x0 -> ret` => helper
-        //     returns 0 ALWAYS right after a headless construct, so this branch is
-        //     equally a live-object wall, NOT a one-store seed.
-        //   guard helper 0x57816f0 -> adrp x8,0x6d2d000; add #0xf30 = guard cell
-        //   [0x6d2df30] (its own lazy-Meyers once byte, separate from the 0x106a64d78
-        //   value cell SH270 wired).
-        // VERDICT (do-not-re-tread either branch): SH174/SH204 live-object class —
-        //   the getter needs the REAL session to construct + populate the object
-        //   (its vt[+16] dispatch target + non-null [obj+80]). Route-B gate
-        //   UNCHANGED; SH174 capture-latch stays the single forward hook.
+        // SH272: WHY nativePreloadFlagOverrides getter (0x2dae5f0) returns 0 on BOTH
+        // branches (the standing SendAppEventOnAppReady terminal) — so a future cycle
+        // does NOT re-attack either as a seed lever.
+        //   Value-cell branch (guard bit0 SET, falls 0x2dae5fc tbz): 0x2dae600 adrp
+        //   6a64000 / 0x2dae604 ldr [0x106a64d78] / cbz->ret / ldr x8,[x0] / ldr x2,[x8,#16]
+        //   / br x2 = VTABLE dispatch needing a REAL preload-overrides object (vt[+16]
+        //   functioning), NOT a wired pointer — not a soft-return cell.
+        //   Construct branch (0x2dae624 bl ctor 0x101df8ff8 -> helper 0x2daf5c8): ctor
+        //   zero-INITs (0x1df9058 stp x0,xzr,[x19,#72] -> [obj+80]=0); helper 0x2daf5ec
+        //   ldr x0,[x19,#80]; cbz->ret => returns 0 ALWAYS post-construct — equally a
+        //   live-object wall, not a one-store seed. guard helper 0x57816f0 once byte
+        //   [0x6d2df30] separate from the 0x106a64d78 value cell.
+        // VERDICT (do-not-re-tread): SH174/SH204 live-object class — getter needs a real
+        // session to construct+populate (vt[+16] + non-null [obj+80]). Route-B UNCHANGED;
+        // SH174 capture-latch single forward hook.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
