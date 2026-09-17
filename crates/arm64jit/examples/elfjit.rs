@@ -7316,7 +7316,31 @@ fn main() {
                     );
                 }
                 // rung index 1 == nativeGameGlobalInit in the rungs array below.
+                // SH269-lever (opt-in --v2boot-skip-appstart): the two ladder rungs that
+                // self-drive DEEP into app-start (StartLuaAppDM 0x1023efe2c via the
+                // DMCONT continuation, and V2StartAppWithParams 0x10258b144) terminate
+                // the PROCESS (SIGABRT after the LSM free-list/map SIGSEGV, SH268/267)
+                // before the loop reaches the POST-LADDER session-ctor rungs
+                // (--v2boot-send-appevent / --v2boot-send-game-loaded / --v2boot-session-bus).
+                // Those post-ladder rungs are the SEP-17 SESSION-CTOR PRIMARY lever, but have
+                // NEVER executed headlessly (SH264-267 all measured them "latent" precisely
+                // because the ladder self-terminates first). The flag skips the two
+                // app-start self-driver rungs so the loop COMPLETES and the session rungs run
+                // for the FIRST time — a genuine new measurement of the session-ctor drive,
+                // not another seed into the app-start wall. Default (flag absent) = exact
+                // prior behavior; this is the A/B side-lever that isolates whether the
+                // session rungs can advance independent of the app-start crash. Also skips
+                // the V1 AppStart__ fallback + surface-handoff block below (both drive
+                // app-start) so the session rungs are reached on a clean non-crashing path.
                 for (name, guest, args) in rungs.iter() {
+                    if std::env::args().any(|a| a == "--v2boot-skip-appstart")
+                        && (*guest == 0x1023efe2c || *guest == 0x10258b144)
+                    {
+                        eprintln!(
+                            "[elfjit:v2boot] SH269 --v2boot-skip-appstart: SKIPPING app-start self-driver rung {name} @ {guest:#x} (would terminate the process at the LSM / app-start live-object wall) — letting the loop reach the post-ladder session-ctor rungs for the first time"
+                        );
+                        continue;
+                    }
                     eprintln!("[elfjit:v2boot] driving {name} @ guest {guest:#x} (env={env_ptr:#x} thiz={thiz:#x})");
                     if *guest == 0x102206404 {
                         // rung 1 = nativeGameGlobalInit: make its thread-dispatch
@@ -7641,6 +7665,10 @@ fn main() {
                 // session/home-screen renderer can start even if the V2 path
                 // stays gated (reads params as individual jstrings, not the
                 // AutoValue getters). nativeAppBridgeAppStart__ (0x102338510).
+                // SH269: under --v2boot-skip-appstart we skip these app-start
+                // self-drivers too (they walk the same LSM/app-start live-object
+                // wall) so the loop cleanly reaches the session-ctor rungs.
+                if !std::env::args().any(|a| a == "--v2boot-skip-appstart") {
                 eprintln!("[elfjit:v2boot] driving V1 AppStart__ (fallback)");
                 let mut sv = arm64jit::jit::CpuState::new();
                 sv.tpidr = tpidr;
@@ -7662,6 +7690,7 @@ fn main() {
                     Ok(r) => eprintln!("[elfjit:v2boot] V1 AppStart__ returned Ok({r:#x})"),
                 }
                 dump("V1 AppStart__");
+                } // close SH269 `if !--v2boot-skip-appstart` (V1 AppStart fallback skipped)
                 // SH113 (recon-sh113-surface-handoff.md): after V2Start/V1 drive
                 // nativeAppBridgeV2UpdateSurfaceAppWithPlatformParams so the REAL
                 // wired XID lands at [0x10683d348] (the window the engine's
@@ -7728,6 +7757,25 @@ fn main() {
                     // takes the synchronous do-init path. All plain data stores.
                     if std::env::var("JIT_SH115_SINGLETON_PATCH").ok().as_deref() == Some("1") {
                         routeb_patch_sendapp_appevent_vtable();
+                        // SH269 (opt-in JIT_ROUTEB_APPSART_GOVFLAG): SendAppEventOnAppReady
+                        // drives the governor predicate 0x102ea0b9c which faults `ldr x8,[x0]`
+                        // where x0=[app-governor+1032] (the app-DM controller) = 0 when its
+                        // flag byte [0x106a64da0] is clear. The block has ALREADY been JIT-cached
+                        // by the earlier ladder rungs, so the in-crate block-entry guard cannot
+                        // re-fire mid-session — seed the flag byte DIRECTLY here (idempotent OR).
+                        // Read-only file-backed page -> mprotect RW via routeb_ensure_writable.
+                        if std::env::var_os("JIT_ROUTEB_APPSART_GOVFLAG").is_some() {
+                            const GOVFLAG: u64 = 0x106a64da0;
+                            if arm64jit::jit::routeb_ensure_writable(GOVFLAG) {
+                                let cur = unsafe { std::ptr::read_unaligned(GOVFLAG as *const u8) };
+                                if cur & 1 == 0 {
+                                    unsafe { std::ptr::write_unaligned(GOVFLAG as *mut u8, cur | 1) };
+                                    eprintln!("[elfjit:v2boot] SH269 seeded governor-predicate flag [0x{GOVFLAG:x}] bit0=1 before SendAppEventOnAppReady (routes the live governor object to the preload-overrides helper, not the NULL app-DM controller @ governor 0x102ea0b9c)");
+                                }
+                            } else {
+                                eprintln!("[elfjit:v2boot] SH269 WARN: could not make governor flag [0x{GOVFLAG:x}] writable");
+                            }
+                        }
                         // SH126 runner-up #2: the do-init (0x2206c40) reached via the
                         // pipe is once-latched on [0x106a68410].bit0 and thread-gated
                         // on [0x106863a68] (ladder latched both). Clear the once-guard

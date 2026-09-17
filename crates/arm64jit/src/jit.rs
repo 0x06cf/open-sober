@@ -1011,6 +1011,45 @@ fn routeb_appstart_settings_once_seed_guard(_state: *mut CpuState, pc: u64) {
     }
 }
 
+/// SH269 (Route-B, opt-in JIT_ROUTEB_APPSART_GOVFLAG): the post-ladder SESSION-CTOR
+/// rungs (SEP-17 PRIMARY lever) — SendAppEventOnAppReady (0x102bb463c),
+/// SendAppEventOnGameLoaded (0x102bb429c), MessageBus.subscribe (0x102ba5bb8) — were
+/// wired in SH264-267 but NEVER executed headlessly because the --v2boot ladder's
+/// StartLuaAppDM / V2StartApp rungs self-drove deep into app-start and terminated the
+/// PROCESS before the loop reached them. The opt-in --v2boot-skip-appstart elfjit flag
+/// (same cycle) skips those two rungs so the loop completes; this guard then drives the
+/// governor predicate SendAppEventOnAppReady reaches. MEASURED (real libroblox.so, full
+/// SH267 seed set + --v2boot-skip-appstart): SendAppEventOnAppReady REACHED the governor
+/// predicate fn 0x2ea0b9c for the FIRST time and faulted `[SIGSEGV] fault=0x0
+/// guestpc=0x102ea0b9c x0=0 x21=host-app-governor` — disasm of 0x2ea0b9c..0x2ea0be0:
+///   ldrb w8,[6a64000+#3488] (=0x106a64da0)  ; cbz w8 -> 0x2ea0bd0 (flag CLEAR)
+///   [flag clear] ldr x0,[x21,#1032]; ldr x8,[x0]  <- x0 = app-DM controller = 0 -> NULL deref
+///   [flag set]   mov x0,x21; bl 0x2ea3a84  (passes the REAL live governor object to the
+///                preload-overrides helper instead of the NULL controller)
+/// [0x106a64da0] is a seeded fixed-.bss flag byte (same region as the SH239 ctor-guard
+/// 0x106a64d70), NOT a live-object. Seeding bit0=1 routes the governor to its
+/// (helper-driven) branch so the session drive advances PAST the NULL-controller deref —
+/// the SH248e/SH259 once-flag pattern at a NEW cell, reached from the REAL session path.
+/// Default-inert: fires only under the env; idempotent (ORs bit0 only).
+fn routeb_govflag_seed_guard(_state: *mut CpuState, pc: u64) {
+    if std::env::var_os("JIT_ROUTEB_APPSART_GOVFLAG").is_none() {
+        return;
+    }
+    if !(0x102ea0b60..0x102ea0bd0).contains(&pc) {
+        return;
+    }
+    const FLAG: u64 = 0x106a64da0; // governor predicate byte (6a64000+#3488)
+    if routeb_ensure_writable(FLAG) {
+        let cur = unsafe { std::ptr::read_unaligned(FLAG as *const u8) };
+        if cur & 1 == 0 {
+            unsafe { std::ptr::write_unaligned(FLAG as *mut u8, cur | 1) };
+            eprintln!(
+                "[routeb-sh269] seeded governor-predicate flag [0x{FLAG:x}] bit0=1 at pc=0x{pc:x} (session-ctor drive past the NULL app-DM controller deref @ governor 0x102ea0b9c)"
+            );
+        }
+    }
+}
+
 /// SH253 (Route-B, opt-in JIT_ROUTEB_SOURCE_SEED): seed the bulk-registrar SOURCE
 /// vector so the engine's OWN in-ladder registrar loop populates the RESOLVER map.
 /// SH252 measured (full exec-text sweep) that the resolver 0x106dca0e70 — the
@@ -5769,6 +5808,13 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // bl @0x102339d44) so it early-returns the registry object without running the
         // builder that walks into the standing map wall 0x1021dde34.
         routeb_appstart_settings_once_seed_guard(state, pc);
+        // SH269 (opt-in JIT_ROUTEB_APPSART_GOVFLAG): seed the governor-predicate
+        // flag [0x106a64da0] reached from the NOW-EXECUTING post-ladder session-ctor
+        // rung SendAppEventOnAppReady, so its governor dispatch (0x102ea0b9c) routes the
+        // REAL live governor object to the preload-overrides helper instead of
+        // dereferencing the NULL app-DM controller (fault=0x0). First-ever headless
+        // session-ctor advance past that NULL-deref.
+        routeb_govflag_seed_guard(state, pc);
         // SH253 (opt-in JIT_ROUTEB_SOURCE_SEED): seed the bulk-registrar SOURCE
         // vector at the engine's OWN in-ladder registrar loop block entry 0x1022085c0,
         // so nativeGameGlobalInit's registrar populates the name->classid resolver
