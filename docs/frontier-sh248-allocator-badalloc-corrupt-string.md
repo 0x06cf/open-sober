@@ -72,3 +72,29 @@ caller at 0x2b50600), repair/zero its SSO word so the assign reallocs normally, 
 to see the continuation's NEXT fencepost. That is a different, smaller surface than the
 whole size-class bootstrap SH247 proposed. Standing forward hook unchanged: SH174
 capture-latch arming at a real make_shared<DataModel>.
+
+## SH248b (follow-up, same session): minimal non-perturbing probe + the corrupt object captured
+- **PROBE-PERTURBATION LEVER (measured):** the first all-thread/heavy-log probe shifted the
+  run to a *deterministic* secondary-thread crash (guestpc=0x101d96768 fault=0x24 at
+  operator_new B, `rbx_matches_gueststate=false`, harness-tid=4096) on every run (0/6 to the
+  continuation), while probe-OFF reached the continuation bad_alloc 2/2. Cause = per-entry
+  gettid syscalls + 265 eprintln lines perturbing the main-thread/secondary-thread race.
+  FIX: probe now fires at the op_new entries but eprintlns ONLY the corrupt-size sentinel
+  call (~1 line/run, no per-entry syscall). With this minimal probe the clean continuation
+  run is RESTORED (3/4 EXIT 139 bad_alloc) and the object is captured.
+- **THE OBJECT (deterministic, runs 1/3/4):** `CORRUPT_SENTINEL(size=-9) x1=0x55.. x30(caller)=
+  0x102b506bc x19=0 x2=0 x20(this)=0x7f1dfc5a3ac8  [this+0]=0x1  [this+8]=0x7f1dfc033800(host
+  ptr)  [this+16]=0x5`. `this` is a HOST-heap object (0x7f range), NOT in-image. Decode of the
+  0x2b50600 absent-path: `x8=[this]=1 -> x9=0; cmp x9,x2(0) -> b.ls -> resize path; x9=oldcap-1
+  =0xffffffffffffffff; cmp 0xffff..ff vs max 0x7fff..f2 -> b.hi -> x23=-9`. So the -9 fires on a
+  LENGTH-0 assign into a host-heap string whose capacity processing underflows — the object is
+  a host-heap std::string whose [this+0]=0x1 (owned-flag set, data-word 0) interacts with the
+  resize path. Refined mechanism: not "garbage capacity" but a host-heap string state the
+  resize underflows on. The engine's guest strings are host-heap objects (SH172-177 class).
+- **NEXT lever (refined):** the failing construction is a length-0 assign at 0x2b50600 whose
+  caller x30=0x102b506bc. Both the exact site and the object are now captured reproducibly
+  with a non-perturbing probe. The fix is either (a) seed/initialize that host-heap string
+  object's SSO word so the resize takes its normal growth (>0) path, or (b) identify the
+  upstream constructor that left it empty-but-flagged and fix the headless init. Honest:
+  does not manufacture a DM; AppBridge lifetime says a live DM is still gated upstream
+  (SH174/SH204). The fatal alloc is now located + reproducible at exact addresses.

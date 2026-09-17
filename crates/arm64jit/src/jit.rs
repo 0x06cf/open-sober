@@ -2760,85 +2760,40 @@ fn routeb_alloc_probe_guard(state: *mut CpuState, pc: u64) {
     if std::env::var_os("JIT_ROUTEB_ALLOC_PROBE").is_none() {
         return;
     }
-    // Windows (guest addr). block entry can be the op_new variants, the tail wrapper,
-    // or the free-list allocator tail.
-    let op_new_a = (0x101db1a38..0x101db1a44).contains(&pc); // 0x1db1a38
-    let op_new_b = (0x101d96768..0x101d96774).contains(&pc); // 0x1d96768
-    let wrap = (0x101db1c60..0x101db1c6c).contains(&pc); // 0x1db1c60 tail wrapper
-    let tail = (0x10623fe1c..0x10623fe28).contains(&pc); // 0x623fe1c free-list allocator
-    if !(op_new_a || op_new_b || wrap || tail) {
-        // SH248b: the continuation's `std::bad_alloc` is caused by libc++ string::assign
-        // into an object whose capacity word [x0] is garbage-huge (SH248 measured size
-        // 0xfffffffffffffff7 = -9). Probe the assign entry 0x2b50600 to capture the
-        // CALLER (x30) + the destination string object (x0) + src/len (x1/x2).
-        if pc == 0x102b50600 {
-            let s = unsafe { &*state };
-            eprintln!(
-                "[allocprobe] pc={pc:#x} STRING_ASSIGN x0(this)={:#x} [x0]={:#x} x1(src)={:#x} x2(len)={:#x} x30(caller)={:#x} x19={:#x}",
-                s.x[0],
-                if s.x[0] != 0 && s.x[0] < 0x8000_0000_0000 { unsafe { std::ptr::read_unaligned(s.x[0] as *const u64) } } else { 0 },
-                s.x[1], s.x[2], s.x[30], s.x[19],
-            );
-        }
+    // SH248: minimal, near-zero-perturbation diagnostic. Heavy per-entry logging
+    // measurably shifted the run to a deterministic secondary-thread 0x101d96768 crash
+    // before the continuation (probe off -> clean bad_alloc 2/2). So this fires at the
+    // op_new entries but ONLY eprintlns the ONE corrupt-size sentinel call:
+    //   operator_new(0xfffffffffffffff7 = -9) from libc++ std::string::assign 0x2b50600.
+    // Captures x20 = the destination string object (`this`) whose capacity word is the
+    // garbage that triggers the sentinel. ~one line total per run.
+    if pc != 0x101d96768 && pc != 0x101db1a38 {
         return;
     }
     let s = unsafe { &*state };
-    let x0 = s.x[0];
-    let x1 = s.x[1];
-    let x2 = s.x[2];
-    // allocator-activation byte [0x10727570c].bit0 (headlessly clear -> NULL for size>0xa)
-    let flag = if (0x10727570cu64) >= 0x1000 {
-        unsafe { std::ptr::read_unaligned(0x10727570c as *const u8) }
+    if s.x[0] != 0xffff_ffff_ffff_fff7 {
+        return;
+    }
+    let obj = s.x[20]; // `this` preserved across operator_new at the string-assign site
+    let objw = if obj != 0 && obj < 0x8000_0000_0000 {
+        unsafe { std::ptr::read_unaligned(obj as *const u64) }
     } else {
         0
     };
-    if tail {
-        // free-list allocator: x0=base, x1=size, x2=align
-        let base = x0;
-        let size = x1;
-        let align = x2;
-        let in_class = size != 0 && size <= 0x400 && (align == 0 || size >= align);
-        let r8 = if in_class { (size + 7) & !7 } else { 0 };
-        let node = if in_class && base != 0 && base < 0x8000_0000_0000 {
-            base + r8 + 232
-        } else {
-            0
-        };
-        let freehead = if node != 0 && node >= 0x1000 && node < 0x8000_0000_0000 {
-            unsafe { std::ptr::read_unaligned((node + 8) as *const u64) }
-        } else {
-            0
-        };
-        let count = if node != 0 && node >= 0x1000 && node < 0x8000_0000_0000 {
-            unsafe { std::ptr::read_unaligned((node + 16) as *const u16) }
-        } else {
-            0
-        };
-        eprintln!(
-            "[allocprobe] pc={pc:#x} TAIL base={base:#x} size={size:#x} align={align:#x} flag={flag:02x} round8={r8:#x} node={node:#x} freehead={freehead:#x} count={count}{}{}",
-            if size > 0x400 { " SLOW(size>0x400)" } else { "" },
-            if align != 0 && size < align { " SLOW(align>size)" } else { "" }
-        );
-    } else if op_new_a || op_new_b {
-        // operator_new entry: x0=size, x1=2nd arg, x30=caller ret-addr (identifies the
-        // exact call site so a corrupted size like 0xfffffffffffffff7 can be located).
-        // x20 = usually this/object ptr at the call site (preserved across operator_new).
-        let obj = s.x[20];
-        let objw = if obj != 0 && obj < 0x8000_0000_0000 {
-            unsafe { std::ptr::read_unaligned(obj as *const u64) }
-        } else {
-            0
-        };
-        eprintln!(
-            "[allocprobe] pc={pc:#x} OPERATOR_NEW x0(size)={x0:#x} x1={x1:#x} x30(caller)={:#x} x19={:#x} x2={x2:#x} x20={obj:#x} [x20]={objw:#x} flag={flag:02x}",
-            s.x[30], s.x[19],
-        );
+    let obj8 = if obj != 0 && obj + 8 < 0x8000_0000_0000 {
+        unsafe { std::ptr::read_unaligned((obj + 8) as *const u64) }
     } else {
-        // tail wrapper: x0->(size), x1->align
-        eprintln!(
-            "[allocprobe] pc={pc:#x} WRAP x0={x0:#x} x1={x1:#x} x2={x2:#x} flag={flag:02x}",
-        );
-    }
+        0
+    };
+    let obj16 = if obj != 0 && obj + 16 < 0x8000_0000_0000 {
+        unsafe { std::ptr::read_unaligned((obj + 16) as *const u64) }
+    } else {
+        0
+    };
+    eprintln!(
+        "[allocprobe] pc={pc:#x} CORRUPT_SENTINEL(size=-9) x1={:#x} x30(caller)={:#x} x19={:#x} x2={:#x} x20(this)={obj:#x} [this+0]={objw:#x} [this+8]={obj8:#x} [this+16]={obj16:#x}",
+        s.x[1], s.x[30], s.x[19], s.x[2],
+    );
 }
 
 /// SH88: the coherent empty span-hash map seeded by the --v2boot harness for the
