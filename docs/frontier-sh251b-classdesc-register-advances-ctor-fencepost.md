@@ -55,3 +55,24 @@ deliverables stay shipped + verified.
   (8 real-image byte-pins: PlayerGui getter 0x201fce0/0x201fce8, ScreenGui getter 0x201f42c, PlayerGui
   once-body 0x201fda4, new ctor 0x2b9eca0/0x2b9ecac/0x2b9ecb0 + fault insn 0x2b9ecbc).
 - No default-config production path edited. Workspace green (cargo build + cargo test exit 0).
+
+## SH251c CORRECTION (same session, hermes-worker) — 0x102b9eca0 is TEARDOWN, not a forward ctor
+The SH251b "new forward ctor fencepost 0x102b9eca0 (indirect-dispatch-only, 0 direct callers,
+next-unsynthesized-object)" classification is CORRECTED this cycle. The function's TRUE entry is
+**0x2b9ec9c** (`paciasp`, 4 bytes before 0x2b9eca0), and the whole exec segment has **64,748 direct
+`bl 0x2b9ec9c` callers and ZERO `bl 0x2b9eca0`** (measured by two independent BL-imm26 decoders —
+my throwaway self-caller scan AND GNU objdump). Two of those callers are in the PlayerGui getter
+0x10201fce0 and are EXCEPTION LANDING PADS (0x201fda0 / 0x201fe48, each preceded by a __cxa
+call_once cleanup `bl 284cfbc` / `bl 5fb25e0`, saving the caught/unwinding context into x0 then
+`bl 0x2b9ec9c`). So the observed `this=x19=NULL` (fault=0x10) is the NULL unwind context during the
+spawned-thread SIGTRAP unwind (the run log's "SH131 spawned-thread raise(SIGTRAP) — unwinding this
+jit_run" line immediately precedes the SIGSEGV). 0x2b9eca0 first calls 0x2ba2ba0, which saves ALL
+GPRs+FP regs into the frame, then dispatches on `[x19+16]/[x19+24]` — a setjmp/ucontext-style
+context-save trampoline used as the ubiquitous __cxa landing-pad cleanup. It is NOT a class-descriptor
+ctor, NOT the register continuation, NOT a GuiObject producer, and there is NO fabricatable
+receiver to seed. Do-not-re-tread: do NOT derive a "receiver for 0x2b9eca0" (64,748 callers; NULL-
+this is expected-on-unwind). Genuine forward state UNCHANGED (descriptors registered; resolver map
+0x106dca0e70 still empty, live-ctor-gated per SH193/194; SH174 capture-latch stays the forward hook).
+recon-v3 stays green. +hermetic sh251c (byte-pins the paciasp entry + two landing-pad bl words +
+their __cxa cleanup bls; asserts bl-imm26 targets 0x2b9ec9c NOT 0x2b9eca0). Workspace green 576/0,
+examples 92/0. Full correction doc: docs/frontier-sh251b-corrected-teardown-helper.md.

@@ -13379,6 +13379,53 @@ mod sh115_tests {
         }
     }
     #[test]
+    fn sh251c_getter_landingpad_cleanup_not_forward_ctor() {
+        // SH251b CORRECTION (SH251c): 0x102b9eca0 is NOT a unique indirect-only "next-
+        // unsynthesized-object" ctor reached by the class-register continuation. Its TRUE
+        // function entry is 4 bytes earlier — 0x2b9ec9c (`paciasp`) — and the whole exec
+        // segment contains 64,748 direct `bl 0x2b9ec9c` callers (measured two ways) and ZERO
+        // `bl 0x2b9eca0`. Two of those callers are INSIDE the PlayerGui getter 0x10201fce0 and
+        // are EXCEPTION LANDING PADS (each preceded by a __cxa call_once cleanup bl): the
+        // observed NULL-this crash at 0x102b9ecbc is unwind teardown after the spawned-thread
+        // SIGTRAP, NOT forward Route-B construction, and there is NO fabricatable receiver to
+        // seed. Pin the true paciasp entry + the two landing-pad bl words + their __cxa cleanup
+        // bls, and assert the bl-imm26 target resolves to 0x2b9ec9c (not 0x2b9eca0), so a +4-entry
+        // drift (the SH251b error class) fails loudly. Real-image guard family, skip-if-absent.
+        fn bl_target(pc: usize, img: &[u8]) -> u64 {
+            let w = u32::from_le_bytes([img[pc], img[pc + 1], img[pc + 2], img[pc + 3]]);
+            assert_eq!(w & 0xfc00_0000, 0x9400_0000, "word at 0x{pc:x} must be a BL");
+            let imm26 = (w & 0x3ff_ffff) as i64;
+            let imm26 = if imm26 & 0x200_0000 != 0 { imm26 - 0x400_0000 } else { imm26 };
+            (pc as i64 + imm26 * 4) as u64
+        }
+        let ep = 0x2b9ec9c; // true paciasp entry (SH251b pinned 0x2b9eca0, +4 too late)
+        let lpad_1 = 0x201fda0; // getter landing pad bl 0x2b9ec9c
+        let lpad_2 = 0x201fe48; // getter landing pad bl 0x2b9ec9c
+        let cxa_1 = 0x201fd98; // bl 284cfbc (__cxa cleanup) preceding lpad_1
+        let cxa_2 = 0x201fe40; // bl 5fb25e0 (__cxa cleanup) preceding lpad_2
+        for &pc in &[ep, lpad_1, lpad_2, cxa_1, cxa_2] {
+            assert_eq!(pc & 3, 0, "site 0x{pc:x} must be 4-aligned");
+        }
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            // true entry = paciasp
+            let epw = u32::from_le_bytes([img[ep], img[ep + 1], img[ep + 2], img[ep + 3]]);
+            assert_eq!(epw, 0xd503233f, "0x2b9ec9c must be paciasp (true entry)");
+            // both landing-pad bls must target the paciasp entry 0x2b9ec9c
+            assert_eq!(bl_target(lpad_1, &img), ep as u64, "lpad_1 must bl 0x2b9ec9c");
+            assert_eq!(bl_target(lpad_2, &img), ep as u64, "lpad_2 must bl 0x2b9ec9c");
+            // their preceding bls are the __cxa cleanup helpers (NOT to 0x2b9ec9c)
+            let t1 = bl_target(cxa_1, &img);
+            assert_ne!(t1, ep as u64, "cxa_1 must not target the helper entry");
+            assert_ne!(t1, 0x2b9eca0, "cxa_1 must not target 0x2b9eca0");
+            let t2 = bl_target(cxa_2, &img);
+            assert_ne!(t2, ep as u64, "cxa_2 must not target the helper entry");
+        } else {
+            eprintln!("sh251c real-image guard: no real libroblox.so, skipping");
+        }
+    }
+    #[test]
     fn sh200_v2_dispatch_window_materializes_obj_and_nops_to_blr() {
         // SH200 V2-init dispatch window (fn 0x6251e0c etc.): the first 4 slots
         // load the stable object into x0, the rest are nops (killing the
