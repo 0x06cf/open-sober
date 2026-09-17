@@ -14838,6 +14838,63 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh260_lsm_insert_wall_anchored() {
+        // SH260 (single-agent, cone suppressed): pin the NEW terminal reached by the
+        // SH259-cleared app-start orchestrator. After settings-once clears the standing
+        // 0x1021dde34 wall, the app-start body walks 93 region pcs into
+        // nativeAppBridgeAppStart's LocalStorageManager init (the data-store/objective-2b
+        // line) and terminates SIGSEGV guestpc=0x101db1d04. The crash path (measured this
+        // cycle, JIT_DUMP_PC register dump at /tmp/dump_lsm.txt):
+        //   fn 0x1db1cc8 (small-key map-insert) does
+        //     0x1db1d08 adrp x8,726f000; 0x1db1d14 ldr x8,[x8,#2240]  => x8=[map base 0x10726f8c0]
+        //     0x1db1d20 add x9,x8,x9,lsl#3 (bucket slot); 0x1db1d2c ldar x9,[x9] (read bucket ptr)
+        //     ... then lb at 0x1db1d44 `bl 0x2b9ea40` (insert leaf, x30=0x101db1d48 at crash)
+        //   The harness-seeded LSM map (seed_static_empty_map, global->4M-bucket array shared
+        //   zero sub) IS intact at the crash (*0x10726f8c0 = 0x7f9c7c51a010 == seeded bucket
+        //   array). The fault advanced PAST the NULL-bucket read into the INSERT leaf:
+        //   0x2b9ea40 = bti c; adrp x16,683b000; ldrb [x16,#2648] (atomic-or flag); the atomic
+        //   claim `ldset x0,x0,[x1]` on the empty sub-slot (x1=0 => store-to-0) faults fault=0x0.
+        //     0x2b9ea40 = 0xd503245f (bti c), 0x2b9ea44 = 0xb001e4f0 (adrp x16,683b000),
+        //     0x2b9ea48 = 0x39696210 (ldrb w16,[x16,#2648])
+        // HONEST: this is the persistence/detour line (objective 2b), NOT Route B; per the
+        // operator SEP-15 directive it is MEASURED and parked (no further levers churned here —
+        // the insert leaf needs genuine per-node live allocation, the SH174 live-object gate).
+        // These words pin the wall so a drift fails loudly; default-inert (test only).
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            // LSM map-insert fn entry + map-base read + bucket deref
+            assert_eq!(word(0x101_db1_cc8), 0xa9bd7bfd, "sh260 lsm insert-fn entry stp x29,x30,[sp,#-48]!");
+            assert_eq!(word(0x101_db1_d08), 0xd002a5e8, "sh260 lsm adrp x8,726f000 (map base global page)");
+            assert_eq!(word(0x101_db1_d14), 0xf9446108, "sh260 lsm ldr x8,[x8,#2240] (map base 0x726f8c0)");
+            assert_eq!(word(0x101_db1_d2c), 0xc8dffd29, "sh260 lsm ldar x9,[x9] (bucket ptr read)");
+            assert_eq!(word(0x101_db1_d44), 0x9437b33f, "sh260 lsm bl 0x2b9ea40 (insert leaf)");
+            // insert leaf entry
+            assert_eq!(word(0x102_b9_ea40), 0xd503245f, "sh260 lsm insert-leaf bti c");
+            assert_eq!(word(0x102_b9_ea44), 0xb001e4f0, "sh260 lsm insert-leaf adrp x16,683b000");
+            assert_eq!(word(0x102_b9_ea48), 0x39696210, "sh260 lsm insert-leaf ldrb w16,[x16,#2648]");
+            // map base global is a writable .bss cell in the image
+            let map_global = el.host_addr_of(0x107_26f_8c0).unwrap_or(0);
+            assert_ne!(map_global, 0, "sh260 LSM map base [0x10726f8c0] maps into the image");
+            for a in [
+                0x101_db1_cc8u64, 0x101_db1_d08u64, 0x101_db1_d14u64,
+                0x101_db1_d2cu64, 0x101_db1_d44u64, 0x102_b9_ea40u64,
+                0x102_b9_ea44u64, 0x102_b9_ea48u64,
+            ] {
+                assert!(a & 3 == 0, "sh260 {a:#x} 4-aligned");
+            }
+        } else {
+            eprintln!("sh260 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh236_startluaappdm_receivecall_dispatch_softreturns_before_marshaler() {
         // SH236 (Route-B re-attack, single-agent): SH235 statically concluded the EC world
         // 0x102e24598's only headless front-door (StartLuaAppDM -> bl 0x1023f1210 @0x1023f075c) is
