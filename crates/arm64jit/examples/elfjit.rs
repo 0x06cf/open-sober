@@ -15131,6 +15131,58 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh273_lifecycle_natives_converge_on_shared_dispatcher() {
+        // SH273: SEP-17 names JNIActivityLifecycleCallbacks nativeOn* as REAL
+        // session primitives; SH264 only measured OnResumed+setActive. All 12 public entries
+        // (PreCreated..Destroyed) are 44-byte JNI stubs -> prologue stp x29,x30,[sp,#-16]!,
+        // JNIEnv GetStringUTFChars (slot169/offset1352 = SH186 shim), then a FINAL
+        // `b 0x21f15a4` tail. 0x102_21f15a4 = the SINGLE shared Activity-lifecycle
+        // dispatcher (sub sp,#0x1c0) whose downstream deref of a real lifecycle-registry
+        // object is the SH264 fault (0x1021f3748=0xd10243ff, fault=0x50). ONE closed wall.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            // The single shared dispatcher all 12 lifecycle stubs tail-branch into.
+            assert_eq!(word(0x102_1f15a4), 0xd10703ff, "sh273 shared lifecycle dispatcher prologue sub sp,#0x1c0");
+            // Each 44-byte lifecycle public entry: prologue stp x29,x30,[sp,#-16]!
+            const SHARED_DISPATCHER: u64 = 0x102_1f15a4;
+            let lifecycle_entries: &[(u64, &str)] = &[
+                (0x102_1f1578, "nativeOnPreCreated"), (0x102_1f5334, "nativeOnCreated"),
+                (0x102_1f5d34, "nativeOnPreStarted"), (0x102_1f5d60, "nativeOnStarted"),
+                (0x102_1f5d8c, "nativeOnPreResumed"), (0x102_1f5db8, "nativeOnResumed"),
+                (0x102_321ac8, "nativeOnPrePaused"), (0x102_321af4, "nativeOnPaused"),
+                (0x102_5f66c4, "nativeOnPreStopped"), (0x102_5f66f0, "nativeOnStopped"),
+                (0x102_5f671c, "nativeOnPreDestroyed"), (0x102_5f6748, "nativeOnDestroyed"),
+            ];
+            for &(guest, name) in lifecycle_entries {
+                assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh273 {name} {guest:#x} in window");
+                assert!(guest & 3 == 0, "sh273 {name} {guest:#x} 4-aligned");
+                // prologue: stp x29,x30,[sp,#-16]!
+                assert_eq!(word(guest), 0xa9bf7bfd, "sh273 {name} prologue");
+                // The stub is 44 bytes = 11 insns; the last instruction (entry+40)
+                // is the unconditional `b <shared dispatcher>`.
+                let tail_w = word(guest + 40);
+                assert_eq!(tail_w >> 26, 0x5, "sh273 {name} tail is an unconditional b (0x{tail_w:08x})");
+                // decode imm26 -> recompute target; must equal the shared dispatcher.
+                let imm = tail_w & 0x3ff_ffff;
+                let signed = if imm & (1 << 25) != 0 { (imm as i64) - (1 << 26) } else { imm as i64 };
+                let target = (guest + 40) as i64 + signed * 4;
+                assert_eq!(target as u64, SHARED_DISPATCHER, "sh273 {name} tail-branches to the shared dispatcher 0x102_1f15a4");
+            }
+            // The SH264-measured live-object fault prologue (reached from the
+            // shared dispatcher's state dispatch): guestpc=0x1021f3748 = `sub sp,#0x90`.
+            assert_eq!(word(0x102_1f3748), 0xd10243ff, "sh273 lifecycle-registry fault-site prologue (SH264 guestpc fault=0x50)");
+            eprintln!("sh273 ALL 12 JNIActivityLifecycleCallbacks nativeOn* entries converge on the single shared dispatcher 0x102_1f15a4 (one SH184 live-object wall; NOT independent levers) — pinned on libroblox.so");
+        } else {
+            eprintln!("sh273 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh270_preload_wall_is_canary_cell_pinned() {
         // SH270 (CORRECTED attribution; SUPERSEDES the canary mislabel in the
         // initial source — see note). The SendAppEventOnAppReady post-advance wall
