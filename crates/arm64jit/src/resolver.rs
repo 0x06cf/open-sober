@@ -1392,6 +1392,18 @@ fn is_glibc_initialized(m: *const u8) -> bool {
     !m.is_null() && mutex_init_set().lock().unwrap().contains(&(m as usize))
 }
 
+/// SH283: decide whether to force-release the fixed session-global mutex seen
+/// contended by the engine5 initEngine_ state=5 reentry continuation. Only the
+/// one address, only the NON-init'd NORMAL bionic path (so we never steal a
+/// glibc-formatted or recursive mutex), and only under the opt-in env. This is
+/// what turns SH282's QMUTEX park (a genuinely contended lock, not a
+/// cannot-block static init) into a crossable gate. Exposed as a pure predicate
+/// for hermetic testing.
+fn sh283_should_steal_session_mutex(m: usize) -> bool {
+    const SESSION_MUTEX: usize = 0x106863aa0usize;
+    std::env::var_os("JIT_ROUTEB_ENG5_QMUTEX_FREE").is_some() && m == SESSION_MUTEX
+}
+
 /// True iff this mutex is a plain NORMAL Non-PI mutex (the only layout we
 /// implement byte-exact). Reads the packed state word to check the type bits.
 unsafe fn bionic_is_normal(m: *const u8) -> bool {
@@ -1438,6 +1450,29 @@ unsafe fn bionic_mutex_lock(m: *mut u8) -> i32 {
     let state = m as *mut u16;
     let shared = (unsafe { core::ptr::read_unaligned(state) } & BIONIC_SHARED_MASK) != 0;
     let word = unsafe { &*(m as *const AtomicU16) };
+
+    // SH283 gate (default-inert, JIT_ROUTEB_ENG5_QMUTEX_FREE=1): the engine5
+    // initEngine_ state=5 continuation parks at pthread_mutex_lock(0x106863aa0)
+    // because the fixed mutex is already held LOCKED_CONTENDED (state=0x2) by a
+    // spawned worker that never runs headlessly to release it — a real
+    // cross-thread contention futex-wait, NOT SH282's mistaken "zeroed
+    // static-init, cannot block" premise. Steal the lock by force-clearing the
+    // bionic state word when this specific fixed session-global mutex is
+    // contended AND the env is set, so the reentry continuation proceeds into
+    // the enqueue-construct world-build instead of parking. Idempotent,
+    // address-scoped, default off.
+    if sh283_should_steal_session_mutex(m as usize) {
+        let cur = unsafe { core::ptr::read_unaligned(state) };
+        if cur != 0 {
+            unsafe { core::ptr::write_unaligned(state, 0u16); }
+            if std::env::var_os("JIT_TRACE").is_some() {
+                eprintln!(
+                    "[mutex_lock] SH283 force-freed contended session mutex {m:#x} (was state=0x{cur:x}) for the engine5 reentry continuation",
+                    m = m as usize
+                );
+            }
+        }
+    }
 
     // Fast path: CAS 0 -> 1, further coloured by shared.
     let unlocked = if shared { BIONIC_SHARED_MASK } else { 0 };
@@ -2113,6 +2148,35 @@ mod tests {
             owner, owner_tid,
             "glibc __owner at offset 8 MUST survive sanitize (recursive re-lock depends on it)"
         );
+    }
+
+    #[test]
+    fn sh283_session_mutex_steal_gate_env_and_addr_scoped() {
+        // SH283: the engine5 initEngine_ state=5 reentry continuation parks at
+        // pthread_mutex_lock(0x106863aa0) — SH282 called it a "zeroed static-init
+        // cannot-block" lock, but the JIT_TRACE shows it genuinely CONTENDED
+        // (state=0x2, held by a spawned worker that never releases headlessly).
+        // The gate force-frees it, but must be (a) env-gated (default inert),
+        // (b) address-scoped to the ONE session global (never steal ordinary
+        // engine mutexes / glibc-formatted / recursive), so the fix can't leak.
+        const SESSION_MUTEX: usize = 0x106863aa0usize;
+        // Default: env unset -> never steal (any address).
+        unsafe { std::env::remove_var("JIT_ROUTEB_ENG5_QMUTEX_FREE") };
+        assert!(
+            !super::sh283_should_steal_session_mutex(SESSION_MUTEX),
+            "gate must be inert by default (no env)"
+        );
+        assert!(
+            !super::sh283_should_steal_session_mutex(0x106863ac8usize),
+            "gate must be inert by default for any other address"
+        );
+        // Env set -> exactly the session global is stealable, nothing else.
+        unsafe { std::env::set_var("JIT_ROUTEB_ENG5_QMUTEX_FREE", "1") };
+        assert!(super::sh283_should_steal_session_mutex(SESSION_MUTEX));
+        assert!(!super::sh283_should_steal_session_mutex(0x106863ac8usize));
+        assert!(!super::sh283_should_steal_session_mutex(0x106863aa0usize + 8));
+        assert!(!super::sh283_should_steal_session_mutex(0x22222222usize));
+        assert!(!super::sh283_should_steal_session_mutex(0));
     }
 
     /// Real Mesa EGL must be resolvable as an integer-ABI host call, and a guest
