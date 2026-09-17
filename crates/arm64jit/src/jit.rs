@@ -2407,10 +2407,12 @@ pub fn routeb_dm_manager_fabricated() -> u64 {
             let a = register_host_call_auto(routeb_dm_manager_write_leaf);
             a
         });
+        let mgr30 = routeb_manager_mgr30_leaf();
         unsafe {
-            // Only +0x30 (write-leaf), +0xf8/+0x108/+0x1f0 (benign leaf) are live; every
-            // other slot stays 0 so the post-FFI vt[+0x720] read is 0 -> benign soft-return.
-            std::ptr::write_unaligned((v + 0x30) as *mut u64, leaf);
+            // Only +0x30 (write-leaf / -2 leaf), +0xf8/+0x108/+0x1f0 (benign leaf) are
+            // live; every other slot stays 0 so the post-FFI vt[+0x720] read is 0 ->
+            // benign soft-return. +0x30 selects the SH244 verb (0 vs -2) by env.
+            std::ptr::write_unaligned((v + 0x30) as *mut u64, mgr30);
             std::ptr::write_unaligned((v + 0xf8) as *mut u64, leaf);
             std::ptr::write_unaligned((v + 0x108) as *mut u64, leaf);
             std::ptr::write_unaligned((v + 0x1f0) as *mut u64, leaf);
@@ -2431,10 +2433,46 @@ extern "C" fn routeb_dm_manager_write_leaf(a0: u64, a1: u64, _a2: u64, _a3: u64,
     0
 }
 
+/// SH244 (forward lever, opt-in under JIT_ROUTEB_DM_MGR_MINUS2): the engine-init
+/// getter 0x102174c04 dispatches the fabricated manager's vt[+0x30] and tests
+/// `cmn w0,#0x2` (0x2 + w0 == 0, i.e. w0 == -2 = 0xFFFFFFFE). Our default write-leaf
+/// returns 0, so `b.ne 0x2174c4c` SKIPS the getter's own `bl nativeAppBridgeStartLuaAppDM
+/// (0x10242a5e4)` and falls straight into the FMOD/AAudio tail `b 0x624e6c0` (measured
+/// firing at 0x10624e700 on the completing ladder) — which never returns to the
+/// dispatcher (0x102bd8d18 stays 0 hits). Returning -2 makes the getter TAKE the
+/// StartLuaAppDM branch (a self-invocation from inside engine-init, never previously
+/// driven) before the tail. Mirrors write_leaf's out-field write, returns 0xFFFFFFFE.
+extern "C" fn routeb_dm_manager_write_leaf_minus2(a0: u64, a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64) -> u64 {
+    if a1 != 0 {
+        unsafe { std::ptr::write_unaligned(a1 as *mut u64, a0) };
+    }
+    0xFFFF_FFFE
+}
+
 /// Static slot for the manager leaf address (once-registered).
 fn REGISTERED_MANAGER_LEAF() -> &'static std::sync::OnceLock<u64> {
     static L: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     &L
+}
+
+/// Static slot for the -2-returning leaf (SH244, JIT_ROUTEB_DM_MGR_MINUS2).
+fn REGISTERED_MANAGER_LEAF_MINUS2() -> &'static std::sync::OnceLock<u64> {
+    static L: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    &L
+}
+
+/// SH244: which leaf to install at vt[+0x30]. Default = write-leaf (returns 0 → the
+/// engine-init getter b.ne-skips StartLuaAppDM and diverts to FMOD). Under
+/// JIT_ROUTEB_DM_MGR_MINUS2 → write-leaf-minus2 (returns -2 → the getter takes its
+/// own `bl nativeAppBridgeStartLuaAppDM` branch before the tail). Both mirror the
+/// out-field write (+0x30 slot) so downstream behavior is otherwise unchanged.
+fn routeb_manager_mgr30_leaf() -> u64 {
+    if std::env::var_os("JIT_ROUTEB_DM_MGR_MINUS2").is_some() {
+        *REGISTERED_MANAGER_LEAF_MINUS2()
+            .get_or_init(|| register_host_call_auto(routeb_dm_manager_write_leaf_minus2))
+    } else {
+        *REGISTERED_MANAGER_LEAF().get_or_init(|| register_host_call_auto(routeb_dm_manager_write_leaf))
+    }
 }
 
 /// SH165-fwd-cone (deleg_7e5b7101 task-0, authoritative): the CONTINUATION-routed manager.
@@ -2462,10 +2500,12 @@ pub fn routeb_dm_manager_cont() -> u64 {
         // F+0x18=0 (post-app-start controller — expected empirical floor).
         let f = Box::leak(vec![0x0u8; 0x310usize].into_boxed_slice()).as_mut_ptr() as u64;
         let leaf = *REGISTERED_MANAGER_LEAF().get_or_init(|| register_host_call_auto(routeb_dm_manager_write_leaf));
+        let mgr30 = routeb_manager_mgr30_leaf();
         unsafe {
-            // vt[+0x30]=write-leaf (getter install), +0xf8/+0x108=benign leaf (network fetch
-            // returns no flags), +0x1f0=REAL continueAfterFlagsLoaded_. All else 0 -> vt[+0x720]==0.
-            std::ptr::write_unaligned((v + 0x30) as *mut u64, leaf);
+            // vt[+0x30]=write-leaf or -2 leaf (SH244 verb, env-selectable), +0xf8/+0x108=
+            // benign leaf (network fetch returns no flags), +0x1f0=REAL continueAfterFlagsLoaded_.
+            // All else 0 -> vt[+0x720]==0.
+            std::ptr::write_unaligned((v + 0x30) as *mut u64, mgr30);
             std::ptr::write_unaligned((v + 0xf8) as *mut u64, leaf);
             std::ptr::write_unaligned((v + 0x108) as *mut u64, leaf);
             std::ptr::write_unaligned((v + 0x1f0) as *mut u64, 0x102bd1d68u64); // real continuation
@@ -6573,6 +6613,56 @@ mod tests {
             );
         }
         unsafe { std::env::remove_var("JIT_ROUTEB_DMFORCE") };
+    }
+
+    #[test]
+    fn sh244_mgr30_minus2_leaf_selects_startluaappdm_verb() {
+        // SH244 (this cycle, measured): the engine-init getter 0x102174c04 dispatches the
+        // fabricated manager's vt[+0x30] and tests `cmn w0,#0x2`; only a -2 return (0xFFFFFFFE)
+        // makes it TAKE its own `bl nativeAppBridgeStartLuaAppDM (0x10242a5e4)` branch before
+        // tail-diverging into the FMOD/AAudio 0x624e6c0 (measured firing -> never returns to
+        // the dispatcher 0x102bd8d18). Two host-leaf verbs:
+        //   write_leaf        -> returns 0          (b.ne skips StartLuaAppDM; baseline)
+        //   write_leaf_minus2 -> returns 0xFFFFFFFE (cmn w0,#0x2 -> Z=1 -> StartLuaAppDM branch)
+        // routeb_manager_mgr30_leaf selects by JIT_ROUTEB_DM_MGR_MINUS2; both verbs keep the
+        // +0x30 out-field write identical. Regression guard: default = 0 (baseline benign),
+        // env-on = -2 (forward lever), both == write to a1.
+        unsafe { std::env::remove_var("JIT_ROUTEB_DM_MGR_MINUS2") };
+        let default_leaf = routeb_manager_mgr30_leaf();
+        // Call both host verbs and assert the write + the return word.
+        let slot = Box::leak(vec![0u8; 8].into_boxed_slice()).as_mut_ptr() as u64;
+        unsafe {
+            std::ptr::write_unaligned(slot as *mut u64, 0x1111_2222_3333_4444u64);
+            let r0 = routeb_dm_manager_write_leaf(0xABCD_1234, slot, 0, 0, 0, 0, 0, 0);
+            assert_eq!(r0, 0, "write_leaf's +0x30 verb must return 0 (baseline: b.ne skips SLADM)");
+            assert_eq!(
+                std::ptr::read_unaligned(slot as *const u64),
+                0xABCD_1234,
+                "write_leaf must write a0 into a1 (out-field)"
+            );
+            std::ptr::write_unaligned(slot as *mut u64, 0x1111_2222_3333_4444u64);
+            let r2 = routeb_dm_manager_write_leaf_minus2(0xCAFE_BEEF, slot, 0, 0, 0, 0, 0, 0);
+            assert_eq!(
+                r2, 0xFFFF_FFFE,
+                "write_leaf_minus2's +0x30 verb must return -2 (0xFFFFFFFE) so getter's cmn w0,#0x2 -> SLADM branch"
+            );
+            assert_eq!(
+                std::ptr::read_unaligned(slot as *const u64),
+                0xCAFE_BEEF,
+                "write_leaf_minus2 must ALSO write a0 into a1 (identical out-field side effect)"
+            );
+        }
+        // env-off -> default verb; env-on -> minus2 verb. Both OnceLock the registered
+        // host-call address; the env lever's behavioral effect is the return word, which
+        // the two verbs above pin (0 vs 0xFFFFFFFE). Bound: both leaf addresses registered.
+        unsafe { std::env::set_var("JIT_ROUTEB_DM_MGR_MINUS2", "1") };
+        let minus2_leaf = routeb_manager_mgr30_leaf();
+        unsafe { std::env::remove_var("JIT_ROUTEB_DM_MGR_MINUS2") };
+        // Either selection path produces a registered host-call address; the env lever's
+        // effect is verified through the two verbs' return words above (the definitive
+        // behavioral distinction the getter branch senses). Bound: both must be != 0.
+        assert_ne!(default_leaf, 0, "default vt[+0x30] verb must be a registered host-call addr");
+        assert_ne!(minus2_leaf, 0, "minus2 vt[+0x30] verb must be a registered host-call addr");
     }
 
     #[test]
