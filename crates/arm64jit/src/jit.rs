@@ -836,6 +836,49 @@ fn routeb_cookie_jar_guard(_state: *mut CpuState, pc: u64) {
     }
 }
 
+/// A leaked valid empty libc++ std::string (zeroed 0x20 buffer = SSO short, size/cap 0).
+/// Safe as a string-ASSIGN DESTINATION: the assign's short path copies 24 bytes into it.
+fn routeb_empty_sso_string() -> u64 {
+    static E: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *E.get_or_init(|| Box::leak(vec![0u8; 0x20usize].into_boxed_slice()).as_mut_ptr() as u64)
+}
+
+/// SH248d (opt-in JIT_ROUTEB_APPSART_JAR_SEED=1): post-nativeAppBridgeAppStart fencepost.
+/// Just inside nativeAppBridgeAppStart's string-dispatch the engine assigns into the
+/// cookie-jar container global [0x106ed7a20]: `adrp x8,6ed7000; ldr x8,[x8,#2592];
+/// mov x0,x8; bl 2b504e4` (0x21f4824-30) with x0=dest=[0x106ed7a20]. That .bss global
+/// is NULL headlessly -> the string copy faults (SIGSEGV guestpc=0x102b504e4 fault=0x0,
+/// x0=0, lr=0x1021f4834). Fires at the assign site's block entry and seeds
+/// [0x106ed7a20] with a valid empty SSO string so the assign's dest is non-NULL and the
+/// continuation (now inside nativeAppBridgeAppStart, SH248c) advances past it.
+/// Default-inert; idempotent (no-op when already seeded). Fires on any block-entry pc
+/// in the enclosing fn [0x1021f47f0,0x1021f4834) so it seeds BEFORE the mid-block `bl
+/// 2b504e4` at 0x21f4830 (block entry is the fn prologue 0x21f47fc; the assign is
+/// mid-block, never its own entry).
+fn routeb_appstart_jar_seed_guard(_state: *mut CpuState, pc: u64) {
+    if std::env::var("JIT_ROUTEB_APPSART_JAR_SEED").ok().as_deref() != Some("1") {
+        return;
+    }
+    if !(0x1021f47f0..0x1021f4840).contains(&pc) {
+        return;
+    }
+    // Two adjacent cookie-jar container globals both written by this fn's string assigns:
+    // [0x106ed7a20] (dest for `bl 2b504e4` at 0x21f4830) and [0x106ed7a28] (dest byte-read at
+    // 0x21f4848/0x21f4860). Both are NULL headlessly -> NULL-dest string copy / NULL byte-read.
+    const JAR_SLOTS: [u64; 2] = [0x106ed7a20, 0x106ed7a28];
+    for jar in JAR_SLOTS {
+        if routeb_ensure_writable(jar)
+            && unsafe { std::ptr::read_unaligned(jar as *const u64) } == 0
+        {
+            let empty = routeb_empty_sso_string();
+            unsafe { std::ptr::write_unaligned(jar as *mut u64, empty) };
+            eprintln!(
+                "[routeb-sh248d] seeded cookie-jar container [0x{jar:x}] = 0x{empty:x} (empty SSO std::string) at appstart assign site pc=0x{pc:x} (was NULL -> would fault)"
+            );
+        }
+    }
+}
+
 /// SH177 (objective 2b / recon deleg_48e16777 task-0+task-1): write a classified
 /// value into the engine's cookie-jar container as a valid libc++ `std::string`.
 ///
@@ -5455,6 +5498,9 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
             routeb_tail_trace(state, pc);
         }
         routeb_cookie_jar_guard(state, pc); // SH175: seed cookie-jar container + gates at worker 0x102203148 (JIT_ROUTEB_COOKIE)
+        // SH248d (opt-in JIT_ROUTEB_APPSART_JAR_SEED): seed [0x106ed7a20] cookie-jar string
+        // at the nativeAppBridgeAppStart string-assign site 0x1021f4830 (was NULL -> crash).
+        routeb_appstart_jar_seed_guard(state, pc);
         // SH164 (recon deleg_94aac9d7): governor-tail dispatch block-entry capture.
         // Fires on EVERY run (self-gated on JIT_ROUTEB_DMTRACE) so a follow-up cycle
         // can observe whether the tail's vt[+0x30] dispatch ever resolves to the
