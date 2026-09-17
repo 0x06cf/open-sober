@@ -56,6 +56,29 @@ with all three levers measured/proven closed at the SAME site:
   static-header-seed (SH248g), runtime-header-repair (SH248h), segment-protected
   (SH249, this cycle).
 
+## SH250 (same session, follow-up): the "clamp the outer collection count" lever
+## A/B-FALSIFIED with a full register dump
+While tracing the caller chain this cycle, an apparently-open alternative to the
+map-header repairs was considered: SH248g/h both attacked the MAP object's header
+fields, but the wall is really an under-allocated outer SLOT-ARRAY of stride 0x2a0 —
+so maybe the *iteration count* that bounds the walk is a seedable fixed global (a
+levier neither prior session ever tried). A full JIT_DUMP_PC register dump at the
+wall (runs/batch_sh248f_adapter_seed.sh + JIT_DUMP_PC=0x1021dde34) FALSIFIES it with
+three clean captures then the fault:
+  - x19 (per-insert hash) DIFFERS each iteration: 0x6bfdfab08a4be46a /
+    0x3e66f7c296aef7de / 0x40c29c7e746e86a1 (distinct keys, 3 real inserts).
+  - x24 = STABLE map identity 0x55cd0fcf02d0 across all 3 inserts AND === the value
+    stored at the caller-side global [0x1067d16f0] (guardGOT reads it) — the map
+    root lives at an ASLR host-heap global, count/capacity are live fields of that
+    heap object, re-set by each insert. There is NO fixed .bss count to clamp.
+  - x21 (bucket cursor) advances per-iteration (host-heap), then iteration-4 reads
+    an element computed from a ctor-uninitialized field -> faults 0x0.
+The register dump independently reproduces SH248g's finding and extends it: the
+outer collection root is a host-heap map object whose integer fields are set live
+at runtime — so "clamping the iteration count" is not a seedable lever either. The
+SH249 segment-proof closes the remaining static-write angle. No further lever at
+this wall without a real DataModel ctor.
+
 ## Code / files
 - crates/arm64jit/examples/elfjit.rs: extended the sh248g real-image guard
   `sh248g_appstart_hashfind_wall_anchored` with a SH249 segment-membership
