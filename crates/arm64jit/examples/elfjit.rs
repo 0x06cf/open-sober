@@ -14629,6 +14629,71 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh255_marshaler_enclosing_fn_indirect_only_ec_selfcallers_in_world() {
+        // SH255 (Route-B re-attack, single-agent, mechanical grounding of the SH235/236/238
+        // live-state gate): SH235 pinned the marshaler 0x1023f1210's 3 direct callers
+        // {0x1023f075c, 0x102e15bf0, 0x102e33494} and SH236/238 measured StartLuaAppDM soft-returns
+        // before ever reaching 0x1023f075c. The two other callers (0x102e15bf0, 0x102e33494) — the only
+        // direct calls into the marshaler that do NOT go through StartLuaAppDM — live in the high
+        // ExperienceController/game-start region (0x2e00000+), the same live-DataModel-gated area
+        // SH231 measured headless-unreached (they are NOT inside StartLuaAppDM's own body
+        // [0x1023efe2c,0x1023f0800)). This
+        // cycle closes the last static residual: the marshaler's ENCLOSING function 0x1023f03b4 (sub
+        // sp,#0x190 body that calls `bl 0x1023f1210` at 0x1023f075c) has ZERO direct bl/b callers over
+        // the whole executable .text — it is reachable ONLY via indirect dispatch (blr/br), exactly the
+        // fabricatable-object-graph/live-this class. So there is no in-image static call site that can
+        // reach the EC world except (a) the StartLuaAppDM dispatch switch (measured inert, SH236/238)
+        // and (b) EC-world internal self-calls (gated on the world already running). This mechanizes
+        // the "no headless seed reaches the genuine DataModel factory" verdict at the enclosing-fn
+        // level: a drifted constant (a now-direct caller, or a relocated enclosing fn) fails loudly.
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if p.exists() {
+            let el = load_real_image();
+            // pin the marshaler-enclosing fn entry + the StartLuaAppDM call word (SH235 re-pin)
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            assert_eq!(word(0x102_3f03b4), 0xfc190fe8, "sh255 marshaler-enclosing fn 0x1023f03b4 entry str d8,[sp,#-112]!");
+            assert_eq!(word(0x102_3f075c), 0x940002ad, "sh255 StartLuaAppDM -> marshaler bl word");
+            let (tea, teb) = el.text_segment().expect("sh255 text segment");
+            let host_base = el.host_addr_of(0x1_0000_0000).expect("sh255 host base");
+            let guest_of = |h: u64| 0x1_0000_0000 + (h - host_base);
+            // (a) enclosing fn 0x1023f03b4 must have ZERO direct bl/b callers in all of .text
+            let mut enclosing_fn_callers: Vec<u64> = Vec::new();
+            // (b) the marshaler's non-StartLuaAppDM callers must land inside the EC world body
+            let mut gaddr = tea;
+            while gaddr + 4 <= teb {
+                let w = unsafe { (gaddr as *const u32).read_unaligned() };
+                if w & 0xfc00_0000 == 0x9400_0000 || w & 0xfc00_0000 == 0x1400_0000 {
+                    let imm = w & 0x03ff_ffff;
+                    let signed = if imm & 0x200_0000 != 0 { (imm as i64) - 0x400_0000 } else { imm as i64 };
+                    let pc = guest_of(gaddr);
+                    let tgt = pc.wrapping_add_signed(signed << 2);
+                    if tgt == 0x102_3f03b4 { enclosing_fn_callers.push(pc); }
+                }
+                gaddr += 4;
+            }
+            assert!(enclosing_fn_callers.is_empty(),
+                "sh255 marshaler-enclosing fn 0x1023f03b4 must be INDIRECT-ONLY (0 direct bl/b callers), got {:x?}", enclosing_fn_callers);
+            // the two non-StartLuaAppDM marshaler callers are NOT inside StartLuaAppDM's own body
+            // [0x1023efe2c,0x1023f0800); they live in the high ExperienceController/game-start
+            // region (0x2e00000+), the same live-DataModel-gated area SH231 measured headless-unreached.
+            for c in [0x102_e15bf0u64, 0x102_e33494u64] {
+                assert!(c >= 0x102_3f0800,
+                    "sh255 non-SLADM marshaler caller {c:#x} must be OUTSIDE StartLuaAppDM body [0x1023efe2c,0x1023f0800)");
+                assert!(c >= 0x102_e00000,
+                    "sh255 caller {c:#x} must be in the ExperienceController/game-start region (0x2e00000+)");
+                assert!(c & 3 == 0, "sh255 {c:#x} 4-aligned");
+            }
+        } else {
+            eprintln!("sh255 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh236_startluaappdm_receivecall_dispatch_softreturns_before_marshaler() {
         // SH236 (Route-B re-attack, single-agent): SH235 statically concluded the EC world
         // 0x102e24598's only headless front-door (StartLuaAppDM -> bl 0x1023f1210 @0x1023f075c) is
