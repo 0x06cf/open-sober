@@ -58,6 +58,26 @@ descriptor path. Its measured failure (descriptor path can't serve >0xa) removes
 last "maybe the working small path can handle the larger boxes" candidate and pins
 the alloc wall to the size-class region setup — a live-session state, not a seed.
 
+## Corroborating observation: the allocator is THE headless construction crux
+The SAME allocator-activation byte [0x10727570c].bit0 + size threshold gates
+StartLuaAppDM's OWN real body too: file 0x23ff31c (inside nativeAppBridgeStartLuaAppDM
+0x1023efe2c, the +0xf4a4 offset) reads the byte and `tbnz w8,#0`; with the bit clear it
+does `cmn x20,#0x9; b.cs 0x23ff4ec` — a ~9-byte threshold routing to the SAME
+descriptor/real-alloc path. So op_new (both variants), the DMCONT continuation, AND
+StartLuaAppDM's real construction path ALL funnel through this one flag: headlessly,
+no engine-authored object >~10 bytes can be built (every string / vector / container /
+the DataModel itself). Solving the 0x70c-size-class bootstrap would be the single
+enabler for all of Route B; the flag's =1 route alone SIGABRTs (regions/cache not set
+up) and the flag-writers (file 0x2817b48/0x282a004) sit deep in full-session
+app-lifecycle init, not a headless-invokable CRT bootstrap.
+
+## Why this specific gate (not a re-tread)
+Every prior attempt to clear the continuation's alloc wall hit a single mechanism
+(NULL fast path). SH247 closes the surviving *unmodified* route: the working
+descriptor path. Its measured failure (descriptor path can't serve >0xa) removes the
+last "maybe the working small path can handle the larger boxes" candidate and pins
+the alloc wall to the size-class region setup — a live-session state, not a seed.
+
 ## Code / files
 - crates/arm64jit/examples/elfjit.rs: `routeb_patch_opnew_size_gate()` (opt-in
   JIT_ROUTEB_OPNEW_SIZE_GATE, real-image byte-guard on both `b.ls` gate words,
