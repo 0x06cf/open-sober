@@ -7774,6 +7774,15 @@ fn main() {
                     unsafe { *((mgr3 + 649u64) as *mut u8) = 1u8; }
                     let scfg = Box::leak(vec![0x0u8; 0xc00usize].into_boxed_slice()).as_mut_ptr() as u64;
                     unsafe { *( (mgr3 + 0x40u64) as *mut u64) = scfg; }
+                    // SH281: state=5 config dispatch bl 0x2bce0d4 (w2=1) -> b 275a0c4
+                    // (GlobalInit-reentry), whose `ldr x0,[x21,x8]` @0x10275a148 faults on
+                    // x21=[config+56]=0. Callee 0x275a23c DROPS the read value (overwrites x0
+                    // with operator_new(0x40)) — so [config+56] only needs a valid buffer.
+                    let c56 = Box::leak(vec![0x0u8; 0x100usize].into_boxed_slice()).as_mut_ptr() as u64;
+                    unsafe { *( (scfg + 56u64) as *mut u64) = c56; }
+                    eprintln!(
+                        "[elfjit:v2boot] SH281 seeded [config+56]=0x{c56:x} (0x100 zeroed buf; callee 0x275a23c drops the value) so the reentry ldr [x21,x8] @0x10275a148 no longer NULL-faults"
+                    );
                     eprintln!(
                         "[elfjit:v2boot] SH279 seeded [this+0x40]=settings-config 0x{scfg:x} (static-init mutex at +0x300) so the state=3 config-lock helper 0x2bcdfc4 does not fault at [0x300]"
                     );
@@ -13991,11 +14000,10 @@ mod sh115_tests {
     fn sh213_fmod_aaudio_first_contact_anchors() {
         // SH212/SH213: the "sound" pillar's first measured boot contact is the
         // FMOD/AAudio JNI export Java_org_fmod_FMOD_OutputAAudioHeadphonesChanged
-        // (guest 0x106240d8c region, run-variable NULL-`this` fault, non-seedable).
+        // (guest 0x106240d8c, run-variable NULL-`this` fault, non-seedable).
         // Pin (a) the crash block-entry opcode, (b) the two libc++ std::string
-        // member reads off the jobject (`this`) it faults on, (c) the function
-        // entry, against the real libroblox.so so a future audio-hardening
-        // milestone cannot target a drifted constant. Also pin the SH132 AAudio
+        // member reads off the jobject it faults on, (c) the function entry, so a future
+        // audio-hardening milestone can't target a drifted constant. Also pin the SH132 AAudio
         // bridge's customer-side anchors (driver region / fn-ptr table / JNI
         // entry) and assert the guest transform + 4-alignment. Same real-image
         // guard family as sh211/sh116b/sh200. Test-only, no default path.
@@ -14051,21 +14059,11 @@ mod sh115_tests {
 
     #[test]
     fn sh219_postfamily_frag_and_flagmanager_words_pinned() {
-        // SH219 (Sep 16, 2026): SH203 classified the "post-family fault" (a
-        // NULL-singleton pthread_mutex_lock, x0=0x28, at lr=0x102b53a78 = host-call
-        // slot 0x7f00000022b0) as a deterministic 4/12 live-world-build gate using
-        // the "0 direct bl callers" method that SH205 later PROVED unreliable.
-        // After SH116b (flag-manager lock fix) + SH217 (SH161b window) landed, that
-        // post-family fault did NOT reproduce in 28 fresh ladder runs (16 GSDSP +
-        // 12 under SH203's exact env; only the known FMOD crash-A 0x106240c24 and
-        // SH208 singleton-vtable 0x1021dea94 classes fired). Both SH203's site and
-        // SH116b's site are NULL-singleton mutex-lock x0=0x28 — same family, so the
-        // closure is consistent with SH116b having fixed the shared family.
-        // Regression net (real-image guard family as sh213/sh211): pin the exact
-        // words of (a) the flag-manager load slot SH116b patches (0x2320a24 +
-        // 0x2320a2c) and (b) the post-family fragment (0x2b53a64 bl JNICallProtocol
-        // receiveCall+0x558 / 0x2b53a74 bl pthread_mutex_lock@plt). If either set
-        // drifts, a future session catches it before re-classifying the gate.
+        // SH219: the SH203 "post-family fault" (NULL-singleton mutex_lock x0=0x28 at
+        // lr=0x102b53a78, classed via the SH205-proven-unreliable "0 direct callers")
+        // did NOT reproduce in 28 fresh ladder runs after SH116b+SH217 landed — same
+        // NULL-singleton-mutex family, so SH116b fixed it. Regression net pins the
+        // flag-manager slot SH116b patches (0x2320a24/0x2320a2c) and the fragment.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
@@ -14103,17 +14101,12 @@ mod sh115_tests {
 
     #[test]
     fn sh221_fp16_doc_flagged_simd_immediate_opcodes_decode_as_vecmovi() {
-        // docs/fp16-decode-gap.md (pre-4dd5e3d area) lists a "NEXT lever" of ~100
-        // `orc/bic/orr/mvni/movi Vd.2S/.4S` SIMD modified-immediate opcodes encoded
-        // 0x4f0177eX / 0x2f047400, claiming they fall to Inst::Unsupported and "will
-        // JIT-abort the moment the real boot reaches them". That verdict is STALE:
-        // the broad VecMovi gate (top byte {0F,1F,2F,4F,5F,6F}) + cmode-shift arms
-        // (kind 1=bic/AND~imm, 2=orr/OR imm) already decode them. Verify on the real
-        // image that (a) representative modified-immediate opcodes decode as the
-        // CORRECT VecMovi (right lo/hi immediates + kind, never Unsupported), and
-        // (b) a fresh decode of the real .text window [file 0x1d95980..+0x4540104]
-        // surfaces ZERO Unsupported — the durable "decode coverage must not regress"
-        // pin. Skip-if-absent real-image guard family as sh219/sh213/sh211.
+        // docs/fp16-decode-gap.md's "NEXT lever" (~100 SIMD modified-immediate
+        // opcodes claimed to JIT-abort) is STALE: the broad VecMovi gate +
+        // cmode-shift arms already decode them. Verify on the real image that (a)
+        // representative opcodes decode as the CORRECT VecMovi (never Unsupported),
+        // and (b) a fresh decode of the real .text window [file 0x1d95980..+0x4540104]
+        // surfaces ZERO Unsupported — the durable "decode coverage must not regress" pin.
         use arm64jit::decode::{decode, Inst};
         // kind: 0=write(movi/mvni), 1=bic(AND ~imm), 2=orr(OR imm).
         let cases: &[(u32, Option<(u64, u64, u8)>, &str)] = &[
@@ -14450,18 +14443,11 @@ mod sh115_tests {
 
     #[test]
     fn sh227_doinit_binder_dispatch_decode_corrected_and_bne_bypass() {
-        // SH227 (Route-B re-attack) — CORRECTION of the SH225/226 pin. SH156 decoded the closure-build
-        // load as `ldr x0,[x19,#32]`; SH225 "re-corrected" to `#4` + SH226 propagated "AUTHORITATIVE".
-        // Fresh decode proves SH156 RIGHT, SH225/226 WRONG on the OFFSET: word 0xf9401260 = LdStrImm{
-        // rn=19, imm=4, size=8 }, translate uses address = rn + imm*size = x19 + 4*8 = x19+#32.
-        // (imm12 is the BYTE count / access size; for a 64-bit LDR size=8, raw imm12 4 => byte offset 32.
-        // SH225 applied the 32-bit size-4 scale, giving the wrong "#4".) AND the dispatch block is
-        // MEASURED BYPASSED at runtime: closure-build 0x102206db8 -> `bl pthread_self` -> `cmp x0,x20`
-        // (stored main-id [0x106863a68]) -> `b.ne 0x102206e28` TAKEN on the ladder (this != main) -> jumps
-        // to LocalStorageManager construction, so binder-dispatch 0x102206df4..0x102206e24 NEVER executes
-        // headlessly. Therefore "fabricate a binder at [union+4]" is a MEASURED DEAD-END on BOTH grounds
-        // (wrong offset AND reachability bypass). Re-anchors: offset semantics (#32), the b.ne thread-match
-        // gate, and the non-match LocalStorageManager target.
+        // SH227 (Route-B) — CORRECTION of the SH225/226 pin: word 0xf9401260 = LdStrImm{rn=19,
+        // imm=4, size=8} => addr = x19 + 4*8 = x19+#32 (SH156 RIGHT; SH225's #4 is the 32-bit
+        // scale error). The closure-build dispatch block is ALSO MEASURED BYPASSED at runtime
+        // (b.ne thread-match gate -> LocalStorageManager, binder 0x102206df4 NEVER runs
+        // headlessly) — so "fabricate a binder" is a measured DEAD-END on both grounds.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
@@ -14497,23 +14483,10 @@ mod sh115_tests {
 
     #[test]
     fn sh228_engineinit_dispatcher_sub_never_fires_blocks() {
-        // SH228 (Route-B re-attack, single-agent): closes SH166's explicitly-left-open
-        // question (a) — "does the vt[+0x1f0] dispatch execute, or is it diverted?" — at
-        // full block-entry confidence. Fresh region-watch (4 windows in ONE completing
-        // --v2boot ladder run, DMCONT=1): fnB (0x102bd1b98) AND the dispatcher
-        // (0x102bd8ce8) BOTH fire as their own block entries, but sub_2bd8dac (the
-        // `bl 0x2bd8dac` at 0x2bd8d60 is UNCONDITIONAL) and continueAfterFlagsLoaded_
-        // (0x102bd1d68) NEVER fire. Since the JIT creates a fresh block entry for each
-        // distinct function target, a separate-function entry that never appears as a
-        // block is ENTERED-NEVER (block-entry-definitive), not region-watch-blind.
-        // This (a) closes SH166(a) as a DEFINITIVE NEGATIVE, and (b) CORRECTS SH226's
-        // completion mechanism: SH226 claimed the pipeline "benign-completes via its
-        // 2nd-frame (sub_2bd8dac) -> 0x102bd9058 soft-return" — but sub_2bd8dac never
-        // even enters as a block, so the dispatcher completes through resolve/leaf
-        // paths WITHOUT reaching sub, and the +0x1f0 blr at 0x2bd8e28 never runs.
-        // Standing bottom line (unchanged): DMCONT continuation unreached; live-DM =
-        // structural gate. Each of the three anchor sites must stay pinned so a drift
-        // fails loudly instead of silently re-measuring 0 region hits.
+        // SH228 (Route-B): closes SH166(a) — the vt[+0x1f0] dispatch — at full block-entry
+        // confidence: fnB + dispatcher fire as block entries, but sub_2bd8dac and
+        // continueAfterFlagsLoaded_ (0x102bd1d68) NEVER fire -> ENTERED-NEVER (block-entry-
+        // definitive). CORRECTS SH226's "2nd-frame soft-return" claim. DMCONT unreached.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
@@ -15138,14 +15111,10 @@ mod sh115_tests {
 
     #[test]
     fn sh280_engine_settings_state5_body_direct_driven() {
-        // SH280: the initEngine_ settings-state machine's state=5 body (0x2bd24b4) was NEVER driven.
-        // New opt-in --v2boot-session-engine5 drives 0x2bd24b4 DIRECTLY as its own jit_run before
-        // the =3 serializer (which self-drives into app-start and dies at the LSM wall before
-        // returning). MEASURED det 3/3 (real libroblox.so, SH279 manager seeds): the body
-        // executes headlessly for the FIRST time, sets state->6, and its config dispatch
-        // bl 0x2bce0d4 (w2=1) -> b 275a0c4 (GlobalInit-reentry) faults at guestpc=0x10275a148/x154
-        // `ldr x0,[x21,x8]` fault=0x0 (x21=[config+56]=0, settings-config content live-object
-        // field — structural gate). Guest = file vaddr.
+        // SH280: the initEngine_ settings-state machine's state=5 body (0x2bd24b4), driven DIRECT
+        // by --v2boot-session-engine5, executes headlessly for the FIRST time (set state->6) then
+        // config-dispatch bl 0x2bce0d4 (w2=1) -> b 275a0c4 (GlobalInit-reentry) faults at
+        // guestpc=0x10275a148/x154 `ldr x0,[x21,x8]` fault=0x0 (x21=[config+56]=0). Guest = file vaddr.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15176,6 +15145,43 @@ mod sh115_tests {
             eprintln!("sh280 engine-settings state=5 body + config-dispatch + GlobalInit-reentry anchors pinned on libroblox.so");
         } else {
             eprintln!("sh280 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
+    fn sh281_config56_seed_crosses_reentry_continuation() {
+        // SH281: the state=5 config dispatch -> GlobalInit-reentry faulted @0x10275a154 `ldr x0,[x21,x8]`
+        // because x21=[config+56]=0. The callee 0x275a23c DROPS the read value (overwrites x0 with
+        // operator_new(0x40)), so [config+56] only needs a valid buffer. Seeding it crosses the wall:
+        // MEASURED the state=5 body runs the FULL GlobalInit-reentry (hits 0x10275a148 -> 0x275a23c ->
+        // 0x2207118) with no SIGSEGV (EXIT 124 timeout park at 0x2207118 `add x0,#0xaa0; bl mutex_lock`,
+        // box+0xaa0 = junk heap beyond the 0x40 callee box). Guest = file vaddr + 0x1_0000_0000.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            let in_win = |g: u64| g >= 0x1_0000_0000 && g < 0x120_0000_00 && g & 3 == 0;
+            // GlobalInit-reentry 275a0c4: ldr [x21,x8] (crossed fault) -> bl 275a23c (drops x0).
+            assert_eq!(word(0x10275a154), 0xf8686aa0, "sh281 reentry fault ldr x0,[x21,x8]");
+            assert_eq!(word(0x10275a160), 0x94000037, "sh281 reentry bl 0x275a23c");
+            // Callee 0x275a23c: own 0x40 box, never derefs incoming value.
+            assert_eq!(word(0x10275a23c), 0xa9bd7bfd, "sh281 callee prologue stp x29,x30,[sp,#-48]!");
+            assert_eq!(word(0x10275a24c), 0x52800800, "sh281 callee mov w0,#0x40");
+            assert_eq!(word(0x10275a258), 0x97d8f144, "sh281 callee bl 1d96768");
+            // Tail: b 2207118 continuation.
+            assert_eq!(word(0x10275a294), 0x17eab3a1, "sh281 callee tail b 0x2207118");
+            // Continuation 0x2207118: locks [x0+0xaa0] (junk heap past the 0x40 box -> park).
+            assert_eq!(word(0x102207118), 0xd100c3ff, "sh281 continuation prologue sub sp,#0x30");
+            assert_eq!(word(0x102207144), 0x94253249, "sh281 continuation bl 2b53a68 [x0+0xaa0]");
+            for g in [0x10275a154u64, 0x10275a23cu64, 0x10275a294u64, 0x102207118u64, 0x102207144u64] {
+                assert!(in_win(g), "sh281 site {g:#x} in-window+aligned");
+            }
+            eprintln!("sh281 config+56 seed-crossed GlobalInit-reentry continuation anchors pinned on libroblox.so");
+        } else {
+            eprintln!("sh281 real-image guard: no real libroblox.so, skipping anchors");
         }
     }
 
