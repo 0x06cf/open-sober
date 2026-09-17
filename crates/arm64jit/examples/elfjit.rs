@@ -1733,20 +1733,11 @@ fn routeb_seed_task_singletons() {
         a
     });
     // SH111: differential 0x580 vtable (blanketed identity-widening regressed
-    // nativeInitializeNativeFlags — SH110 — so widen selectively):
-    //   slots 0..0x60 = proven identity leaf (current clean baseline);
-    //   [0x60,0x580)  = stable-zeroed 0x40 guest-resident object leaf
-    //                   (caller [ret+off] read is a valid zeroed field, not NULL+0x28);
-    //   +0xf8/+0x108/+0x548 (soft-return gate sites): identity leaf (store-only,
-    //                   never deref'd) so V2Init/V2Start/V1 resolve their dispatch;
-    //   +0x558/+0x568 (nativeInit count/ptr): NULL leaf (identity would loop a huge
-    //                   low-32 count);
-    //   keep 0x580 (< +0x720 bool-gate read) so deep slots keep the benign
-    //   soft-return.
-    // SH111: differential 0x580 vtable tried + REVERTED — ANY widening past 0x60
-    // (identity or stable-zeroed leaf) makes nativeInitializeNativeFlags hard-crash
-    // before StartLuaAppDM (vtable SHARED with nativeInit; stays clean only via the
-    // 0x60 baseline). Keep the 0x60 baseline; V2Start/V2Init soft-return is benign.
+    // nativeInitializeNativeFlags — SH110 — so widen selectively). Baseline = the
+    // 0x60 identity leaf (current clean); deep slots tried + REVERTED (ANY widening
+    // past 0x60 makes nativeInit hard-crash before StartLuaAppDM — vtable SHARED
+    // with nativeInit; stays clean only via the 0x60 baseline). V2Start/V2Init
+    // soft-return is benign. Keep the 0x60 baseline.
     let vtable: &'static mut [u8] = Box::leak(vec![0u8; 0x60].into_boxed_slice());
     {
         let mut fill = |i: u64, v: u64| unsafe {
@@ -2844,18 +2835,16 @@ fn read_visible_u64(a: u64) -> u64 {
 /// emitter (0x105b35288, SH66) consumes to draw an authored quad through the
 /// engine GL stack (primitive-setup 0x105b353d0 -> glVertexAttribPointer +
 /// glDrawArrays via @plt -> real Mesa on the live ctx). Desync-safe: the emitter
-/// runs as its OWN top-level jit_run, never nested inside the present-walker.
-/// Layout (real libroblox.so disasm, SH66 recon): emitter(x0=G,w1=idx,w2=count,
-/// w3=geom_key,w4=first,w5=indexed): x19=G; ldrh w8,[G+0x8e]; ldr x9,[G+0x78];
-/// w22=w1; bl primitive_setup(G,w3)->mask w0; if !indexed && [G+0x78]!=0 ->
-/// glDrawElements else glDrawArrays(mode=draw_mode_table[w22],first,count).
-/// primitive_setup(x0=G,w1=geom_key): x25=[G+0x38]=M; spec [M+0x48..), 24B/e;
-/// BD at G+0x48, slot[attr]*0x10->BD; BD+0x48=u32 VBO; spec+0=attr,spec+4=off,
-/// spec+8=fmt,spec+12=loc-enum,spec+16=size; stride=[M+0x60]tbl[attr];
-/// format=vform[0xcecf8c+fmt*12]; glBindBuffer+glEnableVertexAttribArray+
-/// glVertexAttribPointer. Fabricate minimal G for colored quad (pos vec2@0,
-/// color vec4@1, stride 24), upload verts via host glGenBuffers/glBufferData,
-/// drive emitter as own jit_run.
+/// runs as its OWN top-level jit_run, never nested. Layout (SH66 recon):
+/// emitter(x0=G,w1=idx,w2=count,w3=geom_key,w4=first,w5=indexed): x19=G; ldrh
+/// w8,[G+0x8e]; ldr x9,[G+0x78]; w22=w1; bl primitive_setup(G,w3)->mask w0; if
+/// !indexed && [G+0x78]!=0 -> glDrawElements else glDrawArrays(mode,first,count).
+/// primitive_setup: x25=[G+0x38]=M; spec [M+0x48..) 24B/e; BD at G+0x48,
+/// slot[attr]*0x10->BD; BD+0x48=u32 VBO; spec+0=attr,+4=off,+8=fmt,+12=loc,
+/// +16=size; stride=[M+0x60]tbl[attr]; format=vform[0xcecf8c+fmt*12];
+/// glBindBuffer+glEnableVertexAttribArray+glVertexAttribPointer. Fabricate
+/// minimal G for a colored quad (pos vec2@0, color vec4@1, stride 24), upload
+/// verts via host glGenBuffers/glBufferData, drive emitter as own jit_run.
 pub fn render_engine_emitter_quad(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) -> u64 {
     if !(ctx >= 0x100000000 && ctx >> 56 == 0) {
         return 0;
@@ -6455,19 +6444,15 @@ fn main() {
             *s = sub;
         }
         // SH267 (default-inert, opt-in JIT_ROUTEB_APPSART_LSM_NODES=1): the LSM
-        // INSERT leaf (fn 0x1db1cc8, atomic-OR claim bl 0x2b9ea40 at 0x1db1d44)
-        // reads the slot `x1 = sub[idx]` and does `ldset x0,x0,[x1]` (OR bit1)
-        // into *x1. With the empty-map (all sub slots = 0) that is an atomic op
-        // on address 0 -> SIGSEGV fault=0x0 at guestpc=0x101db1d04. SH260 parked
-        // this as "persistence detour live-object"; the SEP-17 relabel makes the
-        // SESSION-DRIVE the PRIMARY lever, and SH264-266 session rungs are ALL
-        // latent precisely because the ladder self-terminates here first. So
-        // fabricate GENUINE per-node cells: point each of the 0x2000 sub-slots
-        // at its own leaked zeroed 0x60-byte node cell. Then the insert's atomic
-        // OR lands in real memory (node[0] bit1 set = key recorded present) and
-        // the reader (0x1d99e50 ldr [x8,idx*8]; cbz -> found-node path) returns
-        // node+40 = 0 (an empty stored value) instead of faulting. Default OFF:
-        // default run keeps the proven all-zero empty-map behavior.
+        // INSERT leaf (fn 0x1db1cc8, atomic-OR claim bl 0x2b9ea40 @0x1db1d44) reads
+        // slot `x1 = sub[idx]` and does `ldset x0,x0,[x1]` (OR bit1) into *x1. With the
+        // empty-map (all sub slots = 0) that is an atomic op on addr 0 -> SIGSEGV
+        // fault=0x0 at 0x101db1d04 (SH260 parked as persistence-detour live-object; SEP-17
+        // relabel makes SESSION-DRIVE primary, SH264-266 rungs latent because the ladder
+        // self-terminates here). Fix: point each of the 0x2000 sub-slots at its own leaked
+        // zeroed 0x60-byte node cell so the insert's atomic OR lands in real memory (node[0]
+        // bit1 = present) and the reader (0x1d99e50) returns node+40=0 (empty value) instead
+        // of faulting. Default OFF (keeps the all-zero empty-map behavior).
         let node_cells: bool =
             std::env::var("JIT_ROUTEB_APPSART_LSM_NODES").ok().as_deref() == Some("1");
         if node_cells {
@@ -6891,17 +6876,17 @@ fn main() {
                 ];
                 dump("boot start");
                 // Route-B latch (recon-routeB-globaltinit-unblock.md): nativeGameGlobalInit
-                // only leaves its nanosleep park once [0x72739d4].bit0==1 "flags loaded";
-                // SH55/62 stalled at rung1 (defaulted 0). Drive nativeInitializeNativeFlags
-                // (0x10232048c) FIRST as rung 0 — it's on the engine's own flags-loaded write
-                // chain (0x2320cec->0x2320f2c->latch setter) so the latch is set through GUEST
+                // only leaves its nanosleep park once [0x72739d4].bit0==1 (flags loaded);
+                // SH55/62 stalled at rung1. Drive nativeInitializeNativeFlags (0x10232048c)
+                // FIRST as rung 0 — it's on the engine's OWN flags-loaded write chain
+                // (0x2320cec->0x2320f2c->latch setter), so the latch is set through GUEST
                 // code, not a raw host write. SH82: GlobalInit thread-dispatch (0x2206db8)
                 // compares pthread_self vs stored main-id [0x6863a68] @0x2206de4; matching ->
-                // b.ne not taken -> tail-call vt[+48] (immediate, done); differing (ladder
-                // thread is non-main) -> b.ne to 0x2206e28 -> real scheduler construction then
-                // parks forever at 0x2207648 (posted-job flag headless scheduler never sets).
-                // SH82 A/B: NOP-ing the b.ne is a REGRESSION (routes the MAIN thread's own
-                // boot call wrong). Instead seed [0x6863a68] = THIS rung thread's pthread_self.
+                // b.ne NOT taken -> tail-call vt[+48] (immediate, done); differing (ladder
+                // thread is non-main) -> schedules a real scheduler then parks forever at
+                // 0x2207648. SH82 A/B: NOP-ing the b.ne is a REGRESSION (routes the MAIN
+                // thread's own boot call wrong) — instead seed [0x6863a68] = this rung's
+                // pthread_self.
                 let main_id_cell: u64 = 0x106863a68;
                 let orig_main_id = unsafe { *(main_id_cell as *const u64) };
                 // SH86: the OTel/pb_defaults registration path (reached deep inside
@@ -7070,18 +7055,15 @@ fn main() {
                         let me = unsafe { libc::pthread_self() };
                         unsafe {
                             *(main_id_cell as *mut u64) = me as u64;
-                            // GATE-FIX (recon deleg_ff125cbc disasm of do-init 0x102206c40):
-                            // do NOT sock once-guard [0x106a68410].bit0=1 here. The do-init's
+                            // GATE-FIX (deleg_ff125cbc disasm of do-init 0x102206c40):
+                            // do NOT set once-guard [0x106a68410].bit0=1 here. The do-init's
                             // first guard check at 0x2206c80 (`ldarb w9,[0x6a68410]; tbz w9,#0`)
-                            // selects std::__call_once (bl 0x284ce54) ONLY when bit0==0, and
-                            // that __call_once is what RUNS the DM-construct lambda whose
-                            // result populates DM-root [0x106a68818] (the +0x20 field of the
-                            // caller app-bridge obj at 0x106a687f8). Forcing bit0=1 SKIPS the
-                            // __call_once entirely, so [0x106a68818] stays NULL and the match
-                            // path's `cbz [x19,#0x20]` at 0x2206df8 dead-ends to the benign
-                            // Ok(0x3e8) soft-return (no session node). Correct order: seed
-                            // flags-latch + main-id, LET the once-lambda populate the DM slot;
-                            // the __call_once sets bit0 itself via stlrb when it completes.
+                            // selects std::__call_once ONLY when bit0==0, and that __call_once
+                            // RUNS the DM-construct lambda whose result populates DM-root
+                            // [0x106a68818]. Forcing bit0=1 SKIPS it, so [0x106a68818] stays NULL
+                            // and the match's `cbz [x19,#0x20]` at 0x2206df8 dead-ends to benign
+                            // Ok(0x3e8) (no session node). Correct: seed flags-latch + main-id,
+                            // LET the once-lambda populate the DM slot (bit0 sets itself).
                             let og = 0x106a68410u64 as *mut u8;
                             let _ = og; // left CLEAR (0) so __call_once runs and builds the DM
                             // SH125 (recon deleg_5e2c8480 of do-init 0x102206c40): the
@@ -7474,27 +7456,21 @@ fn main() {
                     );
                     dump("V2UpdateSurfaceAppWithPlatformParams");
                 }
-                // SH114 (deleg_0d4e5597): MH_* atoms are SET-ONLY — nothing polls
-                // them, so StartLuaAppDM's session never advances and no in-image
-                // GuiObject->scene-list writer runs. The Java->engine response is
-                // nativeAppBridgeV2SendAppEventOnAppReady (0x102bb463c): parses
-                // the event-name jstring (x2) magics ("Home" LE 0x656d6f48 ->
-                // w19=4), builds a 0x50 app-event struct, dispatches via the
-                // shared app-bridge pipe 0x102baeeec -> ExperienceController ->
-                // NativeHelper/AppShell -> DataModel path that builds the shell UI.
-                // Driving as a SEQUENTIAL ladder rung (same thread, after
-                // surface-handoff) fixtures the milestone contract without the
-                // SH44/49 block-cache SIGSEGV of a nested jit_run. ABI (6-arg JNI):
-                // x0=env x1=thiz x2=event jstring, x3/x4/x5 extra jstrings (must
-                // be readable non-null for GetStringUTFChars).
+                // SH114: MH_* atoms are SET-ONLY — nothing polls them, so StartLuaAppDM's
+                // session never advances and no in-image GuiObject->scene-list writer runs.
+                // The Java->engine response is nativeAppBridgeV2SendAppEventOnAppReady
+                // (0x102bb463c): parses the event-name jstring (x2) magics ("Home" LE
+                // 0x656d6f48 -> w19=4), builds a 0x50 app-event, dispatches via the shared
+                // app-bridge pipe 0x102baeeec -> ExperienceController -> DataModel shell-UI
+                // path. Driving it as a SEQUENTIAL ladder rung (same thread, after
+                // surface-handoff) avoids the SH44/49 nested-jit_run SIGSEGV. ABI (6-arg
+                // JNI): x0=env x1=thiz x2=event jstring, x3/x4/x5 readable non-null.
                 if std::env::args().any(|a| a == "--v2boot-send-appevent") {
-                    // SH126: the app-event object's vtable 0x635e068 is all-zero
-                    // (empty .data.rel.ro) -> SendAppEventOnAppReady's terminal blr
-                    // is `blr 0` = benign soft-return -> its body never completes
-                    // and MH_FLAGS_LOADED/APP_READY stay false. Materialize the
-                    // vtable's +0x20/+0x28 slots to the benign leaf + seed the pipe
-                    // sync-gate [0x10683d010]=-1 so the body completes AND the pipe
-                    // takes the synchronous do-init path. All plain data stores.
+                    // SH126: the app-event vtable 0x635e068 is all-zero (.data.rel.ro) ->
+                    // SendAppEventOnAppReady's terminal blr is `blr 0` (benign soft-return),
+                    // body never completes, MH_* stay false. Materialize +0x20/+0x28 to the
+                    // benign leaf + seed pipe sync-gate [0x10683d010]=-1 so it completes AND
+                    // the pipe takes the synchronous do-init path. Plain data stores.
                     if std::env::var("JIT_SH115_SINGLETON_PATCH").ok().as_deref() == Some("1") {
                         routeb_patch_sendapp_appevent_vtable();
                         // SH269 (opt-in JIT_ROUTEB_APPSART_GOVFLAG): SendAppEventOnAppReady
@@ -7604,14 +7580,13 @@ fn main() {
                 // SEP-17 SESSION-CTOR engine-settings receive: SH275 fed the CLIENT-settings input
                 // (nativeInitClientSettingsSigned) that initEngine_ consumes, but the SEP-17
                 // directive's OTHER named primitive — the engine-settings RECEIVE
-                // nativeActivity_onEngineSettingsReceived (guest 0x2bd1c38, FLog [0x4997a7]) — was
-                // never driven. Body: reads version word [0x10683d8f8]; both branches fall through to
-                // `add x0,x19,#0x14; bl 2b53a68` (pthread_mutex_lock on [this+0x14]), `ldrb w8,[x19,#649];
-                // strb w9,[x19,#648]` (LATCH [this+648]=engine-settings-received; if [this+649]!=0 also
-                // `str w8,[x19,#16]` state->3), then `bl 2b53abc` (unlock) + ret. Zeroed pthread_mutex_t
-                // = static initializer. Opt-in --v2boot-session-engine (default-inert). Consumer
-                // state-transition on a fabricated `this`, NOT a DM ctor; value = converting the
-                // SEP-17-named engine-settings receive from \"never driven\" to a measured clean run.
+                // nativeActivity_onEngineSettingsReceived (guest 0x2bd1c38, FLog [0x4997a7]) —
+                // was never driven. Body: reads version word [0x10683d8f8]; both branches fall to
+                // `add x0,x19,#0x14; bl 2b53a68` (mutex_lock [this+0x14]), ldrb w8,[x19,#649];
+                // strb w9,[x19,#648] (LATCH [this+648]; if [this+649]!=0 also `str w8,[x19,#16]`
+                // state->3), then bl 2b53abc (unlock)+ret. Zeroed mutex = static initializer.
+                // Opt-in --v2boot-session-engine. Consumer state-transition on a fabricated `this`,
+                // NOT a DM ctor; value = a clean measured run of a SEP-17-named receive.
                 if std::env::args().any(|a| a == "--v2boot-session-engine") {
                     // version word THIS method reads ([adrp 683d000 + #2296] =
                 // [0x10683d8f8]). Seed 6 (low byte==6, 0xfc00 clear) for the
@@ -7753,16 +7728,13 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                         dump("SH288-consumer");
                     }
                 // SH290 (opt-in --v2boot-session-itemproc): drive the item-PROCESSOR
-                // 0x102207950 alone (not the whole consume loop). A fabricated zeroed
-                // queue-item makes both indir blr dispatches cbz-skip ([item+32]=0 ->
-                // vt[+48] blr skipped; [item+48]=0 -> 0x22193a0 helper skipped), so only
-                // the shared once-body path runs: once-guard [0x106a63b08] ldarb -> tbz
-                // (0==0 -> take the __call_once 0x284ce54 + once-body that builds
-                // [0x106a63b00] via 0x2173b3c and stores, then guard-release 0x284cf5c),
-                // then the clock helper 0x221942c, then canary+ret. SH288's full consumer
-                // drive crossed this gate but SIGSEGV'd at the downstream SH273 lifecycle
-                // wall before [0x106a63b00] was read back; this isolates the once-build
-                // so the engine's own item-proc construction completes cleanly + reads.
+                // 0x102207950 alone. A zeroed queue-item cbz-skips both indir blr
+                // dispatches ([item+32]->vt[+48], [item+48]->0x22193a0), leaving only the
+                // once path: once-guard [0x106a63b08] ldarb -> __call_once 0x284ce54 ->
+                // once-body (string-map insert 0x2173b3c -> [0x106a63b00]) -> guard-release
+                // 0x284cf5c -> clock 0x221942c -> canary+ret. SH288's full consumer crossed
+                // this gate but SIGSEGV'd at the SH273 wall before [0x106a63b00] read; this
+                // isolates the once-build so it completes cleanly + reads back.
                 if std::env::args().any(|a| a == "--v2boot-session-itemproc") {
                     let item = Box::leak(vec![0x0u8; 0x120usize].into_boxed_slice()).as_mut_ptr() as u64;
                     unsafe { *(0x106a63b08u64 as *mut u64) = 0; } // force once-guard clear so the once-body runs
@@ -7784,7 +7756,37 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                     eprintln!(
                         "[elfjit:v2boot] SH290 item-proc post: [0x106a63b00](once-built)=0x{built:x} once-guard=0x{guard:x} MH_FLAGS_LOADED={nf} MH_APP_READY={ar}"
                     );
-                    dump("SH290-itemproc");
+                    // SH291 (same opt-in): SECOND drive with the once-guard latched (0x101). The
+                    // `tbz w8,#0` at 0x2207af0 is not taken (bit0 done-set), so item-proc
+                    // SKIPS the once-body and falls to the SHARED per-item tail
+                    // (0x2207bc0+): clock helper 0x22193a0, canary, ret. THIS is the open
+                    // "second half" SH290 deferred — it proves the engine's own once-cell
+                    // [0x106a63b00] is STABLE across re-entry (not overwritten; the
+                    // once-body does not re-run) and the once-guard done-bit persists.
+                    // Idempotency is the claim; the two `blr x8` (0x2207cb0/0x2207ce0,
+                    // x8=sp, gated x19!=0&x0==0) still cbz-skip (zeroed item) so re-entry
+                    // returns cleanly. Cause-not-symptom SESSION-CTOR.
+                    unsafe { *(0x106a63b08u64 as *mut u64) = 0x101; } // latch (NOT clear) -> skip once-body
+                    eprintln!(
+                        "[elfjit:v2boot] SH291 re-driving item-proc @ guest 0x102207950 (once-guard LATCHED 0x101 -> tbz skips once-body; zeroed item -> per-item blr still cbz-skip; measures idempotent re-entry)"
+                    );
+                    let mut ipr2 = arm64jit::jit::CpuState::new();
+                    ipr2.tpidr = tpidr;
+                    ipr2.x[31] = boot_sp;
+                    ipr2.x[0] = item;
+                    match arm64jit::jit::jit_run(iimg, ib, 0x102207950, &mut ipr2 as *mut CpuState) {
+                        Err(e) => eprintln!("[elfjit:v2boot] SH291 item-proc re-entry stopped: {e}"),
+                        Ok(r) => eprintln!("[elfjit:v2boot] SH291 item-proc re-entry returned Ok({r:#x})"),
+                    }
+                    let built2 = unsafe { *(0x106a63b00u64 as *const u64) };
+                    let guard2 = unsafe { *(0x106a63b08u64 as *const u64) };
+                    let idem = built2 == built && (guard2 & 1) == 1;
+                    eprintln!(
+                        "[elfjit:v2boot] SH291 re-entry post: [0x106a63b00]=0x{built2:x} once-guard=0x{guard2:x} IDEMPOTENT(once-cell stable, guard done-set persisted)={idem} MH_FLAGS_LOADED={} MH_APP_READY={}",
+                        arm64jit::jni::nativehelper_flags_loaded(),
+                        arm64jit::jni::nativehelper_app_ready()
+                    );
+                    dump("SH291-itemproc-reentry");
                 }
                     let mut e3 = arm64jit::jit::CpuState::new();
                     e3.tpidr = tpidr;
@@ -7893,19 +7895,14 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                     );
                     dump("MessageBus.subscribe");
                 }
-                // SH131 (deleg_fbb8faf7, disasm 21f7654): seed the engine's OWN data-path global
-                // before it ever builds an app-data-model. The real client stores its files dir
-                // via nativeSetFilesDirectory (guest 0x1021f7654) into the 24-byte libc++ std::string
-                // at guest 0x10726d600 (file 0x726d600; NOT the 0x1026d600 the earlier SH114 comment
-                // mis-set read-only code segment). Without it the engine's own SQLite
-                // datastore never gets a base path and nothing reaches the fsmap
-                // store. The JNI shim only supplies getFilesDir when the engine CALLS
-                // that getter (gated behind the Lua app-shell wall); driving the
-                // native's STORE body directly is a dead-end (its GetStringUTFChars
-                // reads a REAL Java-arena jstring). Seed the 24-byte std::string slot
-                // consumers read in LONG form (36-byte path > 22-byte SSO):
-                // [0..7]=__data_ ptr, [8..15]=__size_, [16..23]=__cap_ (bit0=0=long).
-                // Opt-in --v2boot-set-filesdir.
+                // SH131 (disasm 21f7654): seed the engine's OWN files-dir global. The real
+                // client stores its files dir via nativeSetFilesDirectory (0x1021f7654)
+                // into the 24-byte libc++ std::string at 0x10726d600 (file 0x726d600; NOT
+                // 0x1026d600). Without it the SQLite datastore gets no base path and nothing
+                // reaches the fsmap store. Driving the native's STORE body is a dead-end
+                // (its GetStringUTFChars reads a real Java-arena jstring) so seed the
+                // std::string in LONG form ([0..7]=data, [8..15]=size, [16..23]=cap cap
+                // bit0=0=long). Opt-in --v2boot-set-filesdir.
                 if std::env::args().any(|a| a == "--v2boot-set-filesdir") {
                     const FILES_DIR_GLOBAL: u64 = 0x10726d600;
                     const DIR: &[u8] = b"/data/user/0/com.roblox.client/files";
@@ -8077,18 +8074,15 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
         if std::env::var_os("JIT_THREADS").is_some() {
             std::thread::spawn(|| {
                 // SH196 (default-inert, JIT_DMCELLS=1): an in-run observable for
-                // the GlobalInit do-init __call_once completion state. StartLuaAppDM's
-                // jit_run never returns (it parks in the engine main-loop idle
-                // nanosleep poll, lr=0x10284d134), so the post-rung SH155 probe
-                // never fires. When the once-lambda runs headlessly it self-latches
-                // once-guard[0x106a68410].bit0 (0->1) and stores the interned string
-                // result into once-slot[0x106a68408] (str x0,[x23,#1032] at file
-                // 0x2206d74) — a small status/hash value (measured 0x400000b from
-                // the strcmp GetOrCreate 0x2173b3c), NOT a live DM (which stays in
-                // our SH156 seed at [0x106a68818]). Polled once per sampler tick so
-                // it captures the transition (the cells are all-zero at spawn,
-                // populated only after the do-init runs); reads are page-guarded so
-                // an unmapped boot can never crash the sampler thread.
+                // the GlobalInit do-init __call_once completion. StartLuaAppDM's jit_run
+                // never returns (parks in the main-loop idle nanosleep poll), so the
+                // post-rung probe never fires. When the once-lambda runs headlessly it
+                // self-latches once-guard[0x106a68410].bit0 (0->1) and stores an interned
+                // result into once-slot[0x106a68408] (str x0,[x23,#1032] @file 0x2206d74) —
+                // a small status/hash (measured 0x400000b from strcmp GetOrCreate
+                // 0x2173b3c), NOT a live DM (which stays in the SH156 seed at
+                // [0x106a68818]). Polled once per sampler tick (cells all-zero at spawn,
+                // populated after do-init); page-guarded so an unmapped boot never crashes.
                 let dmcells = std::env::var_os("JIT_DMCELLS").is_some();
                 let rd8 = |a: u64| -> u64 { if guest_page_mapped(a) { unsafe { *(a as *const u64) } } else { u64::MAX } };
                 let rd1 = |a: u64| -> u64 { if guest_page_mapped(a) { (unsafe { *(a as *const u8) }) as u64 } else { u64::MAX } };
@@ -8471,17 +8465,16 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
         }
         // Host-side task-deque PRODUCER (--deque-node <vtable-hex>). The cycle
         // SH5 frontier is that the parked threads are CONSUMERS of a per-CPU
-        // lock-free task-deque (fns 0x285682c / 0x2856e40): each parks in the
-        // generic version-epoch futex wait 0x10284d018 on Q'=t.x19 (futex Q'+4=t.x1)
-        // because the deque head-cell ([root]=0x10682a638/0x10682b338) points at the
-        // self-referential SENTINEL. Version+latch bumping alone re-parks — no work.
-        // This flag makes a real PRODUCER: CAS a freshly allocated task NODE into
-        // the deque head-cell, link it (node.next = old sentinel head), set
-        // [node+112]=<vtable> so the drain dispatch ([node+112]&~0x3f -> [vt+40])
-        // reaches a real guest handler, then bump [Q']>>32 (epoch) + FUTEX_WAKE Q'+4.
-        // A zeroed node (vt=0) trips the drain at [vt+40]=[0x28]; the sentinel vtable
-        // 0x106829f00 reaches the real engine handler 0x10285371c — the first
-        // controlled crossing (even if it then faults on the foreign task content).
+        // lock-free task-deque (fns 0x285682c / 0x2856e40): each parks in the generic
+        // version-epoch futex wait 0x10284d018 on Q'=t.x19 (futex Q'+4=t.x1) because the
+        // deque head-cell ([root]=0x10682a638/0x10682b338) points at the self-referential
+        // SENTINEL. Version+latch bumping alone re-parks — no work. This makes a real
+        // PRODUCER: CAS a freshly allocated task NODE into the head-cell, link it (node.next
+        // = old sentinel head), set [node+112]=<vtable> so the drain dispatch
+        // ([node+112]&~0x3f -> [vt+40]) reaches a real guest handler, then bump [Q']>>32
+        // (epoch) + FUTEX_WAKE Q'+4. A zeroed node (vt=0) trips the drain at [vt+40]=[0x28];
+        // the sentinel vtable 0x106829f00 reaches the real engine handler 0x10285371c — the
+        // first controlled crossing (even if it then faults on foreign task content).
         if let Some(vt) = {
             let args: Vec<String> = std::env::args().collect();
             args.iter()
@@ -9747,20 +9740,16 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                 }
             }
             let _ = &real_ctx;
-            // --renderframe (opt-in, must accompany --renderinit): after the real
-            // render-init ran, present a buffer through the engine's LIVE EGL
-            // context. Reverse from the real binary (SH17 disasm): the direct
-            // drive of the render-init inner fn (0x105b3a2d8) wrote the live EGL
-            // handles into our `scratch` buffer — [scratch+32]=eglDisplay,
-            // [scratch+40]=surface, [scratch+48]=context (str x0,[x19,#32] /
-            // str x1,[x19,#40] / str x0,[x19,#48], x19=ctx=the fn's x0 param).
-            // The swap fn 0x105b3b408 is a tail thunk `ldp x8,x1,[x0,#32]; mov
-            // x0,x8; b eglSwapBuffers` — i.e. eglSwapBuffers([x0+32],[x0+40]).
-            // Passing x0=scratch (the SAME buffer render-init wrote) makes the
-            // engine's own swap path present the current surface headlessly
-            // (llvmpipe+Xvfb), WITHOUT re-running the init (which crashes because
-            // the thunk re-drive shifts the parent/window args). Same host thread
-            // so the EGL context stays current.
+            // --renderframe (opt-in, must accompany --renderinit): after real render-init
+            // ran, present through the engine's LIVE EGL context. Reverse (SH17):
+            // driving render-init inner fn 0x105b3a2d8 wrote live EGL handles into
+            // `scratch` — [scratch+32]=eglDisplay, [scratch+40]=surface,
+            // [scratch+48]=context (str of x0/x1 at +32/40/48). Swap fn 0x105b3b408
+            // is a tail thunk `ldp x8,x1,[x0,#32]; mov x0,x8; b eglSwapBuffers` =
+            // eglSwapBuffers([x0+32],[x0+40]). Passing x0=scratch makes the engine's
+            // own swap present the current surface headlessly (llvmpipe+Xvfb) WITHOUT
+            // re-running init (re-drive shifts parent/window args -> crash). Same host
+            // thread keeps the EGL context current.
             if renderframe_args.iter().any(|a| a == "--renderframe") {
                 // --renderbind (opt-in): drive the engine's OWN make-current method
                 // (ctx vtable [vt+16] = 0x105b3b358) before presenting, instead of
@@ -10136,18 +10125,16 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                     "[elfjit:renderframe-drawprobe] geometry wrapper 0x5b35288 returned Ok({ok:#x})"
                                 ),
                             }
-                            // --renderframe-triangle: fabricate a COHERENT renderer — a
-                            // real 1-primitive list, a real vertex-descriptor table, a
-                            // real stride table, a real IBO, real vertex/index buffers
-                            // (created + uploaded through the JIT bridge) and a real
-                            // compiled+linked shader program — then drive the engine's
-                            // own geometry wrapper 0x5b35288. Its primitive-setup
-                            // 0x5b353d0 runs its REAL loop (bind ARRAY_BUFFER, enable
-                            // attrib 0, glVertexAttribPointer at the format table) and
-                            // the wrapper then dispatches a REAL indexed glDrawElements
-                            // through GLES dispatch-table slot 9 with count=3, drawing
-                            // an actual visible triangle (proving real geometry, not
-                            // just the clear path, renders through the bridge).
+                            // --renderframe-triangle: fabricate a COHERENT renderer — a real 1-primitive
+                            // list, vertex-descriptor table, stride table, IBO, vertex/index
+                            // buffers (created+uploaded through the JIT bridge) and a real
+                            // compiled+linked shader program — then drive the engine's own
+                            // geometry wrapper 0x5b35288. Its primitive-setup 0x5b353d0 runs
+                            // its REAL loop (bind ARRAY_BUFFER, enable attrib 0,
+                            // glVertexAttribPointer at the format table) and the wrapper
+                            // dispatches a REAL indexed glDrawElements through GLES
+                            // dispatch-table slot 9 with count=3, drawing a visible triangle
+                            // (real geometry, not just the clear path, renders through the bridge).
                             if renderframe_args.iter().any(|a| a == "--renderframe-triangle") {
                                 // GL enums used below.
                                 const GL_ARRAY_BUFFER: u64 = 0x8892;
@@ -11827,17 +11814,14 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                     }
                 }
                 // --renderframe-progbin: prove the SH35-sealed GLES3 pipeline slots are
-                // genuinely FUNCTIONAL (not just resolvable) by driving the engine's OWN
-                // dispatch stubs 0x5b3a1c0+0xc*N (the exact `adrp x8,6d3b000; ldr x3,[x8,
-                // #752+8N]; br x3` mechanism a real session's frame dispatches through)
-                // with real guest-ABI args on the live context. Covers the three modern
-                // pipelines SH35 bridged:
-                //   A. program-binary round-trip   (slots 13/14 glGetProgramBinary/glProgramBinary,
-                //                                   slot 15 glProgramParameteri retrievable hint)
-                //   B. UBO bind-through-slot       (slot 5  glBindBufferBase GL_UNIFORM_BUFFER)
-                //   C. instanced draw dispatch     (slot 10 glDrawArraysInstanced, count=0 no-op)
-                // Each drives a SEALED bridge slot exactly as the engine would; a mis-bridged
-                // or crash-prone slot surfaces as a Mesa GL error or a crash (exit != 124).
+                // FUNCTIONAL (not just resolvable) by driving the engine's OWN dispatch stubs
+                // 0x5b3a1c0+0xc*N (`adrp x8,6d3b000; ldr x3,[x8,#752+8N]; br x3`) with real
+                // guest-ABI args on the live context. Covers the three SH35-bridged pipelines:
+                //   A. program-binary round-trip (slots 13/14 GetProgramBinary/ProgramBinary + 15);
+                //   B. UBO bind-through-slot       (slot 5  BindBufferBase GL_UNIFORM_BUFFER);
+                //   C. instanced draw dispatch     (slot 10 DrawArraysInstanced, count=0 no-op).
+                // Each drives a SEALED bridge slot as the engine would; a mis-bridged slot
+                // surfaces as a Mesa error or a crash (exit != 124).
                 if renderframe_args.iter().any(|a| a == "--renderframe-progbin") {
                     unsafe {
                     // Guest addresses of the engine's slot stubs (bl-targets in its clear/
@@ -13300,19 +13284,16 @@ mod sh115_tests {
     #[test]
     fn sh247_opnew_size_gate_routes_all_sizes_to_small_descriptor_path() {
         // SH246 measured the activated continuation pervasively NULL-allocs: EVERY
-        // interior operator_new (BOTH variants 0x1db1a38 and 0x1d96768) returns NULL
-        // for size>0xa when [0x10727570c].bit0 is clear. SH247's lever: make each
-        // variant's size-gate `b.ls SMALL` (taken ⇔ unsigned size<=0xa) an
-        // UNCONDITIONAL `b SMALL`, so size>0xa ALSO walks the ≤0xa descriptor path
-        // (scudo size-class + real allocator tail 0x1db1c60) that works headlessly.
-        // This hermetic pin:
-        //   (a) the exact real-image gate word (must be a B.cond with cond=LS),
-        //   (b) the replacement is an unconditional B whose imm26 lands on the
-        //       documented SMALL path target (drift fails loudly),
-        //   (c) the real-image word guard passes on the current binary.
-        // Real-image sites (guest = file + 0x100000000):
-        //   variant A file 0x1db1a78 = 0x540001e9  b.ls 0x1db1ab4 -> b 0x1db1ab4 = 0x1400000f
-        //   variant B file 0x1d967ec = 0x540001c9  b.ls 0x1d96824 -> b 0x1d96824 = 0x1400000e
+        // interior operator_new (BOTH variants 0x1db1a38, 0x1d96768) returns NULL for
+        // size>0xa when [0x10727570c].bit0 is clear. SH247 lever: make each variant's
+        // size-gate `b.ls SMALL` (taken ⇔ size<=0xa) an UNCONDITIONAL `b SMALL` so
+        // size>0xa ALSO walks the ≤0xa descriptor path (scudo size-class + real alloc
+        // tail 0x1db1c60) that works headlessly. This hermetic pin: (a) exact real-image
+        // gate word (B.cond cond=LS); (b) replacement is an unconditional B whose imm26
+        // lands on the documented SMALL path target (drift fails loudly); (c) word guard.
+        // Sites (guest = file + 0x100000000):
+        //   A file 0x1db1a78 = 0x540001e9 b.ls 0x1db1ab4 -> b = 0x1400000f
+        //   B file 0x1d967ec = 0x540001c9 b.ls 0x1d96824 -> b = 0x1400000e
         let gate = |file_site: usize, expected: u32, rep: u32, small_target: u64| {
             // (b) replacement decodes to an unconditional B (`b`), imm26 => small path.
             assert_eq!(rep & 0xFF00_0000, 0x1400_0000, "replacement must be an unconditional B");
@@ -14712,19 +14693,18 @@ mod sh115_tests {
 
     #[test]
     fn sh258_appstart_deepest_reach_2339d44_then_map_wall_rx_this() {
-        // SH258 (Route-B): deepest app-start reach at the FULL combined seed set. The
-        // do-init->governor->app-start continuation reaches 0x102339d44 (inside deep app-start
-        // orchestrator fn 0x2339d0c, `bl 21dac2c`) — DEEPEST ever; then terminates at the standing
-        // live-object map wall 0x1021dde34. Register dump: x20=x21=0x100548ca9 (map-`this`), x19=
-        // garbage per-insert hash 0x40c29c7e746e86a1, x22=0x11 (stride-0x2a0 index), x23=0x2.
-        // 0x100548ca9 = file 0x548ca9, inside the single R-E (R-X, write=OFF) exec LOAD segment
-        // [0x0,0x62d8190) — pointer into execute-only code NO seed/repair/count-clamp/dynamic-ctor
-        // lever can write (SH249 proof, re-confirmed at deepest reach). Pins:
-        //   deep orchestrator entry 0x2339d0c = sub sp,#0x160 (0xd10583ff)
-        //   its bl 21dac2c          0x2339d44 = bl 0x21dac2c (0x97fa83ba, deepest reach)
-        //   wall map-this = 0x100548ca9, must be in the R-E exec segment (W off)
-        // FAIL-LOUD pin of the authoritative deepest app-start reach. Route-B live-DM gate
-        // UNCHANGED; SH174 capture-latch stays the single forward hook.
+        // SH258 (Route-B): deepest app-start reach at the FULL combined seed set.
+        // do-init->governor->app-start reaches 0x102339d44 (orchestrator fn 0x2339d0c,
+        // `bl 21dac2c`) — DEEPEST ever; then terminates at the standing live-object map
+        // wall 0x1021dde34 (x20=x21=0x100548ca9=file 0x548ca9 map-`this`, garbage hash
+        // x19, stride-0x2a0 idx x22, x23=2). 0x100548ca9 sits inside the single R-E
+        // (R-X, W=OFF) exec LOAD segment [0x0,0x62d8190) — execute-only, NO
+        // seed/repair/count-clamp/dynamic-ctor lever can write it (SH249). Pins:
+        //   deep orchest. entry 0x2339d0c = d10583ff (sub sp,#0x160)
+        //   bl 21dac2c          0x2339d44 = 97fa83ba (deepest reach)
+        //   wall map-this 0x100548ca9 must lie in the R-E exec segment (W off)
+        // FAIL-LOUD pin of the authoritative deepest app-start reach. Route-B live-DM
+        // gate UNCHANGED; SH174 capture-latch stays the single forward hook.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
@@ -15528,20 +15508,14 @@ mod sh115_tests {
 
     #[test]
     fn sh289_worker_consume_queue_cell_attribution_corrected() {
-        // SH288 left "work-flag atom attribution under investigation" AND labeled the
-        // item-proc's `bl 0x221942c` a "GlobalInit sub world-build". Fresh disasm of the
-        // worker consume loop 0x10220778c + item-proc 0x102207950 (real libroblox.so)
-        // assigns THREE DISTINCT fixed cells and refutes both:
-        //   cond-wait predicate = [queue 0x106863a70 + 0xa98] = [0x106864508]
-        //     (consume loop 0x2207824 `ldr x8,[x25,#2712]` with x25=0x106863a70 adrp 0x2207810);
-        //   item-proc once-guard = [0x106a63b08] (adrp 6a63000+#0xb08 at 0x2207978/7c ->
-        //     ldarb 0x2207980) — the ACTUAL gate the consumer path must pass;
-        //   the previous probe cell [0x106863b08] is NEITHER (0x200000 apart) —
-        //     reading 0 there is meaningless, which is why SH288 measured
+        // SH288 left work-flag attribution open + mislabeled item-proc's 0x221942c a
+        // "GlobalInit sub". Fresh disasm assigns THREE cells, refuting both:
+        //   cond-wait predicate = [queue 0x106863a70+0xa98] = [0x106864508];
+        //   item-proc once-guard = [0x106a63b08] (ldarb 0x2207980) — the ACTUAL gate;
+        //   the old probe [0x106863b08] is NEITHER (0x200000 apart) — explains SH288's
         //     "work-flag read 0 yet consumer proceeded".
-        // The item-proc tail 0x22079e8 `bl 0x221942c` is a CLOCK helper
-        // (stp x29,x30 0xa9bf7bfd; mov w1,#-1; mov w2,#0; bl 0x6201fc8 clock_gettime
-        // family) — NOT a DM world-build. Pin the corrected contract.
+        // 0x22079e8 `bl 0x221942c` is a CLOCK helper (bl 0x6201fc8 clock_gettime
+        // family), NOT a DM world-build. Pin the corrected contract.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15602,11 +15576,11 @@ mod sh115_tests {
                 if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
             };
             // once-body: acquire + release + the two string-map-insert bls
-            assert_eq!(word(0x102_207a18), 0x9419150f, "sh290 once-body bl __call_once 0x284ce54 (guard-acquire)");
-            assert_eq!(word(0x102_207a7c), 0x94191538, "sh290 once-body bl __call_once-gate 0x284cf5c (guard-release)");
+            assert_eq!(word(0x102_207a18), 0x9419150f, "sh290 once-body bl __call_once 0x284ce54 (acquire)");
+            assert_eq!(word(0x102_207a7c), 0x94191538, "sh290 once-body bl __call_once-gate 0x284cf5c (release)");
             assert_eq!(word(0x102_207a68), 0x97fdb035, "sh290 once-body bl string-map insert 0x2173b3c");
             // the build target + guard cells
-            assert_eq!(0x6a63b00u64 + 0x1_0000_0000, 0x106a63b00u64, "sh290 once-built cell [0x106a63b00] guest");
+            assert_eq!(0x6a63b00u64 + 0x1_0000_0000, 0x106a63b00u64, "sh290 once-built cell [0x106a63b00]");
             for (guest, name) in [
                 (0x102_207950u64, "item-proc"),
                 (0x102_207a10u64, "once-body"),
@@ -15621,20 +15595,50 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh291_itemproc_guardlatched_reentry_idempotent() {
+        // SH291 (default-inert --v2boot-session-itemproc): a SECOND drive with the
+        // once-guard latched (0x101) must SKIP the once-body (the `tbz w8,#0` @0x2207af0
+        // not taken) and fall to the shared per-item tail (0x2207bc0+: clock 0x22193a0,
+        // canary, ret), NOT re-running the string-map insert — so [0x106a63b00] stays
+        // (the "second half" SH290 deferred). Pin guard-check branch, tail entry, target.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            // guard-check branch: `tbz w8,#0, 0x2207afc` -> guard DONE (bit0=1) means NOT
+            // branching into the once-body — the once is skipped.
+            assert_eq!(word(0x102_207af0), 0x36000068, "sh291 guard-check tbz w8,#0,0x2207afc (bit0=done)");
+            assert_eq!(word(0x102_207b3c), 0x9100c3e0, "sh291 post-once shared tail add x0,sp,#0x30");
+            assert_eq!(word(0x102_207b50), 0x14000001, "sh291 bloom-branch b (skip once-body latch path)");
+            // shared per-item tail: clock helper + canary area + the two dispatched blr (x8)
+            assert_eq!(word(0x102_207c70), 0x910003e8, "sh291 tail mov x8,sp (dispatch target)");
+            assert_eq!(word(0x102_207cb0), 0xd63f0100, "sh291 tail blr x8 (first indir dispatch)");
+            assert_eq!(word(0x102_207ce0), 0xd63f0100, "sh291 tail blr x8 (second indir dispatch)");
+            // once-built target guest identity + alignment (idempotency is a runtime
+            // property read in elfjit.rs, not a byte pin).
+            assert_eq!(0x6a63b00u64 + 0x1_0000_0000, 0x106a63b00u64, "sh291 once-built cell [0x106a63b00] guest");
+            assert_eq!(0x106a63b08u64 & 3, 0, "sh291 once-guard [0x106a63b08] 4-aligned");
+            assert!((0x102_207af0u64 & 3) == 0 && (0x102_207cb0u64 & 3) == 0, "sh291 anchored pcs 4-aligned");
+        } else {
+            eprintln!("sh291 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh268_lsm_freelist_terminal_mechanism_pinned() {
         // SH268 (single-agent): pin the NEW terminal after the SH267 insert-leaf crossing.
-        // With JIT_ROUTEB_APPSART_LSM_NODES=1 the lane crosses the insert-leaf (fault=0x0 at
-        // 0x101db1d04) but advances one fencepost deeper into the LSM FREE-LIST/pop path and
-        // terminates:
+        // With JIT_ROUTEB_APPSART_LSM_NODES=1 the lane crosses the insert-leaf (fault=0x0
+        // at 0x101db1d04) but advances one fencepost deeper into the LSM FREE-LIST/pop:
         //   SIGSEGV fault=0x101d968e4 guestpc=0x101d9a528 (fn sub_1d9a4e0 tail 0x1d9a528)
         //   x19=host heap, x20=x1=0x101d968e4, lr=0x101d9a6b8, lsm_map_global=host
         // Mechanism: fn 0x1d9a528 computes bucket=*[0x726f8c0], then the pop tail
-        // `ldr x8,[x0,#24]; str x1,[x0,#24]; str x8,[x1] @0x1d9a568` writes the free-list link
-        // into *x1 == the map key. Key 0x101d968e4 (file 0x1d968e4) sits INSIDE the R-E exec
-        // seg [file 0x0,0x62d8190) prot write:off -> str faults (SH249/258 unwritable
-        // live-object class). No seed/repair/count-clamp lever reaches it (SH249). REGRESSION
-        // pin of the CURRENT known frontier, not a forward gate (do NOT re-drive single-object
-        // seeds into it — SH249 class).
+        // `ldr x8,[x0,#24]; str x1,[x0,#24]; str x8,[x1] @0x1d9a568` writes the free-list
+        // link into *x1 == the map key (file 0x1d968e4) INSIDE the R-E exec seg write:off ->
+        // str faults (SH249/258 unwritable live-object). No seed/repair lever reaches it.
+        // REGRESSION pin of the CURRENT frontier, NOT a forward gate (SH249 class).
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
@@ -15730,17 +15734,17 @@ mod sh115_tests {
 
     #[test]
     fn sh261_appstart_drain_surface_advances_past_lsm_wall_pinned() {
-        // SH261 (single-agent): measure the NEW frontier after SH260 parked the LSM insert-leaf
-        // (persistence detour). Re-running the exact SH259 repro the app-start body walks DEEP into
+        // SH261 (single-agent): measure the NEW frontier after SH260 parked the LSM
+        // insert-leaf. Re-running the SH259 repro the app-start body walks DEEP into
         // its own self-drive message-loop drain: region-watch fires 100+ pcs incl. drain
-        // 0x233bc88..0x233bcf0 which calls once-check 0x21dae90 + registry builder 0x21daef8, then
-        // reads [[0x6a70c90]+0] and blr vt+48 (0x233bcc4..0x233bccc) — a LIVE heap virtual dispatch.
-        // TERMINAL = run-variable live-object class: (a) LSM insert-leaf SIGSEGV 0x101db1d04
-        // (dominant), (b) `std::bad_function_call` in the drain (empty std::function in a LIVE heap
-        // app-start object, NOT a fixed global), or (c) engine-init SIGSEGV 0x1021748a4.
-        // NO fixed-.bss seed lever (heap-resolved, SAME structural Route-B live-DM gate). HONEST:
-        // no DM; Route-B gate UNCHANGED; SH174 capture-latch stays the single forward hook. Pins
-        // the newly-reached drain surface; a drift fails loudly. Default-inert (test only).
+        // 0x233bc88..0x233bcf0 (once-check 0x21dae90 + registry 0x21daef8), reads
+        // [[0x6a70c90]+0] and blr vt+48 — a LIVE heap virtual dispatch.
+        // TERMINAL = run-variable live-object class: (a) LSM insert-leaf SIGSEGV
+        // 0x101db1d04 (dominant), (b) `std::bad_function_call` (empty std::function in a
+        // LIVE heap object), or (c) engine-init SIGSEGV 0x1021748a4. NO fixed-.bss seed
+        // lever (heap-resolved, SAME structural Route-B live-DM gate). HONEST: no DM;
+        // Route-B gate UNCHANGED; SH174 latch stays the single forward hook. Pins the
+        // newly-reached drain surface; drift fails loudly. Default-inert (test only).
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
@@ -15781,17 +15785,17 @@ mod sh115_tests {
 
     #[test]
     fn sh236_startluaappdm_receivecall_dispatch_softreturns_before_marshaler() {
-        // SH236 (Route-B): SH235 concluded the EC world's only headless front-door
-        // (StartLuaAppDM -> bl 0x1023f1210 @0x1023f075c) is gated by StartLuaAppDM's receiveCall
-        // dispatch switch. Measured (completing ladder, EXIT 124): region-watch on the FULL
-        // StartLuaAppDM body [0x1023efe2c,0x1023f0800) fires only 14 block-entry pcs, last
-        // 0x1023f01e4, then StartLuaAppDM benign-soft-returns Ok; the marshaler-call block
-        // 0x1023f075c is NEVER entered, marshaler region 0 hits. The dispatch terminates inside
-        // helper fn 0x1023f00f8 (sub sp,#0x70, reads stack flags [sp+8]/[sp+32], benign-returns)
-        // BEFORE the code that builds StartAppParams / reaches 0x1023f075c. Pins:
-        //   StartLuaAppDM entry 0x1023efe2c=0xd10183ff; entry dispatch 0x1023efed8=0xd63f0100;
-        //   helper prologues 0x1023eff4c=0xd10603ff, 0x1023f00f8=0xd101c3ff;
-        //   last-entered block 0x1023f01e4=0x394023e8; marshaler-call 0x1023f075c -> 0x1023f1210.
+        // SH236 (Route-B): SH235 said the EC world's only headless front-door
+        // (StartLuaAppDM -> bl 0x1023f1210 @0x1023f075c) is gated by receiveCall's
+        // dispatch switch. Measured: region-watch on the FULL StartLuaAppDM body
+        // [0x1023efe2c,0x1023f0800) fires 14 block-entry pcs, last 0x1023f01e4, then
+        // StartLuaAppDM benign-soft-returns Ok; the marshaler block 0x1023f075c is
+        // NEVER entered (0 hits). The dispatch terminates inside helper 0x1023f00f8
+        // (sub sp,#0x70, reads stack flags [sp+8]/[sp+32]) BEFORE building
+        // StartAppParams / reaching 0x1023f075c. Pins:
+        //   entry 0x1023efe2c=d10183ff; entry dispatch 0x1023efed8=d63f0100;
+        //   helpers 0x1023eff4c=d10603ff, 0x1023f00f8=d101c3ff;
+        //   last block 0x1023f01e4=394023e8; marshaler-call 0x1023f075c->0x1023f1210.
         // Next drive must satisfy helper 0x1023f00f8. Route-B live-DM gate UNCHANGED.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
