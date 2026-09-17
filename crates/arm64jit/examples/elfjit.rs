@@ -107,28 +107,15 @@ fn seed_libcpp_long_string(global: u64, buf: u64, bytes: &[u8]) -> u64 {
     global
 }
 
-/// SH156: build a live object for DM-root [0x106a68818] so the GlobalInit
-/// do-init's match dispatch advances into REAL global-init construction instead
-/// of the benign Ok(0x3e8) soft-return.
-///
-/// The do-init match (file 0x2206df4..0x2206e24) is:
-///   `ldr x0,[x19,#32]`   (x0 = appbridge[+0x20] = DM-root [0x106a68818])
-///   `cbz x0, 2206ea4`    (0 -> benign Ok(0x3e8) soft-return, no session node)
-///   `ldr x8,[x0]`        (x8 = obj->vtable)
-///   `ldr x1,[x8,#48]`    (x1 = *(vtable + 0x30))
-///   `br x1`              (x1(obj))
-/// Read-only recon deleg_eeec00a2 (APS2-reloc-traced .data.rel.ro) recovered the
-/// REAL dispatch vtable (address point guest 0x10635cce0) whose +0x30 slot
-/// (guest 0x10635cd10, RELATIVE addend 0x2207b50) = guest 0x102207b50 — a real
-/// global-init controller CTOR that runs `__call_once` (0x284ce54) + ~20 guarded
-/// init/telemetry constructs and has ZERO `this` derefs (operates on globals
-/// only). So a 0x10-byte object whose only live word is [0x00]=vtable is enough
-/// and the ctor is provably non-faulting on `this`. Per recon the harness should
-/// also pin vtable[+0x30]=0x102207b50 (idempotent with the loader's RELATIVE
-/// reloc) so the match reliably brs to the real ctor. `buf` must be guest-visible
-/// RW memory of >= 0x10 bytes (guest==host identity holds in the runtime).
-/// Isolated so the layout is hermetic-testable without the runtime. Returns
-/// `buf` (nonzero) on success, else 0 when buf==0.
+/// SH156: build a live object for DM-root [0x106a68818] so GlobalInit do-init's
+/// match dispatch advances into REAL global-init construction instead of the
+/// benign Ok(0x3e8) soft-return. Match (file 0x2206df4..0x2206e24): `ldr x0,[x19,#32]`
+/// (appbridge[+0x20]=DM-root); cbz->Ok(0x3e8); `ldr x8,[x0]; ldr x1,[x8,#48]; br x1`.
+/// Real dispatch vtable (address-point guest 0x10635cce0) +0x30 slot = guest
+/// 0x102207b50 = a real global-init controller CTOR (runs `__call_once` 0x284ce54
+/// + guarded telemetry init, ZERO `this` derefs on globals) — so a 0x10-byte object
+/// whose only live word is [0x00]=vtable is enough. `buf` guest-visible RW >=0x10.
+/// Returns `buf` (nonzero) on success, else 0 when buf==0.
 fn routeb_dm_root_object(buf: u64) -> u64 {
     if buf == 0 {
         return 0;
@@ -1366,35 +1353,17 @@ pub fn routeb_seed_game_global_vector() -> u64 {
     })
 }
 
-/// SH87: the Roblox string/span hash-map family's generic dispatch (file 0x29f427c)
-/// `ldp x1,x8,[x19,#16]; cbz x8,<l1>; blr x8; <l1>: blr x1` branches through the
-/// optional hash-2 slot (+0x18) when non-zero. The OTel rehash-copy creates a NEW map
-/// whose +0x18 carries the STABLE constant 0x1800064 (decoded from a static
-/// `.data.rel.ro` protobuf table, file 0x62f5110) instead of 0 — so `blr x8` jumps to
-/// 0x1800064 (unmapped) -> SIGSEGV. hash2 is REDUNDANT in this family (the observed
-/// value 0x1029b4ae8 is just `br x1` — aliases the primary hash), and the hash only
-/// SELECTS a bucket probe (correctness comes from the key-eq comparator at +0x08), so
-/// forcing `blr x1` (always the primary hash) is behavior-preserving and immune to JIT
-/// block-entry coverage gaps. Patch `blr x8` (d63f0100) -> `blr x1` (d63f0020).
-/// SH93: gameGlobalInit do-init PARKS forever because the do-init's CEvent completion
-/// (a stack sync-task, `bl 2207578` = SyncTask/CEvent::wait -> futex FUTEX_WAIT_BITSET
-/// on [cevent+4], polling byte [cevent+1] bit0) is set by a TaskScheduler worker-thread
-/// callback that never runs headlessly (SH55/SH64 forbid the required concurrent
-/// jit_run). NOP the barrier in the globalinit do-init ONLY: file 0x2206e70 (guest
-/// 0x102206e70) `bl 2207578` (0x940001c2). This block is reached ONLY via `b.ne
-/// 0x2206e28` at file 0x2206df0 (non-main-thread dispatch, verified single predecessor),
-/// i.e. only the --v2boot ladder takes it; the real main thread path (b.ne not-taken ->
-/// 0x2206df4) returns to 0x2206e74 AFTER the barrier, never reaching 0x2206e70, so the
-/// product path is untouched. Append-only bl->nop (d503201f). The TaskScheduler is fully
-/// constructed at 0x2206e68; the barrier is a pure handshake. Gate like SH87.
-/// SH159c: AppBridgeV2 governor 0x102e9fa84's version gate reads [0x6a70700] and
-/// takes a MODERN APPENDIX (0x2e9faf0..0x2e9fb1c) that re-reads the
-/// nativeAppBridgeV2InitWithParams params (bl 0x23c1504) — under the JIT this
-/// faults (mis-translated block / uninitialized union at 0x102e9fb10). We want
-/// the ROUTER path 0x2e9fb20 (router flag [0x6a70880]=1 -> MODERN -> bl
-/// 0x258c6e4 startAppWithParams). Patch `b.cc 0x2e9fb20` -> unconditional
-/// `b 0x2e9fb20` (skip the appendix regardless of the version word). Imm26 from
-/// 0x2e9fad8 to 0x2e9fb20 = +0x48 = 0x12.
+/// SH87: string/span hash-map family dispatch (file 0x29f427c) branches through
+/// optional hash-2 slot (+0x18) when non-zero; OTel rehash gives +0x18 the static
+/// constant 0x1800064 (unmapped) -> SIGSEGV. hash2 is REDUNDANT (aliases `br x1`),
+/// so patch `blr x8`->`blr x1` (behavior-preserving, immune to block-entry gaps).
+/// SH93: gameGlobalInit do-init PARKS on a CEvent completion (bl 2207578 futex-wait)
+/// set by a TaskScheduler worker that never runs headlessly (SH55/64 lock it); NOP the
+/// barrier `bl 2207578` @ file 0x2206e70 (reachable ONLY via the --v2boot ladder's
+/// non-main-thread b.ne; real main path returns at 0x2206e74 after the barrier).
+/// SH159c: AppBridgeV2 governor 0x102e9fa84's version-gate takes a modern appendix
+/// (0x2e9faf0) that re-reads V2Init params and faults under JIT; patch `b.cc 0x2e9fb20`
+/// @0x102e9fad8 -> unconditional `b` (router path) to skip it.
 fn routeb_patch_gov_router() {
     const ADDR: u64 = 0x102e9fad8; // `b.cc 0x2e9fb20` (0x54000243)
     let want = 0x1400_0012u32; // `b 0x2e9fb20` (unconditional, imm26=0x12)
@@ -1517,15 +1486,12 @@ fn routeb_patch_startapp_init3_gates() {
     arm64jit::jit::block_cache_drop_region(0x102e9fcb0, 0x102ea3b40); // widen: whole governor tail + validator (SH160+ 0x102e9fcc4 block-cache race)
 }
 
-/// SH161 (recon deleg_c94a8b2f): the governor TAIL's post-dispatch continuation
-/// (guest 0x2e9fdf4, reached after the vt[+0x30] dispatch resolves benignly via the
-/// SH161 impl[+0x408] seed) does `ldr x0,[x19,#1088]` (=impl[+0x440]) ; `mov x1,x20` ;
-/// `bl 24c3768` — a device-display-handler shared_ptr/refcount helper. impl[+0x440]
-/// is a structural live-launch object (NULL under the partial do-init), and the call
-/// derefs `[x0,#320]` (fault=0x140). The return value is DISCARDED by the caller
-/// (`mov x0,x19` at 0x2e9fe00 right after), so NOPing the 3-instruction window
-/// (ldr/mov/bl) is a benign no-op — mirrors SH160's init3-gate NOP. Verified
-/// encodings: `ldr x0,[x19,#1088]`=0xf9422260, `mov x1,x20`=0xaa1403e1, `bl`=0x97d88e5b.
+/// SH161: governor TAIL post-dispatch continuation (0x2e9fdf4) does
+/// `ldr x0,[x19,#1088]`(=impl[+0x440]); `bl 24c3768` (device-display shared_ptr
+/// helper) which derefs [x0,#320] (fault=0x140; impl[+0x440] is a NULL structural
+/// live-launch object). Return is DISCARDED by the caller (`mov x0,x19` right
+/// after), so NOPing the 3-insn window (ldr/mov/bl = 0xf9422260/0xaa1403e1/0x97d88e5b)
+/// is a benign no-op — mirrors SH160's init3-gate NOP.
 ///
 /// SH177 (objective 2b, recon deleg_8c9de1e2 both tasks, authoritative): the cookie
 /// READ-BACK getter 0x1021ff6b0 selects its emission route on probe F()=0x21ff828,
@@ -1796,35 +1762,15 @@ fn routeb_patch_map_dispatch() {
 static ROUTEB_LEAF_ADDR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static ROUTEB_ADAPTER_REC_ADDR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 /// Route-B SH81: seed the two engine dispatch-singleton `.data` records so the
-/// accessor `2b9dee0`'s lazy-create returns a coherent object instead of an
-/// all-zero stub (whose `+0` vtable is NULL). The gate-force (`routeb_patch_
-/// dispatch_gate`) routes the ~255 `bl 21730ec; tbz w0,#0` sites to their clean
-/// path, but callback `0x624f4bc` reaches the same singletons through a DIRECT
-/// `cbz x1,0x624f4f0` branch (bl 6249e9c/6249eb8) the gate never sees, and there
-/// `ldr x8,[objB]; ldr x8,[x8,#48]; blr` SIGSEGVs on the null vtable (SH80/81
-/// crash at 0x10624f500). Records (guest = file vaddr + 0x100000000; .data,
-/// identity-mapped rw-): {+0 size, +8 pow2 allocclass, +16 ticket(lazy), +24 src}.
-/// `2b9dee0` create path (0x2b9e030) memcpys `[addr+24]` (src) `[addr+0]` (size)
-/// bytes into a fresh 8-aligned heap obj and returns it; src==NULL -> memset 0
-/// (the null-vtable stub). Seeding src = a host template whose +0 is a leaked
-/// vtable (every slot = `routeb_singleton_leaf`) makes every objA/objB accessor
-/// result a real polymorphic object whose virtuals are benign leaves.
-///
-/// SH114 (deleg_83e74525, disasm-verified): the three V2Init/V2Start/V1AppStart/
-/// SendAppEventOnAppReady soft-return sites are lazy-singleton virtual dispatches
-/// `ldr x8,[x8,#N]; blr x8` (site A file 0x62517c4 [+0xf8], A2 0x6251aa8
-/// [+0x108], B 0x6260948 [+0x548]). The 0x60 vtable (SH110/111 baseline, locked
-/// by sh111_singleton_vtable_stays_0x60_baseline) is too short, so each index
-/// reads past into host bytes and `blr x8` jumps outside image -> benign
-/// soft-return (the enclosing fn body never completes). Widening to 0x580
-/// regresses nativeInit (returned a0 deref'd x0+0x28). A differential SCOPED
-/// patch of the blr->mov x0,xzr was TRIED this cycle and EMPIRICALLY REJECTED:
-/// returning 0 makes the POST-blr caller deref [out]+0x28 -> NULL+0x28 SIGSEGV
-/// in nativeInitializeNativeFlags (fault=0x28) — the same crash class as the
-/// vtable widening. Root cause per SH111: the virtual's return IS deref'd by
-/// SOME caller (nativeInit), so a scoped leaf must return a STABLE zeroed guest
-/// object (routeb_singleton_obj_leaf), NOT 0/xzr — left as the next gate. The
-/// baseline 0x60 soft-return remains benign (ladder completes EXIT 0).
+/// accessor `2b9dee0`'s lazy-create returns a coherent polymorphic object whose
+/// virtuals are benign leaves (gate `2b9e030` memcpys `[addr+24]`(src)`[addr+0]`
+/// (size); src==NULL -> all-zero NULL-vtable stub -> blr SIGSEGV at 0x10624f500).
+/// Records (guest=file vaddr+0x100000000, .data rw-): {+0 size,+8 pow2,+16 ticket,+24 src}.
+/// SH114: the V2Init/V2Start/V1/AppReady soft-return sites are lazy-singleton
+/// virtual dispatches (A 0x62517c4[+0xf8], A2 0x6251aa8[+0x108], B 0x6260948[+0x548]).
+/// The 0x60 vtable is the benchmarked baseline; widening is empirically REJECTED
+/// (regresses nativeInit); SH111 root-cause: a scoped leaf must return a STABLE
+/// zeroed guest object (routeb_singleton_obj_leaf), NOT 0/xzr (caller derefs [out]+0x28).
 fn routeb_seed_task_singletons() {
     if ROUTEB_SINGLETON_SEEDED.load(core::sync::atomic::Ordering::Relaxed) {
         return;
@@ -1849,20 +1795,13 @@ fn routeb_seed_task_singletons() {
     //     there would make the flags-init loop iterate a huge low-32 count.
     // Keep 0x580 (< the +0x720 bool-gate read), so non-gate deep slots keep the
     // same benign soft-return as the 0x60 baseline.
-    // SH111 investigation: differential 0x580 vtable tried + EMPIRICALLY REVERTED.
-    // Covering the soft-return gate slots (+0xf8/+0x108/+0x548) requires widening
-    // the vtable past 0x60, and ANY widening (identity leaf b19b1c2 OR stable-zeroed
-    // object leaf SH111) makes nativeInitializeNativeFlags hard-crash (exit 134,
-    // fault at host-thunk while resolving a deep shared-vtable slot) BEFORE
-    // StartLuaAppDM. The vtable is SHARED between nativeInit (which stays clean
-    // ONLY because 0x60 slots read-past into host bytes -> benign soft-return) and
-    // V2Start/V2Init (which need wide coverage for a genuine return), so widening
-    // cannot serve both. The 0x60 baseline IS the benchmarked milestone (EXIT 0,
-    // 0 crash, StartLuaAppDM returned Ok); the V2Start/V2Init soft-return is benign
-    // (ladder proceeds past it). Revert to 0x60 and instead make the three CALL SITES
-    // resolve without widening (see frontier-sh111 note). NEXT target: patch the 3
-    // dispatch blr sites (0x62517c4/0x6251aa8/0x6260948) to a fixed guest-resident
-    // leaf directly (scoped to known leak sites), leaving the shared vtable 0x60.
+    // SH111: differential 0x580 vtable tried + REVERTED — ANY widening past 0x60
+    // (identity or stable-zeroed leaf) makes nativeInitializeNativeFlags hard-crash
+    // before StartLuaAppDM, because the vtable is SHARED with nativeInit which stays
+    // clean ONLY via 0x60 slots read-past->benign soft-return. Keep the 0x60 baseline
+    // (StartLuaAppDM returned Ok); the V2Start/V2Init soft-return is benign. NEXT:
+    // patch the 3 dispatch blr sites (0x62517c4/0x6251aa8/0x6260948) to a fixed
+    // guest-resident leaf directly, leaving the shared vtable 0x60.
     let vtable: &'static mut [u8] = Box::leak(vec![0u8; 0x60].into_boxed_slice());
     {
         let mut fill = |i: u64, v: u64| unsafe {
@@ -2843,33 +2782,19 @@ fn routeb_patch_singleton_dispatch() {
 }
 
 static ROUTEB_V2_DISPATCH_PATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-/// SH200: the V2InitWithParams / V2StartAppWithParams run-variable "outside
-/// image" stop (SH198's pin: flake pcs 0x41/0xb848c300000100, x30=0x106251eb8) is
-/// actually a SCOPED-SEEDABLE singleton-dispatch site, NOT the "non-seedable
-/// host-pointer class" SH198 concluded. fn file 0x6251e0c (guest 0x106251e0c,
-/// the V2Init/Start app-params accessor) dispatch tail:
-///   `bl 0x6249eg8`(objA) / `bl 0x6249eb8`(objB) getters -> `ldr x8,[x0]`
-///   (x0=objB=self singleton, *objB = the harness-seeded 0x60 leaf vtable) ->
-///   `ldr x8,[x8,#280]` (vtable slot +0x118, PAST the 0x60 vtable, into host
-///   box-alloc bytes that happen to be x86-mcode-looking) -> `blr x8` jumps
-///   outside the image -> V2Init "soft-returns" BEFORE reaching the SH199
-///   world-build gate block 0x102368100 (so fn 0x102ea3b14 never executes).
-///   SH115/119 patch the SIBLING accessor dispatch sites (0x62517c4/+0xf8,
-///   0x6251aa8/+0x108, 0x6260948/+0x548); THIS fn 0x6251e0c@+0x118 is a 4th,
-///   unpatched site.
-///
-/// Fix (scoped, differential, same philosophy as SH115/119): patch the
-/// 9-slot dispatch window [0x6251e94..0x6251eb4) to materialize the STABLE
-/// zeroed singleton object (routeb_singleton_obj_addr) into x0 and NOP the
-/// remainder (killing the `blr`). Post-window the accessor does
-/// `ldr x8,[x19]; str x0,[x8]` (stores the dispatch result into *[x19]) then
-/// returns 0 — so [x19] receives the stable object, exactly what the caller
-/// (-reads-store) expects; the fn return path stays `mov x0,xzr` (unchanged).
-/// Leaves the shared 0x60 vtable + nativeInit's own +0xf8/+0x108/+0x548 reads
-/// untouched (their dedicated sites/SH115 windows already cover them).
-/// SH200: build the window words that materialize `obj` into x0 (movz+3 movk)
-/// followed by nops up to the `blr` slot, for a V2 singleton-dispatch accessor
-/// site. Pure + unit-testable (the runtime `routeb_patch_v2_dispatch` calls it).
+/// SH200: V2Init/V2Start run-variable "outside image" stop is a SCOPED-SEEDABLE
+/// singleton-dispatch site, NOT SH198's "non-seedable host-pointer" class. fn file
+/// 0x6251e0c (guest 0x106251e0c, V2Init/Start app-params accessor): getters ->
+/// `ldr x8,[x0]`(objB=*self=0x60 leaf vtable) -> `ldr x8,[x8,#280]`(+0x118, PAST the
+/// 0x60 vtable into host bytes) -> `blr x8` jumps out of image before SH199's
+/// world-build gate (0x102368100). SH115/119 patch siblings (0x62517c4/+0xf8,
+/// 0x6251aa8/+0x108, 0x6260948/+0x548); THIS @+0x118 is a 4th, unpatched site.
+/// Fix (scoped, same philosophy): patch window [0x6251e94..0x6251eb4) to materialize
+/// the STABLE zeroed singleton object (routeb_singleton_obj_addr) into x0 + NOP the
+/// `blr`. Post-window `ldr x8,[x19]; str x0,[x8]` stores it into *[x19], return stays
+/// `mov x0,xzr`. Leaves the shared 0x60 vtable untouched.
+/// ALSO: build the window words that materialize `obj` into x0 (movz+3 movk) for a
+/// V2 singleton-dispatch accessor site. Pure + unit-testable.
 pub fn sh200_v2_dispatch_window(obj: u64, nslots: usize) -> Vec<u32> {
     assert!(nslots >= 4, "window must hold movz+3 movk");
     let word_at = |hw: u32, imm: u16| -> u32 {
@@ -7859,6 +7784,52 @@ fn main() {
                     let arv = arm64jit::jni::nativehelper_app_ready();
                     eprintln!("[elfjit:v2boot] InitClientSettingsSigned post: MH_FLAGS_LOADED={nfv} MH_APP_READY={arv}");
                     dump("InitClientSettingsSigned");
+                }
+                // SEP-17 SESSION-CTOR engine-settings receive: SH275 fed the CLIENT-settings
+                // input (nativeInitClientSettingsSigned) that initEngine_ consumes, but the
+                // SEP-17 directive's OTHER named primitive — the engine-settings RECEIVE
+                // nativeActivity_onEngineSettingsReceived (guest 0x2bd1c38, file 0x2bd1c38+0x1_0000_0000),
+                // the method whose FLog [0x4997a7] = "[FLog::NativeDM] nativeActivity_onEngineSettingsReceived:"
+                // sits at its version-gate log 0x2bd1c7c) — was never driven (SH264-275 drove
+                // lifecycle natives + client-settings, not this engine-settings transition).
+                // Method body (fresh disasm): reads version word [adrp 0x683d000 + #2296] =
+                // [0x10683d8f8]; BOTH branches fall through to: `add x0,x19,#0x14; bl 2b53a68`
+                // (pthread_mutex_lock on the manager's [this+0x14] mutex), `ldrb w8,[x19,#649];
+                // mov w9,#1; strb w9,[x19,#648]` (LATCH [this+648]=engine-settings-received,
+                // and if [this+649]!=0 also `str w8,[x19,#16]` state->3), then `bl 2b53abc`
+                // (pthread_mutex_unlock) + ret. A ZEROED pthread_mutex_t is the static
+                // initializer, so lock/unlock on a fresh zeroed manager returns immediately
+                // single-threaded; a leaked zeroed 0x800 buffer keeps [this+648]/[this+649]
+                // in-bounds. Opt-in --v2boot-session-engine (default-inert). Honest: this is a
+                // consumer state-transition on a fabricated `this`, NOT a DM ctor — nil-milestone
+                // either way; the value is converting the SEP-17-named engine-settings receive
+                // from "never driven" to a measured clean execution that latches its flag.
+                if std::env::args().any(|a| a == "--v2boot-session-engine") {
+                    // version word THIS method reads ([adrp 683d000 + #2296] =
+                // [0x10683d8f8]). Seed 6 (low byte==6, 0xfc00 clear) for the
+                // silent canonical branch (version-6 = the real client's engine-settings contract).
+                    unsafe { *(0x10683d8f8u64 as *mut u64) = 6u64; }
+                    let mgr = Box::leak(vec![0x0u8; 0x800usize].into_boxed_slice()).as_mut_ptr() as u64;
+                    eprintln!(
+                        "[elfjit:v2boot] driving nativeActivity_onEngineSettingsReceived @ guest 0x102bd1c38 (fabricated zeroed manager this={mgr:#x}, version[0x10683d8f8]=6, [this+0x14]=zeroed/static-init mutex)" 
+                    );
+                    let mut es = arm64jit::jit::CpuState::new();
+                    es.tpidr = tpidr;
+                    es.x[31] = boot_sp;
+                    es.x[0] = mgr; // `this` = fabricated manager (NativeDataModelManager receives on its own instance)
+                    match arm64jit::jit::jit_run(iimg, ib, 0x102bd1c38, &mut es as *mut CpuState) {
+                        Err(e) => eprintln!("[elfjit:v2boot] EngSettingsReceived stopped: {e}"),
+                        Ok(r) => {
+                            let recv = unsafe { *( (mgr + 648u64) as *const u8) };
+                            let opt_state = unsafe { *( (mgr + 16u64) as *const u32) };
+                            let nfv = arm64jit::jni::nativehelper_flags_loaded();
+                            let arv = arm64jit::jni::nativehelper_app_ready();
+                            eprintln!(
+                                "[elfjit:v2boot] EngSettingsReceived returned Ok({r:#x}): [this+648](engine-settings-received)={recv} [this+16](state)={opt_state} MH_FLAGS_LOADED={nfv} MH_APP_READY={arv}"
+                            );
+                        }
+                    }
+                    dump("EngSettingsReceived");
                 }
                 // SEP-17 session-drive (dataModel-bindings live binder): drive the REAL
                 // nativeAppBridgeV2SendAppEventOnGameLoaded receive (guest 0x102bb429c) as a
@@ -14446,36 +14417,16 @@ mod sh115_tests {
 
     #[test]
     fn sh226_doinit_binder_dispatch_chain_reconciled() {
-        // SH226 (Route-B re-attack, single-agent): reconciliation of the
-        // do-init DM-construction dispatch. SH156 decoded the closure-build load
-        // as `ldr x0,[x19,#32]`; SH225 "re-corrected" it to `ldr x0,[x19,#4]`
-        // (the binder). Fresh decode this cycle proves SH156 RIGHT and SH225/226
-        // WRONG on the offset: 0xf9401260 (imm12=4) is a 64-bit LDR scaled by size
-        // 8 => byte offset 4*8 = #32, NOT #4 (SH225 applied the 32-bit x4 scale).
-        // And measurably the blamed "binder dispatch" is bypassed at runtime by
-        // the thread-id `b.ne` (0x206df0 -> 0x206e28), so the block never executes
-        // headlessly (region-watch 3/3). This pins the provenance chain that SH156
-        // and SH197 agree on (the ladder DOES reach the governor 0x1023eff4c via a
-        // different mechanism, NOT via a binder at [union+4]):
-        //   StartLuaAppDM 0x1023efe2c builds {[sp+0]=table, [sp+8..24]=0, [sp+32]=sp}
-        //     -> 0x1023efeac bl dispatcher 0x102baeeec (x0=sp, w1=0)
-        //   dispatcher 0x2baef08 mov x19,x0 (=sp) / 0x2baef04 mov x20,w1
-        //     -> 0x102baef54 mov x1,x19 ; 0x102baef6c mov w2,wzr ; 0x102baef70 bl do-init 0x102206c40
-        //   do-init 0x206c5c x19=x2 / 0x206c60 x20=x1
-        //     -> 0x206cd4 mov x1,x20 ; 0x206cd8 mov x2,x19 ; 0x206cdc bl closure-build 0x102206db8
-        //   closure-build 0x206dd0 mov x19,x1 (=closure-build arg1 = union)
-        //     -> the dispatch load x0=[union + 32] (0xf9401260, imm12=4 scaled by
-        //        size 8 -> #32, NOT #4) = [sp+32] = stack self-ref -> x0=sp (the
-        //        union base), so x8=[sp]=table slot0, x1=[table+0x30].
-        //     -> BUT the `b.ne` thread-match at 0x206df0 is TAKEN on the ladder,
-        //        so 0x206df4..0x206e24 (incl. br x1) NEVER executes headlessly.
-        //        The SH225/226 "binder at [union+4]" premise is FALSIFIED: the
-        //        offset is #32 (SH156 right), and runtime bypasses the dispatch
-        //        entirely (region-watch 3/3). See sh227.
-        // Also pins the DMCONT continuation anchors (the operator's named re-attack target:
-        // continueAfterFlagsLoaded_ 0x102bd1d68 -> app-shell ctor 0x2207b54) so a future drive
-        // of the fabricated manager's vt[+0x1f0] starts from pinned bytes, not re-guessed ones.
-        // Skip-if-absent real-image guard family (sh225/sh224/sh223 pattern).
+        // SH226: reconciliation — the do-init closure-build dispatch offset is #32
+        // (SH156 right, SH225 wrong): 0xf9401260 imm12=4 scaled by size 8 = 4*8=#32.
+        // And runtime BYPASSES the "binder dispatch" entirely via the thread-id `b.ne`
+        // @0x206df0 (0x206df4..0x206e24 never executes headlessly, region-watch 3/3),
+        // so the SH225 "binder at [union+4]" premise is FALSIFIED. Actual chain:
+        // StartLuaAppDM 0x1023efe2c {[sp]=table,[sp+32]=sp} -> bl dispatcher 0x102baeeec
+        // -> bl do-init 0x102206c40 -> bl closure-build 0x102206db8; dispatch x0=[union+32]
+        // = [sp+32]=sp. See sh227. Also pins DMCONT anchors (continueAfterFlagsLoaded_
+        // 0x102bd1d68 -> app-shell ctor 0x2207b54) so a future vt[+0x1f0] drive starts
+        // from pinned bytes. Skip-if-absent real-image guard family.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
@@ -15152,6 +15103,49 @@ mod sh115_tests {
             eprintln!("sh275 client-settings Signed/Cached/CachedCompressed entries + Signed version-gate decode (readLocalFlags path) pinned on libroblox.so");
         } else {
             eprintln!("sh275 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
+    fn sh276_engine_settings_receive_transition_pinned() {
+        // SH276: SEP-17 directive's OTHER named primitive — the engine-settings RECEIVE
+        // nativeActivity_onEngineSettingsReceived (guest 0x2bd1c38) — was never driven
+        // (SH264-275 drove lifecycle natives + client-settings, not this transition).
+        // Forthcoming --v2boot-session-engine drives it on a fabricated zeroed manager.
+        // Pins the method's real shape so the drive (and any downstream session-ctor state
+        // that reads [this+648]/[this+16]) can't drift silently:
+        //   prologue 0x2bd1c38 (sub sp,#0x40) + stp x29,x30,#32
+        //   version-word read [adrp 0x683d000 + #2296] = [0x10683d8f8]
+        //   version gate cmp w9,#0x6 / ccmp / b.eq
+        //   the FLog-0x4997a7 log adrp (0x2bd1c7c) paging "nativeActivity_onEngineSettingsReceived:"
+        //   mutex lock bl 2b53a68 @0x2bd1ca8 and unlock bl 2b53abc @0x2bd1cc8 (x0=this+0x14)
+        //   the LATCH: strb w1,[this+0x288] with the version-gate bumps w0..#stale (0x2bd1cb4)
+        //   state-3 store str w8,[this,#16] (0x2bd1cc0)
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            let in_win = |g: u64| g >= 0x1_0000_0000 && g < 0x120_0000_00 && g & 3 == 0;
+            assert_eq!(word(0x102bd1c38), 0xd10103ff, "sh276 receive prologue sub sp,#0x40");
+            assert_eq!(word(0x102bd1c3c), 0xa9027bfd, "sh276 receive stp x29,x30,[sp,#32]");
+            assert_eq!(word(0x102bd1c5c), 0x9001e368, "sh276 version-word adrp 683d000");
+            assert_eq!(word(0x102bd1c60), 0xf9447d08, "sh276 version-word ldr x8,[x8,#2296] (=0x10683d8f8)");
+            assert_eq!(word(0x102bd1c6c), 0x7100193f, "sh276 version-gate cmp w9,#0x6");
+            assert_eq!(word(0x102bd1c74), 0x54000180, "sh276 version-gate b.eq canonical branch");
+            assert_eq!(word(0x102bd1c7c), 0x90fec643, "sh276 FLog-0x4997a7 adrp (log [FLog::NativeDM] nativeActivity_onEngineSettingsReceived:)");
+            assert_eq!(word(0x102bd1ca8), 0x97fe0770, "sh276 mutex-lock bl 2b53a68 (x0=[this+0x14])");
+            assert_eq!(word(0x102bd1cb4), 0x390a2269, "sh276 strb w1,[this,#0x288] (engine-settings-received latch)");
+            assert_eq!(word(0x102bd1cc0), 0xb9001268, "sh276 str w8,[this,#16] (state->3 on prior receipt)");
+            assert_eq!(word(0x102bd1cc8), 0x97fe077d, "sh276 mutex-unlock bl 2b53abc (x0=[this+0x14])");
+            for g in [0x102bd1c38u64, 0x102bd1c7cu64, 0x102bd1ca8u64, 0x102bd1cc0u64] {
+                assert!(in_win(g), "sh276 site {g:#x} in-window+aligned");
+            }
+            eprintln!("sh276 nativeActivity_onEngineSettingsReceived prologue/version-gate/latch/mutex sites pinned on libroblox.so");
+        } else {
+            eprintln!("sh276 real-image guard: no real libroblox.so, skipping anchors");
         }
     }
 
