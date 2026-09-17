@@ -2326,22 +2326,17 @@ fn routeb_patch_getter_fmod_tail_ret() {
 static ROUTEB_CONT_OPNEW_BOX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 /// SH245 candidate (1) next gate: now that continueAfterFlagsLoaded_ 0x102bd1d68
 /// runs its full body headlessly (GETTER_TAIL_RET + M48_SEED), it reaches the
-/// `bl operator_new(0x28)` at file 0x2bd2128 (guest 0x102bd2128) with w0=0x28.
-/// operator_new 0x1db1a38's fast path returns NULL for size>0xa whenever the
-/// global allocator-activation byte [0x10727570c].bit0 is clear (headlessly
-/// clear) -> x19=0x0 -> the closure boxes a NULL ptr -> `stp x8,x26,[x0]` at
-/// 0x2bd2140 writes to [0] = std::bad_alloc/libc++abi terminate (SH245 #3).
-/// The broader fix — seeding [0x10727570c].bit0=1 so ALL operator_new calls go
-/// real-alloc — is a MEASURED regression (SH245 #4: 3/3 early SIGABRT, real-alloc
-/// path not headless-producible). So: SCOPE to this exact call site. The 3-slot
-/// window 0x2bd2120..0x2bd212c (`mov w0,#0x28; mov w1,#0x8; bl 1db1a38`) is
-/// replaced with materializing a stable leaked 0x40 zeroed box into x0
-/// (movz hw0 / movk hw1 / movk hw2 = 48-bit host heap pointer, safely < 2^48 on
-/// this box), then control falls through to 0x2bd212c (`adrp x8,...`). The
-/// continuation writes its closure into [x0]+0/0x10/0x20 (writethrough at
-/// 0x2bd2140/0x2bd2154/0x2bd2158), so a zeroed writable leak is exactly right —
-/// it boxes a real 0x40 object instead of NULL. Idempotent, opt-in
-/// JIT_ROUTEB_DM_CONT_OPNEW_BOX, real-image word-guarded.
+/// `bl operator_new(0x28)` at file 0x2bd2128 with w0=0x28. operator_new 0x1db1a38's
+/// fast path returns NULL for size>0xa when the allocator-activation byte
+/// [0x10727570c].bit0 is clear (headlessly clear) -> closure boxes NULL -> write to
+/// [0] = bad_alloc/terminate (SH245 #3). The broad seed [0x10727570c].bit0=1 is a
+/// MEASURED regression (SH245 #4: 3/3 early SIGABRT — real-alloc path not
+/// headless-producible). So SCOPE to this exact 3-slot window 0x2bd2120..0x2bd212c
+/// (`mov w0,#0x28; mov w1,#0x8; bl 1db1a38`), replacing it with materializing a
+/// stable leaked 0x40 zeroed box into x0 (movz/movk = 48-bit host pointer < 2^48),
+/// then control falls to 0x2bd212c. The continuation writes its closure into
+/// [x0]+0/0x10/0x20 (0x2bd2140/154/158), so a zeroed leak boxes a real 0x40 object.
+/// Idempotent, opt-in JIT_ROUTEB_DM_CONT_OPNEW_BOX, real-image word-guarded.
 fn routeb_patch_cont_opnew_box() {
     if ROUTEB_CONT_OPNEW_BOX_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
         return;
@@ -2627,23 +2622,16 @@ fn routeb_patch_sendapp_singleton_lambdas() {
 
 static ROUTEB_SENDAPP_VTABLE_PATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// SH126 (recon deleg_f595f562): SendAppEventOnAppReady (guest 0x102bb463c)
-/// builds a real 0x58 app-event object whose vtable is 0x635e068 — an
-/// ALL-ZERO `.data.rel.ro` vtable (zero dynamic relocations). Its terminal
-/// virtual dispatch at guest 0x102bb4984 (`ldr x9,[x0]; ldr x8,[x9,x8]; blr x8`,
-/// x8=0x28 for a non-NULL object) is therefore `blr 0` -> benign soft-return,
+/// builds a real 0x58 app-event object whose vtable 0x635e068 is an ALL-ZERO
+/// `.data.rel.ro` vtable — its terminal virtual dispatch (`ldr x9,[x0]; ldr
+/// x8,[x9,x8]; blr x8` @guest 0x102bb4984, x8=0x28) is `blr 0` -> benign soft-return,
 /// so the rung's body never completes and MH_FLAGS_LOADED/APP_READY stay false.
-/// None of the SH115/117/119 singleton patches cover this structurally-empty
-/// app-event vtable. Fix (two parts, all plain data stores, idempotent):
-///   (a) materialize slots +0x20/+0x28 to the benign identity leaf
-///       (routeb_singleton_leaf, the proven SH115/119 pattern) so the terminal
-///       blr lands instead of `blr 0` — the body reaches its epilogue and the
-///       session-advance probe can observe the REAL next-state;
-///   (b) seed the app-bridge pipe sync-gate [0x10683d010] = -1 so the body's
-///       `bl 0x2baeeec` takes the SYNCHRONOUS path (`cmn x8,#-1` at 0x2baef24 ->
-///       `tbz w20,#0` 0x2baef5c, w20=0 -> `bl 0x2206c40` GlobalInit do-init)
-///       instead of the async pthread_cond_wait block (0x2b4cd1c).
-/// guest vtable base: file 0x635e068 in LOAD(off 0x62d81c0 -> vaddr 0x62dc1c0),
-/// within=0x85ea8 -> vaddr 0x6362068 -> guest 0x106362068 (RW LOAD, plain store).
+/// Fix (idempotent data stores): (a) materialize slots +0x20/+0x28 to the benign
+/// identity leaf (routeb_singleton_leaf) so the terminal blr lands; (b) seed the
+/// app-bridge pipe sync-gate [0x10683d010] = -1 so the body's `bl 0x2baeeec` takes
+/// the SYNCHRONOUS path (`cmn x8,#-1` @0x2baef24 -> tbz w20,#0 0x2baef5c, w20=0 ->
+/// `bl 0x2206c40` GlobalInit do-init) instead of the async pthread_cond_wait (0x2b4cd1c).
+/// guest vtable: file 0x635e068 -> guest 0x106362068 (RW LOAD, plain store).
 fn routeb_patch_sendapp_appevent_vtable() {
     if ROUTEB_SENDAPP_VTABLE_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
         return;
@@ -6782,22 +6770,16 @@ fn main() {
         // Default: pass the historical bare-JSON jstring as the params handle.
         // With --startapp-jobject, pass a real AutoValue-style jobject instead so
         // StartApp's serialization runs through the jni.rs getter-value registry
-        // (Call{Object,Boolean,Int,Long,Float}Method serve real values) — the
-        // recon-v2 Task-2 prescription. This is the live A/B on whether the value
-        // registry unblocks StartApp's json serialization or whether the SH45
-        // guest-stack-leak is genuinely params-independent.
+        // (Call*Method serve real values) — the recon-v2 Task-2 prescription, a live
+        // A/B on whether the value registry unblocks StartApp's json serialization.
         // --startapp-v1: drive the recon v1 "still-live lower-effort"
-        // nativeAppBridgeAppStart__ (0x102338510) as the PRIMARY standalone
-        // start INSTEAD of V2StartAppWithParams. V1 reads 6 individual jstrings
-        // (JNI signature String,String,Z,String,String,String straight from the
-        // mangled sym Java_...AppStart__Ljava_lang_String_2Ljava_lang_String_2Z
-        // Ljava_lang_String_2Ljava_lang_String_2Ljava_lang_String_2) — no AutoValue
-        // jobject, no Call*Method getter, so it BYPASSES the params-collapse
-        // json-abort (SH56: the value registry never even fires on the V2 path).
-        // It has only ever run as the UNREACHABLE tail of the v2boot ladder
-        // (which stalls at rung 1 nativeGameGlobalInit every time), so its
-        // downstream path (session/home-screen renderer) was NEVER exercised.
-        // This lever drives it standalone so that path is finally reached.
+        // nativeAppBridgeAppStart__ (0x102338510) as the PRIMARY standalone start
+        // INSTEAD of V2StartAppWithParams. V1 reads 6 individual jstrings (no AutoValue
+        // jobject, no Call*Method getter) so it BYPASSES the params-collapse json-abort
+        // (SH56: the value registry never even fires on the V2 path); it has only ever
+        // run as the UNREACHABLE tail of the v2boot ladder (stalls at rung 1
+        // nativeGameGlobalInit every time), so its downstream session/home-screen
+        // renderer was NEVER exercised. This lever drives it standalone.
         let use_v1 = std::env::args().any(|a| a == "--startapp-v1");
         let params = if std::env::args().any(|a| a == "--startapp-jobject") {
             arm64jit::jni::new_fake_object() // AutoValue InitParams/StartAppParams jobject
@@ -7806,6 +7788,28 @@ fn main() {
                         eprintln!("[elfjit:v2boot] SH280 post state=5 direct: [this+16](state)={st5}");
                         dump("SH280-engine5");
                     }
+                    // SH284-next: engine9 opt-in drives the LAST never-driven initEngine_ state body — state=9
+                    // (0x2bd2668). SH273/SH277 measured states 5 and 9 were NEVER driven; SH283
+                    // crossed state=5's reentry continuation (5->7). The state=9 body is the SAME
+                    // shape: it sets state->10 then `bl 0x2bce0d4` with w2=1 -> `b 275a0c4` (the
+                    // GlobalInit-reentry SH283's JIT_ROUTEB_ENG5_QMUTEX_FREE steal carries through).
+                    // Reuses the SH279 manager seeds (app-name 'Home' long + [this+0x40] config +
+                    // [config+56] buffer). Opt-in --v2boot-session-engine9.
+                    if std::env::args().any(|a| a == "--v2boot-session-engine9") {
+                        unsafe { *( (mgr3 + 16u64) as *mut u32) = 9u32; }
+                        eprintln!("[elfjit:v2boot] SH284 driving initEngine_ state=9 body DIRECT @ guest 0x102bd2668 (app-name 'Home' + [this+0x40] config pre-seeded; state->10 then config-dispatch w2=1 -> reentry 275a0c4, gated by JIT_ROUTEB_ENG5_QMUTEX_FREE/0x106863aa0 steal)");
+                        let mut e9 = arm64jit::jit::CpuState::new();
+                        e9.tpidr = tpidr;
+                        e9.x[31] = boot_sp;
+                        e9.x[0] = mgr3;
+                        match arm64jit::jit::jit_run(iimg, ib, 0x102bd2668, &mut e9 as *mut CpuState) {
+                            Err(e) => eprintln!("[elfjit:v2boot] SH284 state=9 body direct stopped: {e}"),
+                            Ok(r) => eprintln!("[elfjit:v2boot] SH284 state=9 body direct returned Ok({r:#x})"),
+                        }
+                        let st9 = unsafe { *( (mgr3 + 16u64) as *const u32) };
+                        eprintln!("[elfjit:v2boot] SH284 post state=9 direct: [this+16](state)={st9}");
+                        dump("SH284-engine9");
+                    }
                     let mut e3 = arm64jit::jit::CpuState::new();
                     e3.tpidr = tpidr;
                     e3.x[31] = boot_sp;
@@ -7913,24 +7917,17 @@ fn main() {
                     );
                     dump("MessageBus.subscribe");
                 }
-                // SH131 (deleg_fbb8faf7, disasm 21f7654): seed the engine's OWN
-                // data-path global before it ever builds an app-data-model. The
-                // real client stores its files dir via nativeSetFilesDirectory
-                // (guest 0x1021f7654) into the 24-byte libc++ std::string at
-                // guest 0x10726d600 (file 0x726d600; disasm `adrp 726d000; add
-                // x8,x8,#0x600` = file 0x726d600 + 0x100000000 — NOT the
-                // 0x1026d600 the earlier SH114 comment mis-set, which is the
-                // read-only code segment). Without it the engine's own SQLite
-                // datastore (rbx-storage.db) never gets a base path and nothing
-                // reaches the fsmap store. The JNI shim (SH114) only supplies
-                // getFilesDir when the engine CALLS that getter (gated behind
-                // the Lua app-shell wall). Driving the native's STORE body
-                // directly is a dead-end: its GetStringUTFChars helper reads a
-                // REAL Java-arena jstring, not our fabricated handle, so the
-                // materialized string came back empty. Instead seed the same
-                // 24-byte libc++ std::string slot the engine's consumers read,
-                // in LONG form (36-byte path exceeds the 22-byte SSO): [0..7]=
-                // __data_ ptr (guest-arena bytes), [8..15]=__size_,
+                // SH131 (deleg_fbb8faf7, disasm 21f7654): seed the engine's OWN data-path global
+                // before it ever builds an app-data-model. The real client stores its files dir
+                // via nativeSetFilesDirectory (guest 0x1021f7654) into the 24-byte libc++ std::string
+                // at guest 0x10726d600 (file 0x726d600; NOT the 0x1026d600 the earlier SH114 comment
+                // mis-set, which is the read-only code segment). Without it the engine's own SQLite
+                // datastore (rbx-storage.db) never gets a base path and nothing reaches the fsmap
+                // store. The JNI shim (SH114) only supplies getFilesDir when the engine CALLS that
+                // getter (gated behind the Lua app-shell wall); driving the native's STORE body
+                // directly is a dead-end (its GetStringUTFChars helper reads a REAL Java-arena
+                // jstring). Seed the same 24-byte std::string slot the engine's consumers read in
+                // LONG form (36-byte path exceeds 22-byte SSO): [0..7]=__data_ ptr, [8..15]=__size_,
                 // [16..23]=__cap_ (bit0=0 => long). Opt-in --v2boot-set-filesdir.
                 if std::env::args().any(|a| a == "--v2boot-set-filesdir") {
                     const FILES_DIR_GLOBAL: u64 = 0x10726d600;
@@ -14805,15 +14802,12 @@ mod sh115_tests {
     fn sh258_appstart_deepest_reach_2339d44_then_map_wall_rx_this() {
         // SH258 (Route-B): deepest app-start reach at the FULL combined seed set. The
         // do-init->governor->app-start continuation reaches 0x102339d44 (inside deep app-start
-        // orchestrator fn 0x2339d0c, `bl 21dac2c`) — DEEPEST ever (SH251 reached 0x10233907c);
-        // then terminates at the standing live-object map wall 0x1021dde34. Register dump at
-        // the wall is decisive: x20=x21=0x100548ca9 (map-`this`), x19=garbage per-insert hash
-        // 0x40c29c7e746e86a1, x22=0x11 (stride-0x2a0 live-array index), x23=0x2. The map-`this`
+        // orchestrator fn 0x2339d0c, `bl 21dac2c`) — DEEPEST ever; then terminates at the standing
+        // live-object map wall 0x1021dde34. Register dump: x20=x21=0x100548ca9 (map-`this`), x19=
+        // garbage per-insert hash 0x40c29c7e746e86a1, x22=0x11 (stride-0x2a0 index), x23=0x2.
         // 0x100548ca9 = file 0x548ca9, inside the single R-E (R-X, write=OFF) exec LOAD segment
-        // [file 0x0,0x62d8190) — pointer into execute-only code NO seed/repair/count-clamp/
-        // dynamic-ctor lever in this JIT can write (SH249 proof, re-confirmed at deepest reach).
-        // Stride-0x2a0 allocators {0x1df48c0,0x1eb9af4,0x1eba550} stay at 0 hits (never
-        // constructed headlessly — SH254). Pins:
+        // [0x0,0x62d8190) — pointer into execute-only code NO seed/repair/count-clamp/dynamic-ctor
+        // lever can write (SH249 proof, re-confirmed at deepest reach). Pins:
         //   deep orchestrator entry 0x2339d0c = sub sp,#0x160 (0xd10583ff)
         //   its bl 21dac2c          0x2339d44 = bl 0x21dac2c (0x97fa83ba, deepest reach)
         //   wall map-this = 0x100548ca9, must be in the R-E exec segment (W off)
@@ -14882,12 +14876,11 @@ mod sh115_tests {
     #[test]
     fn sh264_activity_lifecycle_natives_jni_receive_pinned() {
         // SH264 (SEP-17 directive, single-agent): the four REAL Android Activity/AppBridge
-        // session-lifecycle natives the engine asserts on (SH184 lifecycle map) are all
-        // JNI-RECEIVE entries — ZERO in-image bl callers, so only the Java side of a real
-        // Activity invokes them and the harness must drive them as real guest entries
-        // (new --v2boot-session stage, elfjit.rs). Pin their guest entries + the two
-        // sub-primitives they reach so a silent drift breaks loudly (real-image guard
-        // family as sh260/261, skip-if-absent, guest = file vaddr + 0x100000000):
+        // session-lifecycle natives the engine asserts on are all JNI-RECEIVE entries — ZERO
+        // in-image bl callers, so only the Java side of a real Activity invokes them and the
+        // harness must drive them as real guest entries (--v2boot-session). Pin their guest
+        // entries + the two sub-primitives they reach (real-image guard family, skip-if-absent,
+        // guest = file vaddr + 0x100000000):
         //   nativeOnResumed              0x1021f5db8 = stp x29,x30,[sp,#-16]! (0xa9bf7bfd)
         //   initAppShellReporter         0x1021f53b8 = sub sp,#0x30 (0xd100c3ff)
         //   JNIAppLifecycleNativeAdapter_setActive 0x1021f5de4 = sub sp,#0x40 (0xd10103ff)
@@ -14895,7 +14888,6 @@ mod sh115_tests {
         //   setActive core 0x21f5f80 -> adapter-triplet read adrp 6b0b000/#0xde0
         //     (0xd00248a9) at 0x1021f5f80 + ldp (0xa940252a) @ 0x21f5f88 — the SH248f
         //     adapter triplet [0x106b0bde0] setActive non-NULL-faults on.
-        //   SetInitParams first ldp store stp x28,x27 (0xa9016ffc) @ 0x102bcc818
         // Route-B gate UNCHANGED; SH174 capture-latch stays the single forward hook.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
@@ -15205,6 +15197,43 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh284_engine_settings_state9_body_last_never_driven() {
+        // SH284: drive the LAST never-driven initEngine_ state body — state=9 (0x2bd2668).
+        // SH273/SH277 measured states 5 and 9 were NEVER driven; SH283 crossed state=5's
+        // reentry continuation (5->7). The state=9 body sets state->10 then `bl 0x2bce0d4`
+        // with w2=1 -> `b 275a0c4` (the SAME GlobalInit-reentry the JIT_ROUTEB_ENG5_QMUTEX_FREE
+        // steal carries through). MEASURED 3/3: body returns Ok + state->10, then self-drives
+        // into app-start and dies at the SH260 LSM wall (0x101db1d04) — parked detour, not a
+        // regression. Guest = file vaddr + 0x1_0000_0000.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            let in_win = |g: u64| g >= 0x1_0000_0000 && g < 0x120_0000_00 && g & 3 == 0;
+            // state=9 body 0x2bd2668: sub sp,#0x80 prologue + (both branches) reads version
+            // word [0x10683d8f8] + state->10 store.
+            assert_eq!(word(0x102bd2668), 0xd10203ff, "sh284 state=9 body prologue sub sp,#0x80");
+            assert_eq!(word(0x102bd2694), 0xf001e348, "sh284 state=9 adrp 683d000 (version word [0x10683d8f8])");
+            assert_eq!(word(0x102bd26e8), 0xb9001268, "sh284 state=9 str w8,[x19,#16] (state->10)");
+            // state=9 then reuses config-dispatch 0x2bce0d4 (w2=1 -> b 275a0c4 GlobalInit-reentry).
+            assert_eq!(word(0x102bd2720), 0x97ffee6d, "sh284 state=9 bl 0x2bce0d4 (config dispatch, w2=1)");
+            // Shared config-dispatch + reentry anchors (same as state=5's SH280/SH281 pins).
+            assert_eq!(word(0x102bce0d4), 0xf9401c00, "sh284 config dispatch ldr x0,[x0,#56]");
+            assert_eq!(word(0x102bce0e0), 0x17ee2ff9, "sh284 config dispatch b 275a0c4 (GlobalInit-reentry)");
+            assert_eq!(word(0x10275a0c4), 0xd10303ff, "sh284 GlobalInit-reentry prologue sub sp,#0xc0");
+            for g in [0x102bd2668u64, 0x102bd26e8u64, 0x102bd2720u64, 0x102bce0d4u64, 0x10275a0c4u64] {
+                assert!(in_win(g), "sh284 site {g:#x} in-window+aligned");
+            }
+            eprintln!("sh284 initEngine_ state=9 body (last never-driven state) pins + shared config-dispatch/reentry anchors verified on libroblox.so");
+        } else {
+            eprintln!("sh284 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh279_settings_serializer_worldbuild_gates_pinned() {
         // SH279: cross the SH278 settings-serializer (continueAfterFlagsLoaded_ 0x2bd1d68)
         // internal world-build gates. Gate 1: serializer reads [this+0x40]=0 -> 0x2bcdfc4
@@ -15404,21 +15433,13 @@ mod sh115_tests {
     fn sh265_gameloaded_binder_receive_pinned() {
         // SH265 (single-agent): pin the dataModel-bindings live-binder receive
         // nativeAppBridgeV2SendAppEventOnGameLoaded (guest 0x102bb429c) — the sibling of
-        // OnAppReady that SH264's honest note leaves "still un-driven". The new
-        // --v2boot-send-game-loaded rung drives it as a real guest entry. Pin:
+        // OnAppReady SH264 left "still un-driven". The --v2boot-send-game-loaded rung drives it
+        // as a real guest entry. Pin (docs detail):
         //   entry 0x102bb429c = sub sp,#0x110 (0xd10443ff)
-        //   its 3 jstring marshals all bl 0x21e1fec (identity shim) at 0x2bb4330/0x2bb4340/0x2bb4350
-        //   AppEvent vtable base add adrp 635d000/#0xfe8 @0x2bb43ec = 0x913fa129 (-> guest 0x10635dfe8)
-        //   the @0x2bb43f4 str vtable store = 0xf80086a9
-        //   synchronous do-init pipe bl 0x2baeeec @0x2bb447c = 0x97ffea9c (w1=0 -> do-init 0x2206c40)
-        //   terminal teardown ldr x8,[x9,x8] @0x2bb44a4 = 0xf8686928 + blr @0x2bb44a8 = 0xd63f0100
-        //   the event vtable slots [+0x20/+0x28] — MEASURED loader-populated with REAL
-        //   teardown code (0x102bb782c / 0x102bb7834), NOT the all-zero SH126 class (readelf
-        //   can't decode packed-RELA; on-disk zeros, but load_elf_image applies RELATIVE
-        //   addends -> real destructor/tail leaves at load time). Read via host_addr_of on the
-        //   RW LOAD so a silent drop to empty (i.e. a future drift into the SH126 soft-return
-        //   class) fails loudly. Route-B gate UNCHANGED; SH174 capture-latch stays the single
-        //   forward hook.
+        //   the event vtable slots [+0x20/+0x28] — MEASURED loader-populated with REAL teardown
+        //   code (0x102bb782c / 0x102bb7834), NOT the all-zero SH126 class (readelf can't decode
+        //   packed-RELA; on-disk zeros but load_elf_image applies RELATIVE addends -> real
+        //   destructor leaves at load time). Route-B gate UNCHANGED; SH174 latch stays forward hook.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15471,20 +15492,14 @@ mod sh115_tests {
     fn sh266_messagebus_subscribe_jni_receive_pinned() {
         // SH266 (single-agent, cone suppressed): drive the SEP-17 messageBus receive
         // Java_com_roblox_universalapp_messagebus_MessageBus_subscribe (guest 0x102ba5bb8) —
-        // the ONLY Route-B candidate SH185 closed by STATIC judgment alone (its doc says
-        // "subscribe registered only inside the migration-gated initializeLuaApp_", never
-        // driven). New --v2boot-session-bus rung drives it as a real guest entry. Pin its
-        // real-image ABI so a silent drift breaks loudly:
+        // the ONLY Route-B candidate SH185 closed by STATIC judgment alone. New
+        // --v2boot-session-bus rung drives it as a real guest entry. Pin its real-image ABI:
         //   entry 0x102ba5bb8 = sub sp,#0x190 (0xd10643ff)
-        //   JNI table slot dispatch ldr x8,[x0]/ldr x8,[x8,#248]/blr  @0x2ba5bf4/0x2ba5bf8/0x2ba5bfc
-        //   jstring marshal bl 0x21e1fec @0x2ba5c7c = 0x97d8f0dc (identity shim, SH186)
-        //   subscription vtable-base adrp 635c000/#388 @0x2ba5cfc = 0xf001bda8
-        //   operator_new sizes (0x28 box @0x2ba5d34 bl 0x1d96768; 0x28 @0x2ba5e2c) — the
-        //     headless-alloc wall class SH245-248 (returns NULL for >0xa; the leak is the
-        //     same live-object gate the ladder hits, NOT a new seed)
+        //   JNI table slot dispatch ldr x8,[x0]/ldr x8,[x8,#248]/blr @0x2ba5bf4/f8/fc
+        //   operator_new sizes (0x28 box @0x2ba5d34 bl 0x1d96768) — the headless-alloc wall
+        //     SH245-248 (returns NULL for >0xa; same live-object gate, NOT a new seed)
         //   REAL app-start driver bl 0x2343c10 @0x2ba5e14 = 0x97de777f (nativeAppBridgeAppStart
-        //     String,..,String,Z,..,Z marshaller) — the genuine app-start route via messageBus
-        // Route-B live-DM structural gate UNCHANGED; SH174 capture-latch stays single forward hook.
+        //     String,..,String,Z,..,Z marshaller). Route-B live-DM gate UNCHANGED; SH174 latch stays.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15638,19 +15653,14 @@ mod sh115_tests {
     #[test]
     fn sh260_lsm_insert_wall_anchored() {
         // SH260 (single-agent): pin the NEW terminal of the SH259-cleared app-start orchestrator.
-        // After settings-once clears the 0x1021dde34 wall, the app-start body walks 93 region pcs
-        // into nativeAppBridgeAppStart's LocalStorageManager init (objective-2b data-store line)
-        // and terminates SIGSEGV guestpc=0x101db1d04. Crash path (JIT_DUMP_PC at /tmp/dump_lsm.txt):
-        //   fn 0x1db1cc8 (small-key map-insert): 0x1db1d08 adrp x8,726f000; 0x1db1d14 ldr x8,[x8,#2240]
-        //     => x8=[map base 0x10726f8c0]; 0x1db1d20 add x9,x8,x9,lsl#3 (bucket); 0x1db1d2c ldar x9,[x9]
-        //     (read bucket ptr); then 0x1db1d44 `bl 0x2b9ea40` (insert leaf, x30=0x101db1d48 at crash)
-        //   The seeded LSM map (seed_static_empty_map, global->4M-bucket array) IS intact at crash
-        //     (*0x10726f8c0 = 0x7f9c7c51a010). Fault advanced PAST the NULL-bucket read into the INSERT
-        //     leaf: 0x2b9ea40 = bti c; adrp x16,683b000; ldrb [x16,#2648] (atomic-or flag); atomic claim
-        //     `ldset x0,x0,[x1]` on the empty sub-slot (x1=0 => store-to-0) faults fault=0x0.
-        // HONEST: persistence/detour line (objective 2b), NOT Route B; per the SEP-15 directive it is
-        // MEASURED and parked (insert leaf needs genuine per-node live allocation, the SH174 live-object
-        // gate). Pins the wall so drift fails loudly (test only, default-inert).
+        // After settings-once clears 0x1021dde34, app-start walks 93 region pcs into
+        // nativeAppBridgeAppStart's LocalStorageManager init and terminates SIGSEGV guestpc=0x101db1d04.
+        // Crash path (JIT_DUMP_PC /tmp/dump_lsm.txt): fn 0x1db1cc8 (small-key map-insert) reads
+        // *[0x10726f8c0]=seeded 4M-bucket base, 0x1db1d20 add bucket, 0x1db1d2c ldar, then 0x1db1d44
+        // `bl 0x2b9ea40` (insert leaf: bti/adrp 683b000/ldrb atomic-or flag/`ldset x0,x0,[x1]` on the
+        // empty sub-slot x1=0 => store-to-0 fault=0x0). HONEST: persistence/detour (objective 2b), NOT
+        // Route B; per SEP-15 directive MEASURED + parked (insert needs genuine per-node live alloc,
+        // the SH174 live-object gate). Pins the wall so drift fails loudly (test only, default-inert).
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
@@ -15912,24 +15922,13 @@ mod sh115_tests {
 
     #[test]
     fn sh240_dmcont_dispatch_chain_pinned_fresh_negative() {
-        // SH240 (real-image guard family as sh239/238/237; skip-if-absent). Fresh-at-HEAD
-        // re-measurement of the DMCONT continuation lever (operator's named "keep grinding
-        // the DMCONT continuation" line). The engine-init dispatcher 0x102bd8ce8 is entered
-        // as a block on the completing --v2boot ladder under JIT_ROUTEB_DMFORCE=1 +
-        // JIT_ROUTEB_DMCONT=1 (manager holder 0x102727550 seeded so vt[+0x1f0] -> the REAL
-        // continueAfterFlagsLoaded_ 0x102bd1d68), yet the guest NEVER resumes past the
-        // dispatcher's first call-boundary: JIT_REGION_WATCH on the interior resumption pcs
-        // (0x2bd8d30 after `blr vt+0xf8`, 0x2bd8d54 after `blr vt+0x108`) AND sub_2bd8dac
-        // AND continueAfterFlagsLoaded_ all = 0 hits across 3/3 clean EXIT 124 runs; a
-        // JIT_DUMP_REGION shot fired exactly once at block-entry 0x102bd8ce8 only. So the
-        // `bl sub_2bd8dac` -> vt+0x1f0 -> continueAfterFlagsLoaded_ -> nativeAppBridgeAppStart
-        // chain is still block-entry-unreached headlessly (SH228's "dispatcher completes
-        // through the resolve/leaf paths before the unconditional bl sub" holds fresh at the
-        // newest state). The DMCONT manufactured-manager continuation is WIRED + ARMED but
-        // LATENT — it fires only if a real flags-loaded engine state materializes the leaves
-        // (network feature-flag fetch), the standing live-session gate; an all-leaf fabricated
-        // manager supplies no such state. Pin the chain so a future drive/fix starts from
-        // drift-verified anchors. Guest = file + 0x100000000.
+        // SH240: DMCONT continuation fresh-at-HEAD block-entry-definitive negative. The engine-init
+        // dispatcher 0x102bd8ce8 is entered as a block on the completing --v2boot ladder under
+        // DMFORCE+DMCONT (holder 0x102727550 -> vt[+0x1f0] = real continueAfterFlagsLoaded_ 0x102bd1d68)
+        // yet the guest NEVER resumes past the first call-boundary: JIT_REGION_WATCH on interior
+        // resumption pcs (0x2bd8d30/0x2bd8d54), sub_2bd8dac, AND continueAfterFlagsLoaded_ all = 0 hits
+        // across 3/3 clean EXIT 124 runs; JIT_DUMP_REGION fired once at entry 0x102bd8ce8 only. DMCONT
+        // stays WIRED+ARMED but LATENT (fires only on real flags-loaded state). Pins (docs detail):
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
