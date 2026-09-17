@@ -1480,23 +1480,20 @@ fn routeb_patch_startapp_init3_gates() {
     arm64jit::jit::block_cache_drop_region(0x102e9fcb0, 0x102ea3b40); // widen: whole governor tail + validator (SH160+ 0x102e9fcc4 block-cache race)
 }
 
-/// SH161: governor TAIL post-dispatch continuation (0x2e9fdf4) does
-/// `ldr x0,[x19,#1088]`(=impl[+0x440]); `bl 24c3768` (device-display shared_ptr helper)
-/// which derefs [x0,#320] (fault=0x140; impl[+0x440] is NULL structural live-launch).
-/// Return DISCARDED by caller, so NOPing the 3-insn window (0xf9422260/0xaa1403e1/0x97d88e5b)
-/// is a benign no-op — mirrors SH160's init3-gate NOP.
+/// SH161: governor TAIL continuation (0x2e9fdf4) does `ldr x0,[x19,#1088]`(impl[+0x440]);
+/// `bl 24c3768` (device-display shared_ptr helper) which derefs [x0,#320] (fault=0x140;
+/// impl[+0x440] NULL structural live-launch). Return DISCARDED, so NOPing the 3-insn window
+/// (0xf9422260/0xaa1403e1/0x97d88e5b) is benign (mirrors SH160's init3-gate NOP).
 ///
-/// SH177 (objective 2b): the cookie READ-BACK getter 0x1021ff6b0 selects its route on probe
-/// F()=0x21ff828, which returns 0 unconditionally because helper 1dc7428 hardcodes `mov w0,wzr;
-/// ret` (17 call sites incl. GL-unsupported-message semantics — do NOT patch globally). w2==0 +
-/// features[+73].bit0==0 + F()==0 -> getter takes MAIN path 0x21ff744 (WebLogin store, never the
-/// jar) -> out empty. To reach the jar-driven Route B (0x5fee984, re-emits the jar value via
-/// #HttpOnly_ format constant .rodata 0x304d0e, ZERO WebLogin dependency), NOP the two read-back-
-/// local branch gates, env JIT_ROUTEB_COOKIE_READBACK (bare ladder path byte-identical):
-///   A) getter 0x1021ff72c `tbnz w8,#0, 21ff744` (0x370000c8) -> nop, F()==0 falls THROUGH to Route B.
-///   B) Route-B gate 0x105fee9c4 `tbz w0,#0, 5feec00` (per-entry re-check of the 1dc7428 stub via
-///      `bl 1dc7428` @0x105fee9c0; 0x360011e0) -> nop, Route B does not bail to empty. Both
-///      read-back-local; the 17-caller stub 1dc7428 is never touched (GL-message semantics).
+/// SH177 (obj 2b): cookie READ-BACK getter 0x1021ff6b0 selects route on F()=0x21ff828, which
+/// returns 0 unconditionally (helper 1dc7428 hardcodes `mov w0,wzr; ret`, 17 call sites incl.
+/// GL-unsupported-message semantics — do NOT patch globally). w2==0 + features[+73].bit0==0 +
+/// F()==0 -> getter takes MAIN path (WebLogin store, never the jar) -> out empty. To reach the
+/// jar-driven Route B (0x5fee984, re-emits jar value via #HttpOnly_ format .rodata 0x304d0e,
+/// ZERO WebLogin dep), NOP the two read-back-local branch gates, env JIT_ROUTEB_COOKIE_READBACK:
+///   A) getter 0x1021ff72c `tbnz w8,#0, 21ff744` (0x370000c8) -> nop, F()==0 falls through.
+///   B) Route-B gate 0x105fee9c4 `tbz w0,#0, 5feec00` (0x360011e0) -> nop, Route B doesn't bail.
+///   The 17-caller stub 1dc7428 is never touched.
 fn routeb_patch_cookie_readback() {
     if std::env::var_os("JIT_ROUTEB_COOKIE_READBACK").is_none() {
         return;
@@ -2287,23 +2284,16 @@ fn sh245_getter_tail_words(ret: bool) -> u32 {
         0x1503_6690u32 // b 0x624e6c0 (tail into the FMOD/AAudio distractor)
     }
 }
-/// SH245 (Route-B, opt-in JIT_ROUTEB_GETTER_TAIL_RET): the engine-init getter
-/// 0x102174c04 (JNI_OnLoad+0xc10) ends with an UNCONDITIONAL tail `b 0x624e6c0`
-/// (file 0x2174c80, word 0x15036690) into `Java_org_fmod_FMOD_OutputAAudioHeadphonesChanged`
-/// — REGARDLESS of which vt[+0x30] verb ran. That tail never returns to the dispatcher
-/// (0x2bd8d18 stays 0 region-hits: dispatcher block 1 [0x2bd8ce8,0x2bd8d14] -> call
-/// getter -> getter tails into FMOD which diverts into its audio body or a NULL
-/// vt[+0x720] blr; control never comes back). The getter already restored x30 =
-/// dispatcher return (0x2bd8d18) at 0x2174c7c (`ldp x29,x30,[sp],#32`), so patching the
-/// tail `b` -> `ret` makes the getter return STRAIGHT to 0x2bd8d18. Then the dispatcher
-/// runs its two benign vt[+0xf8]/vt[+0x108] leaves (our fabricated manager's leaves)
-/// and reaches `bl sub_2bd8dac` -> vt[+0x1f0] dispatch: with DMCONT that is the REAL
-/// continueAfterFlagsLoaded_ (0x102bd1d68) — the first headless execution of the real
-/// continuation = the concrete SH244 "does the FMOD tail return" answer + forward motion.
-/// The getter is shared by ~3 callers in this area (0x2bd8d14/0x2bd8e84/0x2bd8f80); all
-/// currently tail into the same FMOD distractor, so making it return benignly is a
-/// strict robustness improvement for each (each resumes at its own reset pc). Default
-/// INERT: only fires under JIT_ROUTEB_GETTER_TAIL_RET=1. Idempotent, non-vtable-widening.
+/// SH245 (opt-in JIT_ROUTEB_GETTER_TAIL_RET): engine-init getter 0x102174c04 ends with an
+/// UNCONDITIONAL tail `b 0x624e6c0` (file 0x2174c80, word 0x15036690) into the FMOD
+/// audio fn — regardless of which vt[+0x30] verb ran. That tail never returns to the
+/// dispatcher (0x2bd8d18 stays 0 region-hits; getter tails into FMOD which diverts to its
+/// audio body or a NULL vt[+0x720] blr). The getter already restored x30=dispatcher return
+/// (0x2bd8d18) at 0x2174c7c, so patching tail `b`->`ret` returns STRAIGHT to 0x2bd8d18;
+/// dispatcher then runs its benign vt[+0xf8]/vt[+0x108] leaves and reaches `bl sub_2bd8dac`
+/// -> vt[+0x1f0]: with DMCONT that is REAL continueAfterFlagsLoaded_ (0x102bd1d68) — the
+/// first headless execution of the real continuation. Getter is shared by ~3 callers
+/// (0x2bd8d14/8e84/8f80); all tail into the same FMOD distractor. Default INERT, idempotent.
 fn routeb_patch_getter_fmod_tail_ret() {
     if ROUTEB_GETTER_FMOD_TAIL_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
         return;
@@ -2935,31 +2925,22 @@ fn read_visible_u64(a: u64) -> u64 {
     }
 }
 
-/// Guest-arena build of the engine's REAL geometry context G that its own
-/// geometry emitter (0x105b35288, SH66 frontier) consumes to draw an authored
-/// quad through the ENGINE's GL stack (primitive-setup 0x105b353d0 →
-/// glVertexAttribPointer + glDrawArrays via @plt → real Mesa on the live ctx).
-/// Desync-safe: the emitter runs as its OWN top-level jit_run, never nested
-/// inside the present-walker block, so no executing translation is invalidated.
-///
-/// Layout (from fresh disasm of real libroblox.so, confirmed SH66 recon):
-///   emitter(x0=G, w1=mode_idx, w2=count, w3=geom_key, w4=first, w5=indexed):
-///     x19=G; ldrh w8,[G+0x8e] (elem-type); ldr x9,[G+0x78] (elem-buffer);
-///     w22=w1; bl primitive_setup(G, geom_key=w3) -> returns attrib mask in w0;
-///     if !indexed (w5==0): if [G+0x78]!=0 -> glDrawElements; else ->
-///       glDrawArrays(mode=draw_mode_table[w22], first=w4, count=w2) @0x62d7840.
-///   primitive_setup(x0=G, w1=geom_key):
-///     x25=[G+0x38]=M (mesh); spec array [M+0x48..M+0x50), 24B/entry;
-///       BD array at G+0x48, slot[attr]*0x10 = ptr to BD; BD+0x48 = u32 VBO id;
-///       spec+0=attr idx, spec+4=offset-addend, spec+8=format idx,
-///       spec+12=attrib-loc-enum (0->0,1->1,2->+2,3->+4,else -1), spec+16=size-add;
-///       stride = [M+0x60] table[attr] (u64);
-///       format = vform_table[0xcecf8c + fmt*12] = {size u32, type u32, norm u8};
-///       glBindBuffer(0x8892, bd_id) + glEnableVertexAttribArray(loc) +
-///       glVertexAttribPointer(index=loc,size,type,norm,stride,stride*key+offset).
-/// We fabricate the minimal coherent G for a colored quad (pos vec2 @loc0,
-/// color vec4 @loc1, interleaved stride 24), upload verts into a real VBO via
-/// host glGenBuffers/glBufferData, and drive the emitter as its own jit_run.
+/// Guest-arena build of engine's REAL geometry context G that ITS OWN geometry
+/// emitter (0x105b35288, SH66) consumes to draw an authored quad through the
+/// engine GL stack (primitive-setup 0x105b353d0 -> glVertexAttribPointer +
+/// glDrawArrays via @plt -> real Mesa on the live ctx). Desync-safe: the emitter
+/// runs as its OWN top-level jit_run, never nested inside the present-walker.
+/// Layout (real libroblox.so disasm, SH66 recon): emitter(x0=G,w1=idx,w2=count,
+/// w3=geom_key,w4=first,w5=indexed): x19=G; ldrh w8,[G+0x8e]; ldr x9,[G+0x78];
+/// w22=w1; bl primitive_setup(G,w3)->mask w0; if !indexed && [G+0x78]!=0 ->
+/// glDrawElements else glDrawArrays(mode=draw_mode_table[w22],first,count).
+/// primitive_setup(x0=G,w1=geom_key): x25=[G+0x38]=M; spec [M+0x48..), 24B/e;
+/// BD at G+0x48, slot[attr]*0x10->BD; BD+0x48=u32 VBO; spec+0=attr,spec+4=off,
+/// spec+8=fmt,spec+12=loc-enum,spec+16=size; stride=[M+0x60]tbl[attr];
+/// format=vform[0xcecf8c+fmt*12]; glBindBuffer+glEnableVertexAttribArray+
+/// glVertexAttribPointer. Fabricate minimal G for colored quad (pos vec2@0,
+/// color vec4@1, stride 24), upload verts via host glGenBuffers/glBufferData,
+/// drive emitter as own jit_run.
 pub fn render_engine_emitter_quad(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) -> u64 {
     if !(ctx >= 0x100000000 && ctx >> 56 == 0) {
         return 0;
@@ -10536,10 +10517,9 @@ fn main() {
                                                                             let _ = gcall(plt_tex_parameteri, GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST, 0, 0, 0);
                                                                             let _ = gcall(plt_tex_parameteri, GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST, 0, 0, 0);
                                                                             if mesh_tex.is_some() {
-                                                                                // REAL Roblox material map: parse the DDS R8 surface, expand to RGBA,
-                                                                                // upload via 9-arg glTexImage2D (real APK pixel data on real mesh
-                                                                                // geometry). R8 gray -> (v,v,v,255) in a dedicated leaked RGBA buffer
-                                                                                // (studs atlas is 128x2048, ~1 MiB rgba).
+                                                                                 // REAL Roblox material map: parse DDS R8 surface, expand to RGBA, upload via 9-arg
+                                                                                 // glTexImage2D (real APK pixels on real mesh geometry). R8 gray -> (v,v,v,255) in a
+                                                                                 // dedicated leaked RGBA buffer (studs atlas 128x2048 ~1 MiB rgba).
                                                                                 let dds_bytes = std::fs::read(mesh_tex.as_ref().unwrap()).expect("read studs.dds");
                                                                                 let (tw, th, r8) = parse_roblox_dds_r8(&dds_bytes).expect("dds R8 parse");
                                                                                 eprintln!(
@@ -10590,11 +10570,10 @@ fn main() {
                                                                                 stex.x[7] = GL_UNSIGNED_BYTE; // type
                                                                                 let _ = arm64jit::jit::jit_run(iimg, ibase, plt_tex_image_2d, &mut stex as *mut CpuState);
                                                                             } else {
-                                                                                // ETC1 compressed-texture interception live-path: upload a REAL 8x8 ETC1 texture
-                                                                                // (4 solid 4x4 blocks = 32 bytes) via glCompressedTexImage2D (GL_ETC1_RGB8_OES).
-                                                                                // The bridge decodes ETC1->RGBA (texture-codec) and re-uploads via glTexImage2D.
-                                                                                // All 8 args fit x0-x7 (no stack arg). Each block: individual mode, table codeword
-                                                                                // 0, all selectors 0 -> decoded color = (c*0x11)+2 per channel, clamped.
+                                                                                 // ETC1 compressed texture live-path: upload a REAL 8x8 ETC1 texture (4 solid 4x4 blocks = 32B)
+                                                                                 // via glCompressedTexImage2D (GL_ETC1_RGB8_OES). Bridge decodes ETC1->RGBA (texture-codec)
+                                                                                 // and re-uploads via glTexImage2D; all 8 args fit x0-x7. Each block: indiv mode, table cw 0,
+                                                                                 // all selectors 0 -> decoded color = (c*0x11)+2 per channel, clamped.
                                                                                 const GL_ETC1_RGB8_OES: u64 = 0x8d64;
                                                                                 const GL_COMPRESSED_RGB8_ETC2: u64 = 0x9274;
                                                                                 // ETC2 mode 1/2 are bit-identical to ETC1 individual/differential, so the
@@ -10638,11 +10617,7 @@ fn main() {
                                                                             let _ = gcall(plt_uniform_1i, ploc, 0, 0, 0, 0, 0);
                                                                             eprintln!("[elfjit:renderframe-tex] texture tex_id={tex_id:#x} bound+uploaded uTex loc={ploc:#x}<-unit0");
                                                                                                                                                     if mesh_uv_mode {
-                                                                                                                                                        // SH143: upload the REAL camera/MVP as uMVP (column-major,
-                                                                                                                                                        // transpose=0, 16 floats) so model-space mesh positions are
-                                                                                                                                                        // transformed at draw time. glUniformMatrix4fv is a
-                                                                                                                                                        // pure-integer+pointer ABI (loc,count,transpose,ptr) -> the
-                                                                                                                                                        // int resolver's Mesa binding, not the float-ABI bridge.
+                                                                                                                                                        // SH143: upload REAL camera/MVP as uMVP (col-major, trans=0, 16 fl); glUniformMatrix4fv is int+ptr ABI.
                                                                                                                                                         let mvp_uname = objs.as_ptr() as u64 + 0xe40;
                                                                                                                                                         std::ptr::copy_nonoverlapping(b"uMVP\0".as_ptr(), mvp_uname as *mut u8, 5);
                                                                                                                                                         let mvp_loc = gcall(plt_get_uniform_location, program, mvp_uname, 0, 0, 0, 0).unwrap_or(0) & 0xffff_ffff;
@@ -10656,8 +10631,7 @@ fn main() {
                                                                                                                                                         sm.tpidr = tpidr; sm.x[31] = isp;
                                                                                                                                                         sm.x[0] = mvp_loc; sm.x[1] = 1; sm.x[2] = 0; sm.x[3] = mvp_ptr;
                                                                                                                                                         let _ = arm64jit::jit::jit_run(iimg, ibase, mat4fv, &mut sm as *mut CpuState);
-                                                                                                                                                        // SH145: upload the (identity) model-rotation to uModelRot so the VS's
-                                                                                                                                                        // mat3(uModelRot)*aNormal yields world-space normals for the diffuse light.
+                                                                                                                                                        // SH145: upload identity model-rotation to uModelRot so VS's mat3*uNormal -> world-space normals for diffuse light.
                                                                                                                                                         let mrot_uname = objs.as_ptr() as u64 + 0x1000;
                                                                                                                                                         std::ptr::copy_nonoverlapping(b"uModelRot\0".as_ptr(), mrot_uname as *mut u8, 10);
                                                                                                                                                         let mrot_loc = gcall(plt_get_uniform_location, program, mrot_uname, 0, 0, 0, 0).unwrap_or(0) & 0xffff_ffff;
@@ -11572,7 +11546,7 @@ fn main() {
                                 let _ = gcall(0x1062d75a0, prog, 0,0,0,0,0);          // glUseProgram
                                 // Texture: default = 2x2 RGBA checkerboard RED/GREEN/BLUE/WHITE;
                                 // --renderframe-etc2a = a REAL 8x8 ETC2-RGBA8/EAC texture (0x9278)
-                                // via glCompressedTexImage2D (the last compressed format with an
+                                                                                 // via glCompressedTexImage2D (the last compressed format with an
                                 // unimplemented live-path prove). The bridge decodes ETC2-RGBA8 and
                                 // re-uploads, so the EAC alpha + RGB both reach the quad.
                                 let tex_data = base + 0x6000;
@@ -15173,15 +15147,60 @@ mod sh115_tests {
             assert_eq!(word(0x10275a258), 0x97d8f144, "sh281 callee bl 1d96768");
             // Tail: b 2207118 continuation.
             assert_eq!(word(0x10275a294), 0x17eab3a1, "sh281 callee tail b 0x2207118");
-            // Continuation 0x2207118: locks [x0+0xaa0] (junk heap past the 0x40 box -> park).
+            // Continuation 0x2207118: locks FIXED GLOBAL 0x106863aa0 (static-init .bss, cannot
+            // block), saves x0 to [sp], then enqueues via 0x2d9713c -> construct 0x22071ac.
+            // CORRECTION (sh282): NOT [box+0xaa0]. SH281's 'box +0xaa0 junk/(make box bigger)'
+            // premise was WRONG here — the lock target is adrp 6863000 + add #0xaa0 = fixed .bss.
             assert_eq!(word(0x102207118), 0xd100c3ff, "sh281 continuation prologue sub sp,#0x30");
-            assert_eq!(word(0x102207144), 0x94253249, "sh281 continuation bl 2b53a68 [x0+0xaa0]");
-            for g in [0x10275a154u64, 0x10275a23cu64, 0x10275a294u64, 0x102207118u64, 0x102207144u64] {
+            assert_eq!(word(0x10220713c), 0x900232e0, "sh281 continuation adrp x0, 6863000");
+            assert_eq!(word(0x102207140), 0x912a8000, "sh281 continuation add x0,#0xaa0 (=0x106863aa0 fixed global)");
+            assert_eq!(word(0x102207144), 0x94253249, "sh281 continuation bl 2b53a68 pthread_mutex_lock");
+            assert_eq!(word(0x102207150), 0x910003e1, "sh281 continuation mov x1,sp (queue value)");
+            assert_eq!(word(0x102207154), 0x942e3ffa, "sh281 continuation bl 2d9713c (enqueue into 0x106863a70)");
+            for g in [0x10275a154u64, 0x10275a23cu64, 0x10275a294u64, 0x102207118u64, 0x10220713cu64, 0x102207144u64] {
                 assert!(in_win(g), "sh281 site {g:#x} in-window+aligned");
             }
             eprintln!("sh281 config+56 seed-crossed GlobalInit-reentry continuation anchors pinned on libroblox.so");
         } else {
             eprintln!("sh281 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
+    fn sh282_entry_continuation_locks_fixed_bss_not_box() {
+        // SH282: corrects SH281's wrong premise. The state=5 GlobalInit-reentry continuation
+        // 0x2207118 does NOT lock [box+0xaa0] (a 'junk' offset past the callee's 0x40 box) — it
+        // locks FIXED GLOBAL 0x106863aa0, which is TRUE zeroed .bss (behind the LOAD's filesize,
+        // so an OS/zro static-init pthread_mutex_t that a plain lock returns immediately on).
+        // The 'supply a correctly-sized settings box' next-step SH281 proposed is a DEAD END —
+        // the box is never deref'd at +0xaa0. The real forward work is the enqueue-construct on
+        // fixed object 0x106863a70 (0x2d9713c -> 0x22071ac), not the box size. Do-not-re-tread.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            let in_win = |g: u64| g >= 0x1_0000_0000 && g < 0x120_0000_00 && g & 3 == 0;
+            // The continuation's lock-target decode (fixed global, not box):
+            assert_eq!(word(0x10220713c), 0x900232e0, "sh282 adrp x0, 6863000");
+            assert_eq!(word(0x102207140), 0x912a8000, "sh282 add x0,#0xaa0");
+            assert_eq!(word(0x102207144), 0x94253249, "sh282 bl 2b53a68 (pthread_mutex_lock)");
+            // The enqueue consumer (real forward work):
+            assert_eq!(word(0x102207150), 0x910003e1, "sh282 mov x1,sp");
+            assert_eq!(word(0x102207154), 0x942e3ffa, "sh282 bl 2d9713c");
+            assert_eq!(word(0x102d97148), 0xf9401008, "sh282 2d9713c ldr x8,[x0,#32]");
+            assert_eq!(word(0x102d9715c), 0x97d1c014, "sh282 2d9713c bl 22071ac (construct)");
+            // 0x106863aa0 must be behind the last LOAD's filesize => true zeroed .bss.
+            let host = el.host_addr_of(0x106863aa0u64);
+            assert!(host.is_some(), "sh282 0x106863aa0 is loaded");
+            for g in [0x10220713cu64, 0x102207144u64, 0x102d97148u64, 0x102d9715cu64] {
+                assert!(in_win(g), "sh282 site {g:#x} in-window+aligned");
+            }
+            eprintln!("sh282 continuation lock fixed-global 0x106863aa0 (.bss static-init) not box+0xaa0 — SH281 box-size premise refuted");
+        } else {
+            eprintln!("sh282 real-image guard: no real libroblox.so, skipping anchors");
         }
     }
 
@@ -15839,25 +15858,19 @@ mod sh115_tests {
 
     #[test]
     fn sh239_doinit_oncelambda_intern_store_and_ctor_deep_body_pinned() {
-        // SH239 (real-image guard family as sh237/236/235; skip-if-absent):
-        // two measured Route-B facts at HEAD that QUALIFY the "StartLuaAppDM's do-init
-        // never completes app-shell construction" label. Real libroblox.so, guest =
-        // file + 0x100000000.
-        // (1) The do-init once-lambda completion STORES the __call_once result into the
-        //     once-slot via `str x0,[x23,#1032]` at file 0x2206d74 (x23=adrp 6a68000 =>
-        //     guest [0x106a68408]). Measured live that result is the intern 0x400000b
-        //     (once-slot), NOT an in-image DM controller => the operator's "LET the
-        //     once-lambda populate [0x106a68818]" premise is FALSIFIED headlessly: A/B
-        //     WITHOUT the SH156 fabricated DM-root seed leaves [0x106a68818]==0 even
-        //     though the once-lambda runs and self-latches oncel-guard bit0. The gen
-        //     DM-root seed is necessary-but-insufficient; the wall is not seed-caused.
-        // (2) When the SH156 seed IS present, the app-shell / global-init ctor
-        //     0x102207b50 (entry `b +4` then 0x2207b54 a9be7bfd stp) RUNS DEEP: measured
-        //     61+ distinct block-entry pcs through the body to 0x102208eac, and its
-        //     terminal tail targets the FMOD/AAudio iterate region 0x5fb30b4 (sub sp,#0x60)
-        //     — the sound pillar first contact (SH212/213-class), not a soft-return at the
-        //     ctor head. So "do-init never completes construction" is too coarse: the ctor
-        //     body executes far; what never happens is a make_shared<DataModel>.
+        // SH239 (real-image guard; skip-if-absent). Two measured Route-B facts QUALIFY the
+        // "StartLuaAppDM's do-init never completes app-shell construction" label (guest=file+0x100000000).
+        // (1) do-init once-lambda STORES the __call_once result via `str x0,[x23,#1032]` at file 0x2206d74
+        //     (x23=adrp 6a68000 => guest [0x106a68408]). Measured live that result is intern 0x400000b
+        //     (once-slot), NOT an in-image DM => the operator's "LET the once-lambda populate
+        //     [0x106a68818]" premise is FALSIFIED headlessly: A/B WITHOUT the SH156 fabricated DM-root
+        //     seed leaves [0x106a68818]==0 even though the once-lambda runs and self-latches oncel-guard
+        //     bit0. The gen DM-root seed is necessary-but-insufficient; the wall is not seed-caused.
+        // (2) With the SH156 seed present, the app-shell/global-init ctor 0x102207b50 (entry `b +4`,
+        //     0x2207b54 a9be7bfd) RUNS DEEP: measured 61+ distinct block-entry pcs to 0x102208eac, and its
+        //     terminal tail targets FMOD/AAudio iterate 0x5fb30b4 (sound pillar first contact, SH212/213-
+        //     class), not a soft-return at the ctor head. So "do-init never completes construction" is too
+        //     coarse: the ctor body executes far; what never happens is a make_shared<DataModel>.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
@@ -15926,19 +15939,15 @@ mod sh115_tests {
                 let host = el.host_addr_of(guest).unwrap_or(0);
                 if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
             };
-            // fnB entry (the real engine-init driven by the SH165 shell at governor tail).
-            //     0x2bd1b98 sub sp,#0x40 ; 0x2bd1c10 bl 0x2bd8ce8 (dispatcher call).
+            // fnB entry (real engine-init driven from governor tail). 0x2bd1b98 sub sp,#0x40; 0x2bd1c10 bl 0x2bd8ce8.
             assert_eq!(word(0x102_bd1b98), 0xd10103ff, "sh240 fnB 0x102bd1b98 prologue sub sp,#0x40");
-            // The dispatcher call-site bl (sign-extended imm26 -> 0x2bd8ce8). objdump: 0x94001c36.
             assert_eq!(word(0x102_bd1c10), 0x94001c36, "sh240 fnB bl dispatcher 0x2bd8ce8");
-            // Dispatcher 0x102bd8ce8: entry sub sp,#0x50 ; 0x2bd8d14 bl getter 0x2174c04.
+            // Dispatcher 0x102bd8ce8: sub sp,#0x50; 0x2bd8d14 bl getter 0x2174c04.
             assert_eq!(word(0x102_bd8ce8), 0xd10143ff, "sh240 dispatcher 0x102bd8ce8 prologue sub sp,#0x50");
-            // Getter 0x2174c04 reads the manager holder via ldar at 0x2174c28 (adrp x8,7275000
-            // -> GUEST 0x107275550 (+0x550) — NOT 0x102727550. SH243: 0x102727550 is vaddr
-            // 0x2727550 inside the R-E CODE seg; the getter's true read cell 0x107275550 is
-            // vaddr 0x7275550 in the RW data seg [0x67d67c0,0x7333c3c). The prior 8 cycles
-            // (SH165-240) seeded the wrong cell; the SH243 A/B (4/4) showed StartLuaAppDM
-            // returns Ok(M) with the true cell seeded vs Ok(0x3e8) baseline.
+            // Getter 0x2174c04 reads manager holder via ldar 0x2174c28 (adrp x8,7275000 -> GUEST 0x107275550,
+            // NOT 0x102727550. SH243: 0x102727550 is inside the R-E CODE seg; real cell 0x107275550 is RW
+            // data seg [0x67d67c0,0x7333c3c). SH165-240 seeded the wrong cell; SH243 A/B (4/4) shows
+            // StartLuaAppDM Ok(M) with the true cell vs Ok(0x3e8) baseline.
             assert_eq!(word(0x102_174c18), 0xb0028808, "sh240 getter adrp x8,7275000 (manager holder page)");
             assert_eq!(word(0x102_174c28), 0xc8dffd00, "sh240 getter ldar x0,[0x107275550] (seeded manager holder, SH243-corrected)");
             // The two leaf dispatches in the dispatcher body: 0x2bd8d2c blr x8 (vt+0xf8),
