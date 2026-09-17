@@ -1,4 +1,5 @@
 # Open Sober — Agent Handoff
+## SH286 (Sep 17, 2026, hermes-worker): classify the SH285 terminal MECHANISM by register dump (runs/sh286-dump-b1.txt). Reproduced SH285-B: fault=0xffffffffffffffff @0x101db1b08 is a libc++ std::string BACKWARD-COPY through UNINITIALIZED [x19+0x50] (guest host-heap) = SH174/204 LIVE-OBJECT class, NOT a .bss seed (already sh285-pinned). Do NOT re-drive a [obj+0x50] repair (SH248h/256 std). No prod path edited. Gates: build 0; test --workspace 0; recon-v3 green (24 frames swap Ok(0x1), 197 pops, 0 abort, EXIT 124). Addendum frontier-sh285. Tree clean.
 ## SH285 (Sep 17, 2026, hermes-worker): drive the engine's OWN initEngine_ settings-state self-drive past the LSM INSERT-LEAF wall for the FIRST time. SH260 parked the LocalStorageManager insert-leaf (guestpc=0x101db1d04) as the terminal that stops the SEP-17 SESSION-CTOR drive; SH280-284 drove the settings-state machine but ALWAYS with LSM_NODES off (the SH267 node-cell seed was measured only on the full app-start ladder), so every settings-state run parked AT the insert leaf. This cycle A/B's the genuinely-new combination (3x each, real libroblox.so, full SH284 seed set, runs/capture_sh285_settings_lsmnodes_ab.sh): A (LSM_NODES off) = SH284 baseline, 3/3 SIGSEGV guestpc=0x101db1d04 (insert-leaf); B (+LSM_NODES) = 3/3 SIGSEGV guestpc=0x101db1b08 — the LSM READER/pop path, ONE fencepost DEEPER (insert-leaf's atomic-OR lands in the seeded node cell; drive walks into its readback). 0x101db1b08 is a DIFFERENT reader-side fn than SH268's pinned free-list pop (0x101d9a528); 6 real-image byte-pins carry it (+ insert-leaf 0x101db1d04=0xb4000240). HONEST: does NOT manufacture a DataModel (DM-root 0, MH_* false, Route-B live-DM gate UNCHANGED); the crossed terminal is still the SH174/204 live-object readback class. New+measured: the engine's OWN session-state path now deterministically advances ONE fencepost past the insert leaf — cause-level SESSION-CTOR progress (SEP-17 primary lever), closing the SH267-vs-SH284 gap. +1 hermetic sh285 (examples 117/0). Verify: build+test EXIT 0; sh285 1 passed; recon-v3 re-verified green (24 task frames swap Ok(0x1), 197 pops, 0 crash). Doc docs/frontier-sh285-settings-lsmnodes-cross.md. Trimmed elfjit.rs comments to hold 1,048,360B. Single-agent, default-inert.
 ## SH284 (Sep 17, 2026, hermes-worker): drive the LAST never-driven initEngine_ state body — state=9 (0x2bd2668) — headlessly for the FIRST time. SH273/277 pinned the settings-state dispatch on [this+16] (==3→serializer 0x2bd1d68 / ==5→0x2bd24b4 / ==9→0x2bd2668) and measured ONLY state=3 was ever driven. SH280-283 crossed state=5 (SH281 seed [config+56] then the SH283 JIT_ROUTEB_ENG5_QMUTEX_FREE steal carried it through the GlobalInit-reentry continuation 5→7). This cycle drives the LAST body (state=9), the SAME shape as state=5: sub sp,#0x80, reads version [0x10683d8f8], sets state→10 at 0x2bd26e8, then `bl 0x2bce0d4` w2=1 → `b 275a0c4` = the same reentry continuation SH283's steal carries through. New opt-in `--v2boot-session-engine9` (elfjit.rs): sets [mgr3+16]=9, jit_run(0x102bd2668) as its own jit_run on the single ladder thread, reusing the SH279 manager seeds (app-name 'Home' long + [this+0x40] config + [config+56]) with no new fabrication. MEASURED 3/3 (real libroblox.so, full SH279 seeds + SH283 steal, runs/sh284-repro-{1,2,3}.txt): `state=9 body direct returned Ok(0x0)` + `[this+16](state)=10` — the LAST never-driven initEngine_ state body now SELF-COMPLETES headlessly (was never reached before). Run then self-drives into app-start (once-cell seed fires, deeper reach) and dies at the SH260 LSM wall 0x101db1d04 — the parked SEP-15 persistence detour, NOT a regression (identical to SH283 run-1). HONEST: cause-not-symptom SESSION-CTOR (engine's OWN settings-state machine now self-completes all THREE driven variants of its initEngine_ state bodies: 3→serializer, 5→7, 9→10); NO DM (MH_* false, DM-root 0); Route-B live-DM gate UNCHANGED; SH174 latch single forward hook. +hermetic sh284 (real-image pins: state=9 prologue 0x102bd2668=0xd10203ff, version adrp 0x102bd2694, state→10 0x102bd26e8=0xb9001268, config-dispatch bl 0x102bd2720=0x97ffee6d→0x2bce0d4, reentry 0x10275a0c4=0xd10303ff). Verify: sh284 1; examples 116/0 (was 115); build+test --workspace EXIT 0 (25 ...
 ## SH283 (Sep 17, 2026, hermes-worker): CROSS the SH280-282 engine5 reentry park AND falsify their "zeroed .bss static-init, cannot block" premise. The park is a REAL cross-thread contended lock: JIT_TRACE shows the state=5 continuation's last block is `hostcall@pthread_mutex_lock x0=0x106863aa0` with `bionic_word=0x2 state=2 g_owner_tid=0x3ab673` — LOCKED_CONTENDED and OWNED by a spawned worker (pthread_create 0x2d97d70, start 0x1022076f8) that never runs headlessly to release, so the runner futex-waits (EXIT 124). It IS in zeroed .bss (readelf last RW LOAD memsz ends 0x7333c3c) but the worker wrote state=2 into it — so SH282's "supply a correctly-sized box" was the wrong mechanism. GATE (default-inert JIT_ROUTEB_ENG5_QMUTEX_FREE=1, resolver.rs bionic_mutex_lock): if env set AND m==0x106863aa0, force-clear the 16-bit state word (steal from the never-running worker) so the continuation proceeds into the enqueue-construct. A/B (full SH281/282 seed set, runs/capture_sh283_ab.sh): A parks (enqueue 0 & construct 0 hits); B **`SH280 state=5 body direct returned Ok(0x0)` + `[this+16](state)=7`** — the engine's OWN settings-state machine SELF-COMPLETES its state=5 body through config-dispatch→reentry→continuation→enqueue 0x2d9713c→construct 0x1022071ac for the FIRST time. Repro 3/3 state=7 (run1 later self-drove into app-start and died at the SH260 LSM wall, not a regression). HONEST: cause-not-symptom SESSION-CTOR (one full gate past SH281/282); NO DM (MH_* false, DM-root 0); Route-B live-DM gate UNCHANGED; SH174 latch single forward hook. +hermetic sh283 (env+addr-scoped predicate). Verify: sh283 1; lib 400/0; examples 115/0; workspace EXIT 0. Doc docs/frontier-sh283-session-mutex-contended-gate.md. Single-agent, default-inert.
@@ -10115,9 +10116,8 @@ JNI_OnLoad prologue+init code before faulting on the JNI fake-object vtable wall
    faulted. Updated the e2e JIT JNI test (`jit_jni_onload_getenv_getversion`).
 
 ### Current boot frontier (verified via JIT_TRACE / JIT_STEP)
-The guest now loads, binds 597 imports, gets a live JavaVM* in x0, and
-executes the JNI_OnLoad prologue, `__stack_chk_guard` store, once-guard init,
-clock/time setup, and dispatches into real JNI code. It then faults on a
+The guest now loads, binds imports, gets a live JavaVM* in x0, executes the
+JNI_OnLoad prologue + once-guard init, and dispatches into real JNI code, then faults on a
 `ldr x8,[x8,#48]` C++ virtual-method dispatch where the handle's word0 (method
 table) is 0 — the documented **JNI fake-object backing wall**: the guest
 builds a C++ object from JNI getters/results and virtual-dispatches on a null
@@ -10128,17 +10128,13 @@ code dispatching on an object its own init built. Real fix = JNI fake-object
 model (real vtable-backed handles the guest can dispatch on), a multi-session
 subsystem.
 
-Repro run-log artifact: `/home/hermes-worker/runs/real-boot-runlog.txt`.
-
 ### Environment / assets now on this box
 - `~/.cache/open-sober/apks/roblox-android.apk` — real Roblox 2.738.1397 (229MB)
 - `~/.cache/open-sober/robbox/libroblox.so` — extracted arm64 lib (109MB)
 - elfjit command: `cargo run -p arm64jit --example elfjit -- <lib> 0x2173ff4 --jni`
 
 ### Status
-`cargo test --workspace` **384/0** green (`cargo build --workspace` clean; the
-decode.rs/plt.rs edits surface only the pre-existing rustfmt-churn warnings —
-rustfmt isn't installed on this box). Local `dev` commits only (no push).
+`cargo test --workspace` green (superseded — see newest entries top-of-file).
 
 ---
 
@@ -10169,10 +10165,4 @@ Three boot fixes (dev commits `9bf61e3`, `a3a8372`):
    `bionic_pthread_create/join` + `spawn_pthread()` — glibc pthread_create
    called the guest worker start routine natively (SIGILL); now spawns a fresh
    host thread running it through jit_run with its own guest stack+TLS.
-
-Current wall (engine data access): JNIMain/TelemetryProtocol SIMD-copies a
-struct to guest addr 0x109285fb0 (unmapped, ~33MB past image end). The pointer
-isn't a 0x55... heap result — likely a guest svc mmap returning a low address or
-a computed arena base. Next: trace who produced 0x109285fb0 and make it real.
-
-`cargo test --workspace` **387/0** green. Local dev commits only (no push).
+(Stale SEP-11 wall note condensed; superseded by later sessions — see newest entries top-of-file.)

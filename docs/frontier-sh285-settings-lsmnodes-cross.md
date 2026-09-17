@@ -65,9 +65,39 @@ the gate under test is the downstream LSM lane). Repro: `runs/capture_sh285_sett
 - The remaining wall is still the standing live-object class a real
   LocalStorageManager/session ctor owns; no seed manufacturing added.
 
-## Disposition
-`JIT_ROUTEB_APPSART_LSM_NODES=1` = SH267's committed seed, reused here (not new
-code). Repro logged to runs/. LEDGER: STATUS.md + HANDOFF.md updated; tree clean.
+## Follow-up: terminal MECHANISM classified (fresh register dump, SH285+1)
+
+SH285 labeled the B-arm terminal only as "reader/pop path, one fencepost deeper".
+A fresh dump at the terminal (same B command + `JIT_DUMP_PC`, `runs/sh286-dump-b1.txt`,
+state9ok=1, terminal `guestpc=0x101db1b08` reproduced) pins the ACTUAL fault
+mechanism — it is NOT a second fixed-.bss reader cell, it is a live host-heap
+string-object backward-copy:
+
+```
+[SIGSEGV] fault=0xffffffffffffffff guestpc=0x101db1b08 lr=0x101db1b18
+  x0=x19=0x7f4c38dc5b40  x20=0xffff80b3c723a4c0  x10=0xffffffffffffffff  x21=sp
+translated tail: add [obj+0x48],1 ; rdx=[obj+0x50] ; rax=[obj+0x58] ;
+  mov [rdx],al ; add [obj+0x50],-1        -> the byte-store lands at
+  [obj+0x50] = 0xffffffffffffffff
+```
+
+`x19` (0x7f4c38..) is a **guest-constructed host-heap std::string/container**
+whose internal data-pointer field `[obj+0x50]` is **0xffffffffffffffff**
+(uninitialized — the upstream ctor that sets up its buffer never ran headlessly).
+The caller (`initStorageManagerNative`, bl'd at 0x1db1b14, returns to 0x1db1b18)
+drives a backward byte-copy loop writing through that pointer -> store to
+0xff..ff -> SIGSEGV. lsm_map_global points at the SH267-seeded bucket array, so
+the map IS coherent past the insert-leaf; the fault is one level up, in the map's
+*consumer* object which owns an uninitialized string buffer.
+
+**Verdict (classification, not a lever):** the SH285 terminal is the SH174/204
+live-object class — a guest heap object field awaiting real construction, NOT a
+fixed-.bss seedable cell. It is already byte-pinned by the `sh285` hermetic
+(0x101db1b08/0x101db1b14/insert-leaf). Do NOT re-drive a repair/[obj+0x50] seed
+into it: repairing a live object's buffer pointer + count + bound is
+manufacturing its full invariants (SH248h/SH256-standard), and this remains the
+same structural wall Route B already targets via cause-not-symptom SESSION-CTOR.
+Evidence kept locally at runs/sh286-dump-b1.txt (gitignored).
 
 ## Verify
 Workspace green (cargo build + cargo test --workspace exit 0). A/B repro above
