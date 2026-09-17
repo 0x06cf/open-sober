@@ -2527,6 +2527,64 @@ fn routeb_patch_cont_opnew_box() {
     ROUTEB_CONT_OPNEW_BOX_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 static ROUTEB_CONT_OPNEW_BOX_PATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static ROUTEB_OPNEW_SIZEGATE_PATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// SH246's measured conclusion is that the activated continuation
+/// (continueAfterFlagsLoaded_ 0x102bd1d68) pervasively NULL-allocs: EVERY interior
+/// operator_new — BOTH variants 0x1db1a38 and 0x1d96768 — returns NULL for size>0xa
+/// whenever the global allocator-activation byte [0x10727570c].bit0 is clear
+/// (headlessly clear): the fast-path `b.ls SMALL` (taken ⇔ unsigned size<=0xa) falls
+/// through to `mov x19,xzr` for larger sizes and std::bad_alloc throws. The broad
+/// fix (bit0=1 -> ALL op_new real-alloc) is a MEASURED regression (SH245 #4, 3/3 early
+/// SIGABRT on a secondary thread before the continuation). SH247's lever (the one
+/// untried, cheap, in-image door): route EVERY size through the SAME ≤0xa "small
+/// path" (0x1db1ab4/0x1d96824) that demonstrably WORKS headlessly — it builds an
+/// allocator size-class descriptor (scudo 0x1d969cc/0x1d99bf0 classifier, classes up
+/// to ~2.8KB) and calls the REAL allocator tail 0x1db1c60, which returns real memory
+/// for the tiny sizes that DO run today. So this is a SINGLE-WORD patch per variant:
+/// change the size-gate `b.ls SMALL` (conditional, taken ⇔ size<=0xa) to an
+/// UNCONDITIONAL `b SMALL`, so the continuation's 0x28/0x20 closures + string / JSON
+/// constructions also take the working descriptor path — WITHOUT touching the bit0
+/// flag. Empirical (measured, real binary): does the descriptor path serve size>0xa
+/// headlessly (continuation advances -> next gate) or fall through to the raw
+/// allocator SIGABRT (= the same alloc wall via a 2nd mechanism, proof-of-dead-end)?
+/// Opt-in JIT_ROUTEB_OPNEW_SIZE_GATE, byte-guarded, whole-function block-cache drop.
+fn routeb_patch_opnew_size_gate() {
+    if ROUTEB_OPNEW_SIZEGATE_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    if std::env::var("JIT_ROUTEB_OPNEW_SIZE_GATE").ok().as_deref() != Some("1") {
+        return;
+    }
+    // (site_guest, block_drop_lo, block_drop_hi, expected_word, replacement_word)
+    // AArch64 B.cond targets pc + (imm19<<2); unconditional `b` targets pc + (imm26<<2).
+    // variant A 0x1db1a78 b.ls 0x1db1ab4 (0x540001e9) -> b 0x1db1ab4: imm26=0xf -> 0x1400000f.
+    // variant B 0x1d967ec b.ls 0x1d96824 (0x540001c9) -> b 0x1d96824: imm26=0xe -> 0x1400000e.
+    let sites: [(u64, u64, u64, u32, u32); 2] = [
+        (0x101db1a78, 0x101db1a38, 0x101db1c60, 0x5400_01e9, 0x1400_000f),
+        (0x101d967ec, 0x101d96768, 0x101d969a0, 0x5400_01c9, 0x1400_000e),
+    ];
+    unsafe {
+        for (start, drop_lo, drop_hi, exp, rep) in sites {
+            let page = (start & !0xfff) as *mut libc::c_void;
+            if libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_WRITE) != 0 {
+                eprintln!("[elfjit:routeB] WARN SH247 op_new size-gate @0x{start:x} mprotect RW failed errno={}", std::io::Error::last_os_error());
+                continue;
+            }
+            if *(start as *const u32) != exp {
+                eprintln!("[elfjit:routeB] WARN SH247 op_new size-gate @0x{start:x} unexpected word {:08x} (expected {:08x}), not patched", *(start as *const u32), exp);
+                libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+                continue;
+            }
+            *(start as *mut u32) = rep;
+            let rb = *(start as *const u32);
+            libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+            // whole-function block-cache drop so the patched branch byte re-translates.
+            arm64jit::jit::block_cache_drop_region(drop_lo, drop_hi);
+            eprintln!("[elfjit:routeB] SH247 op_new size-gate @0x{start:x} -> unconditional b small-path (readback {rb:08x})");
+        }
+    }
+    ROUTEB_OPNEW_SIZEGATE_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
 static ROUTEB_RUNG0_DISPATCH_PATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// SH126-followup (recon deleg_fcd65c31): with JIT_SERIALIZE_RENDER the drain
 /// overlap is gone, but the residual run-variable rung-0 crash is a null-store in
@@ -6922,6 +6980,12 @@ fn main() {
             // NULL headlessly (allocator-activation gate clear, size>0xa) -> box a
             // leaked 0x40 object instead. Self-guards on its own env (inert by default).
             routeb_patch_cont_opnew_box();
+            // SH247 (Route-B, opt-in JIT_ROUTEB_OPNEW_SIZE_GATE): the continuation
+            // pervasively NULL-allocs (bad_alloc from MANY op_new sites, SH246). Route
+            // EVERY size through the working ≤0xa descriptor/allocator path by
+            // making both op_new variants' size-gate branch unconditional. Self-guards
+            // on its own env (inert by default).
+            routeb_patch_opnew_size_gate();
             // SH115: the three nullable-singleton dispatch accessors (V2Init/
             // V2Start/V1AppStart/SendAppEventOnAppReady) soft-return because
             // their `blr` reads past the 0x60 vtable. Scoped-patch each site to
@@ -13113,6 +13177,53 @@ mod sh115_tests {
             assert!(!drifted, "a drifted site already holding a materialize word would mean the patch is already applied / binary is rebuilt (false negative)");
         } else {
             eprintln!("sh246 real-image guard: no real libroblox.so, skipping");
+        }
+    }
+    #[test]
+    fn sh247_opnew_size_gate_routes_all_sizes_to_small_descriptor_path() {
+        // SH246 measured the activated continuation pervasively NULL-allocs: EVERY
+        // interior operator_new (BOTH variants 0x1db1a38 and 0x1d96768) returns NULL
+        // for size>0xa when [0x10727570c].bit0 is clear. SH247's lever: make each
+        // variant's size-gate `b.ls SMALL` (taken ⇔ unsigned size<=0xa) an
+        // UNCONDITIONAL `b SMALL`, so size>0xa ALSO walks the ≤0xa descriptor path
+        // (scudo size-class + real allocator tail 0x1db1c60) that works headlessly.
+        // This hermetic pin:
+        //   (a) the exact real-image gate word (must be a B.cond with cond=LS),
+        //   (b) the replacement is an unconditional B whose imm26 lands on the
+        //       documented SMALL path target (drift fails loudly),
+        //   (c) the real-image word guard passes on the current binary.
+        // Real-image sites (guest = file + 0x100000000):
+        //   variant A file 0x1db1a78 = 0x540001e9  b.ls 0x1db1ab4 -> b 0x1db1ab4 = 0x1400000f
+        //   variant B file 0x1d967ec = 0x540001c9  b.ls 0x1d96824 -> b 0x1d96824 = 0x1400000e
+        let gate = |file_site: usize, expected: u32, rep: u32, small_target: u64| {
+            // (b) replacement decodes to an unconditional B (`b`), imm26 => small path.
+            assert_eq!(rep & 0xFF00_0000, 0x1400_0000, "replacement must be an unconditional B");
+            let imm26 = (rep & 0x03FF_FFFF) as u64;
+            if imm26 & (1 << 25) != 0 {
+                panic!("positive small forward branch expected");
+            }
+            let site_guest = 0x100000000u64 + file_site as u64;
+            let target = site_guest + imm26 * 4;
+            assert_eq!(target, small_target, "unconditional B must land on the documented SMALL path");
+            // (a) the ORIGINAL gate word is a B.cond with cond==0x9 (LS: lower-or-same).
+            assert_eq!(expected & 0xFF00_0000, 0x5400_0000, "gate must be a B.cond");
+            assert_eq!(expected & 0x1F, 0x09, "gate cond must be LS (0x9) — the size<=0xa branch");
+        };
+        gate(0x1db1a78, 0x5400_01e9, 0x1400_000f, 0x101db1ab4);
+        gate(0x1d967ec, 0x5400_01c9, 0x1400_000e, 0x101d96824);
+        // (c) real-image pin: both gate words literal on disk.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            for (site, exp, _rep, _tgt) in [
+                (0x1db1a78usize, 0x5400_01e9u32, 0x1400_000fu32, 0x101db1ab4u64),
+                (0x1d967ecusize, 0x5400_01c9u32, 0x1400_000eu32, 0x101d96824u64),
+            ] {
+                let w = u32::from_le_bytes([img[site], img[site + 1], img[site + 2], img[site + 3]]);
+                assert_eq!(w, exp, "SH247 op_new size-gate file vaddr 0x{site:x} must be {exp:08x}");
+            }
+        } else {
+            eprintln!("sh247 real-image guard: no real libroblox.so, skipping");
         }
     }
     #[test]
