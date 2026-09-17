@@ -7213,6 +7213,62 @@ fn main() {
                 }
                 eprintln!("[elfjit:v2boot] SH109 seeded version-gate [0x10683d350]=6 so V2Init/V2Start keep the clean main path");
                 let _ = (iimg, ib);
+                // SEP-17 SESSION DRIVE (--v2boot-session, opt-in):
+                // The operator's hard directive identifies the missing surface as the
+                // REAL Android Activity/AppBridge session life-cycle natives the engine
+                // asserts on (SH184 lifecycle map): JNIAppLifecycleNativeAdapter_setActive,
+                // initAppShellReporter, nativeActivity_onEngineSettingsReceived
+                // (client-settings), nativeAppBridgeSetInitParams. All are JNI-RECEIVE
+                // entries (verified: ZERO in-image bl callers — only the Java side of a
+                // real Activity invokes them), so the harness MUST drive them as real
+                // guest entries; nothing does today. This stage drives the four lifecycle
+                // natives as fresh guest jit_runs ON THE SAME single ladder thread
+                // (SH55/64: concurrent top-level jit_runs corrupt the shared block cache —
+                // must stay serialized), reusing boot_sp/tpidr + the fabricated
+                // Activity/thiz + AutoValue init-params jobject, in the order the real
+                // Android activity asserts them (pre-GlobalInit, before the app-start
+                // orchestration SH259-263 walked). setActive's core (0x21f5f80) reads the
+                // app-lifecycle adapter triplet [0x106b0bde0] that SH248f fabricates, so
+                // it resolves a benign path instead of NULL-faulting. Reference:
+                // docs/recon-routeB-globaltinit-unblock.md + frontier-sh184-routeb.
+                if std::env::args().any(|a| a == "--v2boot-session") {
+                    let mut lifecycle: Vec<(&str, u64, [u64; 8])> = vec![
+                        ("initAppShellReporter", 0x1021f53b8, [env_ptr, thiz, 0, 0, 0, 0, 0, 0]),
+                        ("setActive",            0x1021f5de4, [env_ptr, thiz, 0, 0, 0, 0, 0, 0]),
+                        ("SetInitParams",        0x102bcc814, [env_ptr, thiz, init_params, 0, 0, 0, 0, 0]),
+                    ];
+                    // nativeOnResumed (0x1021f5db8) tail-branches into the SHARED Activity
+                    // lifecycle-notifier dispatcher 0x21f15a4 whose body derefs a real
+                    // lifecycle-callback registry object at +0x50 (fault=0x50 @ 0x1021f3748)
+                    // — the SH184 live-object class, NOT a seedable cell. It hard-aborts the
+                    // whole process (SIGABRT after the SIGSEGV), so it is AMBULATORY: driven
+                    // ONLY under the explicit --v2boot-session-resumed flag (a diagnostic),
+                    // never in the default clean session drive, which must leave the app-start
+                    // ladder reachable. Same honest classification as SH248h/256 reverted levers.
+                    if std::env::args().any(|a| a == "--v2boot-session-resumed") {
+                        lifecycle.push(("nativeOnResumed", 0x1021f5db8, [env_ptr, thiz, 0, 0, 0, 0, 0, 0]));
+                    }
+                    eprintln!("[elfjit:v2boot-session] SEP-17 session drive: driving REAL Activity-lifecycle natives (single ladder thread)");
+                    for (name, guest, args) in &lifecycle {
+                        eprintln!("[elfjit:v2boot-session] driving {name} @ guest {guest:#x} (env={env_ptr:#x} thiz={thiz:#x})");
+                        let mut s = arm64jit::jit::CpuState::new();
+                        s.tpidr = tpidr;
+                        s.x[31] = boot_sp;
+                        s.x[..8].copy_from_slice(args);
+                        match arm64jit::jit::jit_run(iimg, ib, *guest, &mut s as *mut CpuState) {
+                            Err(e) => eprintln!("[elfjit:v2boot-session] {name} stopped: {e}"),
+                            Ok(r) => eprintln!("[elfjit:v2boot-session] {name} returned Ok({r:#x})"),
+                        }
+                        dump(&format!("lifecycle:{name}"));
+                    }
+                    let nf = arm64jit::jni::nativehelper_flags_loaded();
+                    let ni = arm64jit::jni::nativehelper_engine_initialized();
+                    let ar = arm64jit::jni::nativehelper_app_ready();
+                    let abv_slot = unsafe { *(0x106a705e8u64 as *const u64) };
+                    eprintln!(
+                        "[elfjit:v2boot-session] post-lifecycle: MH_FLAGS_LOADED={nf} MH_ENGINE_INITIALIZED={ni} MH_APP_READY={ar} AppBridgeV2[0x106a705e8]=0x{abv_slot:x}"
+                    );
+                }
                 // rung index 1 == nativeGameGlobalInit in the rungs array below.
                 for (name, guest, args) in rungs.iter() {
                     eprintln!("[elfjit:v2boot] driving {name} @ guest {guest:#x} (env={env_ptr:#x} thiz={thiz:#x})");
@@ -14834,6 +14890,52 @@ mod sh115_tests {
             }
         } else {
             eprintln!("sh259 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
+    fn sh264_activity_lifecycle_natives_jni_receive_pinned() {
+        // SH264 (SEP-17 directive, single-agent): the four REAL Android Activity/AppBridge
+        // session-lifecycle natives the engine asserts on (SH184 lifecycle map) are all
+        // JNI-RECEIVE entries — ZERO in-image bl callers, so only the Java side of a real
+        // Activity invokes them and the harness must drive them as real guest entries
+        // (new --v2boot-session stage, elfjit.rs). Pin their guest entries + the two
+        // sub-primitives they reach so a silent drift breaks loudly (real-image guard
+        // family as sh260/261, skip-if-absent, guest = file vaddr + 0x100000000):
+        //   nativeOnResumed              0x1021f5db8 = stp x29,x30,[sp,#-16]! (0xa9bf7bfd)
+        //   initAppShellReporter         0x1021f53b8 = sub sp,#0x30 (0xd100c3ff)
+        //   JNIAppLifecycleNativeAdapter_setActive 0x1021f5de4 = sub sp,#0x40 (0xd10103ff)
+        //   nativeAppBridgeSetInitParams 0x102bcc814 = stp x29,x30,[sp,#-96]! (0xa9ba7bfd)
+        //   setActive core 0x21f5f80 -> adapter-triplet read adrp 6b0b000/#0xde0
+        //     (0xd00248a9) at 0x1021f5f80 + ldp (0xa940252a) @ 0x21f5f88 — the SH248f
+        //     adapter triplet [0x106b0bde0] setActive non-NULL-faults on.
+        //   SetInitParams first ldp store stp x28,x27 (0xa9016ffc) @ 0x102bcc818
+        // Route-B gate UNCHANGED; SH174 capture-latch stays the single forward hook.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            assert_eq!(word(0x102_1f5db8), 0xa9bf7bfd, "sh264 nativeOnResumed prologue stp x29,x30");
+            assert_eq!(word(0x102_1f53b8), 0xd100c3ff, "sh264 initAppShellReporter prologue sub sp,#0x30");
+            assert_eq!(word(0x102_1f5de4), 0xd10103ff, "sh264 setActive prologue sub sp,#0x40");
+            assert_eq!(word(0x102bcc814), 0xa9ba7bfd, "sh264 SetInitParams prologue stp x29,x30,#-96");
+            assert_eq!(word(0x102bcc818), 0xa9016ffc, "sh264 SetInitParams stp x28,x27");
+            assert_eq!(word(0x102_1f5f80), 0xd00248a9, "sh264 setActive core adrp 6b0b000 (adapter triplet)");
+            assert_eq!(word(0x102_1f5f88), 0xa940252a, "sh264 setActive core ldp triplet (SH248f [0x106b0bde0])");
+            for (guest, name) in [
+                (0x102_1f5db8u64, "nativeOnResumed"), (0x102_1f53b8u64, "initAppShellReporter"),
+                (0x102_1f5de4u64, "setActive"), (0x102bcc814u64, "SetInitParams"),
+                (0x102_1f5f80u64, "setActive-core-adrp"), (0x102_1f5f88u64, "setActive-core-ldp"),
+            ] {
+                assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh264 {name} {guest:#x} in window");
+                assert!(guest & 3 == 0, "sh264 {name} {guest:#x} 4-aligned");
+            }
+            eprintln!("sh264 Activity-lifecycle natives (nativeOnResumed/initAppShellReporter/setActive/SetInitParams + setActive core adapter-triplet read) pinned on libroblox.so");
+        } else {
+            eprintln!("sh264 real-image guard: no real libroblox.so, skipping anchors");
         }
     }
 
