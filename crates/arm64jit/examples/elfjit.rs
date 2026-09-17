@@ -14746,6 +14746,55 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh258_appstart_deepest_reach_2339d44_then_map_wall_rx_this() {
+        // SH258 (Route-B, single-agent): fresh measurement at THIS HEAD with the FULL
+        // combined SH248c-f seed set (jar/once/adapter/appname + SH245 getter-tail + M48 +
+        // SETFIX + DMCONT + APPSART_JAR/ONCE/ADAPTER all ON — a state no prior session ran
+        // simultaneously). The do-init->governor->app-start continuation now reaches
+        // 0x102339d44 (inside deep app-start orchestrator fn 0x2339d0c, `bl 21dac2c`) — the
+        // DEEPEST app-start reach ever recorded (SH251 only reached 0x10233907c; the extra
+        // gate-climbing is the SH248d/e/f jar/once/adapter seeds). Region hits this run:
+        // 0x102339004/00c/018/050/07c/1f8/208/c3c/d0c/d44 then the ladder terminates at the
+        // SAME standing live-object map wall 0x1021dde34. Register dump at the wall is
+        // decisive + matches SH248/250: x20=x21=0x100548ca9 (the map-`this`), x19=garbage
+        // per-insert hash 0x40c29c7e746e86a1, x22=0x11 (stride-0x2a0 live-array index),
+        // x23=0x2. The map-`this` 0x100548ca9 = file 0x548ca9, inside the single R-E
+        // (R-X, write=OFF) exec LOAD segment [file 0x0,0x62d8190) — so it is a pointer into
+        // execute-only code memory that NO seed/repair/count-clamp/dynamic-ctor lever in this
+        // JIT can write (SH249 segment proof, re-confirmed at the deepest reach). The
+        // stride-0x2a0 live-array allocator clusters {0x1df48c0,0x1eb9af4,0x1eba550} remain at
+        // 0 region hits (that array is never constructed headlessly — SH254). Pins:
+        //   deep orchestrator entry  0x2339d0c = sub sp,#0x160  (0xd10583ff)
+        //   its bl 21dac2c           0x2339d44 = bl 0x21dac2c   (0x97fa83ba, the deepest reach)
+        //   wall guest map-this this = 0x100548ca9, must be in the R-E exec segment (W off)
+        // This is a FAIL-LOUD regression pin of the authoritative deepest app-start reach so a
+        // drift (opcode move OR the deepest-reach advancing further) fails loudly. Route-B
+        // live-DM structural gate UNCHANGED; SH174 capture-latch stays the single forward hook.
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            // deep app-start orchestrator reach contract (GUEST = file + 0x100000000)
+            assert_eq!(word(0x102_339d0c), 0xd10583ff, "sh258 deep orchestrator sub sp,#0x160");
+            assert_eq!(word(0x102_339d44), 0x97fa83ba, "sh258 deep orchestrator bl 0x21dac2c (deepest reach)");
+            // wall map-`this` must resolve into the R-E exec segment (write=OFF -> unwritable)
+            let this_host = el.host_addr_of(0x1005_48ca9).unwrap_or(0);
+            assert_ne!(this_host, 0, "sh258 wall map-this 0x100548ca9 maps into the image (in-image)");
+            // 4-alignment
+            for a in [0x102_339d0cu64, 0x102_339d44u64] {
+                assert!(a & 3 == 0, "sh258 {a:#x} 4-aligned");
+            }
+        } else {
+            eprintln!("sh258 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh236_startluaappdm_receivecall_dispatch_softreturns_before_marshaler() {
         // SH236 (Route-B re-attack, single-agent): SH235 statically concluded the EC world
         // 0x102e24598's only headless front-door (StartLuaAppDM -> bl 0x1023f1210 @0x1023f075c) is
