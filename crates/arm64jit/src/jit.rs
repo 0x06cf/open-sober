@@ -879,6 +879,40 @@ fn routeb_appstart_jar_seed_guard(_state: *mut CpuState, pc: u64) {
     }
 }
 
+/// SH248e (opt-in JIT_ROUTEB_APPSART_ONCE_SEED): seed the nativeAppBridgeAppStart
+/// once-cell global [0x106b0bdf0] so the app-start path's once-check skips cleanly.
+/// The DMCONT continuation (SH248d) advanced DEEP into nativeAppBridgeAppStart to
+/// fn 0x2339208 (`bl 2339208` @ 0x2339014, bl'd from the app-start string-dispatch).
+/// Its prologue does `adrp x9,6b0b000; ldr x0,[x9,#3568]; ldar x8,[x0]; cmn x8,#0x1;
+/// b.eq 0x2339264` — reading a once-cell POINTER global [0x106b0bdf0] that is NULL
+/// headlessly -> `ldar x8,[x0]` (x0=0) SIGSEGVs fault=0x0 at guestpc=0x102339208
+/// (x0=0,x1=0, lr=0x102339018, host x19/x20 = 0x5645.. host heap). Seeding
+/// [0x106b0bdf0] = a leaked cell holding -1 makes the `cmn x8,#0x1; b.eq` take the
+/// clean canary-check+ret path (0x2339264) instead of the pthread_mutex_lock branch
+/// (bl 2b4cd1c). Fires on the fn region [0x102339208,0x102339244); idempotent (only
+/// when the global is 0). Default-inert.
+fn routeb_appstart_once_seed_guard(_state: *mut CpuState, pc: u64) {
+    if std::env::var("JIT_ROUTEB_APPSART_ONCE_SEED").ok().as_deref() != Some("1") {
+        return;
+    }
+    if !(0x102339208..0x102339244).contains(&pc) {
+        return;
+    }
+    const ONCE_CELL: u64 = 0x106b0bdf0; // global POINTER to the once-cell (+3568 of 6b0b000)
+    if routeb_ensure_writable(ONCE_CELL)
+        && unsafe { std::ptr::read_unaligned(ONCE_CELL as *const u64) } == 0
+    {
+        static MINUS_ONE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let cell = *MINUS_ONE.get_or_init(|| {
+            Box::leak(vec![0xffu8; 8usize].into_boxed_slice()).as_mut_ptr() as u64
+        });
+        unsafe { std::ptr::write_unaligned(ONCE_CELL as *mut u64, cell) };
+        eprintln!(
+            "[routeb-sh248e] seeded appstart once-cell global [0x{ONCE_CELL:x}] = 0x{cell:x} (-1 cell) at pc=0x{pc:x} (was NULL -> would SIGSEGV 0x102339208)"
+        );
+    }
+}
+
 /// SH177 (objective 2b / recon deleg_48e16777 task-0+task-1): write a classified
 /// value into the engine's cookie-jar container as a valid libc++ `std::string`.
 ///
@@ -5501,6 +5535,10 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // SH248d (opt-in JIT_ROUTEB_APPSART_JAR_SEED): seed [0x106ed7a20] cookie-jar string
         // at the nativeAppBridgeAppStart string-assign site 0x1021f4830 (was NULL -> crash).
         routeb_appstart_jar_seed_guard(state, pc);
+        // SH248e (opt-in JIT_ROUTEB_APPSART_ONCE_SEED): seed the app-start once-cell
+        // global [0x106b0bdf0] -> -1 cell so fn 0x2339208 skips its pthread_mutex_lock
+        // branch (NULL once-cell -> SIGSEGV 0x102339208 on the DMCONT continuation).
+        routeb_appstart_once_seed_guard(state, pc);
         // SH164 (recon deleg_94aac9d7): governor-tail dispatch block-entry capture.
         // Fires on EVERY run (self-gated on JIT_ROUTEB_DMTRACE) so a follow-up cycle
         // can observe whether the tail's vt[+0x30] dispatch ever resolves to the
@@ -6986,6 +7024,62 @@ mod tests {
         unsafe { std::env::remove_var("JIT_ROUTEB_APPSART_JAR_SEED") };
         unsafe { std::ptr::write_unaligned(A as *mut u64, 0) };
         unsafe { std::ptr::write_unaligned(B as *mut u64, 0) };
+    }
+
+    #[test]
+    fn sh248e_appstart_once_guard_is_env_pc_gated_and_seeds_minus_one() {
+        // SH248e: routeb_appstart_once_seed_guard must be (a) inert without
+        // JIT_ROUTEB_APPSART_ONCE_SEED, (b) fire only in the app-start once-check fn
+        // range [0x102339208,0x102339244), (c) seed the once-cell POINTER global
+        // [0x106b0bdf0] with a leaked cell holding -1 (so the `cmn x8,#0x1; b.eq`
+        // skip is taken instead of the pthread_mutex_lock branch), idempotently.
+        const ONCE_CELL: u64 = 0x106b0bdf0;
+        unsafe {
+            assert!(
+                routeb_ensure_writable(ONCE_CELL),
+                "once-cell pointer page must be made writable (fixed .bss in a unit test)"
+            );
+            // (a) env unset, pc in-range -> inert.
+            std::env::remove_var("JIT_ROUTEB_APPSART_ONCE_SEED");
+            std::ptr::write_unaligned(ONCE_CELL as *mut u64, 0);
+            routeb_appstart_once_seed_guard(std::ptr::null_mut(), 0x102339208);
+            assert_eq!(
+                std::ptr::read_unaligned(ONCE_CELL as *const u64),
+                0,
+                "env-gated: without JIT_ROUTEB_APPSART_ONCE_SEED the guard must stay inert"
+            );
+
+            // (b) env set, wrong pc -> inert.
+            std::env::set_var("JIT_ROUTEB_APPSART_ONCE_SEED", "1");
+            routeb_appstart_once_seed_guard(std::ptr::null_mut(), 0x102339000);
+            assert_eq!(
+                std::ptr::read_unaligned(ONCE_CELL as *const u64),
+                0,
+                "pc-gated: must fire only in [0x102339208,0x102339244)"
+            );
+
+            // (c) env set + in-range pc -> seed ONCE_CELL = leaked -1 cell.
+            routeb_appstart_once_seed_guard(std::ptr::null_mut(), 0x102339230);
+            let cell = std::ptr::read_unaligned(ONCE_CELL as *const u64);
+            assert_ne!(cell, 0, "once-cell pointer must be seeded non-NULL");
+            let val = std::ptr::read_unaligned(cell as *const u64);
+            assert_eq!(
+                val,
+                u64::MAX,
+                "the seeded cell must hold -1 so `cmn x8,#0x1; b.eq` takes the skip"
+            );
+
+            // Idempotent: re-fire leaves the already-populated slot untouched.
+            std::ptr::write_unaligned(ONCE_CELL as *mut u64, 0x1234);
+            routeb_appstart_once_seed_guard(std::ptr::null_mut(), 0x102339240);
+            assert_eq!(
+                std::ptr::read_unaligned(ONCE_CELL as *const u64),
+                0x1234,
+                "idempotent: a non-NULL slot must be left untouched"
+            );
+            std::env::remove_var("JIT_ROUTEB_APPSART_ONCE_SEED");
+            std::ptr::write_unaligned(ONCE_CELL as *mut u64, 0);
+        }
     }
 
     #[test]
