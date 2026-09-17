@@ -14694,6 +14694,58 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh257_doinit_fmod_iterate_earlyreturn_completes_to_governor() {
+        // SH257 (Route-B, single-agent): correct SH239's "app-shell ctor tails into FMOD
+        // iterate 0x5fb30b4 and NEVER completes construction (absorbed by the sound tail)".
+        // Fresh measurement on the real binary with the FULL SH248c-f seed set
+        // (jar/once/adapter/appname + SH245 getter-tail + M48 + SETFIX + DMCONT) shows the
+        // FMOD iterate's EMPTY-CONTAINER early-return DISPATCHES: `ldp x8,x9,[x0,#8];
+        // cmp; b.eq 0x5fb3134` -> 0x5fb3134 (canary-reload) -> 0x5fb3154 `ret`, so the
+        // app-shell/do-init init body COMPLETES its terminal tail and the chain climbs to
+        // POST-do-init 0x1023eff4c -> governor 0x102e9fa84 -> govtail 0x102ea30dc (all
+        // region-hit in the same run), THEN app-start dies at the standing live-object map
+        // wall 0x1021dde34 (SH248g/h/249..256). So SH239's "never completes, FMOD-absorbed"
+        // is wrong at the latest HEAD with full seeds — do-init construction now advances.
+        // Pin the corrected contract so a drifted opcode fails loudly:
+        //   FMOD iterate ent     0x5fb30b4 = sub sp,#0x60        (0xd10183ff)
+        //   empty-check ldp      0x5fb30d8 = ldp x8,x9,[x0,#8]   (0xa940a408)
+        //   empty-return b.eq    0x5fb30e0 = b.eq 0x5fb3134      (0x540002a0)
+        //   early-return entry   0x5fb3134 = ldr x8,[x20] (canary-reload, 0xf9400288)
+        //   post-do-init entry   0x1023eff4c = sub sp,#0x180     (0xd10603ff)
+        //   governor entry       0x102e9fa84 = stp x29,x30,[sp,#-96]! (0xa9ba7bfd), lsl+and flags (0xd348fea8/0x12001ea9)
+        //   app-shell ctor entry 0x102207b50 = b 0x102207b54 (0x14000001)  [SH239 re-pin]
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            // FMOD iterate empty-return contract
+            assert_eq!(word(0x105_fb30b4), 0xd10183ff, "sh257 FMOD iterate entry sub sp,#0x60");
+            assert_eq!(word(0x105_fb30d8), 0xa940a408, "sh257 FMOD empty-check ldp x8,x9,[x0,#8]");
+            assert_eq!(word(0x105_fb30e0), 0x540002a0, "sh257 FMOD empty-return b.eq 0x5fb3134");
+            assert_eq!(word(0x105_fb3134), 0xf9400288, "sh257 FMOD early-return canary-reload ldr x8,[x20]");
+            // do-init completion chain (all reached in the SH257b full-seed run)
+            assert_eq!(word(0x102_3eff4c), 0xd10603ff, "sh257 post-do-init entry sub sp,#0x180");
+            assert_eq!(word(0x102_e9fa84), 0xa9ba7bfd, "sh257 governor entry stp x29,x30,[sp,#-96]!");
+            assert_eq!(word(0x102_e9fa88), 0xa9016ffc, "sh257 governor stp x28,x27,[sp,#16]");
+            assert_eq!(word(0x102_e9fac4), 0xd348fea8, "sh257 governor flags lsl x8,x21,#8");
+            assert_eq!(word(0x102_e9fac8), 0x12001ea9, "sh257 governor flags and w9,w21,#0xff");
+            assert_eq!(word(0x102_207b50), 0x14000001, "sh257 app-shell ctor tail branch (SH239 re-pin)");
+            assert_eq!(word(0x102_208ebc), 0x14f6a87e, "sh257 app-shell ctor tail `b 0x5fb30b4`");
+            // 4-alignment of the pinned entry points
+            for a in [0x105_fb30b4u64, 0x102_3eff4cu64, 0x102_e9fa84u64, 0x102_207b50u64] {
+                assert!(a & 3 == 0, "sh257 {a:#x} 4-aligned");
+            }
+        } else {
+            eprintln!("sh257 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh236_startluaappdm_receivecall_dispatch_softreturns_before_marshaler() {
         // SH236 (Route-B re-attack, single-agent): SH235 statically concluded the EC world
         // 0x102e24598's only headless front-door (StartLuaAppDM -> bl 0x1023f1210 @0x1023f075c) is
