@@ -585,3 +585,98 @@ fn fsmap_preadv_pwritev_sync_support_sqlite_durability_path() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// R1 content-path staging (Route-B recon V3, deleg_39d9b453): the engine's
+/// CoreScripts Lua loader reads the home/login UI source from the guest files
+/// dir `scripts/CoreScripts/` — the synthetic module that would let the engine
+/// SELF-CONSTRUCT real GuiObjects -> R+0x180/0x188 scene nodes (zero host
+/// layout). Prove the module lands as a real on-disk file at the exact guest
+/// path the loader opens and survives a fresh boot (the data plane an engine
+/// session relies on once do-init completes). Also asserts the loader's
+/// statx(291) existence probe (stx_size) discovers the staged module — the
+/// "does the CoreScripts UI source exist" check before open.
+#[test]
+fn r1_synthetic_corenodes_stages_persistent_module() {
+    let _g = lock_fsmap();
+    let root = std::env::temp_dir().join(format!(
+        "opensober-r1-corenodes-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    fsmap::set_root_for_tests(root.clone());
+
+    // The R1 module: ~20 lines of Luau that build a ScreenGui under CoreGui so
+    // the engine self-constructs GuiObjects. Its Source is what the loader
+    // consumes; the file name (AppShell.lua) is the inferred CoreScripts name.
+    const MODULE: &str = "/data/user/0/com.roblox.client/files/scripts/CoreScripts/AppShell.lua";
+    const SRC: &[u8] = b"local core = game:GetService('CoreGui')\n\
+local g = Instance.new('ScreenGui')\ng.Name = 'Home'\ng.Parent = core\n";
+
+    // -- boot #1: stage the module through the guest ABI (the loader's own open).
+    let path = cstr(MODULE);
+    let fd = svc(
+        [
+            libc::AT_FDCWD as u64,
+            path.as_ptr() as u64,
+            (libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC) as u64,
+            0o600,
+            0, 0,
+        ],
+        56,
+    );
+    assert!(fd >= 0, "openat O_CREAT for CoreScript module failed: {fd}");
+    let fd = fd as i32;
+    let buf = cstr(std::str::from_utf8(SRC).unwrap());
+    let n = svc([fd as u64, buf.as_ptr() as u64, SRC.len() as u64, 0, 0, 0], 64);
+    assert_eq!(n, SRC.len() as i64, "write of CoreScript module short/failed: {n}");
+    assert_eq!(svc([fd as u64, 0, 0, 0, 0, 0], 57), 0);
+
+    // The remap must land a REAL host file (the fsmap-backed content store).
+    let host_file = root.join("data/user/0/com.roblox.client/files/scripts/CoreScripts/AppShell.lua");
+    let on_disk = std::fs::read(&host_file)
+        .unwrap_or_else(|e| panic!("mapped CoreScript module {} missing: {e}", host_file.display()));
+    assert_eq!(on_disk, SRC, "host-disk CoreScript bytes != staged Source");
+
+    // -- boot #2: a FRESH state reopens the same guest path and sees the module
+    //    -> the loader finds its self-constructing UI source after a restart.
+    let path2 = cstr(MODULE);
+    let fd2 = svc(
+        [
+            libc::AT_FDCWD as u64,
+            path2.as_ptr() as u64,
+            libc::O_RDONLY as u64,
+            0,
+            0, 0,
+        ],
+        56,
+    );
+    assert!(fd2 >= 0, "reopen read of CoreScript module failed: {fd2}");
+    let fd2 = fd2 as i32;
+    let mut rd = [0u8; SRC.len()];
+    let r = svc([fd2 as u64, rd.as_mut_ptr() as u64, rd.len() as u64, 0, 0, 0], 63);
+    assert_eq!(r, SRC.len() as i64, "read of CoreScript module short/failed: {r}");
+    assert_eq!(&rd, SRC, "CoreScript module source did not survive restart");
+    assert_eq!(svc([fd2 as u64, 0, 0, 0, 0, 0], 57), 0);
+
+    // The loader's existence probe: statx(291) on the module path must SUCCEED
+    // (0) via the store with the real module size (stx_size @ offset 40) — the
+    // "does the CoreScripts UI source exist" check before it opens the module.
+    let stpath = cstr(MODULE);
+    let mut stx = [0u8; 256];
+    let sr = svc(
+        [
+            libc::AT_FDCWD as u64,
+            stpath.as_ptr() as u64,
+            0,
+            0x80000, // STATX_SIZE
+            stx.as_mut_ptr() as u64,
+            0,
+        ],
+        291,
+    );
+    assert_eq!(sr, 0, "statx on staged CoreScript module failed: {sr}");
+    let size = u64::from_le_bytes((&stx[40..48]).try_into().unwrap());
+    assert_eq!(size, SRC.len() as u64, "statx module size != staged Source");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
