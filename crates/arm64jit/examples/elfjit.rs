@@ -48,10 +48,8 @@ fn redrive_enabled() -> bool {
 }
 
 /// SH128: is a packed deque head cell ("low48 = node ptr, high16 = tag") coherent
-/// for the re-drive — i.e. its low-48 node pointer is in-guest and its high-16 tag
-/// is a non-zero, plausible 16-bit value? Pure predicate (no deref), used to pick a
-/// head cell for the re-driven drain 0x102856e40 whose entry tag-guard compares
-/// [deque+8] tag against the packed head's high-16.
+/// for re-drive — low-48 in-guest + non-zero plausible high-16 tag. Pure predicate,
+/// picks a head cell for the re-driven drain 0x102856e40.
 fn sh128_packed_has_coherent_node(packed: u64) -> bool {
     let node = packed & 0xffff_ffff_ffff;
     let tag = packed >> 48;
@@ -1265,7 +1263,7 @@ pub fn routeb_seed_game_global_vector() -> u64 {
             *(0x106dcaeB0u64 as *mut u64) = node; // second vector begin
         }
         eprintln!(
-            "[elfjit:routeB] SH99 seeded empty 0x10-stride global vector [0x106dcae08..0x18]=0x{node:x} + dispatch obj [0x106dcae20]=0x{obj:x}(+8 leaf) so the globalinit probe+deref validate without NULL or blr-into-0"
+            "[elfjit:routeB] SH99 seeded empty 0x10-stride vector [0x106dcae08]=0x{node:x} + dispatch obj [0x106dcae20]=0x{obj:x}"
         );
         node
     })
@@ -1291,7 +1289,7 @@ fn routeb_patch_gov_router() {
             if before == 0x5400_0243u32 {
                 *(ADDR as *mut u32) = want;
                 eprintln!(
-                    "[elfjit:routeB] SH159c patched governor version-gate 0x{ADDR:x} ({before:08x}) -> unconditional `b 0x2e9fb20` — governor always takes the ROUTER path (router flag -> MODERN -> bl 0x258c6e4), skipping the faulting InitWithParams appendix"
+                    "[elfjit:routeB] SH159c patched governor version-gate 0x{ADDR:x} ({before:08x}) -> unconditional b 0x2e9fb20 (router path)"
                 );
             } else if before == want {
                 eprintln!("[elfjit:routeB] SH159c governor version-gate 0x{ADDR:x} already patched");
@@ -1403,11 +1401,9 @@ fn routeb_patch_startapp_init3_gates() {
 /// `bl 24c3768` (device-display shared_ptr helper) which derefs [x0,#320] (fault=0x140;
 /// impl[+0x440] NULL structural live-launch). Return DISCARDED, so NOPing the 3-insn window
 /// (0xf9422260/0xaa1403e1/0x97d88e5b) is benign (mirrors SH160's init3-gate NOP).
-// SH176/177 (opt-in JIT_ROUTEB_COOKIE_READBACK, persistence detour; parked): the
-// browser-cookie getter returns WebLogin only; Route B (re-emit jar value via
-// #HttpOnly_ format 0x304d0e, ZERO WebLogin dep) needs both read-back-local gates NOPed:
-//   A) getter 0x1021ff72c tbnz w8,#0 (0x370000c8) -> nop
-//   B) route-B 0x105fee9c4 tbz w0,#0 (0x360011e0) -> nop (17-caller stub 1dc7428 untouched)
+// SH176/177 (opt-in JIT_ROUTEB_COOKIE_READBACK, persistence detour, parked): cookie getter
+// returns WebLogin only; route-B needs both read-back-local gates NOPed: A) getter 0x1021ff72c
+// tbnz w8,#0 -> nop; B) 0x105fee9c4 tbz w0,#0 -> nop (17-caller stub 1dc7428 untouched)
 fn routeb_patch_cookie_readback() {
     if std::env::var_os("JIT_ROUTEB_COOKIE_READBACK").is_none() {
         return;
@@ -1712,7 +1708,7 @@ fn routeb_seed_task_singletons() {
         *((rb + 0x18) as *mut u64) = src_b;
     }
     println!(
-        "[elfjit:routeB] seeded dispatch singletons .data 0x106829a48/0x106829a68 (size=0x28 alloc=8 src=template 0x{src_a:x}/0x{src_b:x}, vtable@0x{vtable_addr:x}=leaf 0x{leaf:x}) — 2b9dee0 lazy-create returns coherent objects, no null-vtable crash"
+        "[elfjit:routeB] seeded dispatch singletons 0x106829a48/0x106829a68 (vtable@0x{vtable_addr:x}=leaf 0x{leaf:x}) — 2b9dee0 lazy-create returns coherent objects, no null-vtable crash"
     );
     ROUTEB_SINGLETON_SEEDED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
@@ -5984,6 +5980,41 @@ enum KickerMode {
     Pulse,
 }
 
+/// Xvfb PIDs **this process spawned** (not pre-existing servers we merely
+/// connected to), so an `atexit` hook can reap them. Without this each
+/// render/window-wiring run leaked one Xvfb (~61MB RSS) forever.
+static SPAWNED_XVFB: std::sync::Mutex<Vec<std::process::Child>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Install a process-exit reaper for Xvfb children we spawned (once).
+/// Only our own children are killed; other processes' displays stay intact.
+fn install_xvfb_reaper() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        extern "C" fn reap() {
+            // std's process::exit drops statics; grab them for a manual kill+wait.
+            let pids: Vec<i32> = {
+                let mut g = SPAWNED_XVFB.lock().unwrap_or_else(|p| p.into_inner());
+                g.drain(..)
+                    .map(|mut c| {
+                        let _ = c.kill();
+                        c.id() as i32
+                    })
+                    .collect()
+            };
+            for pid in pids {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                    let mut st: libc::c_int = 0;
+                    libc::waitpid(pid, &mut st, 0);
+                }
+            }
+        }
+        unsafe { libc::atexit(reap) };
+    });
+}
+
 /// Bring up an Xvfb X server + a 1280x720 window and register its XID as the
 /// guest's ANativeWindow handle (GRAPHICS_RECOMMENDATION §5.3). Runs
 /// SYNCHRONOUSLY so the real window is wired before StartApp reaches the
@@ -5998,6 +6029,8 @@ fn wire_real_window() -> u64 {
     // ANativeWindow (so the render surface could never be real on the boot
     // window). Rewritten to be connect-first: try the display as-is, and only
     // if that fails unlink the stale socket and spawn our own Xvfb on it.
+    // SH303 (resource-leak fix): on exit, reap any Xvfb this run spawned.
+    install_xvfb_reaper();
     let pid = std::process::id();
     for attempt in 0..24usize {
         let display_num = 220 + (((pid as usize) + attempt * 7) % 250);
@@ -6032,6 +6065,9 @@ fn wire_real_window() -> u64 {
             for _ in 0..20 {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 if let Ok((conn, win)) = x11::open_window_sized(Some(&display), 1280, 720) {
+                    // SH303: this spawned Xvfb is now ours — register it so the
+                    // process-exit reaper kills it (it would otherwise leak).
+                    SPAWNED_XVFB.lock().unwrap_or_else(|p| p.into_inner()).push(c);
                     Box::leak(Box::new(conn));
                     unsafe {
                         std::env::set_var("DISPLAY", &display);
@@ -6881,7 +6917,7 @@ fn main() {
                         && (*guest == 0x1023efe2c || *guest == 0x10258b144)
                     {
                         eprintln!(
-                            "[elfjit:v2boot] SH269 --v2boot-skip-appstart: skipping app-start self-driver rung {name} @ {guest:#x} (would terminate at LSM/app-start live-object wall) -> letting the loop reach post-ladder session-ctor rungs"
+                            "[elfjit:v2boot] SH269 --v2boot-skip-appstart: skipping app-start rung {name} @ {guest:#x} (live-object-wall) -> let loop reach post-ladder session-ctor rungs"
                         );
                         continue;
                     }
@@ -6959,7 +6995,7 @@ fn main() {
                                     // also keep the GlobalInit dispatch vtable pin so app-shell/global
                                     // init ctor remains reachable via the other path.
                                     *(0x10635cd10u64 as *mut u64) = 0x102207b50;
-                                    eprintln!("[elfjit:v2boot] SH239 GENUINE DM-root: [0x106a68818]+0x20 = manufactured genuine-vptr DM {dm:#x} (vt 0x1067162e8, vt[+0x30]=0x1057d6ef4 real app-shell ctor); holder [0x106a68818]=0x{holder:x}");
+                                    eprintln!("[elfjit:v2boot] SH239 GENUINE DM-root: [0x106a68818]+0x20 = manufactured DM {dm:#x} (vt 0x1067162e8, vt[+0x30]=0x1057d6ef4); holder [0x106a68818]=0x{holder:x}");
                                 } else {
                                 // 0x10-byte object: only [0x00]=vtable is live (the
                                 // ctor 0x102207b50 never derefs `this`).
@@ -7108,7 +7144,7 @@ fn main() {
                                         }
                                     }
                                 }
-                                eprintln!("[elfjit:v2boot] SH156 seeded DM-root [0x106a68818]=0x{dmobj:x} (object[0]=dispatch vtable 0x10635cce0, vtable[+0x30]=0x102207b50 real global-init ctor) -> do-init match brs into REAL construction");
+                                eprintln!("[elfjit:v2boot] SH156 seeded DM-root [0x106a68818]=0x{dmobj:x} (obj[0]=vtable 0x10635cce0, vt[+0x30]=0x102207b50 ctor) -> do-init match brs into REAL construction");
                                 eprintln!("[elfjit:v2boot] SH157 seeded governor router flag [0x106a70880]=1 -> AppBridgeV2 governor takes MODERN path to nativeAppBridgeStartAppWithParams (0x258c6e4)");
                                 unsafe {
                                     eprintln!(
@@ -7152,18 +7188,18 @@ fn main() {
                         // flags byte [0x7285fb0]. Reading both post-rung tells whether
                         // the ctor chain ENGAGED (guard self-set 0->1) without JIT_TRACE.
                         // Guarded so an unmapped page can never crash the probe.
-                        let ctor_guard = if guest_page_mapped(0x106a64d70u64) {
+                        let _ctor_guard = if guest_page_mapped(0x106a64d70u64) {
                             Some(unsafe { *(0x106a64d70u64 as *const u8) })
                         } else {
                             None
                         };
-                        let ctor_flags = if guest_page_mapped(0x1067285fb0u64) {
+                        let _ctor_flags = if guest_page_mapped(0x1067285fb0u64) {
                             Some(unsafe { *(0x1067285fb0u64 as *const u8) })
                         } else {
                             None
                         };
                         eprintln!(
-                            "[elfjit:v2boot] SH155 post-StartLuaAppDM: once-guard[0x6a68410]={og_now:#x} DM-root[0x106a68818]=0x{dm_now:x} liveDM-image={ok} once-slot[0x106a68408]=0x{once_slot:x} once-live={once_ok} ctor-guard[0x6a64d70]={ctor_guard:?} ctor-flags[0x7285fb0]={ctor_flags:?}"
+                            "[elfjit:v2boot] SH155 post-StartLuaAppDM: once-guard[0x6a68410]={og_now:#x} DM-root[0x106a68818]=0x{dm_now:x} liveDM={ok} once-slot[0x106a68408]=0x{once_slot:x}"
                         );
                         // SH158: probe the AppBridgeV2 governor dispatch. do-init 0x1023eff4c builds the
                         // singleton via GetOrCreate 0x2367270 then `blr [obj->vt+0x18]` @0x23effbc
@@ -7178,7 +7214,6 @@ fn main() {
                         };
                         let abv_slot = unsafe { *(0x106a705e8u64 as *const u64) };
                         let vt18 = unsafe { *(0x1063a3428u64 as *const u64) };
-                        let vt00 = unsafe { *(0x1063a3410u64 as *const u64) };
                         let vt18_is_gov = vt18 == 0x102e9fa84;
                         // SH159 (recon deleg_0eff24ca, union-init gate): the
                         // AppBridgeV2 union-init 0x2366694's first sub-constructor
@@ -7202,7 +7237,7 @@ fn main() {
                             "[elfjit:v2boot] SH159 union-init guard probe: G[0x106a63da0]=0x{guard_g:x} W[0x106a63d70]=0x{guard_w:x} (recon: G should be 0x499fe5 string, W 0x2617d4)"
                         );
                         eprintln!(
-                            "[elfjit:v2boot] SH158 AppBridgeV2 dispatch probe: once-guard[0x106a70618]={abv_guard:?} singleton[0x106a705e8]=0x{abv_slot:x} vt[0x1063a3410]=0x{vt00:x} vt[+0x18]@0x1063a3428=0x{vt18:x} gov_expected=0x102e9fa84 vt18_is_gov={vt18_is_gov}"
+                            "[elfjit:v2boot] SH158 AppBridgeV2 probe: once-guard[0x106a70618]={abv_guard:?} singleton[0x106a705e8]=0x{abv_slot:x} vt18@0x1063a3428=0x{vt18:x} gov_expected=0x102e9fa84 vt18_is_gov={vt18_is_gov}"
                         );
                     }
                     if *guest == 0x102206404 || *guest == 0x1023efe2c {
@@ -7309,7 +7344,7 @@ fn main() {
                                 let cur = unsafe { std::ptr::read_unaligned(GOVFLAG as *const u8) };
                                 if cur & 1 == 0 {
                                     unsafe { std::ptr::write_unaligned(GOVFLAG as *mut u8, cur | 1) };
-                                    eprintln!("[elfjit:v2boot] SH269 seeded governor-predicate flag [0x{GOVFLAG:x}] bit0=1 before SendAppEventOnAppReady (routes the live governor object to the preload-overrides helper, not the NULL app-DM controller @ governor 0x102ea0b9c)");
+                                    eprintln!("[elfjit:v2boot] SH269 seeded governor-predicate flag [0x{GOVFLAG:x}] bit0=1 before SendAppEventOnAppReady (routes live governor obj, not NULL app-DM controller @ 0x102ea0b9c)");
                                 }
                             } else {
                                 eprintln!("[elfjit:v2boot] SH269 WARN: could not make governor flag [0x{GOVFLAG:x}] writable");
@@ -7507,7 +7542,7 @@ fn main() {
                     // [config+56] buffer). Opt-in --v2boot-session-engine9.
                     if std::env::args().any(|a| a == "--v2boot-session-engine9") {
                         unsafe { *( (mgr3 + 16u64) as *mut u32) = 9u32; }
-                        eprintln!("[elfjit:v2boot] SH284 driving initEngine_ state=9 body DIRECT @ guest 0x102bd2668 (app-name 'Home' + [this+0x40] config pre-seeded; state->10 then config-dispatch w2=1 -> reentry 275a0c4, gated by JIT_ROUTEB_ENG5_QMUTEX_FREE/0x106863aa0 steal)");
+                        eprintln!("[elfjit:v2boot] SH284 driving initEngine_ state=9 body DIRECT @ 0x102bd2668 (app-name 'Home' + config pre-seeded; state->10, gated by JIT_ROUTEB_ENG5_QMUTEX_FREE/0x106863aa0 steal)");
                         let mut e9 = arm64jit::jit::CpuState::new();
                         e9.tpidr = tpidr;
                         e9.x[31] = boot_sp;
@@ -7607,7 +7642,7 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                     let vt0 = unsafe { *(obj as *const u64) };
                     let vt48 = unsafe { *(vt0.wrapping_add(48) as *const u64) };
                     eprintln!(
-                        "[elfjit:v2boot] SH292 driving item-proc per-item dispatch: item[+32]=benign obj {:x} [vt={:x} vt[+48]={:x}] -> vt[+48] blr EXECUTES (identity leaf); item[+48]=0 -> 0x22193a0 skipped (SH273 wall); once-guard latched skips once-body",
+                        "[elfjit:v2boot] SH292 item-proc per-item dispatch: item[+32]=benign obj {:x} [vt={:x} vt[+48]={:x}] -> vt[+48] blr EXECUTES; item[+48]=0 -> 0x22193a0 skipped",
                         obj,
                         vt0,
                         vt48
@@ -7648,7 +7683,7 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                         eprintln!("[elfjit:v2boot] SH295 seeded []0x1068262e8]={leaf:#x} benign leaf (SH294 cell)");
                     }
                     eprintln!(
-                        "[elfjit:v2boot] SH295 driving item-proc [item+48] edge: item[+48]={item48:#x} (benign cont obj) -> 0x22193a0 -> dispatcher w2==0 -> 0x28511c4 live-object wall (expected); once-guard latched skips once-body"
+                        "[elfjit:v2boot] SH295 item-proc [item+48] edge: item[+48]={item48:#x} (benign cont obj) -> 0x22193a0 -> dispatcher w2==0 -> live-object wall"
                     );
                     let mut ipr4 = arm64jit::jit::CpuState::new();
                     ipr4.tpidr = tpidr;
@@ -8039,7 +8074,7 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                         // SH196b: current-DM holder — if the do-init world-build
                         // itself constructed a real DM, the genuine owner would update our
                         // SH156 seed (never observed ~30 angles; holder is session-built).
-                        let holder = rd8(0x106391908);
+                        let _holder = rd8(0x106391908);
                         // SH197: the do-init -> app-shell ctor -> governor continuation
                         // may populate the class-name RESOLVER map 0x106dca0e70 (SH194
                         // found EMPTY standalone). Probe header + REGISTER 0x106dca0f60 +
@@ -8056,12 +8091,12 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                         let src_end = rd8(0x106dca0e98);
                         let reg_begin = rd8(0x106dca0f60);
                         let reg_end = rd8(0x106dca0f68);
-                        let resolve_live = resolve_begin != 0 && resolve_end != 0 && resolve_begin != u64::MAX;
+                        let _resolve_live = resolve_begin != 0 && resolve_end != 0 && resolve_begin != u64::MAX;
                         eprintln!(
-                            "[elfjit:dmcells] map-resolver[0x106dca0e70]={{0x{resolve_begin:x},0x{resolve_end:x},n=0x{resolve_count:x} live={resolve_live}}} src[0x106dca0e90]={{0x{src_begin:x},0x{src_end:x}}} register[0x106dca0f60]={{0x{reg_begin:x},0x{reg_end:x}}}"
+                            "[elfjit:dmcells] map-resolver[0x106dca0e70]={{0x{resolve_begin:x},0x{resolve_end:x},n=0x{resolve_count:x}}} src[0x106dca0e90]={{0x{src_begin:x},0x{src_end:x}}} register[0x106dca0f60]={{0x{reg_begin:x},0x{reg_end:x}}}"
                         );
                         eprintln!(
-                            "[elfjit:dmcells] SH196 do-init: once-guard[0x106a68410]={once_guard:#x} once-slot[0x106a68408]=0x{once_slot:x} DM-root[0x106a68818]=0x{dm_root:x} flags-latch[0x106a683e8]=0x{flags_latch:x} app-data-model[0x106dca000+0xe88]=0x{appdm:x} holder[0x106391908]=0x{holder:x}"
+                            "[elfjit:dmcells] SH196 do-init: once-guard[0x106a68410]={once_guard:#x} once-slot[0x106a68408]=0x{once_slot:x} DM-root[0x106a68818]=0x{dm_root:x} flags-latch[0x106a683e8]=0x{flags_latch:x} appdm[0x106dca000+0xe88]=0x{appdm:x}"
                         );
                     }
                     let snaps = arm64jit::jit::snapshot_threads();
@@ -15924,7 +15959,7 @@ mod sh115_tests {
             eprintln!("sh237 select slots: +0x20 addend={:#x} -> loaded guest {:#x} (__clone stub 0x1db2cf0); +0x28 addend={:#x} -> loaded guest {:#x} (invoke 0x21e96f8) — std::function lambda-world pair (SH231 EC-world machinery), loader-synthesized RELATIVE, NOT session-written",
                 addend_of(0x635dd88), loaded_val(0x635dd88),
                 addend_of(0x635dd90), loaded_val(0x635dd90));
-            eprintln!("sh237 StartLuaAppDM receiveCall dispatch-select union table [0x10635dd68+0x20/+0x28] is LOADER-SYNTHESIZED .data.rel.ro (slots = __clone 0x1db2cf0 / invoke 0x21e96f8 = SH231 EC-world machinery, NOT session-gated); corrects SH235/236 'fabricatable-live-graph' framing for THIS select — route to marshaler 0x1023f075c is gated downstream (helper 0x1023f00f8 completes a real V2Init struct-copy + FMOD tail) on libroblox.so");
+            eprintln!("sh237 StartLuaAppDM receiveCall dispatch-select [0x10635dd68+0x20/+0x28] = LOADER-SYNTHESIZED .data.rel.ro (__clone 0x1db2cf0/invoke 0x21e96f8), not session-gated; route to marshaler 0x1023f075c gated downstream (0x1023f00f8 V2Init copy + FMOD tail)");
         } else {
             eprintln!("sh237 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -15974,7 +16009,7 @@ mod sh115_tests {
                 assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh239 {name} {guest:#x} in window");
                 assert!(guest & 3 == 0, "sh239 {name} {guest:#x} 4-aligned");
             }
-            eprintln!("sh239 qualified Route-B do-init facts: once-lambda completion store 0x102206d74 writes the __call_once result (live = intern 0x400000b, NOT an in-image DM) into once-slot [0x106a68408]; the app-shell ctor 0x102207b50 body runs DEEP (measured 61+ blocks to 0x102208eac, terminal tail FMOD 0x5fb30b4) with the SH156 DM-root seed; no make_shared<DataModel> ever runs — Route-B live-DM structural gate UNCHANGED");
+            eprintln!("sh239 qualified do-init facts: once-lambda store 0x102206d74 writes intern 0x400000b (not in-image DM) to [0x106a68408]; app-shell ctor 0x102207b50 runs deep (61+ blocks, tail FMOD 0x5fb30b4); no make_shared<DataModel> — Route-B live-DM gate UNCHANGED");
         } else {
             eprintln!("sh239 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -16033,7 +16068,7 @@ mod sh115_tests {
                 assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh240 {name} {guest:#x} in window");
                 assert!(guest & 3 == 0, "sh240 {name} {guest:#x} 4-aligned");
             }
-            eprintln!("sh240 DMCONT dispatch chain pinned fresh-at-HEAD (fnB 0x102bd1b98 -> bl dispatcher 0x2bd8ce8 -> getter + leaf blrs -> sub_2bd8dac/vt+0x1f0 -> continueAfterFlagsLoaded_ 0x102bd1d68); MEASURED 3/3 EXIT 124: dispatcher enters at block-entry 0x102bd8ce8 but the guest NEVER resumes past its first call-boundary (interior + sub + continueAfterFlagsLoaded_ all 0 hits) — DMCONT manufactured-manager continuation stays LATENT (SH228 negative re-confirmed; live engine-init session = standing structural gate)");
+            eprintln!("sh240 DMCONT chain pinned fresh-at-HEAD (fnB 0x102bd1b98 -> dispatcher 0x2bd8ce8 -> getter+leaf blrs -> sub_2bd8dac/vt+0x1f0 -> continueAfterFlagsLoaded_ 0x102bd1d68); 3/3 EXIT 124: dispatcher enters at 0x102bd8ce8 but guest never resumes past first call-boundary (interior+sub+continueAfterFlagsLoaded_ 0 hits) — DMCONT continuation LATENT (SH228 negative re-confirmed)");
         } else {
             eprintln!("sh240 real-image guard: no real libroblox.so, skipping anchors");
         }
