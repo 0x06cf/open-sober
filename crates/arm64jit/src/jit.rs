@@ -652,6 +652,63 @@ fn routeb_worldbuild_gate_seed(_state: *mut CpuState, pc: u64) {
     );
 }
 
+/// Leaked benign object whose vt[+136] (byte offset 0x88, slot 17) is a host leaf, sized >=0x140
+/// so the app-start continuation's `ldr x8,[x8,#136]` read is in-bounds. Used by
+/// routeb_appstart_408_guard. All 0x180 slot words = the identity leaf.
+fn routeb_appstart_408_benign_obj() -> u64 {
+    use std::sync::OnceLock;
+    static OBJ: OnceLock<u64> = OnceLock::new();
+    *OBJ.get_or_init(|| {
+        extern "C" fn leaf(a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64) -> u64 {
+            a0
+        }
+        let leaf = register_host_call_auto(leaf);
+        let vt: &'static mut [u8] = Box::leak(vec![0u8; 0x180usize].into_boxed_slice());
+        for slot in 0..(0x180 / 8) {
+            unsafe { *(vt.as_mut_ptr().wrapping_add(slot * 8) as *mut u64) = leaf; }
+        }
+        let o = Box::leak(vec![0u8; 0x90usize].into_boxed_slice()).as_mut_ptr() as u64;
+        unsafe { *(o as *mut u64) = vt.as_ptr() as u64; } // [OBJ+0] = benign vt
+        eprintln!("[routeb-appstart408] benign vt[+136]-leaf object 0x{o:x} (vt={:#x} leaf={leaf:#x})", vt.as_ptr() as u64);
+        o
+    })
+}
+
+/// SH330 (opt-in JIT_ROUTEB_APPSART_408SEED): the app-start continuation's standing gate is
+/// AppStarted+0x408 == 0 — the live member read by `ldr x0,[x19,#1032]` @0x25f504c (both arms of the
+/// SH329 governor-flag fork converge on it), then `ldr x8,[x0]; ldr x8,[x8,#136]; blr x8` @0x25f5050/58/5c.
+/// SH329 closed only the fork (no flag value swaps which null arm); a seed on the MEMBER was never
+/// tested, and unlike the SH324 x8-out-param dead-end this dispatch is a plain vt[+136] blr — so a
+/// fabricated object whose vt[+136] is a benign host leaf passes 0x25f5050 and reveals the NEXT gate
+/// downstream (`ldr x8,[x21]` @0x25f5060). The faulting base x19 is a RUNTIME heap AppStarted (only
+/// known in-process), so this seeds [x19+0x408] at block-entry into the gate window. FORWARD-PROBE
+/// only: reveals what the real session ctor must build at +0x408 (or what runs next), NOT a live DM.
+/// Default-inert (env-gated); idempotent (only writes when 0/sub-image).
+fn routeb_appstart_408_guard(state: *mut CpuState, pc: u64) {
+    if std::env::var_os("JIT_ROUTEB_APPSART_408SEED").is_none() {
+        return;
+    }
+    if pc < 0x1025f501c || pc > 0x1025f5060 {
+        return;
+    }
+    let s = unsafe { &*state };
+    let implb = s.x[19];
+    if implb == 0 {
+        return;
+    }
+    let slot = implb + 0x408;
+    let cur = unsafe { std::ptr::read_unaligned(slot as *const u64) };
+    let sub_image = cur < 0x100000000 && cur != 0;
+    if cur != 0 && !sub_image {
+        return; // already a live pointer — leave it (real session).
+    }
+    let obj = routeb_appstart_408_benign_obj();
+    unsafe { std::ptr::write_unaligned(slot as *mut u64, obj) };
+    eprintln!(
+        "[routeb-appstart408] SH330 seeded [x19+0x408] ({slot:#x}) = {obj:#x} (vt[+136]=leaf) at pc={pc:#x} -> app-start continuation should pass 0x25f5050; next gate downstream (was {cur:#x})"
+    );
+}
+
 /// SH161 (recon deleg_c94a8b2f): broad tail-entry probe — log every block entry whose
 /// pc falls in the governor-tail region so we can pin exactly which block contains the
 /// NULL-deref dispatch. Debug-only, gated on JIT_ROUTEB_SETFIX + JIT_ROUTEB_TAILTRACE.
@@ -6186,6 +6243,7 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
             routeb_startluaapp_invoke_guard(state, pc); // SH238: cross StartLuaAppDM receiveCall select to the EC invoke slot (JIT_ROUTEB_SLADM_INVOKE)
             routeb_tail_trace(state, pc);
         }
+        routeb_appstart_408_guard(state, pc); // SH330: seed [AppStarted+0x408] (runtime heap x19) benign vt[+136] leaf at the 0x25f5050 gate (JIT_ROUTEB_APPSART_408SEED, standalone)
         routeb_cookie_jar_guard(state, pc); // SH175: seed cookie-jar container + gates at worker 0x102203148 (JIT_ROUTEB_COOKIE)
         // SH248d (opt-in JIT_ROUTEB_APPSART_JAR_SEED): seed [0x106ed7a20] cookie-jar string
         // at the nativeAppBridgeAppStart string-assign site 0x1021f4830 (was NULL -> crash).

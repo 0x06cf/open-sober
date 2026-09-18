@@ -14995,11 +14995,10 @@ mod sh115_tests {
 
     #[test]
     fn sh320_donepath_dispatcher_main_branch_binder_dispatch_pinned() {
-        // SH320 (candidate (b), SESSION-CTOR): do-init DONE-path dispatcher 0x2206db8 forks
-        // at b.ne @0x2206df0 on main-id [0x106863a68] == pthread_self: TAKEN -> box-build (SH319);
-        // NOT -> MAIN binder-dispatch 0x206df4 `ldr x0,[x19,#32]` -> vt+0x30 -> br x1 @0x206e24
-        // (DM-ctor entry). Crossing it (seed main-id=this thread, elfjit --v2boot-bus-mainid) is the
-        // next SESSION-CTOR lever. Pins the MAIN words.
+        // SH320 (candidate (b), SESSION-CTOR): do-init DONE-path dispatcher 0x2206db8 forks at b.ne
+        // @0x2206df0 on main-id [0x106863a68]==pthread_self: TAKEN -> box-build (SH319); NOT ->
+        // MAIN binder-dispatch 0x206df4 `ldr x0,[x19,#32]` -> vt+0x30 -> br x1 @0x206e24 (DM-ctor
+        // entry). Crossing it is the next SESSION-CTOR lever. Pins the MAIN words.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15028,8 +15027,7 @@ mod sh115_tests {
         // SH321 (guard-gated, A/B 0 vs 2): JIT_ROUTEB_DONEPATH_MAIN=1 makes the do-init MAIN
         // binder-dispatch (0x206df4->vt+0x30->br x1) climb into real engine settings-init
         // (caller 0x2270024->0x2270050 bl 0x21f3748) then fault at the SH273 lifecycle wall
-        // (fn 0x21f3748=0xd10243ff; ldrb [x8,#80]@0x21f3770=0x50 on [x22]=0). Refines SH320's
-        // 'vt+0x30->DM-ctor': it reaches ENGINE-SETTINGS-INIT, not a DM ctor.
+        // (fn 0x21f3748=0xd10243ff; ldrb [x8,#80]@0x21f3770=0x50 on [x22]=0).
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15053,10 +15051,10 @@ mod sh115_tests {
 
     #[test]
     fn sh322_lifecycle_wall_earlyret_canary_pinned() {
-        // SH322 (SESSION-CTOR, crossing the SH273 lifecycle wall on the SH320/321 MAIN path):
-        // fn 0x21f3748 reads ldr x8,[x1] + ldrb [x8,#80] (fault 0x50, sh321), then tbnz w8,#1
-        // @0x21f3774 -> 0x21f3870 = epilogue canary-check+ret (benign no-op). SH322 seeds caller
-        // pair [x1]=obj with byte[+80].bit1=1 so the tbnz is taken (no registry-build).
+        // SH322 (SESSION-CTOR, SH273 lifecycle wall on SH320/321 MAIN path): fn 0x21f3748 reads
+        // ldr x8,[x1] + ldrb [x8,#80] (fault 0x50), then tbnz w8,#1 @0x21f3774 -> 0x21f3870 =
+        // epilogue canary-check+ret (benign). SH322 seeds caller pair [x1]=obj byte[+80].bit1=1 so
+        // the tbnz is taken (no registry-build).
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15076,10 +15074,8 @@ mod sh115_tests {
 
     #[test]
     fn sh323_settings_sso_fencepost_pinned() {
-        // SH323 (SH322 NEXT fencepost): after the SH273 wall clears, fn 0x21f5078
-        // (whitespace-check) reads global std::string [0x106ed7a18] (`adrp x8,6ed7000;
-        // ldr x8,[x8,#2584]` = [0x106ed7a18]) then ldrb [x8] fault=0x0 when NULL. Cell sits
-        // 8B below the SH248d cookie-jar global [0x106ed7a20]. Seed empty SSO string.
+        // SH323 (SH322 NEXT): fn 0x21f5078 reads global std::string [0x106ed7a18] then ldrb
+        // fault=0x0 when NULL. 8B below cookie-jar [0x106ed7a20]. Seed empty SSO string.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15099,12 +15095,11 @@ mod sh115_tests {
 
     #[test]
     fn sh324_startluaappdm_this40_sessionctor_drive_point() {
-        // SH324 (STATUS candidate #1): terminal 0x102256510 (3/3 runs) = real StartLuaAppDM continuation
-        // fn 0x23f00f8 (=+0x2cc, beyond SH156's range). Fn 0x2256510 = this->vt[+32]() with
-        // this=[container+40]=NULL (container = x1 of fn 0x23f00f8; both call sites read it). It
-        // consumes the x8 indirect-result out-param post-dispatch + does LocalStorage init — a
-        // fabricated-obj seed can't satisfy it (AArch64 leaf gets x0-x7 only) => REAL session ctor
-        // is the only cross (SEP-17). Proof-of-dead-end HERE.
+        // SH324 (STATUS #1): terminal 0x102256510 (3/3) = real StartLuaAppDM continuation
+        // fn 0x23f00f8 (+0x2cc, beyond SH156's range). Fn 0x2256510 = this->vt[+32]() with
+        // this=[container+40]=NULL (container = x1 of fn 0x23f00f8). It consumes the x8 indirect-result
+        // out-param + LocalStorage init — a fabricated seed can't satisfy it (leaf gets x0-x7 only) =>
+        // REAL session ctor is the only cross (SEP-17). Proof-of-dead-end HERE.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15133,11 +15128,9 @@ mod sh115_tests {
 
     #[test]
     fn sh325_hoist_init3_gate_clears_sh324_terminal() {
-        // SH325: SH160's init3-gate NOP was gated behind the StartLuaAppDM rung, which
-        // --v2boot-skip-appstart SKIPS and the main StartApp fault reaches first -> SH160 NEVER fired
-        // on the fault path, so the SH324 terminal (0x102256510) persisted 3/3. Hoisted the call into
-        // upfront --v2boot setup (gated DM_SEED/DMFORCE, self-guarding+idempotent). Result: SH160 fires,
-        // terminal 0x102256510 -> 0x1025f5300 (new V2StartAppWithParams field-copy gate) 3/3.
+        // SH325: SH160's init3-gate NOP was gated behind the StartLuaAppDM rung, which the main
+        // StartApp fault reaches first -> SH160 NEVER fired, SH324 terminal persisted 3/3. Hoisted it
+        // into upfront --v2boot setup (DM_SEED/DMFORCE-gated). Result: 0x102256510 -> 0x1025f5300 3/3.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15200,8 +15193,7 @@ mod sh115_tests {
             assert_eq!(word(0x1025f_533c), 0xb941_4288, "sh328 ldr w8,[x20,#320]");
             assert_eq!(word(0x1025f_5460), 0xf940_0268, "sh328 [x19]vt+16 dispatch ldr x8,[x19]");
             assert_eq!(word(0x1025f_55b0), 0xa9bb_7bfd, "sh328 fn 0x25f55b0 stp prologue");
-            // The adrp target = reserved RW tail page (guest 0x107334000), offset from pc alignd page.
-            // Verify the guest RW tail page is the loader's reservation (SH156 maps it).
+            // adrp target = the loader's reserved RW tail page (SH156 maps 0x107334000).
             eprintln!("sh328 params-x20 patch site pinned (mov x20,x0 @0x25f52d8 -> adrp 0x107334000).");
         } else {
             eprintln!("sh328 real-image guard: no real libroblox.so, skipping anchors");
@@ -15210,13 +15202,10 @@ mod sh115_tests {
 
     #[test]
     fn sh329_appstart_afterfork_two_arm_closure_pinned() {
-        // SH329 (A/B measured, real so): the SH328 continuation has a TWO-ARM fork at
-        // 0x25f503c `cbz w8,0x25f504c` on governor-flag byte [0x6a64da0] (x9=adrp 0x6a64000,#3488).
-        // Arm-1 (flag CLEAR, SH328 default): `ldr x0,[x19,#1032]` = [AppStarted+0x408] -> x0=0.
-        // Arm-2 (flag SET, --v2boot-session + JIT_ROUTEB_APPSART_GOVFLAG): `bl 0x2ea3a84`
-        // nativePreloadFlagOverrides(x19) -> ALSO returns x0=0. BOTH converge on `ldr x8,[x0]`
-        // @0x25f5050 (guestpc fault 0x1025f501c, fault=0x0). So the AppStarted live-member gate
-        // is fork-independent: no governor-flag byte value yields a non-null object. SESSION-CTOR.
+        // SH329 (A/B, real so): SH328 continuation has a TWO-ARM fork at 0x25f503c on [0x6a64da0].
+        // Arm-1 (flag CLEAR): `ldr x0,[x19,#1032]`=[AppStarted+0x408]->x0=0. Arm-2 (flag SET):
+        // `bl 0x2ea3a84` nativePreloadFlagOverrides also returns x0=0. Both converge on `ldr x8,[x0]`
+        // @0x25f5050 fault: fork-independent. (SH330 now crosses it — see sh330 test.)
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15237,12 +15226,34 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh330_appstart_408_vt136_dispatch_crossable() {
+        // SH330: the AppStarted+0x408 member the SH329 fork converges on dispatches via a PLAIN
+        // `ldr x8,[x0]; ldr x8,[x8,#136]; blr x8` (@0x25f5050/58/5c) — NOT the x8-out-param ABI SH324
+        // proved un-crossable. A fabricated vt[+136]-leaf object deterministically passes 0x25f5050
+        // (MEASURED 3/3). Pin dispatch + epilogue so the premise stays locked.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            assert_eq!(word(0x1025f_504c), 0xf942_0660, "sh330 arm-1 ldr x0,[x19,#1032]");
+            assert_eq!(word(0x1025f_5050), 0xf940_0008, "sh330 ldr x8,[x0]");
+            assert_eq!(word(0x1025f_5058), 0xf940_4508, "sh330 ldr x8,[x8,#136]");
+            assert_eq!(word(0x1025f_505c), 0xd63f_0100, "sh330 blr x8 (plain dispatch, NOT x8-out-param)");
+            assert_eq!(word(0x1025f_5080), 0xd65f_03c0, "sh330 ret after dispatch epilogue");
+            eprintln!("sh330 AppStarted+0x408 vt[+136] dispatch pinned crossable.");
+        } else {
+            eprintln!("sh330 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh314_appstart_map_header_is_liveobj_not_fixed_cell() {
         // SH314 (do-not-re-tread closure): app-start map wall 0x1021dde34 (`ldr x23,[x21,#8]`,
         // x21 container=0x100548ca9) is fed by the ADDRESS OF A RODATA STRING (file 0x548ca9
-        // ="Id\0assetTypeId\0avatar_load_start\0...") - a map slot type-punned with a string ptr.
-        // 5 STATIC walkers (of 0x21ddbc8) build STACK containers (x0=sp+0xc48,x1=sp+0xa70,w2=1)
-        // from table 0x66e7000 -> benign, not the crash (x22=0x11!=1). No seed crosses it; real ctor.
+        // ="Id\0assetTypeId\0...") - a map slot type-punned with a string ptr. No seed crosses it.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15266,9 +15277,8 @@ mod sh115_tests {
     #[test]
     fn sh315_sessionctor_registry_populates_headlessly() {
         // SH315 (5/5, real so, skip-appstart + session-bus): registry count [0x106fe2f08]=12 after
-        // MessageBus.subscribe drives app-start's session registration - FIRST headless non-zero.
-        // Array [0x106fe6180] (0x60 stride) holds DM-task services but NOT the ctor's 'App' pair,
-        // so the fast-path misses and DM-root stays 0. SESSION-CTOR advance, not a DM.
+        // MessageBus.subscribe -> FIRST headless non-zero. Array [0x106fe6180] (0x60 stride) holds
+        // DM-task services but NOT the 'App' pair, so fast-path misses, DM-root stays 0.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15291,12 +15301,10 @@ mod sh115_tests {
 
     #[test]
     fn sh316_doinit_once_latches_and_ctorstores_execute_service_handle() {
-        // SH316 (measured, plain session-bus): do-init once-guard [0x106a68410] SELF-LATCHES (0x1) -
-        // __call_once COMPLETES on the populated registry (SH315's "never self-latches" held only for
-        // the guard-cleared re-drive). Ctor fast-path returns "Execute" handle 0x400000b into
-        // once-slot [0x106a68408] (str x0,[x23,#1032] @0x2206d74) - real non-NULL do-init result -
-        // while DM-root [0x106a68818] (+0x410, no writer per SH155) stays 0. Done-path 0x2206c8c
-        // `ldr x1,[x8,#1032]` reads once-slot, not DM-root.
+        // SH316 (measured, plain session-bus): do-init once-guard [0x106a68410] SELF-LATCHES -
+        // __call_once COMPLETES on the populated registry. Ctor fast-path returns "Execute" handle
+        // 0x400000b into once-slot [0x106a68408] (str x0,[x23,#1032] @0x2206d74) while DM-root
+        // [0x106a68818] (+0x410, no writer SH155) stays 0. Done-path `ldr x1,[x8,#1032]` reads it.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();

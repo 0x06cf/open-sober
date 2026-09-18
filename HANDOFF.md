@@ -1,16 +1,24 @@
 # Open Sober — Agent Handoff
-## SH329 (Sep 18, 2026, hermes-worker): pinned the app-start AFTER-FORK two-arm closure deterministically —
-## both the [AppStarted+0x408] path (arm-1, SH328 default) and the nativePreloadFlagOverrides return
-## (arm-2, govflag SET) are null headlessly; the 0x25f503c fork is NOT a seed-side bypass.
-Measured (real libroblox.so, full SH328 seed set; govflag arm-2 = JIT_ROUTEB_APPSART_GOVFLAG seeding
-[0x106a64da0].bit0): arm-1 `ldr x0,[x19,#1032]`=[AppStarted+0x408]=0; arm-2 `bl 0x2ea3a84` nativePreloadFlagOverrides
-ALSO returns x0=0. BOTH converge on `ldr x8,[x0]` @0x25f5050 -> `guestpc=0x1025f501c` fault=0x0. No governor-flag
-byte value yields non-null -> the gate is fork-independent SESSION-CTOR class (SH251/SH317/SH324 closure); NO new
-seed. Added sh329 hermetic guard (6 pins: 0x1025f502c ldrb govflag, 0x1025f503c cbz fork, 0x1025f5044 bl
-nativePreloadFlagOverrides, 0x1025f504c ldr [AppStarted+0x408], 0x1025f5050 ldr x8,[x0]. 3bbd arrows, 0x1025f5058
-vt+136) + frontier doc. recon-v3 re-verified (24 frames, present #21..#23 swap Ok(0x1), 395 pops, 0 json abort,
-EXIT 124). elfjit examples 153/0 (152+sh329), arm64jit lib 408/0, workspace green, elfjit.rs 1048564 B (12 B under
-1MB hook; SH-prose comment condensed + sh314 comment lightly condensed, facts preserved).
-HONEST: no DM (DM-root 0, MH_* false); Route-B live-DM gate UNCHANGED. The AppStarted+0x408 /
-nativePreloadFlagOverrides objects are both null and built only by an upstream session ctor. NEXT (SESSION-CTOR
-PRIMARY LEVER): the REAL Activity/AppBridge session drive so the upstream ctor RUNS and builds +0x408 (not a seed).
+## SH330 (Sep 18, 2026, hermes-worker): crossed the SH329 app-start fork gate one deterministic step —
+## a block-entry guard seeds AppStarted+0x408 with a benign vt[+136]-leaf object -> 0x25f5050 no longer SIGSEGVs;
+## downstream is run-variable (SH320-class host-ptr leak / FMOD AAudio), NOT a stable gate. recon-v3 green at HEAD.
+Measured (real libroblox.so, full SH328 seed set + JIT_ROUTEB_APPSART_408SEED=1, 3/3): the SH329 fork at
+0x25f503c converges on `ldr x0,[x19,#1032]` = [AppStarted+0x408] (runtime heap x19) = 0 -> `ldr x8,[x0]`
+@0x25f5050 SIGSEGV. SH329 closed only the fork (no govflag value yields non-null). SH330 discovered the
++0x408 dispatch @0x25f5058/5c is a PLAIN `ldr x8,[x8,#136]; blr x8` — NOT the x8-out-param ABI SH324
+proved un-crossable. New default-inert guard (env JIT_ROUTEB_APPSART_408SEED) fires at block-entry
+[0x1025f501c,0x1025f5060] and seeds the RUNTIME-[x19+0x408] with a leaked benign object whose vt[+136]
+is a host leaf. 3/3: gate deterministically passed. Downstream run-variable on 3 runs: clean EXIT 0
+(vt[+136] leaf -> canary epilogue + ret) / FMOD AAudio SIGSEGV guestpc=0x106240cb8 (SH212-crash-A) /
+leaked-host-pc (SH320 ASLR-flaky). So the next wall is run-variable, not stable. This answers SH326's
+open "sync/determinism gap" question: seeding the member deterministically crosses the gate.
++sh330 hermetic guard (5 pins: 0x25f504c ldr x0,[x19,#1032], 0x25f5050 ldr x8,[x0], 0x25f5058 ldr
+x8,[x8,#136], 0x25f505c blr, 0x25f5080 ret) + frontier doc. elfjit examples 154/0 (152+sh329+sh330),
+arm64jit lib 408/0, workspace green; elfjit.rs 1048570 B under 1MB hook (SH320-329 prose condensed,
+facts preserved). recon-v3 re-verified green (24 frames, present #21..#23 swap Ok(0x1), 0 json abort,
+EXIT 124).
+HONEST: no DM (DM-root 0, MH_* false); Route-B live-DM gate UNCHANGED. SH330 is a fencepost advance
+(crosses one deterministic app-start gate) + documents the next wall is run-variable (host-ptr leak /
+FMOD AAudio — SH320/SH212 class), NOT a session boot or rendered screen. NEXT = drive the REAL
+Activity/AppBridge session so the upstream ctor builds a REAL +0x408 object (real vt[+136] work), not
+a fabricated leaf (SEP-17 SESSION-CTOR PRIMARY LEVER, ref SH184).
