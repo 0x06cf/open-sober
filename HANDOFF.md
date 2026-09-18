@@ -1,39 +1,16 @@
 # Open Sober — Agent Handoff
-## SH325 (Sep 18, 2026, hermes-worker): CLEARED the SH324 SESSION-CTOR terminal. SH160's init3-gate
-## NOP (`routeb_patch_startapp_init3_gates` — replaces both `bl 0x2256510` with `stp xzr,xzr,[x8]`)
-## was DEAD CODE on the fault path: it was gated behind the StartLuaAppDM ladder rung, which
-## `--v2boot-skip-appstart` skips (and without it the main StartApp faults first). Hoisted the call
-## into the upfront --v2boot setup (gated DM_SEED/DMFORCE, self-guarding+idempotent). Result, 3/3:
-## first SIGSEGV advances GUESTPC 0x102256510 -> 0x1025f5300 (SH160 fires at both sites). The new
-## terminal is V2StartAppWithParams' real field-copy gate (fn 0x25f54e8, source x0=[appstart_obj+24] =
-## a genuine session-constructed AppStarted field — next live-object construct, SEP-17 territory, NOT
-## a seedable cell).
-## Verify: sh325 1 passed; elfjit 150/0; arm64jit lib 408/0; cargo test --workspace EXIT 0.
-## Doc docs/frontier-sh325-hoist-init3-gate-clears-sh324.md. HONEST: no DM (DM-root 0, MH_* false);
-## Route-B live-DM gate UNCHANGED. Next: new live-object at [appstart_obj+24] is again a real-session
-## construct (SEP-17), not a host-seed.
-## SH324 (Sep 18, 2026, hermes-worker): ANSWER STATUS candidate #1 — the terminal 0x102256510 IS the
-## SESSION-CTOR drive point, reached into a StartLuaAppDM continuation body SH156 never mapped;
-## pinned on the real image + PROVED the fabricated-object seed is a dead-end on this wall (x8
-## out-param ABI). Next work = real session-ctor drive (SEP-17 primary lever), not another seed.
-## Summary of the finding:
-## - Determinism: the SH320-323 MAIN-path engine-settings-init line stops at guestpc=0x102256510
-##   on 3/3 clean runs (EXIT 139/134/134). Not run-variable — a stable wall.
-## - The wall is reached inside the REAL StartLuaAppDM body: fn 0x23f00f8 (= StartLuaAppDM+0x2cc,
-##   a nested `sub sp,#0x70` tail frame, fall-through after `bl 2b9ec9c`) — FURTHER than SH156's
-##   documented trace (SH156 mapped 0x23efe2c..0x23eff40 + the do-init br to 0x1023eff4c / governor
-##   dispatch; it did NOT map 0x23f00f8). Six consecutive crossings since SH320.
-## - Fn 0x2256510 (faulting) = member method `this->vt[+32]()` with this=[container+40]==NULL;
-##   container = x1 arg of fn 0x23f00f8. BOTH call sites read the same field (0x23f012c
-##   `ldr x9,[x1,#40]`; 0x23f01a0 `ldr x0,[x21,#40]`). this=0 -> `ldr x9,[x0]` fault=0x0.
-## - PROOF-OF-DEAD-END for fabricated-this: after `blr vt[+32]` the fn does `ldr x0,[sp,#8]`
-##   (consumes an x8 indirect-result out-param). A host-thunk leaf receives only x0-x7, so it
-##   cannot write the x8 out-slot -> fabricated-this drifts into 222a9fc/LocalStorage RN. The ONLY
-##   cross is a REAL vt[+32] on a REAL object = the container's +0x40 member built by the upstream
-##   session ctor. This is the "specific gate provably unprocessable by JIT seeds" PROOF form.
-## - New sh324 hermetic real-image guard (8 anchors: fn 0x2256510 prologue+dispatch, both call
-##   sites, post-dispatch out-param read + LocalStorage bl). elfjit examples 149/0.
-## Verify: sh324 1 passed; elfjit 149/0; arm64jit lib 408/0; cargo test --workspace EXIT 0.
-## Doc docs/frontier-sh324-sessionctor-drive-point.md. HONEST: no DM (DM-root 0, MH_* false);
-## Route-B live-DM gate UNCHANGED. Next: do-init/DMCONT continuation + Activity-session drive so
-## the container's +0x40 member is constructed for real (SEP-17), NOT fabricated.
+## SH326 (Sep 18, 2026, hermes-worker): re-verified the two recon-v3 deliverables (type4_frame_thunk
+## self-driven frames + json-zero-fix) are ALREADY landed + green at HEAD (no new code needed), and
+## sharpened the standing 0x1025f5300 gate's SEP-17 forward contract. Verified: 24 task-driven frames,
+## present #19..#23 swap Ok(0x1), 197 node pops, 0 json abort, EXIT 124. The gate 0x1025f5300 is
+## deterministic 3/3 (fault=0x140); its cross is [appstart_obj+24]!=NULL — the genuine AppStarted field
+## built by nativeAppBridgeAppStart (bl @0x25f52ec, out-param [sp+328]->x19). Extended sh325 hermetic
+## guard with 2 new real-image pins (0x1025f52ec=bl-nativeAppBridgeAppStart, 0x1025f52f0=ldr x19,[sp,#328])
+## so the exact session-construct source is pinned. NEW observation: the sh325 ladder probe's SetInitParams
+## (--v2boot-session-set) drives the engine deep enough to wake the REAL type-4 TaskScheduler drain, but it
+## faults NONDETERMINISTICALLY on leaked host-ptrs (RUN1 0x102855fd0 / RUN4 0x10624e6c0 / RUN5 0x1021df3cc;
+## RUN2/6 benign) — run-variable, NOT a stable gate. elfjit examples 150/0, arm64jit lib 408/0, workspace
+## green, elfjit.rs under 1MB hook (condensed SH-prose, facts preserved).
+## Verify: sh325 1 passed; elfjit 150/0; cargo test --workspace EXIT 0. HONEST: no DM (DM-root 0, MH_* false);
+## Route-B live-DM gate UNCHANGED. Next: the standing gate is again a genuine session-constructed AppStarted
+## field at [appstart_obj+24] (SEP-17 real-session drive), not a seedable cell.

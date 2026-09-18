@@ -37,10 +37,9 @@ fn taskv4_frame_seed_active() -> bool {
 }
 
 /// SH128: opt-in combined-frame re-drive (frontier-sh127-serial-combined-frame.md).
-/// When active, the main thread re-drives the engine's drain pop-loop 0x102856e40 bounded
-/// jit_run after the serialized ladder joins, and the renderinit presenter + --deque-node-live
-/// injector hold open for the duration so type-4 dispatches become REAL presented frames in the
-/// SAME run that constructs the session. Inert without the flag.
+/// Main thread re-drives the drain pop-loop 0x102856e40 bounded jit_run after the serialized
+/// ladder joins; presenter + injector hold open so type-4 dispatches become REAL presented frames
+/// in the SAME run that constructs the session. Inert without the flag.
 fn redrive_enabled() -> bool {
     std::env::args().any(|a| a == "--deque-redrive")
 }
@@ -6521,35 +6520,31 @@ fn main() {
                 // 'found' path and the flag-registration loop advances.
                 routeb_patch_nativeinit_flagmap_helper();
                 // SH116b: after SH115/116/117 nativeInit advances into a SECOND read site
-                // (file 0x2320a24 = *(0x10672739b0), sibling of SH116's helper). The
-                // flag-manager global reads 0; `bl pthread_mutex_lock` locks &0+0x28 ->
-                // faults. Seed a stable zeroed object (valid mutex at +0x28) when 0; also
-                // *0x10672739c0.
+                // (file 0x2320a24 = *(0x10672739b0), sibling of SH116's helper). The flag-manager
+                // global reads 0; `bl pthread_mutex_lock` locks &0+0x28 -> faults. Seed a stable
+                // zeroed object (valid mutex at +0x28) when 0; also *0x10672739c0.
                 routeb_patch_nativeinit_flagmanager();
                 // SH119: SendAppEventOnAppReady's two ungated singleton lambdas
                 // (0x6251610 off 0xf0, 0x6260a68 off 0x550) still soft-return;
                 // materialize the stable object into x0 at both.
                 routeb_patch_sendapp_singleton_lambdas();
-                // SH200: the V2Init/V2Start run-variable "outside image" stop is
-                // a 4th singleton-dispatch site (fn 0x6251e0c reads objB vtable slot
-                // +0x118 past the 0x60 seed -> blr into host bytes). Patch it like
-                // SH115/119 so V2Init/V2Start reach the SH199 world-build gate block
+                // SH200: V2Init/V2Start run-variable "outside image" stop = a 4th singleton-dispatch site
+                // (fn 0x6251e0c reads objB vt slot +0x118 past 0x60 seed -> blr host bytes).
+                // Patch like SH115/119 so V2Init/V2Start reach the SH199 world-build gate
                 // 0x102368100 soft-returning first.
                 routeb_patch_v2_dispatch();
-                // SH201: the ~365-site objB-getter singleton-dispatch family is LOCATED (sh201_v2_family_scan)
-                // but runtime patch NOT wired (family-wide scribble crash-loops). Characterized lever +
-                // scanner only (do NOT re-enable routeb_patch_v2_family). SH120: app-bridge event
-                // dispatch reads shared dispatcher .bss (0x10683a460) with unseeded self-link; seed
-                // the DATA (not the shared leaf) to the benign empty state.
+                // SH201: objB-getter singleton-dispatch family LOCATED but not runtime-patched (crash-loops);
+                // characterized lever+scanner only. SH120: app-bridge event dispatch reads unseeded
+                // dispatcher .bss (0x10683a460); seed DATA (not the shared leaf) to benign empty state.
                 routeb_seed_dispatcher_node();
-                // SH126-r0: the rung-0 nativeInit null-map dispatch (vt[+232] -> flag-recorder
-                // 0x101d97c70, null map store). Leaf-rewrite the
-                // callee store no-ops (residual 1/3 crash w/ serialized render).
+                // SH126-r0: rung-0 nativeInit null-map dispatch (vt[+232] -> flag-recorder
+                // 0x101d97c70, null map store). Leaf-rewrite the callee store no-ops
+                // (residual 1/3 crash w/ serialized render).
                 routeb_patch_rung0_flag_recorder();
-                // SH121: setTaskSchedulerBM lazily constructs the TaskScheduler whose ctor asserts
-                // [0x72739d4].bit0 ("flags loaded") -> raise(SIGTRAP) (exit 133). NOP the tbz + seed the
-                // REAL setTaskSchedulerBM version-gate [0x10683cff8] (SH109's [0x10683d350] is V2Init/
-                // V2Start). KEEP OPT-IN: defaulting ON faults the next gate (0x106241c70) - regression.
+                // SH121: setTaskSchedulerBM builds the TaskScheduler whose ctor asserts [0x72739d4].bit0
+                // ("flags loaded") -> raise(SIGTRAP) exit 133. NOP the tbz + seed the REAL
+                // setTaskSchedulerBM version-gate [0x10683cff8] (SH109's [0x10683d350] is V2Init/
+                // V2Start). OPT-IN: defaulting ON faults the next gate (0x106241c70) - regression.
                 routeb_patch_taskscheduler_flags_gate();
                 unsafe {
                     *(0x10683cff8u64 as *mut u64) = 0x0306u64; // low byte 6, byte1 3
@@ -15182,7 +15177,11 @@ mod sh115_tests {
             assert_eq!(word(0x1025_f5304), 0xf940e500, "sh325 ldr x0,[x8,#456] (=version word [0x6a701c8])");
             assert_eq!(word(0x1025_f54e8), 0xd10143ff, "sh325 fn 0x25f54e8 sub sp,#0x50");
             assert_eq!(word(0x1025_f52f8), 0xf9400e60, "sh325 ldr x0,[x19,#24] (field-copy source obj)");
-            eprintln!("sh325 SH160-init3-gate hoist clears SH324 terminal (->0x1025f5300 field-copy gate) pinned.");
+            // SEP-17 fwd: [x19+24] src = AppStarted built by nativeAppBridgeAppStart (bl @0x25f52ec,
+            // out->x19). Cross requires [appstart+24]!=NULL via real-session ctor (host seed = SH324 dead-end).
+            assert_eq!(word(0x1025_f52ec), 0x97f51b0d, "sh325 bl nativeAppBridgeAppStart 0x233bf20");
+            assert_eq!(word(0x1025_f52f0), 0xf940a7f3, "sh325 ldr x19,[sp,#328] (AppStarted out->source)");
+            eprintln!("sh325 SH160 hoist clears SH324 terminal (->0x1025f5300); SEP-17 fwd=AppStarted[+24].");
         } else {
             eprintln!("sh325 real-image guard: no real libroblox.so, skipping anchors");
         }
