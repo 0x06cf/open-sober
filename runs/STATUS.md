@@ -1,17 +1,41 @@
-# Open-Sober run ledger (hermes-worker)
+# Open-Sober run state (hermes-worker)
 
-## Session (Sep 18, 2026): SH304 — SESSION-GATED type-4 producer (recon-v3 self-drive handoff), implemented + hermetic-tested.
+## HEAD: `dev` branch, SH307 (force preload-overrides value branch — SendAppEventOnAppReady crosses its standing terminal) — workspace green.
 
-**State at HEAD**: `dev` (pre-commit). Workspace green (cargo test --workspace: arm64jit 405/0 + all suites; elfjit examples 130/0 = 127 baseline + 3 new sh304; TEST_EXIT 0). Cargo build --workspace 0 errors. Recon-v3 deliverable re-verified green at HEAD first (24 task frames swap Ok(0x1), 197 pops, 0 json abort, EXIT 124). No research subagents (cone suppressed — operator directive).
+**State**: `cargo test --workspace` EXIT 0 (**585/0**: 405 lib + elfjit examples 132/0 + fsmap + others). `cargo build --workspace` EXIT 0. elfjit.rs under the 1MB pre-commit hook (+178 B margin). Not pushed (operator pushes dev).
 
-**This cycle, in order:**
-1. Established baseline: recon-v3 SELF-DRIVEN FRAMES re-verified green (`capture_taskv4_frame.sh`), workspace green.
-2. Re-measured the primary-lever SESSION-CTOR drive (`capture_sh269_session_ctor_exec.sh`) at HEAD: bus1-3 = MessageBus.subscribe Ok(0x3e8) + once-guard latches 0x1 + DM-root 0; game reached; appev-A/B at the documented GOVFLAG walls (0x102ea0b9c / 0x102bb803c preload-overrides). Route-B live-DM gate UNCHANGED — all named levers are built and at measured structural walls.
-3. Audited the tree against the reconciled recon-v3 / SESSION PRODUCER HANDOFF deliverables. Found the ONE genuinely-absent named deliverable: the **session-gated type-4 producer** (`--taskv4-seed session`) that replaces the harness seed on a real session and stays inert otherwise.
-4. Implemented it (elfjit.rs, default-inert): `session_producer_gate` (pure, hermetic), `session_live_dm()` (page-guarded holder [0x106391908] / DM-root [0x106a68818]), `type4_session_gated_thunk` (GATED -> real present via engine make-current/frame-fn/swap; UNGATED -> inert no present), wired into the `--taskv4-seed` install site.
-5. Added 3 hermetic sh304 gate tests; verified (arm64jit examples 130/0).
-6. MEASURED on real libroblox.so (`runs/capture_sh304_session_producer.sh`): registered at 0x7f00000001d0, boot dispatches log UNGATED (app_ready=false, live_dm=true) — inert, GATED=0, 0 json abort, EXIT 124. Session-less boot stays frame-free (only the standalone --renderinit/--renderframe SH18/19 swap, independent of the gate).
-7. Held the 1MB pre-commit hook: condensing elfjit.rs verbosity (SH115/117/118/122/156/157/159/177/223/226/236/255/264/272/276 + option-doc prose) back-filled the ~2.5KB addition; all facts/addresses preserved, no behavior touched. elfjit.rs now +47B margin.
-8. Updated repo HANDOFF.md + this ledger + frontier doc. NOT pushed to origin (operator pushes).
+## This session (SH307)
 
-**Honest status (unchanged)**: Route-B live-DM structural gate UNCHANGED — MH_* false until a real do-init owns a live DM, DM-root [0x106a68818] stays a harness seed (never a genuine make_shared<DataModel>). SH174 capture-latch (arm *(0x106391908) at a real session make_shared) remains the single forward hook. The new session-gated producer is latent-but-correct: it fires the instant a real session advances (the exact recon-v3 §B / SESSION-PRODUCER-HANDOFF contract), and its hermetic test + real-binary inert measurement prove the gate today.
+1. **Forward lever on the standing SESSION-CTOR terminal (Route-B).** SH270 wired the
+   nativePreloadFlagOverrides value cell [0x106a64d78] but measured it INERT; SH272
+   concluded both getter branches are live-object walls. Found the missing reason: the
+   getter 0x2dae5f0 is a Meyers lazy once whose **guard helper** (bl 0x57816f0, once byte
+   [0x6d2df30]) routes control to the CONSTRUCT branch on every headless run — the value
+   cell is NEVER read, so SH270's wire was inert. SH307 forces the VALUE branch (NOP
+   `tbz w0,#0,0x2dae624` @0x2dae5fc) + seeds [0x106a64d78] with the SH248f fabricated
+   all-leaf object, so the getter returns non-NULL.
+2. **MEASURED A/B (real libroblox.so, SH269 ladder):** baseline SIGSEGV at the standing
+   wall guestpc=0x102bb803c (EXIT 139, x20=0); FORWARD → patch fires, **SendAppEventOnAppReady
+   returns Ok(0x107273d50)**, 0 SIGSEGV, ladder completes cleanly (LADDER_DONE=1, EXIT 124).
+   First complete past 0x102bb803c.
+3. **HONEST:** no DM (DM-root 0, MH_* false) — the getter returns a fabricated object, not a
+   real preload map. Route-B live-DM structural gate UNCHANGED; SH174 capture-latch stays the
+   single forward hook.
+
+## Standing (honest, unchanged across sessions)
+
+- **Route-B live-DM structural gate UNCHANGED**: no make_shared<DataModel> fires headlessly;
+  DM-root [0x106a68818] stays 0; MH_APP_READY stays false until a real do-init owns a live DM.
+- SH174 capture-latch (arm *(0x106391908) at a real session make_shared) stays the single forward hook.
+- **SESSION-CTOR is the primary lever** (operator Sep-17). SH307 (this cycle) forced the
+  preload-overrides value branch on SendAppEventOnAppReady — a genuine forward move of that
+  rung's terminal.
+- Everything achievable headlessly (llvmpipe); GPU host for performance later.
+
+## Next-forward candidates
+
+(a) After SH307 crosses the preload-overrides wall, SendAppEventOnAppReady's body continues —
+   region-watch the body (0x2bb8000..0x2bb8300) past the returned-Ok point for the next
+   live-object it derefs. (b) R1 content path (synthetic CoreScript module staged+tested,
+   latent until a live DM requests rbxasset://). (c) SH304 session-gated producer fires from the
+   session side the instant a real session owns a live DM (latent-but-correct).

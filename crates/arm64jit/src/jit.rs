@@ -951,8 +951,10 @@ fn routeb_appstart_adapter_seed_guard(_state: *mut CpuState, pc: u64) {
 }
 
 /// Leaked fabricated app-lifecycle adapter object: all-leaf vtable, so any vt[N]
-/// virtual dispatch resolves to a benign host leaf. Stable per process.
-fn routeb_appstart_adapter_object() -> u64 {
+/// virtual dispatch resolves to a benign host leaf. Stable per process. pub so the
+/// elfjit host-side patcher (SH307) can reuse it as the preload-overrides value-cell
+/// dispatch object.
+pub fn routeb_appstart_adapter_object() -> u64 {
     use std::sync::OnceLock;
     static OBJ: OnceLock<u64> = OnceLock::new();
     *OBJ.get_or_init(|| {

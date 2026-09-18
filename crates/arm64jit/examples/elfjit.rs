@@ -175,12 +175,8 @@ static TASK_FRAME_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 /// list head/tail) so the engine's own frame construction code runs verbatim.
 /// Built once lazily; guest==host so engine code derefs it directly.
 static RENDERSCENE_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// SH126-gate: set once the --v2boot ladder's rungs complete.
 
-/// SH126-gate: set by the --v2boot ladder thread once its rungs complete
-/// ("ladder done"); the --renderinit thread, when JIT_SERIALIZE_RENDER=1,
-/// waits on this before driving the render pipeline so render jit_runs never
-/// run concurrent with the ladder's jit_runs (the SH55/64 block-cache/message-
-/// queue desync that makes the combined run 1/3 flaky). 0 = ladder not done yet.
 static LADDER_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// SH128 combined re-drive: when StartApp RETURNS under the serialized ladder
@@ -291,14 +287,8 @@ fn reseed_task_frame_color(base: u64, cc: [f32; 4]) {
         }
     }
 }
+/// Pending task-frame present requests (drain-thread counter).
 
-/// Pending task-frame present requests, incremented by the drain-thread
-/// type4_frame_thunk (a pure producer: no EGL work, safe on that thread) and
-/// drained by the single presenter loop on the renderinit thread (the ONLY
-/// thread where EGL current-binding is positively established — SH61b ran a
-/// presenter mutex and found the drain thread's run_guest_callback make-current
-/// still returns EGL_FALSE even serialized, so routing the present to the
-/// currency-owning thread is the fix).
 static PENDING_PRESENTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// SH131 combined-run flood bound: after the serialized-capture presenter has
@@ -321,15 +311,10 @@ fn combined_frame_capture() -> bool {
             .map(|i| std::env::args().nth(i + 1).as_deref() == Some("frame"))
             .unwrap_or(false);
     serialize
-}
+}/// The type-4 task-consumer vector seed: registered non-recursive leaf host-thunk
+/// installed into dispatcher slot 0x106829ea8.
 
-/// The type-4 task-consumer vector seed: a registered non-recursive leaf host
-/// thunk. ABI per recon §A: (node=x0, [node+32]&~1=x1, consumer=x2); return
-/// discarded. Must never re-enter the dispatcher/drain/vector (would recurse).
-/// SH61b producer-only: it must NOT do EGL work here — the dispatcher runs it
-/// on the DRAIN thread whose make-current is not current for this layer. It
-/// accounts the dispatch + bumps PENDING_PRESENTS; the renderinit-thread
-/// presenter consumes those and presents real frames where currency holds.
+
 extern "C" fn type4_frame_thunk(
     a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
 ) -> u64 {
@@ -763,14 +748,8 @@ void main(){ gl_FragColor = vColor; }
         Box::new(WalkerMeshProgram { program: prog, vao: 0, vbo, ebo })
     })
 }
+/// The per-scene-item draw dispatch (render-obj vt[+24]) the engine walks.
 
-/// The per-scene-item draw (`render-obj vt[+24]`) the engine's real present
-/// loop blr's per node. MUST be pure host — NO nested jit_run / run_guest_callback
-/// (that recompiles the present-loop block → SH64 desync). SH65: draws REAL
-/// geometry through a cached real-Mesa program — a distinct colored quad per
-/// node, tiling the viewport, plus a colored clear backdrop, so a capture shows
-/// a distinct real mesh per per-node present. x0 = the render-obj (per node+8);
-/// return is discarded by the loop.
 extern "C" fn walker_item_draw_thunk(
     _a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
 ) -> u64 {
@@ -2214,6 +2193,47 @@ fn routeb_patch_getter_fmod_tail_ret() {
     }
     ROUTEB_GETTER_FMOD_TAIL_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
+static ROUTEB_PRELOAD_VALUE_PATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// SH307 (opt-in JIT_ROUTEB_PRELOAD_VALUECELL): SendAppEvent terminal 0x102bb803c derefs
+/// x20=nativePreloadFlagOverrides return=0. Getter 0x2dae5f0 is a Meyers once; SH270 wired
+/// value cell [0x106a64d78] but guard routes to CONSTRUCT (returns 0) — wire never read.
+/// Fresh lever: NOP tbz @0x2dae5fc to force the VALUE branch dispatching [0x106a64d78].vt[+16],
+/// seeded to the all-leaf obj -> getter returns non-NULL -> wall dispatches a leaf -> advances.
+/// Word-guarded + block_cache drop. Default-inert.
+fn routeb_patch_preload_valuecell() {
+    if ROUTEB_PRELOAD_VALUE_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    if std::env::var("JIT_ROUTEB_PRELOAD_VALUECELL").ok().as_deref() != Some("1") {
+        return;
+    }
+    const TBZ: u64 = 0x102dae5fcu64; // tbz w0,#0,0x2dae624 (guest = file 0x2dae5fc + 0x100000000)
+    let page = (TBZ & !0xfff) as *mut libc::c_void;
+    unsafe {
+        if libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_WRITE) != 0 {
+            eprintln!("[elfjit:routeB] WARN mprotect RW failed for SH307 preload tbz @0x{TBZ:x} errno={}", std::io::Error::last_os_error());
+            ROUTEB_PRELOAD_VALUE_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        let before = *(TBZ as *const u32);
+        if before != 0x36000140 {
+            eprintln!("[elfjit:routeB] WARN SH307 preload tbz @0x{TBZ:x} unexpected word {before:08x}, not patched (binary drifted?)");
+            libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+            ROUTEB_PRELOAD_VALUE_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        *(TBZ as *mut u32) = 0xd503201f; // nop
+        libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+        arm64jit::jit::block_cache_drop_region(TBZ, TBZ + 4);
+        const VCELL: u64 = 0x106a64d78; // value-cell read by the value branch @0x2dae604
+        let obj = arm64jit::jit::routeb_appstart_adapter_object();
+        if arm64jit::jit::routeb_ensure_writable(VCELL) {
+            *(VCELL as *mut u64) = obj;
+        }
+        eprintln!("[elfjit:routeB] SH307 preload value-branch@0x{TBZ:x} tbz->nop + value-cell [0x{VCELL:x}]={obj:#x}: getter returns obj -> advances past terminal 0x102bb803c");
+    }
+    ROUTEB_PRELOAD_VALUE_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
 static ROUTEB_CONT_OPNEW_BOX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 /// SH245 next gate: continueAfterFlagsLoaded_ 0x102bd1d68 reaches `bl operator_new(0x28)`
 /// @0x2bd2128. operator_new 0x1db1a38 returns NULL for size>0xa when [0x10727570c].bit0
@@ -2999,14 +3019,8 @@ pub fn render_engine_emitter_quad(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) -
     }
 }
 
+/// Cached real-Mesa TEXTURED program (texture lane only).
 
-/// Cached real-Mesa TEXTURED program used ONLY by the emitter's textured branch
-/// (RENDEREMITTER_TEX=1). SEPARATE from walker_mesh_program so the two don't
-/// fight over the shared GLES2 program state. aPos(0), aColor(1), aTex(2);
-/// uTex sampler; FS outputs texture2D(uTex,vUV) — an unsampled tile reads
-/// black/backdrop, proving the sampler live. Returns (program, uTex loc).
-/// SH69 — minimal offline PNG->RGBA8 (color 0,2,4,6; non-interlaced). Zero new
-/// dep: rides `flate2` (in Cargo.lock via `zip`). Returns (w,h,RGBA8 top-first).
 fn decode_png_rgba(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     const SIG: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
     if data.len() < 8 || &data[..8] != SIG {
@@ -3267,12 +3281,8 @@ fn parse_roblox_mesh_v2(data: &[u8]) -> Option<RbxMeshV2> {
     }
     Some(RbxMeshV2 { positions, normals, uvs, indices })
 }
+/// Center + uniformly scale a mesh into NDC.
 
-/// Center + uniformly scale a mesh's model-space positions into NDC so the
-/// pass-through vertex shader (`gl_Position = aPos`) shows the whole shape.
-/// Returns per-vertex vec4 (x, y, z, 1.0) interleaved, ready for a stride-16
-/// vec4 VBO. `fit` = the fraction of the unit NDC half-extent the max model
-/// extent should occupy (e.g. 0.85).
 fn mesh_positions_to_ndc(m: &RbxMeshV2, fit: f32) -> Vec<f32> {
     if m.positions.is_empty() {
         return Vec::new();
@@ -3338,13 +3348,8 @@ fn mesh_uvs(m: &RbxMeshV2) -> Vec<f32> {
     }
     out
 }
+/// Interleave model-space positions (vec4) with per-vertex UVs (vec2).
 
-/// Interleave model-space positions (vec4) with per-vertex UVs (vec2) into a
-/// single stride-24 VBO: [px,py,pz,1, u,v] per vertex. `mvp_out` receives the
-/// column-major model-view-projection that turns the model-space positions into
-/// clip space. The camera is a fixed axis-aligned perspective framed on the
-/// bbox; `yaw_rad` rotates the MODEL about +Y before the view, so the object can
-/// be presented from any orbit angle (0 = the SH143 head-on camera).
 fn mesh_interleave_model_uv(m: &RbxMeshV2, fit_fov: f32, aspect: f32, yaw_rad: f32, mvp_out: &mut [f32; 16]) -> Vec<f32> {
     let (c, ext) = mesh_bbox(m);
     // Camera looks down -Z at the origin from z=+d, framing the bbox in fit_fov.
@@ -3947,11 +3952,8 @@ fn covered(rings: &[Vec<(f32, f32)>], x: f32, y: f32) -> bool {
     }
     w != 0
 }
+/// Rasterize a text row into a w x h RGBA8 buffer (transparent bg).
 
-/// Rasterize a text row into a w x h RGBA8 buffer (transparent background).
-/// Layout: characters left-to-right; `pu` = px per font unit; `color` baked;
-/// `pen_start_x` (px) = x of the first glyph's origin; `baseline_row` (px,
-/// image y-down) = where glyph y=0 sits. Coverage supersampled ss=4 per pixel.
 fn rasterize_text_row(
     font: &[u8],
     text: &str,
@@ -4033,12 +4035,8 @@ fn login_font_bytes() -> &'static [u8] {
     .as_deref()
     .unwrap_or(&[])
 }
+/// Rasterize a login-form text label into an RGBA8 strip.
 
-/// Rasterize a login-form text label into an `w`-wide RGBA8 strip, centered
-/// (transparent bg, glyph color). Returns None if the font is unavailable.
-/// SH78: `w`/`h`/`pu` are caller-supplied so the label can be supersampled 2x
-/// (w and h both double; w:h is preserved, so on-screen geometry + probes are
-/// bit-identical while texel density and stroke thickness double).
 fn rasterize_login_label(text: &str, color: [u8; 4], w: u32, h: u32, pu: f32) -> Option<RealSprite> {
     let font = login_font_bytes();
     if font.is_empty() {
@@ -4386,15 +4384,8 @@ pub fn render_engine_emitter_grid(ctx: u64, iimg: &[u8], ibase: u64, isp: u64, n
         }
         r
     }
-}
+}/// SH68 — sample the engine-emitted login/home layered frame (host route-a list).
 
-/// SH68 — the engine's real emitter draws a LAYERED "login/home" frame (5 textured
-/// quads: backdrop, panel, button bar, title strip, field strip) in ONE top-level
-/// jit_run with GL_BLEND alpha compositing, sized/placed from the REAL scene list.
-/// Same single-call discipline as SH67d/e (one VBO, GL_TRIANGLES, count=30) so the
-/// SH67c orphan class stays closed. Straight-alpha lives in a 5-texel RGBA strip;
-/// the FS is texture2D-only so overlap readbacks verify the blend equation
-/// (panel∘backdrop = src*src.a + dst*1-src.a). Returns the emitter's ret.
 pub fn render_engine_emitter_home(ctx: u64, iimg: &[u8], ibase: u64, isp: u64, layer_override: usize) -> u64 {
     if !(ctx >= 0x100000000 && ctx >> 56 == 0) {
         return 0;
@@ -4403,11 +4394,8 @@ pub fn render_engine_emitter_home(ctx: u64, iimg: &[u8], ibase: u64, isp: u64, l
     if h.is_null() {
         eprintln!("[elfjit:renderemitter-home] WARN: dlopen libGLESv2.so.2 failed");
         return 0;
-    }
-    // Read the REAL scene-list node count to size the layout (SH68-A): the harness
-    // laid R+0x180 head / R+0x188 tail (0x28-stride, one-past-end) via
-    // render_scene_base/render_engine_present_walker. Verify head/tail-derived
-    // count == SCENE_NODES so the layout is scene-driven, not hardcoded.
+    }/// Read the REAL scene-list node count to size the layout.
+
     let r = RENDERSCENE_BASE.load(core::sync::atomic::Ordering::Relaxed);
     let n_scene = SCENE_NODES.load(core::sync::atomic::Ordering::Relaxed);
     let derived = if r != 0 {
@@ -4773,14 +4761,10 @@ struct RealSprite {
     w: u32,
     h: u32,
     rgba: Vec<u8>,
-}
+}/// SH73 — stage real login-screen artwork (brand panel + credential/button)
+/// through the bridge; the exact assets the in-app login UI composes.
 
-/// SH73 — the real Roblox AUTH/log-in surface assets (the APK's own login
-/// screen artwork, under ExtraContent/textures/ui/LuaApp/graphic/Auth/ plus
-/// the sibling noconnection chip): reversevignette.png (the dark blurred login
-/// backdrop) + logo_white_1x.png (the Roblox wordmark) + noconnection.png (the
-/// connection-loss chip, SH74). Enable with RENDEREMITTER_LOGIN=1. Entries
-/// are absolute (the auth assets live outside the content/textures/ui root).
+
 fn login_ui_textures() -> Vec<RealSprite> {
     static LT: std::sync::OnceLock<Vec<RealSprite>> = std::sync::OnceLock::new();
     LT.get_or_init(|| {
@@ -4909,16 +4893,10 @@ fn login_ui_textures() -> Vec<RealSprite> {
         out
     })
     .clone()
-}
+}/// SH72 — load real Roblox UI textures (spinner + a compressed-E format for
+/// ETC/ETC2/ASTC decode) via the bridge; prove the emitter draws them layered.
 
-/// SH72 — load SEVERAL REAL Roblox UI textures (default: loading spinner,
-/// robux icon, jump button) as RGBA8. Env RENDEREMITTER_MULTI_TEXTURES = a
-/// comma-separated list overrides the defaults (relative to the extracted
-/// assets/textures/ui root, or absolute if an entry starts with '/'). Each is
-/// cached via OnceLock. Sprites that fail to load/decode are skipped with a
-/// warn so the composite still builds from the successes. When
-/// RENDEREMITTER_LOGIN=1 the real auth surface (login_ui_textures) is used
-/// instead (SH73).
+
 fn real_ui_textures() -> Vec<RealSprite> {
     static MT: std::sync::OnceLock<Vec<RealSprite>> = std::sync::OnceLock::new();
     MT.get_or_init(|| {
@@ -6129,16 +6107,9 @@ fn arm_persist_root() {
     } else {
         println!("[fsmap] warn: could not create persistence root {}", dir.display());
     }
-}
+}/// Objective 2b — prove LIVE datastore persistence roundtrip.
 
-/// Objective 2b — prove the LIVE client's data-persistence path end-to-end.
-/// The engine's boot+render never reaches a session (standing producer wall),
-/// so a productized run makes ZERO `[fsmap] remap:` lines. Driving the SAME
-/// guest_svc ABI a real datastore write uses (openat->write->fsync->close->
-/// reopen->read) inside this JIT process — the exact `open-sober play --jit`
-/// executable — with SOBER_ANDROID_ROOT armed, turns the persistent-store
-/// roundtrip into an observable, self-verifying property of the live client:
-/// the write is remapped under the armed root, read back byte-exact in-process.
+
 fn run_persist_roundtrip() {
     let Some(root) = arm64jit::fsmap::configured_root() else {
         println!("[persist] SOBER_ANDROID_ROOT not armed — skipping datastore roundtrip");
@@ -6650,6 +6621,12 @@ fn main() {
             // returns to the dispatcher (0x2bd8d18) instead of diving into a tail that
             // never returns. Self-guards on its own env (inert by default).
             routeb_patch_getter_fmod_tail_ret();
+            // SH307 (Route-B, opt-in JIT_ROUTEB_PRELOAD_VALUECELL): force the
+            // nativePreloadFlagOverrides getter's VALUE branch (NOP the tbz) + seed its
+            // value cell with a fabricated object so the getter returns non-NULL and
+            // SendAppEventOnAppReady advances past its standing 0x102bb803c terminal.
+            // Self-guards on its own env (inert by default).
+            routeb_patch_preload_valuecell();
             // SH245-candidate-1 (Route-B, opt-in JIT_ROUTEB_DM_CONT_OPNEW_BOX):
             // once the continuation runs it reaches `bl op_new(0x28)` which returns
             // NULL headlessly (allocator-activation gate clear, size>0xa) -> box a
@@ -15076,16 +15053,40 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh307_preload_valuecell_branch_forced_pinned() {
+        // SH307: SH270's preload-overrides value-cell wire was INERT because the guard
+        // helper (bl 0x57816f0, once [0x6d2df30]) routes getter 0x2dae5f0 to the CONSTRUCT
+        // branch (returns 0), so [0x106a64d78] was never read. This cycle forces the VALUE
+        // branch: NOP `tbz w0,#0,0x2dae624` @0x2dae5fc (0x36000140->0xd503201f) so the getter
+        // falls through to `ldr x0,[0x106a64d78]; ldr x8,[x0]; ldr x2,[x8,#16]; br x2` and
+        // returns that vt[+16]'s result; seeded to the fabricated all-leaf obj it returns
+        // non-NULL -> x20!=0 -> terminal 0x102bb803c dispatches a benign leaf -> ADVANCES.
+        // Pin the tbz we patch, the NOP, the value-cell dispatch words, and RW-window.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            // The tbz we NOP + the value-cell dispatch it gates on.
+            assert_eq!(word(0x102_dae5fc), 0x36000140u32, "sh307 tbz w0,#0,0x2dae624 (the branch SH307 NOPs)");
+            // Value-cell branch (0x2dae600..0x2dae620) — the path the NOP exposes.
+            assert_eq!(word(0x102_dae604), 0xf946bd00, "sh307 value-cell ldr [x8,#3448]=[0x106a64d78]");
+            assert_eq!(word(0x102_dae620), 0xd61f0040, "sh307 value-cell br x2 (vt[+16] dispatch = getter return)");
+            // Value cell must be in the RW .bss window (host-writable).
+            let vcell: u64 = 0x106a64d78;
+            assert!((0x1_0000_0000u64..0x120_0000_00u64).contains(&vcell), "sh307 value-cell in window");
+            eprintln!("sh307 preload-getter value-branch forced (tbz->nop @0x102dae5fc + value-cell [0x106a64d78]=fabricated obj) pinned on libroblox.so — forward lever on SendAppEventOnAppReady terminal 0x102bb803c");
+        } else {
+            eprintln!("sh307 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh272_preload_getter_both_branches_structurally_dead_pinned() {
-        // SH272: WHY nativePreloadFlagOverrides getter (0x2dae5f0) returns 0 on BOTH
-        // branches (SendAppEventOnAppReady terminal) — no future re-attack as a seed lever.
-        //   Value branch (guard bit0 SET): 0x2dae604 ldr [0x106a64d78]/cbz->ret/ldr x8,[x0]/
-        //   ldr x2,[x8,#16]/br x2 = VTABLE dispatch needing a REAL object vt[+16].
-        //   Construct branch (0x2dae624 bl ctor 0x101df8ff8): ctor zero-INITs [obj+80]=0
-        //   (0x1df9058 stp x0,xzr,[x19,#72]); helper 0x2daf5ec ldr [x19,#80]; cbz->ret 0
-        //   ALWAYS — equally a live-object wall. guard once byte [0x6d2df30] separate.
-        // VERDICT (do-not-re-tread): SH174/SH204 live-object class (needs real session
-        // construct+populate). Route-B UNCHANGED; SH174 latch single forward hook.
+        // SH272: preload getter returns 0 on BOTH branches (vtable dispatch / ctor zeroes
+        // [obj+80]). verdict: live-object wall, do-not-re-tread. pin below.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
