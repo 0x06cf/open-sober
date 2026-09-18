@@ -1131,6 +1131,36 @@ fn routeb_ec_arg0_vt_dispatch_obj() -> u64 {
     })
 }
 
+/// SH300 (opt-in JIT_ROUTEB_EC_REALSESSION=1): the EC world 0x102e24598
+/// (SH235/298/298b/299) disassembled further: past the SH299 dispatch at
+/// `cbnz w0 @0x2e2465c` (now taken -> 0x2e24678) it branches at 0x2e246f4 on the
+/// writable .bss byte [0x106d31e28] (`adrp 6d31000; ldrb w8,[x8,#3624]; cbz
+/// w8,0x2e2472c`). Flag=0 (its headless value) -> the benign singleton builder
+/// `bl 23c1b0c` and SKIPS the REAL engine init fns entirely. Flag=1 -> `bl
+/// 23c5538` (real /nativeAppBridgeV2InitWithParams AppBridge-V2 singleton
+/// factory) + `bl 23f1654` (nativeAppBridgeStartLuaAppDM body +0x1828) THEN a
+/// vt[+16] dispatch. Seeding [0x106d31e28]=1 makes the EC body EXECUTE those
+/// real init functions headlessly for the first time — cause-not-symptom
+/// SESSION-CTOR on the Route-B line. Default-inert. Fires at the EC-world entry
+/// block 0x102e24598 when the byte is 0; idempotent (routeb_ensure_writable maps
+/// the .bss page so the write cannot fault).
+fn routeb_ec_world_realsession_guard(_state: *mut CpuState, pc: u64) {
+    if std::env::var("JIT_ROUTEB_EC_REALSESSION").ok().as_deref() != Some("1") {
+        return;
+    }
+    if pc != 0x102e24598 {
+        return;
+    }
+    let cell: u64 = 0x106d31e28;
+    let cur = unsafe { std::ptr::read_unaligned(cell as *const u8) };
+    if cur != 0 {
+        return;
+    }
+    routeb_ensure_writable(cell);
+    unsafe { std::ptr::write_unaligned(cell as *mut u8, 1u8); }
+    eprintln!("[routeb-sh300] seeded EC-world realsession flag [0x{cell:x}]=1 at pc={pc:#x} (was 0 -> EC body took benign 23c1b0c branch, skipped real V2Init 23c5538 + StartLuaAppDM 23f1654)");
+}
+
 /// Crate-side stable object mirror of elfjit routeb_singleton_obj_addr: zeroed 0x80
 /// object with [0]=all-leaf vtable (any virtual returns OBJ), so [obj+0x48] reads 0.
 fn routeb_singleton_obj_addr_crate() -> u64 {
@@ -5988,6 +6018,11 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // coherent dispatch obj whose vt[+16]=ret1 leaf, so the EC marshaller's
         // `ldr x8,[x8,#16]; blr x8` returns 1 and the cbnz advances the app-request build.
         routeb_ec_world_arg0_vt_guard(state, pc);
+        // SH300 (opt-in JIT_ROUTEB_EC_REALSESSION): seed the writable .bss flag
+        // [0x106d31e28]=1 at the EC-world entry so the EC body takes its real
+        // V2Init/StartLuaAppDM branch (bl 23c5538 + bl 23f1654) instead of the
+        // benign 23c1b0c singleton path — first headless execution of those fns.
+        routeb_ec_world_realsession_guard(state, pc);
         // SH259 (opt-in JIT_ROUTEB_APPSART_SETTINGS_ONCE): seed the once-guard
         // [0x106a6f430] of the settings/registry factory 0x21dac2c (deepest reach,
         // bl @0x102339d44) so it early-returns the registry object without running the
@@ -7683,6 +7718,53 @@ mod tests {
             assert_eq!(std::ptr::read_unaligned((state.x[0] + 0x30) as *const u64), 0x1234,
                 "idempotent: non-empty slot left untouched");
             std::env::remove_var("JIT_ROUTEB_EC_ARG0VT");
+        }
+    }
+
+    #[test]
+    fn sh300_ec_world_realsession_guard_is_env_pc_gated_and_seeds_flag() {
+        // SH300: seed the writable .bss realsession flag [0x106d31e28]=1 so the EC
+        // body takes its real V2Init/StartLuaAppDM branch. Must (a) be inert without
+        // JIT_ROUTEB_EC_REALSESSION, (b) fire only at EC-world entry 0x102e24598,
+        // (c) seed 1 into the canonical .bss cell, (d) be idempotent.
+        let cell: u64 = 0x106d31e28;
+        unsafe {
+            assert!(routeb_ensure_writable(cell), "realsession .bss page must be writable");
+            std::env::remove_var("JIT_ROUTEB_EC_REALSESSION");
+            std::ptr::write_unaligned(cell as *mut u8, 0);
+            routeb_ec_world_realsession_guard(std::ptr::null_mut(), 0x102e24598);
+            assert_eq!(
+                std::ptr::read_unaligned(cell as *const u8),
+                0,
+                "env-gated: inert without JIT_ROUTEB_EC_REALSESSION"
+            );
+            // (b) env set, wrong pc -> inert.
+            std::env::set_var("JIT_ROUTEB_EC_REALSESSION", "1");
+            std::ptr::write_unaligned(cell as *mut u8, 0);
+            routeb_ec_world_realsession_guard(std::ptr::null_mut(), 0x102e24590);
+            assert_eq!(
+                std::ptr::read_unaligned(cell as *const u8),
+                0,
+                "pc-gated: must fire only at EC-world entry 0x102e24598"
+            );
+            // (c) env set + entry pc + zero byte -> seed 1.
+            std::ptr::write_unaligned(cell as *mut u8, 0);
+            routeb_ec_world_realsession_guard(std::ptr::null_mut(), 0x102e24598);
+            assert_eq!(
+                std::ptr::read_unaligned(cell as *const u8),
+                1,
+                "must seed the canonical realsession flag [0x106d31e28]=1"
+            );
+            // (d) idempotent: non-zero byte left untouched.
+            std::ptr::write_unaligned(cell as *mut u8, 2);
+            routeb_ec_world_realsession_guard(std::ptr::null_mut(), 0x102e24598);
+            assert_eq!(
+                std::ptr::read_unaligned(cell as *const u8),
+                2,
+                "idempotent: non-zero flag left untouched"
+            );
+            std::env::remove_var("JIT_ROUTEB_EC_REALSESSION");
+            std::ptr::write_unaligned(cell as *mut u8, 0);
         }
     }
 
