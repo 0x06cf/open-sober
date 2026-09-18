@@ -1,46 +1,43 @@
-# Open-Sober run state (hermes-worker)
+# Open-Sober run status (hermes-worker)
 
-## HEAD: `dev` branch, SH327 (force AppStarted factory construction DETERMINISTIC; app-start
-## fencepost 0x1025f5300 advances one level deeper to the V2StartAppWithParams params-obj +0x140
-## member). SEP-17 "force the construction branch" forward (SH326c premise reversal -> fix).
+Updated 2026-09-19, this session: SH334 — LIVE answer to the standing "App"-registration question
+(candidate #1) via a default-inert block-entry registry readout at the DM-ctor lookup, surviving the
+FMOD/LSM crash; workspace green with 2 new hermetic tests.
 
-**State**: `cargo test --workspace` green (0 fail): arm64jit lib 408/0 + elfjit examples 151/0
-(150 + sh327) + fsmap + others. `cargo build` EXIT 0. Commit on local `dev` (not pushed; operator
-pushes). elfjit.rs 31 B under the 1MB hook (condensed SH-prose to fit).
+## Current state
 
-## This session (SH327)
+- `dev` HEAD: to be committed (SH334). Clean after commit, NOT pushed (operator pushes).
+- `cargo test --workspace` green (arm64jit lib 410/0 incl. 2 new sh334 tests; elfjit examples 154/0; all crates 0 fail). elfjit.rs byte-identical at 1048570 B (under 1MB pre-commit hook — not touched this cycle).
+- New repro probe: `runs/probe_sh334_reglive.sh`. New frontier doc: `docs/frontier-sh334-reglive.md`.
 
-1. Recon-v3 render plane intact (untouched this cycle).
-2. **SH327** — deterministic AppStarted construction. `routeb_patch_appstart_construct_force` patches
-   0x2e890f4 `b.ne 0x2e89118` (0x54000121) -> unconditional `b 0x2e89118` (0x14000009), removing the
-   factory 0x2e890c4's sole non-construction exit (producer-counter tag==2 -> unconstructed ret). Idempotent
-   (short-circuits [x19,#24] @0x2e89130). Gated on JIT_ROUTEB_DM_SEED/DMFORCE (inert by default).
-3. MEASURED (3/3 dual-PC dump): construction write fires + lands (`[appstart0x106a6f480]=0x55cb343ab000`,
-   real heap obj, now DETERMINISTIC); field-copy helper 0x25f54e8 completes + returns; fault ADVANCES to
-   `ldr w3,[x20,#320]` @0x25f5328 (fault=0x140), x20 = V2StartAppWithParams params obj = 0.
-4. arm64jit lib 408/0; elfjit examples 150 -> 151/0; +sh327 guard (9 pins); +probe_sh327_construct_force.sh.
+## What advanced this session
 
-## Standing (honest, unchanged)
+- **SH334 (measured 3/3 deterministic):** added `routeb_registry_live_guard` (crates/arm64jit/src/jit.rs,
+  opt-in `JIT_ROUTEB_REG_LIVE=1`, read-only, fires once) that snapshots the service-registry count +
+  entry names + DM-root + once-slot + tier-2 controller cell at the EXACT moment the DM-controller
+  ctor's name->service lookup (fn 0x2168798, entry 0x102168798) runs — BEFORE the run-variable
+  FMOD/LSM crash that makes the post-ladder dump() unreachable.
+- **Decisive result:** at the ctor lookup, `service-registry-count[0x106fe2f08]=0 entries=[] DM-root=0
+  once-slot=0 fixidx0=0 tier2-cell=""` — the registry is EMPTY when the lookup runs on the SH332-style
+  MAIN path, so "App" is NOT registered before the crash. This resolves candidate #1's long-standing
+  "open but UNCHANGED" status with a live measurement: the registration-walk+lookup execute, but they
+  do not produce the "App" entry before the run dies. Consistent with SH315/318 (only the bus route
+  populates the registry, and even then no "App").
+- Terminal remains run-variable (FMOD 0x106240cb8 / LSM reader 0x101dcab68 / leaked-host-pc) — the
+  SH332/SH330-class known downstream, no new stable gate.
 
-- **Route-B live-DM structural gate UNCHANGED**: no make_shared<DataModel> fires headlessly; DM-root
-  [0x106a68818] stays 0; MH_APP_READY stays false.
-- NEW: app-start fencepost is deterministic-constructed; standing wall = V2StartAppWithParams
-  params-obj +0x140 member (x0/x20 param of fn 0x25f5270 = 0).
-- Everything achievable headlessly (llvmpipe); GPU host for performance later.
+## Honest status
+
+- No DM (DM-root [0x106a68818]=0, MH_* false); Route-B live-DM structural gate UNCHANGED.
+- SH334 measures and resolves candidate #1's open status (registry empty at the ctor lookup on the
+  MAIN path); it does not manufacture a DataModel. The SESSION-CTOR "App"-registration remains the
+  standing unblock.
 
 ## Next-forward candidates
 
-(a) The 0x102256510 terminal (JNI-receive fn reading [x0] with x0=0). Determine its caller/arg
-    contract — if x0 is a real object the session should pass, this is the SESSION-CTOR drive; if
-    it is a NULL-able callback, a benign early-ret may clear it (SH322/323 pattern).
-(b) R1 content path (synthetic CoreScript module) latent until a live DM requests rbxasset://.
-(c) SH304 session-gated producer fires the instant a real session owns a live DM.
-(d) Re-examine SESSION-CTOR Activity-session lifecycle drive (nativeActivity_onEngineSettingsReceived
-    + real surface) to construct the lifecycle registry for real.
-
-## Do-not-re-tread (this session)
-
-- "The SH273/settings-init walls are a single closed live-object wall" — SH322+SH323 prove the
-  SH320/321 MAIN-path line crosses FIVE consecutive benign seeds (two lifecycle-notify early-rets
-  + two cookie/string globals) before reaching the live-object class at 0x102256510.
-- Prior do-not-re-tread list (SH314-322, SH302-306, SH251/255/260 etc.) unchanged.
+1. (SESSION-CTOR) The "App" service registration so the DM-ctor fast-path resolves a live controller.
+   SH334 pins the decisive measurement point (empty registry at the lookup); the remaining work is to
+   get a REAL app-start session to register "App" (SH313/315/316/317/318 line) — live-state work.
+2. Clear the FMOD/AAudio + LSM reader run-variable walls (0x106240cb8 / 0x101dcab68) only if a stable
+   gate can be pulled from them — note SH212/213/132/SH332 class them run-variable/non-seedable
+   (do-not-re-derive); SH334 now gives a live readout that survives them, so the dump-gap is closed.

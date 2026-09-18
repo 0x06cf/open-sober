@@ -1326,6 +1326,67 @@ fn routeb_donepath_main_branch_guard(_state: *mut CpuState, pc: u64) {
     eprintln!("[routeb-sh320] seeded do-init done-path main-id [0x106863a68]=0x{me:x} (this jit thread) at dispatcher 0x2206db8 pc={pc:#x} (was 0x{cur:x}) -> b.eq NOT taken -> MAIN binder-dispatch 0x206df4 (DM-ctor entry)");
 }
 
+/// SH334 (opt-in JIT_ROUTEB_REG_LIVE=1): LIVE dump of the service-registry + DM-root +
+/// tier-2 controller-name cell at the exact moment the DM-controller ctor's name->service
+/// lookup (fn 0x2168798, block entry 0x102168798) runs on the MAIN path. The SH332/333
+/// post-ladder dump() that answers "does app-start register 'App'?" never fires because the
+/// run dies at the FMOD/AAudio wall (0x106240cb8) first. This guard snapshots the registry
+/// state WHILE the lookup is about to walk it, so candidate #1 becomes answerable regardless
+/// of the later crash. Read-only + default-inert; fires once per run (deduped).
+fn routeb_registry_live_guard(_state: *mut CpuState, pc: u64) {
+    if std::env::var("JIT_ROUTEB_REG_LIVE").ok().as_deref() != Some("1") {
+        return;
+    }
+    if pc != 0x102168798 {
+        return; // ctor name->service lookup fn entry (once-lambda lookups "App"/"Execute")
+    }
+    use std::sync::OnceLock;
+    static FIRED: OnceLock<bool> = OnceLock::new();
+    if FIRED.get().is_some() {
+        return;
+    }
+    let _ = FIRED.set(true);
+    let rd8 = |a: u64| -> u64 {
+        if any_page_mapped(a) { unsafe { *(a as *const u64) } } else { u64::MAX }
+    };
+    let rd4 = |a: u64| -> u32 {
+        if any_page_mapped(a) { unsafe { *(a as *const u32) } } else { u32::MAX }
+    };
+    // (a) service-registry count + entry names (array base 0x106fe6180, stride 0x60). Same
+    // cells the post-ladder dump reads; if "App"/"Execute" appear here, the ctor fast-path
+    // candidate #1 is answered live.
+    let mut names: Vec<String> = Vec::new();
+    let count = rd4(0x106fe2f08);
+    for i in 0..count.min(16) as u64 {
+        let base = 0x106fe6180u64 + i * 0x60;
+        let mut s = String::new();
+        for k in 0..0x40u64 {
+            let b = unsafe { *(base.wrapping_add(k) as *const u8) };
+            if b == 0 { break; }
+            s.push(b as char);
+        }
+        names.push(s);
+    }
+    // (b) DM-root [0x106a68818] + once-slot [0x106a68408] (SH316 distinct cells).
+    // (c) tier-2 controller-name cell for entry 0 (SH318 per-entry fixidx) — the "App"
+    // match target; measured "Runtime0" invariant on prior runs.
+    let idx0 = unsafe { *(0x107027170u64 as *const u8) };
+    let cc = 0x106fe2f00u64 + (idx0 as u64) * 0x5c + 0x2078;
+    let mut cc_s = String::new();
+    for k in 0..0x20u64 {
+        let b = unsafe { *((cc + k) as *const u8) };
+        if b == 0 { break; }
+        cc_s.push(b as char);
+    }
+    eprintln!(
+        "[routeb-reglive] SH334 LIVE at lookup 0x2168798 entry pc={pc:#x}: service-registry-count[0x106fe2f08]={} entries=[{}] DM-root[0x106a68818]=0x{:x} once-slot[0x106a68408]=0x{:x} fixidx0=0x{idx0:x} tier2-cell[0x{cc:x}]=\"{cc_s}\"",
+        count,
+        names.join(", "),
+        rd8(0x106a68818),
+        rd8(0x106a68408)
+    );
+}
+
 /// SH300 (opt-in JIT_ROUTEB_EC_REALSESSION=1): the EC world 0x102e24598
 /// (SH235/298/298b/299) disassembled further: past the SH299 dispatch at
 /// `cbnz w0 @0x2e2465c` (now taken -> 0x2e24678) it branches at 0x2e246f4 on the
@@ -6300,6 +6361,7 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // whitespace-check fn 0x1021f5078 (reached after the SH273 wall clears) reads global
         // std::string [0x106ed7a18] (=NULL -> ldrb fault=0x0). Seed it = empty SSO string.
         routeb_settings_sso_seed_guard(state, pc);
+        routeb_registry_live_guard(state, pc); // SH334 (JIT_ROUTEB_REG_LIVE): live dump of registry/DM at the ctor lookup 0x2168798 — answers the "App"-registration question despite the later FMOD crash (read-only, once)
         // SH259 (opt-in JIT_ROUTEB_APPSART_SETTINGS_ONCE): seed the once-guard
         // [0x106a6f430] of the settings/registry factory 0x21dac2c (deepest reach,
         // bl @0x102339d44) so it early-returns the registry object without running the
@@ -13943,6 +14005,34 @@ mod thread_snapshot_tests {
         assert_eq!(mine.x5, 0x0, "x5 = uaddr2 (NULL)");
         assert_eq!(mine.x6, 0xff, "x6 = bitset");
         assert_eq!(mine.x29, 0x1111);
+    }
+}
+
+#[cfg(test)]
+mod sh334_registry_live_guard_tests {
+    use super::*;
+
+    #[test]
+    fn inert_without_env() {
+        // Default-inert: with JIT_ROUTEB_REG_LIVE unset the guard must no-op at its own
+        // anchor pc (0x102168798) — no dump, no panic, no state write.
+        unsafe { std::env::remove_var("JIT_ROUTEB_REG_LIVE") };
+        let mut st = CpuState::new();
+        routeb_registry_live_guard(&mut st as *mut CpuState, 0x102168798);
+        // No observable side effect on a default state (guard returns before any read).
+        assert_eq!(st.x[0], 0, "inert guard must not touch guest state");
+    }
+
+    #[test]
+    fn wrong_pc_misses_even_with_env() {
+        // Even when enabled, a non-anchor pc must be skipped (guard's only write is the
+        // OnceLock latch, which must NOT trip here — otherwise a stray pc would consume it).
+        unsafe { std::env::set_var("JIT_ROUTEB_REG_LIVE", "1") };
+        let mut st = CpuState::new();
+        routeb_registry_live_guard(&mut st as *mut CpuState, 0x102168700); // before anchor
+        routeb_registry_live_guard(&mut st as *mut CpuState, 0x1021687a0); // after anchor
+        assert_eq!(st.x[0], 0, "non-anchor pc must not fire the live dump");
+        unsafe { std::env::remove_var("JIT_ROUTEB_REG_LIVE") };
     }
 }
 
