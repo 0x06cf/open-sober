@@ -1161,6 +1161,56 @@ fn routeb_ec_world_realsession_guard(_state: *mut CpuState, pc: u64) {
     eprintln!("[routeb-sh300] seeded EC-world realsession flag [0x{cell:x}]=1 at pc={pc:#x} (was 0 -> EC body took benign 23c1b0c branch, skipped real V2Init 23c5538 + StartLuaAppDM 23f1654)");
 }
 
+/// SH302 (opt-in JIT_ROUTEB_EC_READERGATE=1): SH300's realsession flag at
+/// [0x106d31e28] is CORRECT + latched but its READER at 0x2e246f4 is never
+/// reached (SH301 block-entry proof: neither the real V2Init bl-target
+/// 0x1023c5538 nor the benign 0x1023c1b0c ever fires). Fresh disasm of the
+/// EC body [0x2e24598..0x2e247dc] pinpoints WHY: the reader is gated behind a
+/// caller-frame OBJECT read at 0x2e246b0 `ldr x8,[x29,#104]` ->
+/// 0x2e246d8 `ldr x0,[x8,#32]` -> 0x2e246dc `cbz x0, 0x2e246f4` (reader):
+///   - if [x29,#104]+0x20 == 0  -> cbz TAKEN -> falls STRAIGHT into the reader
+///     at 0x2e246f4 (reads the flag; with flag==1 the real V2Init 0x1023c5538
+///     + StartLuaAppDM 0x1023f1654 become reachable).
+///   - if [x29,#104]+0x20 != 0  -> falls to 0x2e246f0 `blr vt[+48]` which
+///     CONSUMES control into a live object dispatch and never falls through to
+///     the reader. This is the "pre-reader continuation" SH301 names as the
+///     real gate (and why the SH300 flag-only seed measured dormant: the
+///     dispatch runs first).
+/// The slot [x29,#104] is a caller-frame memory location (= caller SP + 8 after
+/// the EC prologue `stp x29,x30,[sp,#-96]!` + `mov x29,sp`; address = entry
+/// x31 + 8). This guard, firing at EC entry block 0x102e24598 (before the
+/// prologue runs), reads entry x31 and seeds `space at [x31+8]` to a leaked
+/// ZEROED buffer so [+0x20]==0 -> the cbz @0x2e246dc is taken -> the reader is
+/// reached. Idempotent, env-gated, default-inert. Does NOT restore the object;
+/// the reader's real V2Init/StartLuaAppDM execute next if flag also ==1.
+fn routeb_ec_world_reader_gate_guard(state: *mut CpuState, pc: u64) {
+    if std::env::var("JIT_ROUTEB_EC_READERGATE").ok().as_deref() != Some("1") {
+        return;
+    }
+    if pc != 0x102e24598 {
+        return;
+    }
+    let entry_sp = unsafe { (*state).x[31] };
+    if entry_sp == 0 {
+        return;
+    }
+    let slot = entry_sp.wrapping_add(8); // [x29,#104] after prologue == (entry_sp-96)+104 == entry_sp+8
+    // routeb_ensure_writable maps the page if it is .bss; caller-frame stack is
+    // already writable host RAM, but keep the same rubric.
+    let cur = unsafe { std::ptr::read_unaligned(slot as *const u64) };
+    if cur == 0 {
+        return; // already NULL -> 0x2e246b0 [x29,#104]=0 -> 0x2e246d8 [0+32] would
+                // SIGSEGV; do NOT seed into that (leave for a future fencepost).
+    }
+    routeb_ensure_writable(slot);
+    static ZBUF_LEAK: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let zbuf = *ZBUF_LEAK.get_or_init(|| {
+        Box::leak(vec![0u8; 0x40usize].into_boxed_slice()).as_ptr() as u64
+    });
+    unsafe { std::ptr::write_unaligned(slot as *mut u64, zbuf) };
+    eprintln!("[routeb-sh302] seeded EC reader-gate [x29+8]@0x{slot:x} = zeroed buf 0x{zbuf:x} ([+0x20]=0 -> cbz @0x2e246dc TAKEN -> reader 0x2e246f4 reachable; real V2Init 23c5538 + StartLuaAppDM 23f1654 next) at pc={pc:#x} (was 0x{cur:x})");
+}
+
 /// Crate-side stable object mirror of elfjit routeb_singleton_obj_addr: zeroed 0x80
 /// object with [0]=all-leaf vtable (any virtual returns OBJ), so [obj+0x48] reads 0.
 fn routeb_singleton_obj_addr_crate() -> u64 {
@@ -6023,6 +6073,12 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // V2Init/StartLuaAppDM branch (bl 23c5538 + bl 23f1654) instead of the
         // benign 23c1b0c singleton path — first headless execution of those fns.
         routeb_ec_world_realsession_guard(state, pc);
+        // SH302 (opt-in JIT_ROUTEB_EC_READERGATE): seed the EC reader-gate
+        // caller-frame object [x29,#104]=[entry_sp+8] to a zeroed buffer so the
+        // `cbz x0, reader` @0x2e246dc is TAKEN -> the realsession reader (and
+        // then the real V2Init 0x1023c5538 / StartLuaAppDM 0x1023f1654) become
+        // reachable instead of the dispatch at 0x2e246f0 consuming control.
+        routeb_ec_world_reader_gate_guard(state, pc);
         // SH259 (opt-in JIT_ROUTEB_APPSART_SETTINGS_ONCE): seed the once-guard
         // [0x106a6f430] of the settings/registry factory 0x21dac2c (deepest reach,
         // bl @0x102339d44) so it early-returns the registry object without running the
@@ -7811,6 +7867,76 @@ mod tests {
             eprintln!("sh301 EC realsession-reader frontier + both bl-targets pinned on libroblox.so (reader unreached by block-entry doctrine)");
         } else {
             eprintln!("sh301 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
+    fn sh302_ec_world_reader_gate_guard_is_env_pc_gated_and_seeds_caller_frame_slot() {
+        // SH302: seed the EC reader-gate caller-frame object [x29,#104]=[entry_sp+8]
+        // to a zeroed buffer so the `cbz x0, reader` @0x2e246dc is TAKEN -> the
+        // realsession reader (and real V2Init 0x1023c5538 / StartLuaAppDM
+        // 0x1023f1654) become reachable instead of the dispatch at 0x2e246f0
+        // consuming control. Must (a) be inert without JIT_ROUTEB_EC_READERGATE,
+        // (b) fire only at EC-world entry 0x102e24598, (c) seed [entry_sp+8] to a
+        // zeroed buffer with [+0x20]==0, (d) NOT seed a NULL slot (that would turn
+        // 0x2e246d8 [0+32] into a SIGSEGV).
+        let mut st = CpuState::new();
+        let frame = Box::leak(vec![0xabu64; 0x40usize].into_boxed_slice());
+        unsafe { st.x[31] = frame.as_ptr() as u64; }
+        let entry_sp = unsafe { st.x[31] };
+        let slot = entry_sp + 8;
+        unsafe {
+            std::env::remove_var("JIT_ROUTEB_EC_READERGATE");
+            std::ptr::write_unaligned(slot as *mut u64, 0x1234_5678_9abc_def0u64);
+            routeb_ec_world_reader_gate_guard(&mut st as *mut CpuState, 0x102e24598);
+            assert_eq!(std::ptr::read_unaligned(slot as *const u64), 0x1234_5678_9abc_def0u64,
+                "env-gated: inert without JIT_ROUTEB_EC_READERGATE");
+            // (b) env set, wrong pc -> inert.
+            std::env::set_var("JIT_ROUTEB_EC_READERGATE", "1");
+            std::ptr::write_unaligned(slot as *mut u64, 0x1234_5678_9abc_def0u64);
+            routeb_ec_world_reader_gate_guard(&mut st as *mut CpuState, 0x102e24590);
+            assert_eq!(std::ptr::read_unaligned(slot as *const u64), 0x1234_5678_9abc_def0u64,
+                "pc-gated: must fire only at EC-world entry 0x102e24598");
+            // (c) env set + entry pc + non-NULL slot -> seed zeroed buffer ([+0x20]==0).
+            routeb_ec_world_reader_gate_guard(&mut st as *mut CpuState, 0x102e24598);
+            let seeded = std::ptr::read_unaligned(slot as *const u64);
+            assert_ne!(seeded, 0x1234_5678_9abc_def0u64, "must seed the caller-frame slot");
+            assert_eq!(std::ptr::read_unaligned((seeded + 0x20) as *const u64), 0,
+                "seeded buffer [+0x20]==0 -> cbz @0x2e246dc TAKEN -> reader reachable");
+            assert_eq!(std::ptr::read_unaligned(slot as *const u64), seeded,
+                "idempotent re-seed leaves the same buffer");
+            // (d) NULL slot is left NULL (a future fencepost, NOT this guard).
+            let z = Box::leak(vec![0xabu64; 0x40usize].into_boxed_slice());
+            unsafe { st.x[31] = z.as_ptr() as u64; }
+            let slot2 = unsafe { st.x[31] } + 8;
+            std::ptr::write_unaligned(slot2 as *mut u64, 0);
+            routeb_ec_world_reader_gate_guard(&mut st as *mut CpuState, 0x102e24598);
+            assert_eq!(std::ptr::read_unaligned(slot2 as *const u64), 0,
+                "NULL slot left NULL (would SIGSEGV [0+32] if seeded)");
+            std::env::remove_var("JIT_ROUTEB_EC_READERGATE");
+        }
+        // Real-image guard (as sh301 family): pin the reader-gate mechanism at
+        // [0x2e24598,0x2e24840) so a drifted real binary fails loudly. These bytes
+        // are the pre-reader continuation sh301's "NEXT GATE" names but did NOT pin:
+        //  0x2e246b0 ldr x8,[x29,#104]   (caller-frame object read)
+        //  0x2e246d8 ldr x0,[x8,#32]     (reader-gate [+0x20])
+        //  0x2e246dc cbz x0,0x2e246f4    (the gate -> reader)
+        //  0x2e246f0 blr x8              (vt[+48] dispatch that consumes control)
+        //  0x2e246f4 reader adrp (sh301 pinned this + the two bl-targets).
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let word_at = |v: u64| -> u32 {
+                let b = &img[v as usize..v as usize + 4];
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            };
+            assert_eq!(word_at(0x2e246b0), 0xf94037a8, "sh302 reader-gate ldr x8,[x29,#104]");
+            assert_eq!(word_at(0x2e246d8), 0xf9401100, "sh302 reader-gate ldr x0,[x8,#32]");
+            assert_eq!(word_at(0x2e246dc), 0xb40000c0, "sh302 reader-gate cbz x0,0x2e246f4");
+            assert_eq!(word_at(0x2e246f0), 0xd63f0100, "sh302 reader-gate blr x8 (vt[+48] dispatch)");
+            eprintln!("sh302 EC reader-gate mechanism pinned on libroblox.so (caller-frame object -> cbz -> dispatch; reader behind it)");
+        } else {
+            eprintln!("sh302 real-image guard: no real libroblox.so, skipping anchors");
         }
     }
 
