@@ -684,6 +684,16 @@ fn routeb_appstart_408_benign_obj() -> u64 {
 /// known in-process), so this seeds [x19+0x408] at block-entry into the gate window. FORWARD-PROBE
 /// only: reveals what the real session ctor must build at +0x408 (or what runs next), NOT a live DM.
 /// Default-inert (env-gated); idempotent (only writes when 0/sub-image).
+///
+/// NOTE (SH330b, measured 8-run A/B): the epilogue canary re-read `ldr x8,[x21]` @0x25f5060
+/// requires x21 still == the guard-GOT slot ([x19+0x408]'s dispatch is a host leaf that preserves
+/// CpuState callee-saved regs, so x21 === guardGOT in practice). Restoring x21 defensively was
+/// tested and measured 0 firings + NO distribution change — it is a no-op against an empty
+/// endpoint and was reverted (SH184/SH186 no-cruft discipline). The gate crosses deterministically
+/// (guard fires every run), but the DOWNSTREAM is genuinely run-variable on the full recipe too:
+/// 8-run batch ~5/8 clean EXIT 0, remainder abort at a downstream host-pc/AAudio site — matching
+/// SH330's original doc. So this gate is crossed-but-not-completed; the next wall is that
+/// run-variable host-pc/AAudio leak (SH320/SH212-class), not the canary epilogue.
 fn routeb_appstart_408_guard(state: *mut CpuState, pc: u64) {
     if std::env::var_os("JIT_ROUTEB_APPSART_408SEED").is_none() {
         return;
