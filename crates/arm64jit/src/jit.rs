@@ -1340,18 +1340,24 @@ fn routeb_registry_live_guard(_state: *mut CpuState, pc: u64) {
     if pc != 0x102168798 {
         return; // ctor name->service lookup fn entry (once-lambda lookups "App"/"Execute")
     }
-    use std::sync::OnceLock;
-    static FIRED: OnceLock<bool> = OnceLock::new();
-    if FIRED.get().is_some() {
-        return;
-    }
-    let _ = FIRED.set(true);
+    // SH335: the ctor lookup runs MORE THAN ONCE (bus route: first lookup sees an empty
+    // registry, later lookups after the bus populates 12 match "Execute" -> once-slot). A
+    // once-per-run guard only ever captured the first (empty) readout. Fire on COUNT
+    // TRANSITIONS instead (0->12 etc.) so the registry progression is visible and any time
+    // "App" appears is caught (naturally bounded by the number of distinct count values).
     let rd8 = |a: u64| -> u64 {
         if any_page_mapped(a) { unsafe { *(a as *const u64) } } else { u64::MAX }
     };
     let rd4 = |a: u64| -> u32 {
         if any_page_mapped(a) { unsafe { *(a as *const u32) } } else { u32::MAX }
     };
+    const LAST_COUNT_SEEN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+    let c = rd4(0x106fe2f08);
+    let seen = LAST_COUNT_SEEN.load(std::sync::atomic::Ordering::Relaxed);
+    if seen >= 0 && seen == c as i64 {
+        return; // same count as last dump — skip (idempotent within a count value)
+    }
+    LAST_COUNT_SEEN.store(c as i64, std::sync::atomic::Ordering::Relaxed);
     // (a) service-registry count + entry names (array base 0x106fe6180, stride 0x60). Same
     // cells the post-ladder dump reads; if "App"/"Execute" appear here, the ctor fast-path
     // candidate #1 is answered live.
@@ -1370,13 +1376,19 @@ fn routeb_registry_live_guard(_state: *mut CpuState, pc: u64) {
     // (b) DM-root [0x106a68818] + once-slot [0x106a68408] (SH316 distinct cells).
     // (c) tier-2 controller-name cell for entry 0 (SH318 per-entry fixidx) — the "App"
     // match target; measured "Runtime0" invariant on prior runs.
-    let idx0 = unsafe { *(0x107027170u64 as *const u8) };
+    let idx0 = if any_page_mapped(0x107027170u64) {
+        unsafe { *(0x107027170u64 as *const u8) }
+    } else {
+        0
+    };
     let cc = 0x106fe2f00u64 + (idx0 as u64) * 0x5c + 0x2078;
     let mut cc_s = String::new();
-    for k in 0..0x20u64 {
-        let b = unsafe { *((cc + k) as *const u8) };
-        if b == 0 { break; }
-        cc_s.push(b as char);
+    if any_page_mapped(cc) {
+        for k in 0..0x20u64 {
+            let b = unsafe { *((cc + k) as *const u8) };
+            if b == 0 { break; }
+            cc_s.push(b as char);
+        }
     }
     eprintln!(
         "[routeb-reglive] SH334 LIVE at lookup 0x2168798 entry pc={pc:#x}: service-registry-count[0x106fe2f08]={} entries=[{}] DM-root[0x106a68818]=0x{:x} once-slot[0x106a68408]=0x{:x} fixidx0=0x{idx0:x} tier2-cell[0x{cc:x}]=\"{cc_s}\"",

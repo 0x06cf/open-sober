@@ -1,20 +1,21 @@
 # Open Sober — Agent Handoff
-## SH334 (Sep 19, 2026, hermes-worker): LIVE answer to the standing "App"-registration question (candidate
-## #1) via a default-inert block-entry registry readout at the DM-controller ctor's name->service lookup —
-## measured 3/3: the registry is EMPTY at the lookup on the SH332-style MAIN path, so "App" is not registered
-## before the (run-variable) crash; the post-ladder dump that previously provided the only readout is no longer
-## the gate.
-Added `routeb_registry_live_guard` (crates/arm64jit/src/jit.rs, opt-in `JIT_ROUTEB_REG_LIVE=1`, read-only,
-fires once) that snapshots service-registry count + entry names + DM-root [0x106a68818] + once-slot
-[0x106a68408] + tier-2 controller-name cell at the EXACT moment the DM-ctor lookup (fn 0x2168798, entry
-0x102168798) runs. Measured (real libroblox.so, runs/probe_sh334_reglive.sh, 3/3 deterministic):
-`service-registry-count[0x106fe2f08]=0 entries=[] DM-root=0 once-slot=0 fixidx0=0 tier2-cell=""` at the lookup.
-This RESOLVES candidate #1's "open but UNCHANGED" status: on the SH332-style MAIN-path run the registration-walk
-(0x21e2a90) + lookup (0x2168798) execute and the +0x408 cross fires, but the registry is EMPTY when the ctor
-looks up "App" — the ctor fast-path cbnz still misses, DM-root stays 0. Terminal remains run-variable
-(FMOD 0x106240cb8 / LSM 0x101dcab68 / leaked-host-pc, SH330/332-class); the guard now makes the readout
-survive it. 2 new hermetic tests (arm64jit lib 408->410: inert-without-env, wrong-pc-miss). elfjit.rs
-byte-identical 1048570 B (unchanged, 1MB hook). Workspace green (lib 410/0, elfjit 154/0). HONEST: no DM, no
-manufactured DataModel; Route-B live-DM structural gate UNCHANGED; SESSION-CTOR "App"-registration remains the
-standing unblock, now byte-measured at the exact decision point. NEXT remains SESSION-CTOR "App" registration
-(SH313/315/316/317/318) via a real Activity/AppBridge session drive.
+## SH335 (Sep 19, 2026, hermes-worker): timing-accurate closure on the "App"-registration question
+## (candidate #1) via a count-transition reglive guard — measured 3/3 on the bus route that
+## "App" is NEVER registered at any DM-ctor lookup; the fast-path matches only "Execute" -> no DM.
+Turned the once-per-run `routeb_registry_live_guard` (jit.rs, JIT_ROUTEB_REG_LIVE=1, read-only,
+default-inert) into a **count-transition** latch: it now dumps at guest pc 0x102168798 (DM-ctor
+name->service lookup entry 0x2168798) whenever the service-registry count [0x106fe2f08] changes,
+instead of firing once on the first (empty) lookup. Also page-safe-guarded the tier-2
+fixidx/controller-cell reads (any_page_mapped) so the guard can't SIGSEGV on an unmapped page.
+Measured (real libroblox.so, runs/probe_sh335_bus_reglive.sh, on the --v2boot-session-bus route,
+3/3 deterministic): the lookup fires once per service registration, count 0->12, and at EVERY count
+the registry holds ONLY the task-scheduler family — Thread (BG/FG), Spawn (BG/FG), Yield (BG/FG),
+Close (BG/FG), Sleep, Sched, UNKNOWN — with "App" NEVER a registry entry (exact-token scan across
+all runs: NONE), DM-root [0x106a68818]=0 at every lookup, and once-slot [0x106a68408] transitioning
+0x0->0x400000b only at the terminal count=12 lookup (= the fast-path's match on "Execute", not
+"App"). This closes SH334's open timing gap (its once-per-run guard only captured the empty first
+readout); consistent with SH313/315/316/317/318. 2 hermetic tests kept green, now pass in parallel
+(env-race SIGSEGV eliminated by page-safety). Workspace green (lib 410/0, elfjit 154/0, 590 passed
+workspace, 0 fail). elfjit.rs byte-identical 1048570 B (unchanged). HONEST: no DM; Route-B live-DM
+gate UNCHANGED; NEXT = real session drive that registers the "App" service (SH313/315/316/317/318)
+so the DM-ctor fast-path resolves a live controller. +probe_sh335_bus_reglive.sh +frontier doc.
