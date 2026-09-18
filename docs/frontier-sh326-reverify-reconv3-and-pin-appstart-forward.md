@@ -50,9 +50,21 @@ fabricate-only cell:
   `str x0,[x19,#24]` @0x2e89150 — i.e. **writes [AppStarted+24] = the exact cross cell**. x0 there is the
   return of `bl 35d0608` (a build helper) after `bl 21daef8` (a co-initializer on obj+0x8/+0x30). The
   branch is gated: `ldr x8,[x19,#24]; cbnz x8, skip` @0x2e89130 (already-set short-circuit).
-- Net: the SEP-17 drive that clears this gate = make the once-guard path run, drive `bl 21daef8` and
-  `bl 35d0608` to return a valid object so 0x2e89150 stores a non-NULL [AppStarted+24]. This is REAL
-  ctor logic (state-machine, not a seed), consistent with the operator's cause-not-symptom SEP-17 line.
+## 2c. MEASURED: the construction write FIRES headlessly — premise overturned
+
+JIT_DUMP_PC probe on the standing run (--startapp 0x258b144, --v2boot --v2boot-session, full seed
+set) shows 0x2e89150 (`str x0,[x19,#24]`, the AppStarted+24 constructor write) DOES execute headlessly:
+`DUMPPC pc=0x102e89150 x0=0x5588d0f085e0 x19=0x106a6f468` — so `[0x106a6f468+24]=[0x106a6f480]` is
+populated with a REAL heap object. The prior "cross is unconstructible headlessly / only a real Java
+session builds it" premise (SH324-325) is **OVERTURNED**: the AppStarted ctor runs and writes the
+cross cell. The gate STILL faults (x0=[AppStarted+24]=0 at the field-copy 0x1025f5300) — leading
+hypothesis (NEXT to test): a synchronization/determinism gap, the construction write does not land
+before the main thread's field-copy reads the cell (once-guard bl 233bf20 -> bl 2e890c4 may run
+asynchronously/post-ladder or on a second AppStarted copy), so the read sees 0. SEP-17 forward is
+therefore to test determinism, not construction: drive 0x2e890c4 synchronously on the SAME thread and
+re-read [0x106a6f480] after bl 233bf20 returns (or seed once-guard [0x106a6f490].bit0=1 + verify);
+whether the write raced a clear or a different object is the open question. No code changed this
+cycle; repro steps in this doc + JIT_DUMP_PC=0x102e89150.
 
 ## 3. New observation: SetInitParams drives the real type-4 TaskScheduler drain (NONDETERMINISTIC)
 
