@@ -6670,10 +6670,10 @@ fn main() {
                 }
                 eprintln!("[elfjit:v2boot] SH109 seeded version-gate [0x10683d350]=6 so V2Init/V2Start keep the clean main path");
                 let _ = (iimg, ib);
-                // SEP-17 SESSION DRIVE (--v2boot-session): drives the REAL Android Activity/AppBridge
-                // lifecycle natives (SH184). All JNI-RECEIVE (zero in-image bl callers) - harness MUST
-                // drive them. Fresh guest jit_runs on ONE ladder thread (SH55/64), reusing boot_sp/tpidr
-                // + fabricated thiz. setActive reads SH248f adapter triplet [0x106b0bde0]. Ref recon-routeB.
+                // SEP-17 SESSION DRIVE (--v2boot-session): drive the REAL Android Activity/AppBridge
+                // lifecycle natives (SH184), all JNI-RECEIVE (zero bl callers) — harness MUST drive
+                // them. One ladder thread (SH55/64), reuse boot_sp/tpidr + fabricated thiz.
+                // setActive reads SH248f adapter triplet [0x106b0bde0].
                 if std::env::args().any(|a| a == "--v2boot-session") {
                     let mut lifecycle: Vec<(&str, u64, [u64; 8])> = vec![
                         ("initAppShellReporter", 0x1021f53b8, [env_ptr, thiz, 0, 0, 0, 0, 0, 0]),
@@ -6751,12 +6751,9 @@ fn main() {
                         let me = unsafe { libc::pthread_self() };
                         unsafe {
                             *(main_id_cell as *mut u64) = me as u64;
-                            // GATE-FIX (deleg_ff125cbc disasm of do-init 0x102206c40): do NOT set once-guard
-                            // [0x106a68410].bit0=1 here - do-init's guard (0x2206c80
-                            // `ldarb w9,[0x6a68410]; tbz w9,#0`) runs __call_once ONLY when
-                            // bit0==0, and that lambda populates DM-root [0x106a68818].
-                            // Forcing bit0=1 SKIPS it -> 0x2206df8 dead-ends to Ok(0x3e8).
-                            // Correct: seed flags-latch + main-id, LET the once-lambda run.
+                            // GATE-FIX (do-init 0x102206c40 disasm): do NOT set once-guard [0x106a68410].bit0=1 here —
+                            // the guard (0x2206c80 ldarb/tbz) runs __call_once ONLY when bit0==0, and
+                            // that lambda populates DM-root [0x106a68818]; forcing 1 skips it -> Ok(0x3e8).
                             let og = 0x106a68410u64 as *mut u8;
                             let _ = og; // left CLEAR (0) so __call_once runs and builds the DM
                             // SH125 (do-init 0x102206c40 disasm): the flags-loaded GETTER (guest 0x10220671c)
@@ -7608,67 +7605,90 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                     );
                     dump("MessageBus.subscribe");
                 }
-                // SH315 post-registry do-init re-drive (opt-in --v2boot-postbus-doinit): the
+                // SH315 postbus-doinit: MessageBus.subscribe then re-drive StartLuaAppDM (opt-in).
                 if std::env::args().any(|a| a == "--v2boot-postbus-doinit") {
                     let reg = || unsafe { *(0x106fe2f08u64 as *const u32) };
                     let dm = || unsafe { *(0x106a68818u64 as *const u64) };
                     let ogb = || unsafe { *(0x106a68410u64 as *const u8) };
-                    eprintln!(
-                        "[elfjit:v2boot] SH315 pre-doinit: service-registry-count={} DM-root[0x106a68818]={:#x} once-guard={:#x}",
-                        reg(),
-                        dm(),
-                        ogb()
-                    );
-                    // (1) Drive real MessageBus.subscribe to run app-start's session registration
-                    // walk (populates the registry from 0).
+                    eprintln!("[elfjit:v2boot] SH315 pre: reg={} DM[0x106a68818]={:#x} once[0x106a68410]={:#x}", reg(), dm(), ogb());
                     let b1 = arm64jit::jni::new_string_utf_handle(b"experience-launch");
-                    let b2 = arm64jit::jni::new_string_utf_handle(b"");
-                    let b3 = arm64jit::jni::new_string_utf_handle(b"");
-                    let b4 = arm64jit::jni::new_string_utf_handle(b"");
                     let mut sb = arm64jit::jit::CpuState::new();
-                    sb.tpidr = tpidr;
-                    sb.x[31] = boot_sp;
-                    sb.x[0] = env_ptr;
-                    sb.x[1] = thiz;
-                    sb.x[2] = b1;
-                    sb.x[3] = b2;
-                    sb.x[4] = b3;
-                    sb.x[5] = b4;
+                    sb.tpidr = tpidr; sb.x[31] = boot_sp;
+                    sb.x[0] = env_ptr; sb.x[1] = thiz;
+                    sb.x[2] = b1; sb.x[3] = arm64jit::jni::new_string_utf_handle(b"");
+                    sb.x[4] = arm64jit::jni::new_string_utf_handle(b""); sb.x[5] = arm64jit::jni::new_string_utf_handle(b"");
                     match arm64jit::jit::jit_run(iimg, ib, 0x102ba5bb8, &mut sb as *mut CpuState) {
                         Err(e) => eprintln!("[elfjit:v2boot] SH315 bus stopped: {e}"),
-                        Ok(r) => eprintln!("[elfjit:v2boot] SH315 bus returned Ok({r:#x})"),
+                        Ok(r) => eprintln!("[elfjit:v2boot] SH315 bus Ok({r:#x})"),
                     }
-                    eprintln!(
-                        "[elfjit:v2boot] SH315 after-bus: service-registry-count={}",
-                        reg()
-                    );
-                    // (2) Clear the once-guard + re-seed main-id do-init re-takes the
-                    // DM-construction once-lambda (SH126 pattern; proven working on this path).
+                    eprintln!("[elfjit:v2boot] SH315 after-bus reg={}", reg());
+                    // (2) Clear once-guard + re-seed main-id so do-init re-runs the DM ctor lambda.
                     unsafe {
                         let og = 0x106a68410u64 as *mut u8;
                         *og &= !1u8;
                         let me = libc::pthread_self();
                         *(0x106863a68u64 as *mut u64) = me as u64;
-                        eprintln!(
-                            "[elfjit:v2boot] SH315 cleared once-guard [0x6a68410].bit0=0 + re-seeded main-id 0x{me:x}"
-                        );
+                        eprintln!("[elfjit:v2boot] SH315 cleared once-guard + main-id 0x{me:x}");
                     }
-                    // (3) Re-drive StartLuaAppDM -> do-init -> DM-controller ctor with a
-                    // populated registry.
+                    // (3) Re-drive StartLuaAppDM -> do-init -> DM-ctor with a populated registry.
                     let mut sd = arm64jit::jit::CpuState::new();
-                    sd.tpidr = tpidr;
-                    sd.x[31] = boot_sp;
-                    sd.x[0] = env_ptr;
-                    sd.x[1] = thiz;
+                    sd.tpidr = tpidr; sd.x[31] = boot_sp; sd.x[0] = env_ptr; sd.x[1] = thiz;
                     let res = arm64jit::jit::jit_run(iimg, ib, 0x1023efe2c, &mut sd as *mut CpuState);
-                    eprintln!(
-                        "[elfjit:v2boot] SH315 StartLuaAppDM re-drive -> {:?}; post: service-registry-count={} DM-root[0x106a68818]={:#x} once-guard={:#x}",
-                        res.map(|r| format!("Ok({r:#x})")),
-                        reg(),
-                        dm(),
-                        ogb()
-                    );
+                    eprintln!("[elfjit:v2boot] SH315 re-drive {:?}; post reg={} DM={:#x} once={:#x}", res.map(|r| format!("Ok({r:#x})")), reg(), dm(), ogb());
                     dump("SH315-postbus-doinit");
+                }
+                // SH337 (--v2boot-postbus-v1appstart): drive V1 nativeAppBridgeAppStart__ (0x102338510,
+                // SH336 ABI) AFTER MessageBus.subscribe populates the registry. Prior V1 drives all
+                // ran from count=0; does the walk register "App" against count=12? (DM-ctor fast-path
+                // needs ONE "App", SH313; tier-2 cell invariant "Runtime0", SH317/318.)
+                if std::env::args().any(|a| a == "--v2boot-postbus-v1appstart") {
+                    let reg = || unsafe { *(0x106fe2f08u64 as *const u32) };
+                    let dm = || unsafe { *(0x106a68818u64 as *const u64) };
+                    // (1) bus: registry 0 -> 12 (task-scheduler family; runs app-start's REAL walk).
+                    let b1 = arm64jit::jni::new_string_utf_handle(b"experience-launch");
+                    let mut sb = arm64jit::jit::CpuState::new();
+                    sb.tpidr = tpidr; sb.x[31] = boot_sp;
+                    sb.x[0] = env_ptr; sb.x[1] = thiz;
+                    sb.x[2] = b1;
+                    let b2 = arm64jit::jni::new_string_utf_handle(b"");
+                    let b3 = arm64jit::jni::new_string_utf_handle(b"");
+                    sb.x[3] = b2; sb.x[4] = b3;
+                    let b4 = arm64jit::jni::new_string_utf_handle(b"");
+                    sb.x[5] = b4;
+                    match arm64jit::jit::jit_run(iimg, ib, 0x102ba5bb8, &mut sb as *mut CpuState) {
+                        Err(e) => eprintln!("[elfjit:v2boot] SH337 bus stopped: {e}"),
+                        Ok(r) => eprintln!("[elfjit:v2boot] SH337 bus Ok({r:#x})"),
+                    }
+                    eprintln!("[elfjit:v2boot] SH337 after-bus registry={}", reg());
+                    // (2) V1 AppStart__ with a POPULATED registry.
+                    let mut sv = arm64jit::jit::CpuState::new();
+                    sv.tpidr = tpidr; sv.x[31] = boot_sp;
+                    sv.x[0] = env_ptr; sv.x[1] = thiz;
+                    sv.x[2] = arm64jit::jni::new_string_utf_handle(b"");
+                    sv.x[3] = arm64jit::jni::new_string_utf_handle(b"");
+                    sv.x[4] = 0; // jboolean false
+                    sv.x[5] = arm64jit::jni::new_string_utf_handle(b"");
+                    sv.x[6] = arm64jit::jni::new_string_utf_handle(b"");
+                    sv.x[7] = arm64jit::jni::new_string_utf_handle(b"");
+                    match arm64jit::jit::jit_run(iimg, ib, 0x102338510, &mut sv as *mut CpuState) {
+                        Err(e) => eprintln!("[elfjit:v2boot] SH337 V1 AppStart__ stopped: {e}"),
+                        Ok(r) => eprintln!("[elfjit:v2boot] SH337 V1 AppStart__ Ok({r:#x})"),
+                    }
+                    let og = unsafe { *(0x106a68410u64 as *const u8) };
+                    // dump registry entry names so an "App" registration is detectable.
+                    let cnt = unsafe { *(0x106fe2f08u64 as *const u32) };
+                    let mut names: Vec<String> = Vec::new();
+                    for i in 0..cnt.min(16) as u64 {
+                        let mut s = String::new();
+                        for k in 0..0x40u64 {
+                            let b = unsafe { *((0x106fe6180u64 + i * 0x60 + k) as *const u8) };
+                            if b == 0 { break; }
+                            s.push(b as char);
+                        }
+                        if !s.is_empty() { names.push(s); }
+                    }
+                    eprintln!("[elfjit:v2boot] SH337 post-V1: registry={} DM-root[0x106a68818]={:#x} once-guard={:#x} entries=[{}]", reg(), dm(), og, names.join(", "));
+                    dump("SH337-V1AppStart-postbus");
                 }
                 // SH131 (disasm 21f7654): seed engine's OWN files-dir global. Real client stores it via
                 // nativeSetFilesDirectory (0x1021f7654) - 24-byte libc++ std::string at 0x10726d600.
@@ -7849,13 +7869,10 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                     }
             }));
         }
-        // --v2boot-r246: the sequential --v2boot driver STALLS at rung 1 because
-        // nativeGameGlobalInit parks without returning (SH54/SH55), so rungs 2-6
-        // were NEVER exercised headlessly. A concurrent rung-1 thread is unsafe
-        // (each top-level jit_run clears the block cache mid-other-thread). This
-        // probe instead drives rungs 2-6 + V1 SEQUENTIALLY with NO GlobalInit and
-        // NO extra threads, dumping the type-4 producer vector after each - a safe
-        // test of whether any later bridge native alone installs it. Opt-in.
+        // --v2boot-r246: the sequential --v2boot driver STALLS at rung 1 (GlobalInit park, SH54/55)
+        // and a concurrent rung thread is unsafe (cache clear mid-other-thread). Drive rungs 2-6 +
+        // V1 SEQUENTIALLY with NO GlobalInit/threads, dumping the type-4 vector after each: does any
+        // later native alone install it? Opt-in.
         if std::env::args().any(|a| a == "--v2boot-r246") {
             const BSS_TASKV4: u64 = 0x106829ea8;
             let boot_sp = st.x[31];
@@ -9003,12 +9020,9 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
             eprintln!("[kernel:NOP re-arm store 0x{rearm:x} (gate-2) under JIT_DRIVE_LIFECYCLE");
         }
     }
-    // --drain-poll <ms>: force the engine idle-task-deque consumer's drain (0x2856e40) to FINITE
-    // wait instead of infinite -1 it blocks on during idle. Parked threads deadlock: `mov x2,x22`
-    // (0x2856f40, x22=drain timeout=-1) hands generic-wait 0x284d014 an infinite timeout -> bare-futex
-    // park forever, so pop-loop 0x2856f94 (reached only on timeout w0=1 && version match) never runs.
-    // A finite ms times it out -> pop-loop finds a host-placed node in [headcell+0], dispatches
-    // [node+112]->[vt+40]. Patch the image before it compiles.
+    // --drain-poll <ms>: make the idle-task-deque drain (0x2856e40) wait FINITE not infinite -1
+    // (parked forever on generic-wait 0x284d014, so pop-loop 0x2856f94 never runs; a finite ms
+    // times it out -> pop-loop dispatches a host node in [headcell+0] via [node+112]->[vt+40]).
     {
         let args: Vec<String> = std::env::args().collect();
         if let Some(i) = args.iter().position(|a| a == "--drain-poll") {
@@ -9351,13 +9365,9 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                         "[elfjit:taskv4-frame] presenter drained: {presented} real task-driven frames presented (all on the currency-owning thread); pending={}",
                         PENDING_PRESENTS.load(core::sync::atomic::Ordering::Relaxed)
                     );
-                    // SH131: in the combined serialized-capture run, the frame
-                    // budget only artifact we want - the injector's
-                    // 400-tick re-injection has been flooding the drain through
-                    // the frame thunk past this point, ending in a released
-                    // clone worker's guest raise(SIGTRAP) (exit 133). Null the
-                    // type-4 vector back to its boot-idle no-op state and tell
-                    // the injector to stop, run settles cleanly instead.
+                    // SH131: in the combined serialized-capture run, the frame budget artifact floods the drain
+                       // beyond the frame thunk into a released clone worker's raise(SIGTRAP) (exit 133). Null the
+                       // type-4 vector back to boot-idle no-op + stop the injector, run settles cleanly.
                     if combined_frame_capture() {
                         TASKFRAME_HALT.store(true, core::sync::atomic::Ordering::Release);
                         unsafe { *(0x106829ea8u64 as *mut u64) = 0; }
@@ -9934,12 +9944,9 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                     // crafted blocks are valid ETC2; decode_etc2_rgb must yield colors.
                                     let etc2_mode = renderframe_args.iter().any(|a| a == "--renderframe-etc2");
                                     let comp_mode = etc_mode || etc2_mode;
-                                    // --renderframe-mesh-tex <dds>: upload a REAL Roblox material
-                                    // map (DDS R8 LUMINANCE, e.g. android/textures/studs.dds) and
-                                    // sample it over the --renderframe-mesh geometry. Real APK
-                                    // texture data on real mesh geometry engine's own
-                                    // GLES path (screen-space UV, reusing the proven single-attribute
-                                    // textured bridge; R8->RGBA expand, no decoder).
+                                    // --renderframe-mesh-tex <dds>: upload a REAL Roblox material map (DDS R8 LUMINANCE) and
+                                    // sample it over --renderframe-mesh geometry (real APK tex data on real mesh
+                                    // via the engine's GLES path; R8->RGBA, no decoder).
                                     let mesh_tex: Option<std::path::PathBuf> = renderframe_args
                                         .iter()
                                         .position(|a| a == "--renderframe-mesh-tex")
@@ -10167,9 +10174,9 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                                                                 let _ = arm64jit::jit::jit_run(iimg, ibase, plt_tex_image_2d, &mut stex as *mut CpuState);
                                                                             } else {
                                                                                  // ETC1/ETC2-RGB live-path: upload a REAL 8x8 ETC1 (4 solid 4x4 blocks=32B) via
-                                                                                 // glCompressedTexImage2D; the bridge decodes ETC1->RGBA (texture-codec)+re-uploads
-                                                                                 // glTexImage2D. Indiv mode cw0 sel0 -> color=(c*0x11)+2. ETC2 mode1/2==ETC1;
-                                                                                 // relabel internalformat to prove decode_etc2_rgb handles the real path.
+                                                                                 // glCompressedTexImage2D; the bridge decodes ETC1->RGBA + re-uploads glTexImage2D.
+                                                                                 // Indiv mode cw0 sel0 -> color=(c*0x11)+2; ETC2 mode1/2==ETC1; relabel internalformat
+                                                                                 // to prove decode_etc2_rgb handles the real path.
                                                                                 const GL_ETC1_RGB8_OES: u64 = 0x8d64;
                                                                                 const GL_COMPRESSED_RGB8_ETC2: u64 = 0x9274;
                                                                                 let comp_fmt = if etc2_mode { GL_COMPRESSED_RGB8_ETC2 } else { GL_ETC1_RGB8_OES };
@@ -10368,12 +10375,9 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                     eprintln!(
                                         "[elfjit:renderframe-triangle] vbo={vbo:#x} ebo={ebo:#x} uploaded"
                                     );
-                                    // REFERENCE DRAW (opt-in: SH25_REF=1): drive the
-                                    // draw directly (not engine wrapper) with
-                                    // our own glVertexAttribPointer, to cross-check the
-                                    // engine-path result. Now that the engine wrapper's primitive-setup renders the full
-                                    // triangle (format index fixed 5->3 = GL_FLOAT), the reference is
-                                    // redundant; default OFF (SH25_REF=1 re-enables).
+                                    // REFERENCE DRAW (opt-in SH25_REF=1): drive draw directly (not the engine wrapper) with
+                                    // our own glVertexAttribPointer to cross-check the engine-path result; now the
+                                    // wrapper renders the full triangle (format 5->3 GL_FLOAT), so default OFF.
                                     if std::env::var("SH25_REF").map(|v| v == "1").unwrap_or(false) {
                                     // With a VBO bound, the attrib pointer's 6th arg is a
                                     // byte OFFSET (0 = start buffer), not a host
@@ -11017,12 +11021,9 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                             // blocks' EAC-free ASTC void-extent alphas (255/190/128/64) = 4 gray lobes.
                             let astc_mode = renderframe_args.iter().any(|a| a == "--renderframe-astc");
                             let comp_gray = etc2a_mode || astc_mode;
-                            // --renderframe-quad-loop <N>: SUSTAINABLE textured-quad rendering -
-                            // after the single proof frame, re-drive clear(cycling bg) ->
-                            // engine geometry wrapper -> swap N times detached host thread, so a
-                            // recording proves a fresh textured-geometry render each frame (the last
-                            // property a real main-loop frame drive needs for the textured/mesh path;
-                            // geometry analog of SH25b's triangle-loop).
+                            // --renderframe-quad-loop <N>: SUSTAINABLE textured-quad rendering — after the single proof
+                            // frame, re-drive clear(cycling bg) -> geometry wrapper -> swap N times on a
+                            // detached host thread (fresh textured geometry each frame; SH25b analog).
                             let quad_loop_n: Option<u32> = renderframe_args
                                 .iter()
                                 .position(|a| a == "--renderframe-quad-loop")
@@ -12686,13 +12687,10 @@ mod sh111_tests {
 #[cfg(test)]
 mod sh115_tests {
     use super::*;
-    // Real-image guard family: load_elf_image maps the REAL libroblox.so at a FIXED guest
-    // base (0x100000000) and LEAKS that mapping for the one-shot run. Two loads in ONE
-    // process therefore collide (only one mmap can hold the base; the rest EFAULT) -
-    // why sh224..232 real-image guards failed ONLY under parallel `cargo test
-    // --examples`, each passing filtered (fresh process). Cache ONE load per process so
-    // the whole batch stays green. Test-harness only: production jit_run still loads
-    // exactly once (elfjit.rs main, unchanged).
+    // Real-image guard family: load_elf_image maps the REAL libroblox.so at FIXED guest base
+    // 0x100000000 and LEAKS it for the one-shot run; two loads collide (only one mmap can hold
+    // the base), so parallel `--examples` re-loads EFAULT. Cache ONE load per process. Production
+    // jit_run still loads exactly once (elfjit.rs main, unchanged).
     fn load_real_image() -> &'static libloader::elf::LoadedElf {
         static IMG: std::sync::OnceLock<libloader::elf::LoadedElf> = std::sync::OnceLock::new();
         IMG.get_or_init(|| {
@@ -14137,12 +14135,10 @@ mod sh115_tests {
 
     #[test]
     fn sh257_doinit_fmod_iterate_earlyreturn_completes_to_governor() {
-        // SH257 (Route-B): correct SH239's "app-shell ctor tails into FMOD and NEVER
-                // completes". With the FULL SH248c-f seed set the FMOD iterate EMPTY-CONTAINER
-                // early-return fires (`ldp x8,x9,[x0,#8]; cmp; b.eq 0x5fb3134`) -> canary-reload
-                // -> ret, so do-init COMPLETES and the chain climbs to POST-do-init 0x1023eff4c
-                // -> governor 0x102e9fa84 -> govtail 0x102ea30dc, then app-start dies at the
-                // standing live-object map wall 0x1021dde34. SH239's "FMOD-absorbed" is wrong.
+        // SH257: correct SH239's "app-shell ctor tails into FMOD and NEVER completes" — with the
+                // FULL SH248c-f seed set the FMOD iterate empty-early-return fires, do-init COMPLETES,
+                // chain climbs post-do-init 3eff4c -> governor 9fa84 -> govtail ea30dc, then dies at
+                // 0x1021dde34 map wall. SH239's "FMOD-absorbed" is wrong.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
@@ -14573,12 +14569,10 @@ mod sh115_tests {
 
     #[test]
     fn sh279_settings_serializer_worldbuild_gates_pinned() {
-        // SH279: cross the SH278 settings-serializer (continueAfterFlagsLoaded_ 0x2bd1d68) world-
-        // build gates. Gate 1: serializer reads [this+0x40]=0 -> 0x2bcdfc4 lock(0x300) SIGSEGV;
-        // seed [this+0x40]=zeroed 0xc00 config. Gate 2: app-name 0x2bd1f64 reads [x19+0x48];
-        // empty -> NULL-store @0x2bd1fd4; pre-seed [this+0x48] "Home" + appname-guard re-seeds
-        // [this+0x50]=5. MEASURED 3/3: serializer runs WHOLE body, self-drives into app-start
-        // to LSM wall 0x101db1d04 (SH260). Guest = file vaddr + 0x1_0000_0000.
+        // SH279: cross the SH278 settings-serializer (continueAfterFlagsLoaded_ 0x2bd1d68) world-build
+        // gates. Gate1: [this+0x40]=0 -> 0x2bcdfc4 lock SIGSEGV; seed zeroed 0xc00 config. Gate2:
+        // app-name [x19+0x48] empty -> NULL-store; pre-seed "Home" + appname-guard [this+0x50]=5.
+        // MEASURED 3/3: serializer runs whole body -> app-start to LSM wall 0x101db1d04 (SH260).
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -14867,11 +14861,8 @@ mod sh115_tests {
 
     #[test]
     fn sh336_v1_appstart_abi_pinned() {
-        // SH336: pin V1 nativeAppBridgeAppStart__ (0x102338510) — the SEP-17 primitive
-        // reachable only via the --v2boot V1 fallback (skipped by --v2boot-skip-appstart),
-        // never independently driven. ABI x0 env, x1 thiz, x2..x7: 5 jstrings + bool Z;
-        // version-gates on [0x10683d350] low-byte; jstrings marshal via 0x21e1fec (SH186
-        // identity shim, slots 169/170 non-null) — no AutoValue getters.
+        // SH336: V1 nativeAppBridgeAppStart__ (0x102338510) ABI: x0 env, x1 thiz,
+        // x2..x7 5 jstrings + bool Z; gates on [0x10683d350]; jstr marshal 0x21e1fec.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -16244,12 +16235,10 @@ mod sh115_tests {
 
     #[test]
     fn sh240_dmcont_dispatch_chain_pinned_fresh_negative() {
-        // SH240: DMCONT continuation fresh-at-HEAD block-entry-definitive negative. The engine-init
-        // dispatcher 0x102bd8ce8 entered as a block on a completing --v2boot ladder under
-        // DMFORCE+DMCONT (holder 0x102727550 -> vt[+0x1f0]=real continueAfterFlagsLoaded_
-        // 0x102bd1d68), but the guest NEVER resumes past the first call boundary: interior pcs
-        // (0x2bd8d30/0x2bd8d54), sub_2bd8dac, continueAfterFlagsLoaded_ all 0 hits across 3/3
-        // clean EXIT 124; JIT_DUMP fired once at entry only. DMCONT WIRED+ARMED but LATENT.
+        // SH240: DMCONT continuation fresh-at-HEAD block-entry definitive negative — bd8ce8
+        // entered as block under DMFORCE+DMCONT (continueAfterFlagsLoaded_ real) but guest
+        // never resumes past the first call boundary (0 hits for 2bd8d30/2bd8d54/2bd8dac/d1d68,
+        // 3/3 EXIT124); DMCONT WIRED but LATENT.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
