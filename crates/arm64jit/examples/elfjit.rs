@@ -1090,13 +1090,11 @@ static SINGLETON_OBJ: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 /// sees one coherent pointer.
 fn routeb_singleton_obj_addr() -> u64 {
     *SINGLETON_OBJ.get_or_init(|| {
-        // A zeroed guest-resident object. Its +0 must be a REAL vtable so a
-        // consumer that virtual-dispatches on the returned object (ldr x8,[ret];
-        // ldr x9,[x8,#off]; blr x9) resolves a benign leaf instead of [0+off].
-        // All 0x60 slots = `routeb_singleton_leaf` (identity: returns `this`,
-        // i.e. OBJ itself — a valid non-NULL object), so any in-band virtual
-        // returns a sane pointer and beyond-0x60 reads soft-return benignly.
-        // Sized 0x80 (was 0x40) so a [ret+<0x28..0x80>] read is in-bounds zeroed.
+        // Zeroed guest-resident object. +0 must be a REAL vtable so a virtual
+        // dispatch (ldr x8,[ret]; ldr x9,[x8,#off]; blr x9) resolves a benign leaf
+        // instead of [0+off]. All 0x60 slots = routeb_singleton_leaf (returns OBJ,
+        // valid non-NULL), so an in-band virtual returns a sane pointer; 0x80 sized
+        // (was 0x40) so [ret+<0x28..0x80>] reads are in-bounds zeroed.
         let leaf = *ROUTEB_LEAF_ADDR.get_or_init(|| {
             let a = arm64jit::jit::register_host_call_auto(routeb_singleton_leaf);
             eprintln!("[elfjit:routeB] SH99 benign dispatch leaf registered at {a:#x}");
@@ -1661,14 +1659,13 @@ static DMFN_RET0_ADDR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static ROUTEB_ADAPTER_REC_ADDR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 /// Route-B SH81: seed the two engine dispatch-singleton `.data` records so the
 /// accessor `2b9dee0`'s lazy-create returns a coherent polymorphic object whose
-/// virtuals are benign leaves (gate `2b9e030` memcpys `[addr+24]`(src)`[addr+0]`
-/// (size); src==NULL -> all-zero NULL-vtable stub -> blr SIGSEGV at 0x10624f500).
-/// Records (guest=file vaddr+0x100000000, .data rw-): {+0 size,+8 pow2,+16 ticket,+24 src}.
-/// SH114: the V2Init/V2Start/V1/AppReady soft-return sites are lazy-singleton
-/// virtual dispatches (A 0x62517c4[+0xf8], A2 0x6251aa8[+0x108], B 0x6260948[+0x548]).
-/// The 0x60 vtable is the benchmarked baseline; widening is empirically REJECTED
-/// (regresses nativeInit); SH111 root-cause: a scoped leaf must return a STABLE
-/// zeroed guest object (routeb_singleton_obj_leaf), NOT 0/xzr (caller derefs [out]+0x28).
+/// virtuals are benign leaves (gate `2b9e030` memcpys [addr+24](src)[addr+0](size);
+/// src==NULL -> all-zero vtable stub -> blr SIGSEGV at 0x10624f500). Records
+/// (guest=file+0x100000000, .data rw-): {+0 size,+8 pow2,+16 ticket,+24 src}.
+/// SH114: V2Init/V2Start/V1/AppReady soft-return sites are lazy-singleton virtual
+/// dispatches (A 0x62517c4[+0xf8], A2 0x6251aa8[+0x108], B 0x6260948[+0x548]).
+/// SH111: a scoped leaf must return a STABLE zeroed guest object
+/// (routeb_singleton_obj_leaf), NOT 0 (caller derefs [out]+0x28).
 fn routeb_seed_task_singletons() {
     if ROUTEB_SINGLETON_SEEDED.load(core::sync::atomic::Ordering::Relaxed) {
         return;
@@ -1790,13 +1787,11 @@ fn routeb_patch_taskscheduler_flags_gate() {
 // ---- SendAppEventOnAppReady bodies complete instead of soft-returning) ----
 // The three nullable-singleton accessors end a virtual dispatch through the
 // seeded 0x60 vtable: `ldr x8,[x8,#off]; blr x8` reads past 0x60 into host bytes
-// and soft-returns without completing. SH114 showed a flat `blr->mov x0,xzr`
-// regresses nativeInitializeNativeFlags (the accessor return IS deref'd at +0x28).
-// Differential fix: patch each 28B window to MATERIALIZE
-// routeb_singleton_obj_addr into x0 + store into objA[0]=[x19] + RETURN it — both
-// the stored slot and any [ret+off] read resolve to a valid zeroed guest object.
-// Window (7 instr): slot0 movz x8,#OBJlo; s1-3 movk(16/32/48); s4 mov x0,x8;
-// s5 ldr x9,[x19]; s6 str x0,[x9] (overwrite trailing mov x0,xzr).
+// and soft-returns. SH114: a flat `blr->mov x0,xzr` regresses nativeInit (the
+// accessor return IS deref'd at +0x28). Differential fix: patch each 28B window
+// to MATERIALIZE routeb_singleton_obj_addr into x0 + store into objA[0]=[x19] +
+// RETURN it. Window (7 instr): movz x8,#OBJlo; movk(16/32/48); mov x0,x8;
+// ldr x9,[x19]; str x0,[x9] (overwrites trailing mov x0,xzr).
 fn sh115_movz_x8_imm(imm16: u16) -> u32 {
     0xD280_0000u32 | ((imm16 as u32) << 5) | 8
 }
@@ -6917,10 +6912,9 @@ fn main() {
                             // first guard check at 0x2206c80 (`ldarb w9,[0x6a68410]; tbz w9,#0`)
                             // selects std::__call_once ONLY when bit0==0, and that __call_once
                             // RUNS the DM-construct lambda whose result populates DM-root
-                            // [0x106a68818]. Forcing bit0=1 SKIPS it, so [0x106a68818] stays NULL
-                            // and the match's `cbz [x19,#0x20]` at 0x2206df8 dead-ends to benign
-                            // Ok(0x3e8) (no session node). Correct: seed flags-latch + main-id,
-                            // LET the once-lambda populate the DM slot (bit0 sets itself).
+                            // [0x106a68818]. Forcing bit0=1 SKIPS it so the match's cbz
+                            // 0x2206df8 dead-ends to benign Ok(0x3e8). Correct: seed flags-latch
+                            // + main-id, LET the once-lambda populate the DM slot.
                             let og = 0x106a68410u64 as *mut u8;
                             let _ = og; // left CLEAR (0) so __call_once runs and builds the DM
                             // SH125 (recon deleg_5e2c8480 of do-init 0x102206c40): the
@@ -6997,16 +6991,12 @@ fn main() {
                                                 // returns at 0x2366810, letting the body blr at 0x23effbc reach the governor.
                                     *(0x106a63da0u64 as *mut u64) = 0;
                                     *(0x106a63d70u64 as *mut u64) = 0;
-                                    // SH159c: the governor 0x102e9fa84 gates on the
-                                    // version word [0x6a70700] at 0x2e9fac4-0x2e9fb20
-                                    // (low byte >=6 && byte1 >=3 -> takes the MODERN
-                                    // APPENDIX = a nativeAppBridgeV2InitWithParams
-                                    // param re-read at 0x2e9faf0..0x2e9fb1c that faults
-                                    // on an uninitialized x5 stack union). We want the
-                                    // ROUTER path 0x2e9fb20 (router flag [0x6a70880]=1
-                                    // -> MODERN -> bl 0x258c6e4 startAppWithParams).
-                                    // Force version=0 so `b.cc 0x2e9fb20` skips the
-                                    // appendix entirely.
+                                    // SH159c: the governor 0x102e9fa84 gates on the version word
+                                    // [0x6a70700] at 0x2e9fac4-0x2e9fb20 (low byte >=6 &&
+                                    // byte1 >=3 -> MODERN APPENDIX, an V2Init param re-read
+                                    // that faults on an uninitialized x5 stack union).
+                                    // Force version=0 so `b.cc 0x2e9fb20` skips the appendix
+                                    // to the ROUTER path (router flag [0x6a70880]=1 -> MODERN -> bl 0x258c6e4).
                                     *(0x106a70700u64 as *mut u64) = 0;
                                     // SH159c .text patch: force the governor's
                                     // version-gate to always take the ROUTER path
@@ -7686,12 +7676,9 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                     }
                 }
                 // SH296 (--v2boot-session-dmfn): drive the DM-CONSTRUCTION method-dispatch
-                // handler 0x1023f03b4 DIRECTLY (SH255 proved it indirect-dispatch-only; it is
-                // the app-shell session-ctor front-door calling nativeAppBridgeAppStart +
-                // the EC-world marshaler 0x23f1210). Entry dispatch = blr this.vt[32] (ret0
-                // -> construction body); fields [this+120/128/136/144] gate depth. This
-                // MEASURES the fn headlessly FIRST time + the one-next-unsynthesized-object
-                // gate (SH248 loop) on the DM line. Empty receiver = benign-return path.
+                // handler 0x1023f03b4 DIRECTLY (indirect-dispatch-only per SH255, the app-shell
+                // session-ctor front-door to nativeAppBridgeAppStart + EC marshaler 0x23f1210).
+                // vt[32] ret0 -> construction body; fields [this+120/128/136/144] gate depth.
                 if std::env::args().any(|a| a == "--v2boot-session-dmfn") {
                     let ret0 = *DMFN_RET0_ADDR.get_or_init(|| arm64jit::jit::register_host_call_auto(dmfn_ret0_leaf));
                     let dv: &'static mut [u8] = Box::leak(vec![0u8; 0x100usize].into_boxed_slice());
@@ -7699,24 +7686,35 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                     let dmthis = Box::leak(vec![0u8; 0x200usize].into_boxed_slice()).as_mut_ptr() as u64;
                     unsafe { *(dmthis as *mut u64) = dv.as_ptr() as u64; }
                     let seeded = std::env::var("JIT_ROUTEB_DMFN_FIELDS").is_ok();
+                    let stage3 = std::env::var("JIT_ROUTEB_DMFN_REGISTER").is_ok();
                     let o = routeb_singleton_obj_addr();
+                    let mut regcell = 0u64; // SH298: cell whose [0]=singleton object (stage3)
                     if seeded {
-                        // SH297 correction: the construction body (0x23f0484) reads
-                        // `ldp x21,x24,[x22,#8]` (x22=arg1) then `stp x21,x24,[this,#136]`
-                        // — it CLOBBERS this+136/144 from arg1[8]/arg1[16], so SH296's
-                        // S2 seed of this+136/144 was a no-op (arg1 was a zeroed buffer,
-                        // [arg1+8]=0 -> the cbz x21 safety-epilogue fired before any this
-                        // field read). Real gates: arg1[8]/arg1[16] must be nonzero LIVE
-                        // objects AND [this+120] AND [this+128] (0x2b4ea48 refcount factory).
+                        // SH297: body CLOBBERS this+136/144 from arg1[8]/arg1[16] (arg1 was
+                        // zeroed -> cbz x21 safety-epilogue before any this-field read). Real
+                        // gates: arg1[8]/arg1[16] live objs + this+120 + this+128 (factory).
                         for off in [120u64,128u64] { unsafe { *( (dmthis+off) as *mut u64) = o; } }
-                        eprintln!("[elfjit:v2boot] SH297 stage2 this+120/128=singleton {o:#x} (this+136/144 CLOBBERED from arg1)");
+                        eprintln!("[elfjit:v2boot] SH297 stage2 this+120/128=singleton {o:#x}");
                     }
                     let a1 = Box::leak(vec![0u8; 0x100usize].into_boxed_slice()).as_mut_ptr() as u64;
                     if seeded {
-                        // arg1 must be a coherent struct: [arg1+8]+[arg1+16] = live objs
-                        // (become this+136/144). Using the singleton (valid leaf-vtable).
-                        unsafe { *( (a1+8) as *mut u64) = o; *( (a1+16) as *mut u64) = o; }
-                        eprintln!("[elfjit:v2boot] SH297 arg1[8]/arg1[16]=singleton {o:#x}");
+                        // SH298 (JIT_ROUTEB_DMFN_REGISTER): body does x0=[this+136]=[arg1[8]]
+                        // (DOUBLE deref). arg1[8]=singleton -> x0=singleton VTABLE (leaf) whose
+                        // [+8]=host-leaf -> reg fn 0x21e45c8 faults at [x22+24]. Fix: arg1[8]=
+                        // a CELL->registration obj R with [R+8]=singleton (valid nonzero host
+                        // obj) so 0x21e45c8 completes and body falls to bl nativeAppBridgeAppStart.
+                        if stage3 {
+                            let r = Box::leak(vec![0u8; 0x80usize].into_boxed_slice()).as_mut_ptr() as u64;
+                            unsafe { *(r as *mut u64) = dv.as_ptr() as u64; } // [R+0]=leaf-vt
+                            unsafe { *( (r+8) as *mut u64) = o; }              // [R+8]=singleton obj
+                            regcell = Box::leak(vec![0u8; 0x20usize].into_boxed_slice()).as_mut_ptr() as u64;
+                            unsafe { *(regcell as *mut u64) = r; }
+                            unsafe { *( (a1+8) as *mut u64) = regcell; *( (a1+16) as *mut u64) = o; }
+                            eprintln!("[elfjit:v2boot] SH298 arg1[8]=regcell->r({r:#x},[+8]=o{o:#x})");
+                        } else {
+                            unsafe { *( (a1+8) as *mut u64) = o; *( (a1+16) as *mut u64) = o; }
+                            eprintln!("[elfjit:v2boot] SH297 arg1[8]/arg1[16]=singleton {o:#x}");
+                        }
                     }
                     let a2 = Box::leak(vec![0u8; 0x100usize].into_boxed_slice()).as_mut_ptr() as u64;
                     eprintln!("[elfjit:v2boot] SH296 driving DM-construction fn 0x1023f03b4 this={dmthis:#x} vt32=ret0={ret0:#x} fields_seeded={seeded}");
@@ -8107,13 +8105,8 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                 // pending task node from a sentinel/garbage cell:
                                 // next=[node], cb40=[node+40], vt=[node+112]&~0x3f
                                 // then dispatch-cb [vt+40]; and [root+8] tag.
-                                // Head node internals + the per-CPU slot layout.
-                                // SH5 disasm pinned the deque head ATOMIC at
-                                // slot+0x10 (packed low48=node, high16=tag) and
-                                // tail at slot+0x18; slot+0 is likely a separate
-                                // field (the sentinel/root ptr). Dump the whole
-                                // neighborhood to resolve which offset the parked
-                                // consumer actually drains.
+                                // Head node internals + the per-CPU slot layout (SH5:
+                                // deque head ATOMIC at slot+0x10, tail at slot+0x18).
                                 let node = head & 0xffffffffffff;
                                 // Dump the per-CPU slot neighborhood around the
                                 // head-CELL to resolve the real deque head offset.
@@ -8933,13 +8926,10 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
         // popped-task handler vector at guest BSS 0x106829ea8
         // (dispatcher 0x10285371c w4=4 path: `adrp x8,6829000; ldr x3,[x8,#3752];
         // br x3` at file 0x2853788/0x28537b8). During headless boot this vector is
-        // 0 (a NULL .bss function ptr a real framework producer would install), so
-        // the drain's type-4 dispatch of ANY popped task node returns at
-        // 0x285378c->0x2853af0 doing nothing — the exact mechanical reason no
-        // injected/foreign node can drive the engine toward a frame. Seeding it
-        // with a registered HOST-THUNK probe (or a chosen guest fn) lets a
-        // sentinel-vtable node pop through the REAL dispatcher w4=4 plane and hit
-        // our vector, proving the plane is dispatchable when the slot is live.
+        // 0 (a NULL .bss fn-ptr a real framework producer would install), so a type-4
+        // dispatch of ANY popped node returns at 0x285378c->0x2853af0 doing nothing.
+        // Seeding with a registered HOST-THUNK probe lets a sentinel-vtable node pop
+        // through the REAL dispatcher w4=4 plane and hit our vector.
         if let Some(spec) = std::env::args()
             .position(|a| a == "--taskv4-seed")
             .and_then(|i| std::env::args().nth(i + 1))
@@ -9541,17 +9531,13 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                         "[elfjit:renderscene] drained: {presented} real engine-scene-renderer frames presented (engine-built frame-desc) on the currency-owning thread"
                     );
                 }
-                // --renderwalker (opt-in, must accompany --renderinit + the
-                // renderthunk so real_ctx is the real ctx + --renderscene which
-                // lays the scene-list R): drive the engine's REAL per-node
-                // PRESENT walker (mid-loop entry 0x105b2eec0) so each populated
-                // 0x28-stride scene node actually DRAWS through its render-obj
-                // vt[+24]. Each node's draw is a REGISTERED HOST THUNK
-                // (walker_item_draw_thunk) dispatched via host_call_at — pure
-                // host, ZERO block-cache mutation, so the present-loop block
-                // stays intact and the SH64 nested-jit_run desync SIGSEGV is
-                // closed. The walker then swaps through the real ctx-vt[+24].
-                // Bounded window so the run still exits 124 cleanly.
+                // --renderwalker (opt-in, needs --renderinit/+renderthunk for real_ctx and
+                // --renderscene to lay the scene-list R): drive the engine's REAL per-node
+                // PRESENT walker (mid-loop 0x105b2eec0) so each 0x28-stride scene node DRAWS
+                // through its render-obj vt[+24] via a REGISTERED HOST THUNK
+                // (walker_item_draw_thunk, host_call_at) — ZERO block-cache mutation, so the
+                // SH64 nested-jit_run desync SIGSEGV is closed. Walker swaps via real ctx-vt[+24].
+                // Bounded window so the run exits 124 cleanly.
                 if renderframe_args.iter().any(|a| a == "--renderwalker") {
                     let t0 = std::time::Instant::now();
                     let max_window = std::time::Duration::from_millis(
@@ -9639,17 +9625,13 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
             // re-running init (re-drive shifts parent/window args -> crash). Same host
             // thread keeps the EGL context current.
             if renderframe_args.iter().any(|a| a == "--renderframe") {
-                // --renderbind (opt-in): drive the engine's OWN make-current method
-                // (ctx vtable [vt+16] = 0x105b3b358) before presenting, instead of
-                // relying on the render-init having left the context current. This
-                // is the exact code the engine's frame-render callers dispatch
-                // (0x5b2b214 -> [vt+16] -> blr) when they (re)bind the GL context
-                // before a swap/draw: it reads eglGetCurrentContext, and when not
-                // already == [ctx+48] calls eglMakeCurrent([+32]display,
-                // [+40]surface, [+40]surface, [+48]context). Driving it proves the
-                // engine's own rebind path executes on the recovered ctx (the same
-                // host thread keeps the context current afterwards so the following
-                // swap/draw land on it).
+                // --renderbind (opt-in): drive the engine's OWN make-current
+                // method (ctx vtable [vt+16] = 0x105b3b358) before presenting, the exact
+                // code engine frame-render callers dispatch (0x5b2b214 -> [vt+16] -> blr)
+                // to (re)bind GL before swap/draw: reads eglGetCurrentContext, and when
+                // not == [ctx+48] calls eglMakeCurrent([+32]display,[+40]surface,
+                // [+40]surface,[+48]context). Proves the engine's own rebind executes on
+                // the recovered ctx (host thread keeps it current for the following swap).
                 if renderframe_args.iter().any(|a| a == "--renderbind") {
                     let mut sb = arm64jit::jit::CpuState::new();
                     sb.tpidr = tpidr;
@@ -9792,15 +9774,13 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                             "[elfjit:renderframe-drive] gles-dispatch values = {vals:?}"
                         );
                         // --renderframe-seedgles (opt-in): overwrite the 8 engine
-                        // GLES dispatch slots (BSS 0x106d3b2f0..0x106d3b328) with
-                        // our host-thunk GLES bridge slots (resolve_gles_mixed) so the
-                        // frame clear + geometry draw paths dispatch through the bridge
-                        // instead of jumping to raw Mesa (out-of-image). 16-slot table at
-                        // BSS 0x106d3b2f0 (stub 0x5b3a1c0+0xc*N). Slots 0-7 clear path (SH22:
-                        // slot0=glDrawBuffers, slot2=glClearBufferfv). Slots 8-15 geometry:
-                        // draw wrapper 0x5b35288 dispatches slot9=glDrawElements
-                        // (0x5b352f4 bl 0x5b3a22c) + slot10=glDrawArrays (0x5b35368 bl
-                        // 0x5b3a238) after primitive-setup 0x5b353d0. Seed EVERY slot.
+                        // GLES dispatch slots (BSS 0x106d3b2f0..0x106d3b328) with our
+                        // host-thunk GLES bridge slots (resolve_gles_mixed) so frame clear +
+                        // geometry draw dispatch through the bridge, not raw Mesa (out-of-image).
+                        // 16-slot table at BSS 0x106d3b2f0 (stub 0x5b3a1c0+0xc*N). Slots 0-7 clear
+                        // (slot0=glDrawBuffers, slot2=glClearBufferfv); 8-15 geometry (draw wrapper
+                        // 0x5b35288 -> slot9=glDrawElements @0x5b352f4 + slot10=glDrawArrays @0x5b35368,
+                        // after primitive-setup 0x5b353d0). Seed EVERY slot.
                         let seed_slots: [(usize, &str); 10] = [
                             (0, "glDrawBuffers"),
                             (1, "glClearBufferiv"),
@@ -10414,7 +10394,7 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                                                             let _ = gcall(plt_uniform_1i, ploc, 0, 0, 0, 0, 0);
                                                                             eprintln!("[elfjit:renderframe-tex] texture tex_id={tex_id:#x} bound+uploaded uTex loc={ploc:#x}<-unit0");
                                                                                                                                                     if mesh_uv_mode {
-                                                                                                                                                        // SH143: upload REAL camera/MVP as uMVP (col-major, trans=0, 16 fl); glUniformMatrix4fv is int+ptr ABI.
+									// SH143: upload REAL camera/MVP as uMVP (col-major, trans=0, 16 fl); glUniformMatrix4fv is int+ptr ABI.
                                                                                                                                                         let mvp_uname = objs.as_ptr() as u64 + 0xe40;
                                                                                                                                                         std::ptr::copy_nonoverlapping(b"uMVP\0".as_ptr(), mvp_uname as *mut u8, 5);
                                                                                                                                                         let mvp_loc = gcall(plt_get_uniform_location, program, mvp_uname, 0, 0, 0, 0).unwrap_or(0) & 0xffff_ffff;
@@ -10428,7 +10408,7 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                                                                                                                                         sm.tpidr = tpidr; sm.x[31] = isp;
                                                                                                                                                         sm.x[0] = mvp_loc; sm.x[1] = 1; sm.x[2] = 0; sm.x[3] = mvp_ptr;
                                                                                                                                                         let _ = arm64jit::jit::jit_run(iimg, ibase, mat4fv, &mut sm as *mut CpuState);
-                                                                                                                                                        // SH145: upload identity model-rotation to uModelRot so VS's mat3*uNormal -> world-space normals for diffuse light.
+									// SH145: upload identity model-rotation to uModelRot so VS's mat3*uNormal -> world-space normals for diffuse light.
                                                                                                                                                         let mrot_uname = objs.as_ptr() as u64 + 0x1000;
                                                                                                                                                         std::ptr::copy_nonoverlapping(b"uModelRot\0".as_ptr(), mrot_uname as *mut u8, 10);
                                                                                                                                                         let mrot_loc = gcall(plt_get_uniform_location, program, mrot_uname, 0, 0, 0, 0).unwrap_or(0) & 0xffff_ffff;
@@ -13174,11 +13154,9 @@ mod sh115_tests {
         // (both variants), AND StartLuaAppDM's own construction ALL funnel through
         // the same allocator-activation byte [0x10727570c].bit0 + size-class free-list
         // allocator. Headlessly <=0xa sizes work but 0x28/0x20 fail (bad_alloc);
-        // SH247 proved the working descriptor path can't serve >0xa (SH247 corroborating
-        // the enabler for ALL of Route B). Pin the real-image words (guest=file vaddr+0x100000000;
-        // first LOAD segment file offset==vaddr); then the code array below mirrors them:
-        // (mirrored by the sites array below): op_new A 0x1db1a38/0x1db1a68/0x1db1a6c
-        // (flag-cell -> [0x10727570c]), op_new B 0x1d96768, tail wrapper 0x1db1c60,
+        // SH247 proved the descriptor path can't serve >0xa. Pin the real-image words
+        // (guest=file vaddr+0x100000000): op_new A 0x1db1a38/0x1db1a68/0x1db1a6c
+        // (flag-cell -> [0x10727570c]), op_new B 0x1d96768, tail 0x1db1c60,
         // free-list allocator 0x623fe1c, SLADM own flag-read 0x23ff31c.
         let sites: [(usize, u32); 7] = [
             (0x1db1a38, 0xd10243ff),
@@ -13215,16 +13193,12 @@ mod sh115_tests {
     #[test]
     fn sh248g_appstart_hashfind_wall_anchored() {
         // SH248g (Route-B DMCONT, after SH248f): past the once-cell + app-lifecycle
-        // adapter gates, app-click runs a live host-heap hash-map INSERT loop that
-        // faults at guestpc=0x1021dde34. Register capture (JIT_DUMP_PC, repro
-        // runs/batch_sh248f_adapter_seed.sh): x1=0x1072757e0 CONSTANT fixed .bss
-        // across every iteration (SH243 holder tell), but the dereferenced map
-        // `this` (x21/x24) is per-run ASLR host-heap and the container's
-        // count/bucket fields are ctor-uninitialized (SH174/SH204 live-object
-        // class, NOT a fixed-.bss seed). Anchor the exact wall fn so a silent
-        // drift fails loudly. hash-find visitor entry 0x21dde00=0xd10006e8; bl
-        // 0x21ddf3c 0x21dde30=0x94000043; fault ldr x23,[x21,#8] 0x21dde34=
-        // 0xf94006b7; bucket branch 0x21ddea8=0xeb17011f; fn tail 0x21dd800.
+        // adapter gates, app-click runs a live host-heap hash-map INSERT loop faulting at
+        // guestpc=0x1021dde34. Register capture: x1=0x1072757e0 CONSTANT fixed .bss
+        // (SH243 holder tell) but the deref map `this` (x21/x24) is per-run ASLR host-heap,
+        // ctor-uninitialized (SH174/SH204 live-object class). Anchor the wall so drift fails
+        // loudly: hash-find entry 0x21dde00=0xd10006e8; bl 0x21ddf3c 0x21dde30=0x94000043;
+        // fault ldr x23,[x21,#8] 0x21dde34=0xf94006b7; bucket 0x21ddea8=0xeb17011f; tail 0x21dd800.
         let sites: [(usize, u32); 5] = [
             (0x21dde00, 0xd10006e8),
             (0x21dde30, 0x94000043),
@@ -13892,12 +13866,10 @@ mod sh115_tests {
         // deliverable is JIT_JSON_ZERO_FIX — a pc-gated hook that fires at guest
         // 0x102355d40 to force the leaking guest-stack libc++ std::string length to 0
         // (SSO empty) instead of RBX::json::Writer throwing "string length overflow".
-        // That block-entry pc is load-bearing (the recon-v3 plane depends on it), yet it
-        // had no real-image byte-pin — a drifted constant would silently stop the fix.
-        // Pin the block-entry word (fn prologue `stp x29,x30,[sp,#-48]!` = file 0x2355d40)
-        // the cap-cell guest address it compares against (guest 0x107275648), so a
-        // future shift fails loudly. Skip-if-absent real-image guard family as sh219/
-        // sh213/sh211. Also pin the throw-helper site the fix prevents reaching.
+        // That block-entry pc is load-bearing but had no real-image byte-pin; a drifted
+        // constant would silently stop the fix. Pin fn prologue `stp x29,x30,[sp,#-48]!`
+        // (file 0x2355d40) + the cap-cell guest 0x107275648 it compares against, so a
+        // shift fails loudly (skip-if-absent, family as sh219/213/211).
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
@@ -15659,6 +15631,42 @@ mod sh115_tests {
             eprintln!("sh297 dmfn construction-body arg1-clobber path pinned on libroblox.so");
         } else {
             eprintln!("sh297 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
+    fn sh298_registration_ec_world_reach_pinned() {
+        // SH298 (--v2boot-session-dmfn + JIT_ROUTEB_DMFN_REGISTER): construction body calls
+        // registration fn 0x21e45c8 @0x23f05b8 with x0=[arg1[8]] (DOUBLE deref). SH297
+        // (arg1[8]=singleton) -> x0=singleton VTABLE ([+8]=host-leaf) -> faults at [x22+24].
+        // SH298: arg1[8]=CELL->registration obj R ([R+8]=singleton, valid host obj) ->
+        // 0x21e45c8 COMPLETES and the body falls through SH297's wall into the EC world:
+        // 3/3 terminal SIGSEGV guestpc=0x102e245f4 (EC-world entry 0x102e24598 =
+        // stp x29,x30,[sp,#-96]! = SH235's genuine DM-creation world) inside 0x1023f1354
+        // at a NULL+0x48 live-object deref. First headless penetration of the EC world.
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if p.exists() {
+            let el = load_real_image();
+            let word = |g: u64| -> u32 {
+                let h = el.host_addr_of(g).unwrap_or(0);
+                if h == 0 { 0 } else { unsafe { (h as *const u32).read_unaligned() } }
+            };
+            // construction body -> registration call + app-start bl (post-registration fall-through)
+            assert_eq!(word(0x102_3f0_5b8), 0x97f7d004, "sh298 bl registration 0x21e45c8 (box arg1)");
+            assert_eq!(word(0x102_3f0_5f8), 0x97fdca28, "sh298 bl nativeAppBridgeAppStart 0x2362e98");
+            // the SH297 wall site (must now be crossed): ldr x0,[x21,#8] inside 0x21e45c8
+            assert_eq!(word(0x102_1e4_60c), 0xf94006a0, "sh298 SH297 wall site (ldr [x21,#8])");
+            // EC-world entry + the bl the entry makes into the marshaller-adjacent fn
+            assert_eq!(word(0x102_e2_4598), 0xa9ba7bfd, "sh298 EC-world entry (stp x29,x30,[sp,#-96]!)");
+            assert_eq!(word(0x102_e24_5f0), 0x97d73359, "sh298 EC entry bl -> 0x1023f1354");
+            assert_eq!(word(0x102_3f1_354), 0xa9bd7bfd, "sh298 EC callee 0x1023f1354 entry");
+            // the EC callee's first op_new bl (builds the box whose NULL+0x48 deref is terminal)
+            assert_eq!(word(0x102_3f1_384), 0x97e6af3c, "sh298 EC callee op_new-family bl");
+            eprintln!("sh298 registration-coherent + EC-world reach pinned on libroblox.so");
+        } else {
+            eprintln!("sh298 real-image guard: no real libroblox.so, skipping anchors");
         }
     }
 
