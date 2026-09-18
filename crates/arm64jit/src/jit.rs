@@ -7050,6 +7050,14 @@ mod tests {
     /// overwrite the slot my test pointed the guard at.
     static CONT_MGR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// sh164/sh243/sh165: all three mutate the JIT_ROUTEB_DMFORCE process env AND the
+    /// shared guest-mapped page at 0x102727550 (sh243 also 0x107275550). Without a lock
+    /// the parallel harness makes sh165's `!any_page_mapped(HOLDER)` precondition race —
+    /// a concurrent sh243/sh165 already mapping that page makes the assert fail, and the
+    /// env set/remove interleave makes "env-off inert" run-variable. Same pattern as
+    /// DM_INSTANCE_TEST_LOCK/CONT_MGR_TEST_LOCK for shared fixed-.bss pages + env.
+    static DM_MANAGER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn worker_gate_park_bounded_wait_unparks_promptly() {
         // (a) Gate clear (default) -> park returns immediately, no spin/hang.
@@ -7301,6 +7309,8 @@ mod tests {
         // vt[+0x30]=0x102bd1b98 (real engine-init fnB), and the settings chain
         // [shell+0x40]->[+0x18]->[+0x10] + [shell+0x18] all resolve without fault. Prove
         // the shell layout so a real run that enters fnB derefs cleanly.
+        // Shares JIT_ROUTEB_DMFORCE env + holder page 0x102727550 with sh165/sh243 — serialize.
+        let _g = DM_MANAGER_TEST_LOCK.lock().unwrap();
         // (a) env unset -> no mutation.
         unsafe { std::env::remove_var("JIT_ROUTEB_DMFORCE") };
         let impl_buf = Box::leak(vec![0xAAu8; 0x500usize].into_boxed_slice()).as_mut_ptr() as u64;
@@ -7359,6 +7369,8 @@ mod tests {
         // that it is inert otherwise.
         const OLD: u64 = 0x102727550;
         const GCELL: u64 = 0x107275550; // getter's true read cell (SH243)
+        // Shares JIT_ROUTEB_DMFORCE env + OLD page with sh164/sh165 — serialize.
+        let _g = DM_MANAGER_TEST_LOCK.lock().unwrap();
         // env off -> neither touched. Guard is inert without DMFORCE.
         unsafe { std::env::remove_var("JIT_ROUTEB_DMFORCE") };
         // env on + fnB region -> both cells seeded to the SAME manager M.
@@ -8093,7 +8105,8 @@ mod tests {
         // holder 0x102727550, idempotently. The manager's own vtable must NOT carry
         // engine-init at +0x30 (that would recurse into 0x102bd8ce8 forever).
         //
-        // (a) env unset -> holder untouched.
+        // (a) env unset -> holder untouched. Shares env + holder page with sh164/sh243 — serialize.
+        let _g = DM_MANAGER_TEST_LOCK.lock().unwrap();
         unsafe { std::env::remove_var("JIT_ROUTEB_DMFORCE") };
         const HOLDER: u64 = 0x102727550;
         // The holder is a fixed .bss global NOT loaded by any unit-test process
