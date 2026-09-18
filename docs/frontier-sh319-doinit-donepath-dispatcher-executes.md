@@ -58,4 +58,18 @@ region-watch perturbation (SH248b class); the JIT_DUMP_PC single-pc probe is UNP
 - Recon-v3 re-verified green (`runs/capture_taskv4_frame.sh`: 24 frames, swap Ok(0x1), 197 pops,
   0 json abort, EXIT 124).
 
+## 5. Addendum (measured same cycle): the done-path reaches the SESSION item-queue ENQUEUE
+
+JIT_DUMP_PC=0x102207118 also fires (clean EXIT 124, once-slot=0x400000b): the done-path dispatcher's
+box-build (`bl 0x2207118` @0x2206e68) CONTINUES into enqueue-construct 0x2207118 (`sub sp,#0x30`;
+mutex_lock [0x106863aa0] = adrp 6863000/#0xaa0; `bl 0x2d9713c` enqueue x0=[0x106863a70]; mutex_unlock;
+clean ret 0x220718c). So the once-latched do-init done-path now enqueues an app-shell construct onto
+the SAME fixed session queue [0x106863a70] that SH288's consumer half and SH290-295's item-proc
+consume. SH281-283 measured 0x2207118 on a DIFFERENT entry (initEngine_ state=5/9 reentry) with a
+diagnosed park at the contended mutex (state=2's never-run worker on [0x106863aa0]); this SH319
+finding is the do-init done-path, a NEW caller reaching the identical enqueue source. Still no DM;
+the enqueue feeds a consumer that (SH288) parked at the SH273 lifecycle-notifier wall. Route-B live-DM
+gate UNCHANGED. This confirms the done-path executes to a real session side-effect (enqueue), not
+just the dispatcher prologue.
+
 Single-agent. Workspace green. elfjit.rs held 12 B under the 1MB pre-commit hook.
