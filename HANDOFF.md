@@ -1,34 +1,36 @@
 # Open Sober — Agent Handoff
-## SH344 (Sep 19, 2026, hermes-worker): Route-B re-attack on the SH343-deepened FULL ladder — the NativeDataModelManager session-ctor line now FIRES (DM-creator band 0 hits -> 1 hit @0x102bd1b98), yet the engine's make_shared<DataModel> still never allocs (0 validated), terminal = the SH285 LSM reader/pop live-object wall 0x101db1b08. re-armed + ran the SH174 DM-capture latch on the ladder (latent hook proven live: caught real allocs, 0 validated).
 
-Single-agent (cone suppressed). Persistence landed (SH343) -> returned to Route B per
-the operator's hard directive. Measurement-only (no production editor). Workspace green.
+## SH344c (Sep 19, 2026, hermes-worker): CORRECTION to SH344b + continuation cap pinned
+Single-agent (cone suppressed). Measurement-only. Workspace green (594 passed).
 
-## SH344 (committed): two probes + frontier doc.
-- Run 1 (JIT_DM_ALLOC_CAPTURE+DELEGATE): latch ARM confirmed (`CRT operator-new ACTIVE
-  hook 0x1067daaf0 -> capture trail`) catching real allocs (0x18, 0x20040) but **0
-  [validated]** -> no live DataModel. EXIT 139 bad_function_call = the known
-  delegate-path disruption on the deep ladder (SH170/runbook caveat), not a session fault.
-- Run 2 (region-watch): governor 22 pcs end-to-end (0x102e9fa84..0x102ea30dc) then
-  routeb-dmforce SH164 fabricated manager -> fnB real engine-init guest 0x102bd1b98 ->
-  bl 0x102bd8ce8 -> REAL continueAfterFlagsLoaded_ (0x102bd1d68) -> nativeAppBridgeAppStart
-  (SH165 manager re-seed + SH243 getter cell + SH245 app-name guard all fired).
-  Terminal: guestpc=0x101db1b08 fault=0xffffffffffffffff (SH285 LSM reader/pop live-object
-  wall). ScriptContext + setDataModelToCurrent registry 0 hits. EXIT 134.
-- CONFIRMS: SH343's LSM keyfix does NOT unlock the DM ctor. The full ladder now
-  measureably enters the NativeDataModelManager session-ctor line (distinct from SH340's
-  skip-appstart governor-silent path) but the live-DM gate is UNCHANGED — no DM-root,
-  MH_* false. SH285 verdict stands: 0x101db1b08 is the live-object class,
-  cause-not-symptom only, do NOT repair-seed it.
+### Measured (real libroblox.so, SH343 full-ladder env + KEYFIX)
+- **App-shell ctor band [0x102207b50..0x102209000] is NOT a stable negative.** A 3-run
+  A/B (runs/sh344c_appshell_ab.sh) fires it ~78 distinct pcs on every run (2/3 also
+  showed the activity-lifecycle 0x10284cf5c divergence on mid-cycle runs). SH344b's
+  "0 hits stable negative" was the divergence arm, not the class. BUT the band is
+  recon-sh165fwd's `__cxa_guard` FastLog warmer (0x102207b50 adrp+AcqRel+tbz; deep pcs
+  0x208e88/0x208eac are a destructor-style container loop) — firing it warms logging,
+  it constructs no DM/GuiObject. Corrects SH344b + SH340's framing; not a Route-B crossing.
+- **DMCONT continuation caps at SH285, one hop BEFORE app-start.** Region-watch run 2:
+  continuation body runs end-to-end through its flags-serialize (0x102bd1d68..0x102bd1f64
+  -> 0x102bd2014) then dives into `bl 0x1d9d8b0` (initStorageManagerNative/LSM lane) and
+  faults at 0x101db1b08 (SH285 reader/pop live-object wall, fault ff..ff). The post-app-start
+  tail [0x2bd2050..0x2bd2160] gets **0 hits** — the app-start `bl 0x2bd2058` is never reached.
+  So SH245 lever #2 (seed F+0x18 for the 0x2bd2080 deref) is NOT the effective next gate;
+  it targets a deeper, unreached fencepost. SH285 verdict stands: don't repair-seed 0x101db1b08.
+- Recon-v3 re-verified green: capture_taskv4_frame.sh 24 real task-driven frames, present
+  #19..#23 swap Ok(0x1), 197 node pops, 0 json abort, 0 crash, EXIT 124.
 
-recon-v3 deliverables (type4_frame_thunk self-drive + JIT_JSON_ZERO_FIX) re-verified
-present at HEAD. Route-B live-DM structural gate UNCHANGED. SH174 capture-latch (proven
-armed here) stays the single forward hook.
+### Verdict
+Route-B live-DM structural gate UNCHANGED (DM-root 0x106a68818=0, MH_* false). No seed
+produces a live DataModel. SH174 capture-latch stays the single forward hook. Persistence
+lane (SH343) remains committed + green. elfjit.rs untouched (1,048,479 B).
 
 ## Next (unchanged, authoritative)
-The SEP-17 SESSION-CTOR lever (drive the real Android Activity/AppBridge session init
-state machine) remains the primary forward — now with the NativeDataModelManager line
-reachable. The next implementable artifact is the scoped re-router of the manager's
-flag-completion slot (+0x1f0) toward a real engine-constructed app-shell
-(SH165-fwd "Next"), gated by the fact that seeds cannot produce a live DataModel
-(SH165-fwd task-1/e2, SH174 runbook).
+SEP-17 SESSION-CTOR cause-level drive (real Android Activity/AppBridge session so the
+upstream ctor constructs the DM world for real) remains the primary forward. The DMCONT
++0x1f0 flag-completion line is measured-complete through its serialize body and capped at
+the SH285 reader wall — no product of routing +0x1f0 deeper changes that. Un-driven
+SESSION-CTOR candidates SH264 flagged: messageBus experience-launch receive + dataModel
+bindings (onGameLoaded / onAppLuaWillStart) live-binder entries. SH174 capture-latch stays
+the single forward hook. All research subagents Route-B-scoped / cone still suppressed.
