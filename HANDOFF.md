@@ -1,4 +1,17 @@
 # Open Sober — Agent Handoff
+## SH325 (Sep 18, 2026, hermes-worker): CLEARED the SH324 SESSION-CTOR terminal. SH160's init3-gate
+## NOP (`routeb_patch_startapp_init3_gates` — replaces both `bl 0x2256510` with `stp xzr,xzr,[x8]`)
+## was DEAD CODE on the fault path: it was gated behind the StartLuaAppDM ladder rung, which
+## `--v2boot-skip-appstart` skips (and without it the main StartApp faults first). Hoisted the call
+## into the upfront --v2boot setup (gated DM_SEED/DMFORCE, self-guarding+idempotent). Result, 3/3:
+## first SIGSEGV advances GUESTPC 0x102256510 -> 0x1025f5300 (SH160 fires at both sites). The new
+## terminal is V2StartAppWithParams' real field-copy gate (fn 0x25f54e8, source x0=[appstart_obj+24] =
+## a genuine session-constructed AppStarted field — next live-object construct, SEP-17 territory, NOT
+## a seedable cell).
+## Verify: sh325 1 passed; elfjit 150/0; arm64jit lib 408/0; cargo test --workspace EXIT 0.
+## Doc docs/frontier-sh325-hoist-init3-gate-clears-sh324.md. HONEST: no DM (DM-root 0, MH_* false);
+## Route-B live-DM gate UNCHANGED. Next: new live-object at [appstart_obj+24] is again a real-session
+## construct (SEP-17), not a host-seed.
 ## SH324 (Sep 18, 2026, hermes-worker): ANSWER STATUS candidate #1 — the terminal 0x102256510 IS the
 ## SESSION-CTOR drive point, reached into a StartLuaAppDM continuation body SH156 never mapped;
 ## pinned on the real image + PROVED the fabricated-object seed is a dead-end on this wall (x8
