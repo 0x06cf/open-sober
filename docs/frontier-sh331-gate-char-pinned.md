@@ -61,6 +61,24 @@ Activity/AppBridge session drive (SEP-17 PRIMARY LEVER) so the upstream ctor bui
 +0x408 object (real vt[+136] work) instead of the fabricated leaf — the standing migration-gate
 direction; single-agent cone remains suppressed.
 
+## SH348: once-slot DM-ctor lever = measured-negative (tried, reverted)
+
+Tried: seed on once-slot [0x106a68408] (the cell SH316 says do-init's __call_once result lands
+in, `str x0,[x23,#1032]` @0x2206d74) with a wrapper whose [+32]=manufactured DM so the done-path
+dispatcher 0x2206db8 MAIN branch dispatches the app-shell ctor. REVERTED (no-cruft):
+
+- Disassembled 0x2206db8: `x19 = x1`; the MAIN branch does `x0=[x19+32]`; and the CALLER (do-init
+  0x2206cd4) does `mov x1,x20` — x20 is do-init's ORIGINAL arg1 (0x2206c60 `mov x20,x1`), i.e. the
+  dispatcher consumes the caller's arg1 object, NOT the once-slot value read at 0x2206c8c. So
+  seeding once-slot does not feed the dispatch; the once-slot (a sub-image 0x400000b Execute tag)
+  is a DIFFERENT plane. SH239 rightly seeds the DM-root the match actually derefs.
+- Empirically A/B (bus route + DONEPATH_MAIN): adding the guard changed the crash site run-variably
+  (0x1021f5078 SH323 whitespace-check on one run, host-side SIGSEGV on another) — i.e. noise, not a
+  reproducible forward; the guard itself never fired (block entries were 0x102206c40/cc0, not c88).
+- Do NOT re-attempt once-slot seeding as a DM-ctor lever. The App service / SESSION-CTOR real-session
+  registration (SH313/316/317/318) is the only known route to a real DM through this ctor; it is
+  live-construction work (the controller-name table resolves only "Runtime0", session-built).
+
 ## Verify
 
 - `cargo build --workspace` EXIT 0; `cargo test --workspace` EXIT 0 (arm64jit lib 408/0; elfjit
