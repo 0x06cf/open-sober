@@ -1069,13 +1069,11 @@ pub fn routeb_seed_pb_registry_map(image: &[u8], base: u64) -> u64 {
             *((map + 0x60) as *mut u32) = 0;
         }
         // Install pb_defaults BSS registry slots (idempotent data seed).
-        // NOTE (SH95): 0x106838378 pthread_rwlock POINTER slot (the registrar tail
-        // `ldr x0,[x20,#888]`=+888=0x378 unlocks it) — do NOT seed it with the map ptr,
-        // or the do-init's pthread_rwlock_unlock crashes (it was the SH94-trace crash at
-        // guestpc 0x102a1ce5c, fault==rip==heap on a garbage lock word). .bss is zeroed so
-        // 0x378 holds a valid UNLOCKED rwlock natively — leave it untouched. Only seed the
-        // actual registry-MAP slots the registrar reads (0x106838380 at offset 896, and
-        // 0x106838368 which the find-op registration uses).
+        // NOTE (SH95): 0x106838378 pthread_rwlock POINTER slot (registrar tail `ldr x0,[x20,#888]`
+        // =+888=0x378 unlocks it) — do NOT seed it w/ the map ptr or do-init's rwlock_unlock crashes
+        // (SH94-trace crash guestpc 0x102a1ce5c, garbage lock word). .bss zeroed -> 0x378 is already
+        // a valid UNLOCKED rwlock — leave it. Seed only registry-MAP slots the registrar reads
+        // (0x106838380 @offs896 + 0x106838368 used by find-op registration).
         for slot in [0x106838368u64, 0x106838380] {
             unsafe { *(slot as *mut u64) = map };
         }
@@ -1284,13 +1282,12 @@ pub fn routeb_seed_game_global_vector() -> u64 {
 
 /// SH87: string/span hash-map family dispatch (file 0x29f427c) branches through
 /// optional hash-2 slot (+0x18) when non-zero; OTel rehash gives +0x18 the static
-/// constant 0x1800064 (unmapped) -> SIGSEGV. hash2 REDUNDANT (aliases `br x1`),
-/// so patch `blr x8`->`blr x1` (behavior-preserving, immune to block gaps).
+/// constant 0x1800064 (unmapped) -> SIGSEGV. hash2 REDUNDANT (aliases `br x1`), so
+/// patch `blr x8`->`blr x1` (behavior-preserving, immune to block gaps).
 /// SH93: do-init PARKS on a CEvent completion (bl 2207578 futex-wait) set by a
-/// TaskScheduler worker that never runs headlessly; NOP the barrier `bl 2207578`
-/// @0x2206e70. SH159c: governor 0x102e9fa84's version-gate takes a modern
-/// appendix that re-reads V2Init params + faults under JIT; patch `b.cc
-/// 0x2e9fb20` @0x102e9fad8 -> unconditional `b` (router path).
+/// TaskScheduler worker that never runs headlessly; NOP `bl 2207578` @0x2206e70.
+/// SH159c: governor 0x102e9fa84 version-gate takes a modern appendix that re-reads
+/// V2Init params + faults under JIT; patch `b.cc 0x2e9fb20` @0x102e9fad8 -> `b` (router).
 fn routeb_patch_gov_router() {
     const ADDR: u64 = 0x102e9fad8; // `b.cc 0x2e9fb20` (0x54000243)
     let want = 0x1400_0012u32; // `b 0x2e9fb20` (unconditional, imm26=0x12)
@@ -1617,11 +1614,11 @@ fn routeb_patch_map_dispatch() {
     // Two dispatch `blr x8` sites in the Roblox string/span hash-map family, each the
     // optional-hash2 branch of `ldp x1,x8,[x19,#16]; cbz x8;<tail>blr x1`:
     // FIND/grow file 0x29f4280 (guest 0x1029f4280) — SH87
-    // INSERT op file 0x29f3f78 (guest 0x1029f3f78) — SH89 (29f3f6c ldp x1,x8,[x19,#16];
-    // 29f3f74 cbz x8,29f3f80; 29f3f78 blr x8; 29f3f80 blr x1)
+    // INSERT file 0x29f3f78 (guest 0x1029f3f78) — SH89 (29f3f6c ldp; 29f3f74 cbz;
+    // 29f3f78 blr x8; 29f3f80 blr x1)
     // Forcing `blr x1` (primary hash) at both is behavior-preserving: hash2 is redundant
-    // here (observed real value is `br x1` aliasing the primary) and the hash only picks a
-    // bucket probe (correctness via the key-eq comparator at map+0x08), so garbage +0x18
+    // here (observed = `br x1` aliasing the primary) and the hash only picks a
+    // bucket probe (correctness via key-eq comparator at map+0x08), so garbage +0x18
     // can never be branched into.
     const FIND_BLR: (u64, u64) = (0x1029f4280, 0x29f4280);
     const INSERT_BLR: (u64, u64) = (0x1029f3f78, 0x29f3f78);
@@ -1665,10 +1662,9 @@ static ROUTEB_ADAPTER_REC_ADDR: std::sync::OnceLock<u64> = std::sync::OnceLock::
 /// virtuals are benign leaves (gate `2b9e030` memcpys [addr+24](src)[addr+0](size);
 /// src==NULL -> all-zero vtable stub -> blr SIGSEGV @0x10624f500). Records
 /// (guest=file+0x100000000, .data rw-): {+0 size,+8 pow2,+16 ticket,+24 src}.
-/// SH114: V2Init/V2Start/V1/AppReady soft-return sites are lazy-singleton virtual
-/// dispatches (A 0x62517c4[+0xf8], A2 0x6251aa8[+0x108], B 0x6260948[+0x548]).
-/// SH111: a scoped leaf must return a STABLE zeroed guest object
-/// (routeb_singleton_obj_leaf), NOT 0 (caller derefs [out]+0x28).
+/// SH114: V2Init/V2Start/V1/AppReady soft-returns = lazy-singleton virtual dispatches
+/// (A 0x62517c4[+0xf8], A2 0x6251aa8[+0x108], B 0x6260948[+0x548]). SH111: leaf must
+/// return STABLE zeroed guest obj (routeb_singleton_obj_leaf) not 0 (caller derefs [out]+0x28).
 fn routeb_seed_task_singletons() {
     if ROUTEB_SINGLETON_SEEDED.load(core::sync::atomic::Ordering::Relaxed) {
         return;
@@ -1786,13 +1782,12 @@ fn routeb_patch_taskscheduler_flags_gate() {
 
 // -- SH115: scoped singleton-dispatch patch (make V2Init/V2Start/V1AppStart/ ----
 // -- SendAppEventOnAppReady bodies complete soft-returning) ----
-// The three nullable-singleton accessors end a virtual dispatch through the
-// seeded 0x60 vtable: `ldr x8,[x8,#off]; blr x8` reads past 0x60 into host bytes
-// and soft-returns. SH114: a flat `blr->mov x0,xzr` regresses nativeInit (the
-// accessor return IS deref'd at +0x28). Differential fix: patch each 28B window
-// to MATERIALIZE routeb_singleton_obj_addr into x0 + store into objA[0]=[x19] +
-// RETURN it. Window (7 instr): movz x8,#OBJlo; movk(16/32/48); mov x0,x8;
-// ldr x9,[x19]; str x0,[x9] (overwrites trailing mov x0,xzr).
+// The nullable-singleton accessors end a virtual dispatch through the seeded 0x60
+// vtable: `ldr x8,[x8,#off]; blr x8` reads past 0x60 into host bytes, soft-returns.
+// SH114: flat `blr->mov x0,xzr` regresses nativeInit (accessor return IS deref'd at
+// +0x28). Fix: patch each 28B window to MATERIALIZE routeb_singleton_obj_addr into
+// x0 + store into objA[0]=[x19] + RETURN it. Window (7 instr): movz x8,#OBJlo;
+// movk(16/32/48); mov x0,x8; ldr x9,[x19]; str x0,[x9] (overwrites trailing mov x0,xzr).
 fn sh115_movz_x8_imm(imm16: u16) -> u32 {
     0xD280_0000u32 | ((imm16 as u32) << 5) | 8
 }
@@ -2593,12 +2588,11 @@ fn routeb_patch_singleton_dispatch() {
 }
 
 static ROUTEB_V2_DISPATCH_PATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-/// SH200: V2Init/V2Start run-variable "outside image" stop SCOPED-SEEDABLE
-/// singleton-dispatch, NOT SH198's non-seedable host-pointer class. fn file 0x6251e0c
-/// (guest 0x106251e0c, V2Init/Start app-params accessor): getters -> `ldr x8,[x0]`
-/// (objB=*self=0x60 leaf vtable) -> `ldr x8,[x8,#280]` (+0x118 past the vtable) ->
-/// `blr x8` jumps out of image before SH199's world-build gate. This @+0x118 4th
-/// unpatched site (siblings 0x62517c4/+0xf8, 0x6251aa8/+0x108, 0x6260948/+0x548).
+/// SH200: V2Init/V2Start run-variable "outside image" stop is SCOPED-SEEDABLE
+/// singleton-dispatch, NOT SH198's host-pointer class. fn file 0x6251e0c (guest 0x106251e0c,
+/// V2Init/Start app-params accessor): getters -> `ldr x8,[x0]` (objB=0x60 leaf vtable) -> `ldr
+/// x8,[x8,#280]` (+0x118 past vtable) -> `blr x8` jumps out of image before SH199's gate. This
+/// @+0x118 4th unpatched site (siblings 0x62517c4/+0xf8, 0x6251aa8/+0x108, 0x6260948/+0x548).
 /// Fix (scoped): patch window [0x6251e94..0x6251eb4) materializing routeb_singleton_obj_addr
 /// into x0 + NOP the `blr`; post-window stores it into *[x19], return stays mov x0,xzr.
 pub fn sh200_v2_dispatch_window(obj: u64, nslots: usize) -> Vec<u32> {
@@ -6298,15 +6292,9 @@ fn main() {
         }
     }
 
-    // Seed the LocalStorageManager C++ static hash-map whose .bss base global
-    // (guest 0x10726f8c0 = 0x726f000+0x8c0) is 0 because its constructor never
-    // ran (.init_array is empty). The reader (0x1d99e40) does
-    // ldr x8,[0x726f8c0]; add x8,x8,key>>29<<3; ldar x8,[x8]; ldr x0,[x8,idx<<3]
-    // and faults NULL bucket (`key` heap/guest pointer, so
-    // key>>29 lands up to ~0xb00 buckets in). Seed a real zeroed region as the
-    // bucket array, with every bucket slot pointing at a shared (also-zeroed,
-    // non-overlapping) sub-array slot, so any lookup reads 0 -> "not found".
-    // (Fallback: if the guest later overwrites it with a real map, all the better.)
+    // Seed the LocalStorageManager static hash-map (.bss global 0x10726f8c0) that's 0 because its
+    // ctor never ran. Reader 0x1d99e40 faults NULL bucket; seed a zeroed bucket array with every
+    // slot -> a shared zeroed sub-slot so any lookup reads 0. (Guest may overwrite later.)
     unsafe fn seed_static_empty_map(map_global_guest: u64) {
         const BUCKETS: usize = 0x400000; // key>>29: pointers ~0x56.. give idx ~0x2b2a7; grant headroom
         const SLOT_STRIDE: usize = 8;
@@ -6571,13 +6559,13 @@ fn main() {
         eprintln!("[elfjit] driving StartApp @ guest {start_app:#x} after JNI_OnLoad (env={env_ptr:#x} jobject={activity:#x} params={params:#x}){}",
             if use_v1 { " [V1 6-jstring AppStart__]" } else { "" });
 
-        // --v2boot: REAL engine boot ladder IN ORDER (SH53-124 corrective for the
-                // out-of-order StartApp json-abort). Type-4 producer [0x106829ea8] installed by
-                // TaskScheduler init only in this order: nativeGameGlobalInit -> setTaskSchedulerBackgroundMode
-                // -> V2InitWithParams -> StartLuaAppDM -> V2StartAppWithParams. Each rung = fresh guest
-                // entry on boot SP (AutoValue jobjects); vector dumped after EVERY rung. Spawned BEFORE
-                // start_app jit_run on a detached thread (own warmup sleep) so rungs run while StartApp
-                // idles; joined after StartApp returns (SH124). Opt-in.
+        // --v2boot: REAL engine boot ladder IN ORDER (SH53-124 corrective for the out-of-order
+                // StartApp json-abort). Type-4 producer [0x106829ea8] installed only in this order:
+                // nativeGameGlobalInit -> setTaskSchedulerBackgroundMode -> V2InitWithParams ->
+                // StartLuaAppDM -> V2StartAppWithParams. Each rung = fresh guest entry on boot SP
+                // (AutoValue jobjects); vector dumped after EVERY rung. Spawned BEFORE start_app on a
+                // detached thread (own warmup sleep) so rungs run while StartApp idles; joined after
+                // StartApp returns (SH124). Opt-in.
         let mut v2boot_join: Option<std::thread::JoinHandle<()>> = None;
         if std::env::args().any(|a| a == "--v2boot") {
             const BSS_TASKV4: u64 = 0x106829ea8;
@@ -6850,15 +6838,11 @@ fn main() {
                         unsafe { *(main_id_cell as *mut u64) = me as u64 };
                         eprintln!("[elfjit:v2boot] seeded main-thread-id [0x106863a68]=0x{me:x} for GlobalInit thread-dispatch (this thread == stored == self -> takes the vt[+48] match path, no park)");
                     }
-                    // SH122: StartLuaAppDM fans SAME GlobalInit do-init
-                    // (via 0x2baeeec -> 0x2206c40) once-latched on
-                    // [0x6a68410].bit0 and thread-gated on [0x106863a68]
-                    // (deleg_65301a28). On this (non-main) ladder thread the
-                    // thread-dispatch b.ne parks/soft-returns and the once-guard
-                    // stays unlatched, DM/app-shell is never built. Mirror
-                    // the SH82 trick: seed the main-id cell to self + set the
-                    // once-guard bit0 do-init takes the match/DM-construction
-                    // path. Restore the cell after the rung.
+                    // SH122: StartLuaAppDM fans the SAME GlobalInit do-init (0x2baeeec->0x2206c40),
+                    // once-latched on [0x6a68410].bit0 + thread-gated on [0x106863a68] (deleg_65301a28).
+                    // On this non-main ladder thread the b.ne parks/soft-returns and once-guard stays
+                    // unlatched, so DM/app-shell never builds. Mirror SH82: seed main-id to self + set
+                    // once-guard bit0 so do-init takes the match path; restore the cell after the rung.
                     if *guest == 0x1023efe2c && std::env::var("JIT_SH115_SINGLETON_PATCH").ok().as_deref() == Some("1") {
                         let me = unsafe { libc::pthread_self() };
                         unsafe {
@@ -7118,14 +7102,11 @@ fn main() {
                         let abv_slot = unsafe { *(0x106a705e8u64 as *const u64) };
                         let vt18 = unsafe { *(0x1063a3428u64 as *const u64) };
                         let vt18_is_gov = vt18 == 0x102e9fa84;
-                        // SH159 (recon deleg_0eff24ca, union-init gate): the
-                        // AppBridgeV2 union-init 0x2366694's first sub-constructor
-                        // 0x2366848 guards on globals G=[0x6a63da0] and W=[0x6a63d70]
-                        // which (per recon) hold FEATURE-FLAG NAME STRING addresses
-                        // ("EnableTextChat..."/"EnableUniverseChatChannelMonitor"), not
-                        // a live object. When non-zero it treats the string as `this`,
-                        // garbage-dispatches, and never returns to the body's governor
-                        // dispatch. Probe the ACTUAL runtime values here.
+                        // SH159 (recon deleg_0eff24ca, union-init gate): AppBridgeV2 union-init 0x2366694's
+                        // first sub-ctor 0x2366848 guards on G=[0x6a63da0]/W=[0x6a63d70] which hold
+                        // FEATURE-FLAG NAME STRING addrs ("EnableTextChat..." etc.), not a live
+                        // object — non-zero -> treats string as `this`, garbage-dispatches, never
+                        // returns to the governor dispatch. Probe the ACTUAL runtime values here.
                         let guard_g = unsafe { *(0x106a63da0u64 as *const u64) };
                         let guard_w = unsafe { *(0x106a63d70u64 as *const u64) };
                         // SH159c: read the governor version-word [0x6a70700] that
@@ -7297,12 +7278,11 @@ fn main() {
                 }
                 // SEP-17 SESSION-CTOR client-settings feed: SH264 drove only plain
                 // nativeInitClientSettings (0x1022265fc) at version=0 (empty-early).
-                // nativeInitClientSettingsSigned (0x102bb070c) — what the real app delivers —
+                // nativeInitClientSettingsSigned (0x102bb070c — what the real app delivers)
                 // decodes version (low==6 && byte1==3 -> readLocalFlags 0x21e8f4c + parse
-                // 0x2baf38c, else empty-early), resolves 4 jstrings via SH186 shim, returns w0.
-                // initEngine_ "Engine settings is null" feed (SH184). Measure real version word
-                // 0x0306: a consumer (nil-milestone); value real parse path. Opt-in
-                // --v2boot-session-signed.
+                // 0x2baf38c, else empty-early), resolves 4 jstrings via SH186 shim.
+                // initEngine_ "Engine settings is null" feed (SH184); version 0x0306 -> real
+                // parse path. Opt-in --v2boot-session-signed.
                 if std::env::args().any(|a| a == "--v2boot-session-signed") {
                     unsafe { *(0x10683cff8u64 as *mut u64) = 0x0306u64; } // real version: low byte 6, byte1 3
                     eprintln!("[elfjit:v2boot] SH275 set client-settings version [0x10683cff8]=0x0306 -> Signed receive takes the readLocalFlags parse path (not the empty-early branch)");
@@ -7432,13 +7412,10 @@ fn main() {
                         eprintln!("[elfjit:v2boot] SH280 post state=5 direct: [this+16](state)={st5}");
                         dump("SH280-engine5");
                     }
-                    // SH284-next: engine9 opt-in drives the LAST never-driven initEngine_ state body — state=9
-                    // (0x2bd2668). SH273/SH277 measured states 5 and 9 were NEVER driven; SH283
-                    // crossed state=5's reentry continuation (5->7). The state=9 body SAME
-                    // shape: it sets state->10 then `bl 0x2bce0d4` with w2=1 -> `b 275a0c4` (the
-                    // GlobalInit-reentry SH283's JIT_ROUTEB_ENG5_QMUTEX_FREE steal carries through).
-                    // Reuses the SH279 manager seeds (app-name 'Home' long + [this+0x40] config +
-                    // [config+56] buffer). Opt-in --v2boot-session-engine9.
+                    // SH284-next: engine9 opt-in drives the LAST never-driven initEngine_ state body
+                    // (state=9, 0x2bd2668); SH273/277 had states 5 and 9 never driven, SH283 crossed
+                    // 5->7. State=9 sets state->10 then bl 0x2bce0d4 w2=1 -> b 275a0c4 (GlobalInit-
+                    // reentry, SH283's ENG5_QMUTEX_FREE steal). Reuses SH279 seeds. Opt-in.
                     if std::env::args().any(|a| a == "--v2boot-session-engine9") {
                         unsafe { *( (mgr3 + 16u64) as *mut u32) = 9u32; }
                         eprintln!("[elfjit:v2boot] SH284 driving initEngine_ state=9 body DIRECT @ 0x102bd2668 (app-name 'Home' + config pre-seeded; state->10, gated by JIT_ROUTEB_ENG5_QMUTEX_FREE/0x106863aa0 steal)");
@@ -7826,14 +7803,13 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                     );
                     dump("SH315-postbus-doinit");
                 }
-                // SH131 (disasm 21f7654): seed the engine's OWN files-dir global. The real
-                // client stores its files dir via nativeSetFilesDirectory (0x1021f7654)
-                // 24-byte libc++ std::string at 0x10726d600 (file 0x726d600; NOT
-                // 0x1026d600). Without it the SQLite datastore gets no base path and nothing
-                // reaches the fsmap store. Driving the native's STORE body dead-end
-                // (its GetStringUTFChars reads a real Java-arena jstring) so seed the
-                // std::string in LONG form ([0..7]=data, [8..15]=size, [16..23]=cap cap
-                // bit0=0=long). Opt-in --v2boot-set-filesdir.
+                // SH131 (disasm 21f7654): seed the engine's OWN files-dir global. Real client
+                // stores it via nativeSetFilesDirectory (0x1021f7654) — a 24-byte libc++
+                // std::string at 0x10726d600 (file 0x726d600; NOT 0x1026d600). Without it the
+                // SQLite datastore gets no base path -> nothing reaches the fsmap store. The
+                // native's STORE body dead-ends (GetStringUTFChars reads a real Java-arena
+                // jstring), so seed the string in LONG form ([0..7]=data,[8..15]=size,
+                // [16..23]=cap bit0=0). Opt-in --v2boot-set-filesdir.
                 if std::env::args().any(|a| a == "--v2boot-set-filesdir") {
                     const FILES_DIR_GLOBAL: u64 = 0x10726d600;
                     const DIR: &[u8] = b"/data/user/0/com.roblox.client/files";
@@ -7941,6 +7917,37 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                         "[elfjit:v2boot] SH315 service-registry-count[0x106fe2f08]={srv_reg_count} entries=[{}]",
                         srv_names.join(", ")
                     );
+                    // SH317: ctor name->service lookup (bl 0x2168798) is TWO-TIER.
+                    // tier-1 strncasecmp(OTHER,[entry],0x3f) walks the array; tier-2 strcasecmp
+                    // (PRIMARY, [0x1070271d0]*92+0x106fe2f00+0x2078) resolves the PRIMARY "App"
+                    // through a controller-name cell. Measured: fixidx=0 -> "Runtime0" (not "App"),
+                    // so the fast-path fails though tier-1 matched "Execute" (0x400000b, SH316).
+                    let sh317_idx = unsafe { *(0x1070271d0u64 as *const u8) };
+                    let cc_base = 0x106fe2f00u64 + (sh317_idx as u64) * 0x5c + 0x2078;
+                    let mut cc = String::new();
+                    for k in 0..0x40u64 {
+                        let b = unsafe { *((cc_base + k) as *const u8) };
+                        if b == 0 { break; }
+                        cc.push(b as char);
+                    }
+                    eprintln!(
+                        "[elfjit:v2boot] SH317 ctor-lookup controller-name table: fixidx[0x1070271d0]={sh317_idx:#x} -> cell[0x{cc_base:x}]=\"{cc}\" (tier-2 PRIMARY 'App' match must resolve here)"
+                    );
+                    // SH317b: dump the controller-name table at indices 0..7 (stride 0x5c from
+                    // base 0x106fe2f00, name field +0x2078): all read "Runtime0" -> the cell is
+                    // invariant, so "App" can't resolve via ANY index byte (no hand-seed).
+                    let mut tbl: Vec<String> = Vec::new();
+                    for i in 0..8u64 {
+                        let cb = 0x106fe2f00u64 + i * 0x5c + 0x2078;
+                        let mut cs = String::new();
+                        for k in 0..0x20u64 {
+                            let b = unsafe { *((cb + k) as *const u8) };
+                            if b == 0 { break; }
+                            cs.push(b as char);
+                        }
+                        tbl.push(if cs.is_empty() { "_".to_string() } else { cs });
+                    }
+                    eprintln!("[elfjit:v2boot] SH317b controller-name table[0..7]={}", tbl.join("|"));
             }));
         }
         // --v2boot-r246: the sequential --v2boot driver STALLS at rung 1 because
@@ -8409,13 +8416,12 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                 }
             });
         }
-        // Host-side task-deque PRODUCER (--deque-node <vtable-hex>): the SH5 frontier parked
-        // threads are CONSUMERS of a per-CPU lock-free task-deque (0x285682c/0x2856e40) parked in
-        // the epoch futex wait 0x10284d018 because the head ([0x10682a638]/0x10682b338) is the
-        // self-referential SENTINEL. CAS a fresh task NODE head, link node.next=old sentinel,
-        // set [node+112]=<vtable> so drain ([node+112]&~0x3f -> [vt+40]) reaches a real handler, then
-        // bump [Q']>>32 + FUTEX_WAKE Q'+4. Zeroed node (vt=0) trips drain at [vt+40]=[0x28]; the
-        // sentinel vtable 0x106829f00 reaches real handler 0x10285371c (first controlled crossing).
+        // Host-side task-deque PRODUCER (--deque-node <vtable-hex>): SH5 parked threads are CONSUMERS of
+        // a per-CPU lock-free task-deque (0x285682c/0x2856e40) parked in the epoch futex wait
+        // 0x10284d018 because the head ([0x10682a638]/0x10682b338) is the self-referential SENTINEL.
+        // CAS a fresh NODE head linking to the old sentinel, set [node+112]=<vtable> so drain
+        // ([node+112]&~0x3f -> [vt+40]) reaches a real handler, then bump [Q']>>32 + FUTEX_WAKE Q'+4.
+        // Zeroed node trips drain at [vt+40]; sentinel vtable 0x106829f00 -> handler 0x10285371c.
         if let Some(vt) = {
             let args: Vec<String> = std::env::args().collect();
             args.iter()
@@ -8841,14 +8847,11 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                         continue;
                     }
                     let np = node as u64;
-                    // SH60 frame-mode: hold the node PLACEMENT until --renderthunk
-                    // recovers RENDERCTX. Root/headcell are captured earlier in this
-                    // same iteration (drain active), wait loses nothing; the
-                    // drain stays on its finite-timeout heartbeat (never force-arms,
-                    // never pops the sentinel) until we place + arm. Without this,
-                    // the drain's type-4 (w4=4) dispatches are front-loaded onto the
-                    // first pops, which fire before RENDERCTX is recovered -> the
-                    // seeded frame thunk no-ops and no task frame ever presents.
+                    // SH60 frame-mode: hold node PLACEMENT until --renderthunk recovers RENDERCTX.
+                    // Root/headcell captured earlier this iteration; the drain stays on its finite
+                    // timeout heartbeat (never force-arms) until we place + arm. Otherwise the type-4
+                    // (w4=4) dispatches fire on first pops before RENDERCTX is recovered -> the seeded
+                    // frame thunk no-ops and no task frame presents.
                     if taskv4_frame_seed_active() {
                         let t0 = std::time::Instant::now();
                         let mut had_to_wait = false;
@@ -8991,13 +8994,13 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                 );
             }
         }
-        // --deque-probe: convert the forced-pop sentinel fault into a CONTROLLED type-4 dispatch.
-        // pop-loop 0x2856f94 pops head and dispatches [node+112]&~0x3f -> vt; handler=[vt+40]; if
-        // [node+40]!=0 && handler!=0 then handler([vt+16], consumer, [node+32]&~1, node, w4=4, x5=0).
-        // Idle head = SENTINEL ([node+112]=0x106829f00 -> 0x10285371c engine dispatcher -> strlen-fault
-        // on garbage). REPOINT sentinel [node+112] at a WE-controlled vtable whose [vt+40] is a
-        // registered host-thunk probe: every forced pop dispatches OUR probe w/ real ABI args.
-        // --deque-probe <ctx-qw-hex> writes that qword to sentinel [node+32] (the x2,&~1 arg).
+        // --deque-probe: convert the forced-pop sentinel fault into a CONTROLLED type-4 dispatch:
+        // pop-loop 0x2856f94 dispatches [node+112]&~0x3f -> vt; handler=[vt+40]; if [node+40]!=0
+        // && handler, handler([vt+16],consumer,[node+32]&~1,node,w4=4). Idle head = SENTINEL
+        // ([node+112]=0x106829f00 -> 0x10285371c, strlen-faults on garbage). REPOINT sentinel
+        // [node+112] to a WE-controlled vtable whose [vt+40] is a registered host-thunk probe:
+        // every forced pop dispatches OUR probe w/ real ABI args. --deque-probe <hex> writes the
+        // ctx qword into sentinel [node+32] (the x2,&~1 arg).
         if std::env::args().any(|a| a == "--deque-probe") {
             let ctx = std::env::args()
                 .position(|a| a == "--deque-probe")
@@ -9126,13 +9129,12 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
         }
     }
     // --drain-poll <ms>: force the engine idle-task-deque consumer's drain (0x2856e40)
-    // to a FINITE wait the infinite -1 it blocks on during idle. The parked
-    // threads deadlock because `mov x2,x22` (0x2856f40, x22=drain timeout=-1) hands
-    // generic-wait 0x284d014 an infinite timeout -> parks in a bare futex forever, so the
-    // drain's pop-loop 0x2856f94 (reached only when the wait times out w0=1 AND version
-    // matches) never runs. A finite ms makes the wait time out, the drain reach the pop-loop,
-    // find a host-placed node in [headcell+0], and dispatch [node+112]->[vt+40].
-    // Patch the guest IMAGE before jit_run drain block compiles with it.
+    // to a FINITE wait instead of the infinite -1 it blocks on during idle. Parked threads
+    // deadlock: `mov x2,x22` (0x2856f40, x22=drain timeout=-1) hands generic-wait 0x284d014 an
+    // infinite timeout -> bare-futex park forever, so the pop-loop 0x2856f94 (reached only when
+    // wait times out w0=1 && version matches) never runs. A finite ms times the wait out, the
+    // drain reaches the pop-loop, finds a host-placed node in [headcell+0], dispatches
+    // [node+112]->[vt+40]. Patch the guest IMAGE before the drain block compiles with it.
     {
         let args: Vec<String> = std::env::args().collect();
         if let Some(i) = args.iter().position(|a| a == "--drain-poll") {
@@ -9305,11 +9307,10 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
             // buffer first store lands and we reach the EGL sequence.
             let scratch = Box::leak(vec![0u8; 4096].into_boxed_slice());
             // --renderthunk (opt-in, with --renderinit): drive the render-init THUNK 0x105b3a280
-            // the inner fn, recovering the engine's REAL ctx object. SH17's
-            // "DON'T drive the thunk (SIGSEGV)" was from misplacing harness args: thunk(win,
-            // parent) -> inner(alloc_ctx(0x48), win, parent), returns the real 0x48-byte guest
-            // ctx in x0 (engine callers 0x5b2b214/0x5b2ea90 do `bl 0x105b3a280; ldr x8,[x0];
-            // ldr x8,[x8,#16]; blr x8` vtable-dispatch). Resolving this ctx bridge to
+            // inner fn, recovering the engine's REAL ctx object. SH17's "DON'T drive the thunk
+            // (SIGSEGV)" was from misplacing harness args: thunk(win,parent) -> inner(alloc_ctx(0x48),
+            // win,parent), returns the real 0x48-byte guest ctx in x0 (callers 0x5b2b214/0x5b2ea90
+            // do `bl 0x105b3a280; ldr x8,[x0]; ldr x8,[x8,#16]; blr x8`). Resolving this ctx bridge to
             // driving the engine's own frame-render. Correct drive: thunk(x0=win=XID,
             // x1=parent=0) — NOT scratch as x0.
             let render_thunk = renderframe_args.iter().any(|a| a == "--renderthunk");
@@ -9505,15 +9506,12 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                     // (SH60 marker) on this currency-owning thread.
                     let _ = present_one_task_frame(real_ctx, 0, iimg, ibase, isp);
                 }
-                // --renderscene (opt-in, must accompany --renderinit + the
-                // renderthunk so RENDERCTX real ctx): drive the engine's
-                // OWN scene renderer (0x105b2ead4) with a fabricated-but-engine-
-                // native render-manager R, replacing the harness-fabricated
-                // clear-path renderer with the engine's real frame-desc
-                // construction (its own operator-new 0x1d96768 / frame ctor
-                // 0x5b34de8 / linker 0x5b2d9e0). Bounded window run still
-                // exits 124 cleanly. VERIFIES the engine registered a real
-                // frame-desc into R+0x170 before presenting.
+                // --renderscene (opt-in, must accompany --renderinit + renderthunk so RENDERCTX is
+                // the real ctx): drive the engine's OWN scene renderer 0x105b2ead4 with a fabricated
+                // but engine-native render-manager R, replacing the harness clear-path renderer with
+                // the engine's real frame-desc construction (its operator-new 0x1d96768 / frame ctor
+                // 0x5b34de8 / linker 0x5b2d9e0). VERIFIES the engine registered a real frame-desc
+                // into R+0x170 before presenting. Bounded run still exits 124 cleanly.
                 if renderframe_args.iter().any(|a| a == "--renderscene") {
                     let t0 = std::time::Instant::now();
                     let max_window = std::time::Duration::from_millis(
@@ -9749,14 +9747,11 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                         eprintln!(
                             "[elfjit:renderframe-drive] clear-color x5 obj 0x{ccobj:x} (RGBA {cc:?} at [+0..16])"
                         );
-                        // SH19 diagnostic: dump the 8 engine-GLES dispatch slots the
-                        // frame's clear path `br`-stubs read. The stubs 0x5b3a1c0..
-                        // (with a 0x10 stride) do `adrp x8, 6d3b000; ldr x2,[x8,#752]`
-                        // + 8*N, i.e. slot N at guest 0x106d3b2f0 + 8*N. Each holds a
-                        // function pointer the engine's own GLES-table init is
-                        // supposed to populate (it never does under our headless
-                        // drive), so an unset slot makes the clear path `br` into
-                        // garbage. Since guest==host these vaddrs are dereferenceable.
+                        // SH19 diagnostic: dump the 8 engine-GLES dispatch slots the clear path `br`-stubs read.
+                        // Stubs 0x5b3a1c0.. (0x10 stride) do `adrp 6d3b000; ldr x2,[x8,#752]` + 8*N,
+                        // i.e. slot N at 0x106d3b2f0 + 8*N — fns the engine's own GLES-table init is
+                        // supposed to populate (never does headlessly), so an unset slot br's garbage.
+                        // guest==host so these vaddrs are dereferenceable.
                         let mut vals = [0u64; 8];
                         for i in 0..8 {
                             let slot_v = 0x106d3b2f0u64 + i * 8;
@@ -9840,13 +9835,12 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                         eprintln!(
                             "[elfjit:renderframe-drive] fabricated renderer 0x{renderer:x} (+16=1,+24->0x{objA:x}[+552]=1,+40->0x{objB:x}[+140]=1) view 0x{view:x} ([+128]=1280 [+132]=720 [+140]=0)"
                         );
-                        // --renderframe-loop <N>: repeat the engine's OWN recipe (bind done by
-                                    // renderbind -> real frame-fn 0x105b32c00 -> post-frame swap via real ctx)
-                                    // N times to prove reentry/sustain. Default 1.
-                                    // --rendersustain <fps>: run the recipe CONTINUOUSLY at ~fps on this
-                                    // host thread while StartApp's main loop idles — a live animated render
-                                    // loop (the shape the engine needs); each frame cycles the clear color so a
-                                    // capture proves every frame fresh render.
+                        // --renderframe-loop <N>: repeat the engine's OWN recipe (renderbind done by
+        // the renderbind -> real frame-fn 0x105b32c00 -> post-frame swap via real ctx) N times to
+        // prove reentry/sustain. Default 1.
+        // --rendersustain <fps>: run the recipe CONTINUOUSLY at ~fps on this host thread while
+        // StartApp's main loop idles — a live animated loop; each frame cycles the clear color so a
+        // capture proves every frame fresh render.
                         let loop_n: usize = renderframe_args
                             .iter()
                             .position(|a| a == "--renderframe-loop")
@@ -9968,12 +9962,11 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                 ),
                             }
                             // --renderframe-triangle: fabricate a COHERENT renderer — a real 1-prim
-                            // list, vertex-descriptor/stride tables, IBO, vertex/index buffers
-                            // (created+uploaded via the JIT bridge) + a real compiled+linked shader —
-                            // then drive the engine's geometry wrapper 0x5b35288. Its primitive-setup
-                            // 0x5b353d0 runs its REAL loop (bind ARRAY_BUFFER, enable attrib 0,
-                            // glVertexAttribPointer) and the wrapper dispatches a REAL indexed
-                            // glDrawElements through GLES slot 9 (count=3): a visible triangle.
+                            // list/base tables, IBO, vertex/index buffers (uploaded via JIT bridge) + a real
+                            // compiled+linked shader: drive the engine's geometry wrapper 0x5b35288. Its
+                            // primitive-setup 0x5b353d0 runs its REAL loop (bind ARRAY_BUFFER, enable
+                            // attrib 0, glVertexAttribPointer) + dispatches REAL indexed glDrawElements
+                            // via GLES slot 9 (count=3): a visible triangle.
                             if renderframe_args.iter().any(|a| a == "--renderframe-triangle") {
                                 // GL enums used below.
                                 const GL_ARRAY_BUFFER: u64 = 0x8892;
@@ -10261,11 +10254,10 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                     );
                                     // --renderframe-tex: create + upload a 2x2 RGBA checkerboard
                                     // texture and assign it to the program's uTex sampler (unit 0),
-                                    // all GLES bridge (@plt). Every call here exercises
-                                    // the texture/uniform/shader bridge surface the engine's real
-                                    // textured draws will need. glTexImage2D has 9 args (pixels on
-                                    // the guest stack), so drive it with a dedicated CpuState whose
-                                    // sp=tex_sp points at a slot holding the pixels pointer.
+                                    // all GLES bridge (@plt). Every call here exercises the texture/uniform/shader bridge surface
+                                    // the engine's real textured draws will need. glTexImage2D has 9 args
+                                    // (pixels on guest stack), so drive it with a CpuState whose sp=tex_sp
+                                    // points at a slot holding the pixels pointer.
                                     if tex_mode || comp_mode || mesh_tex.is_some() {
                                                                             const GL_TEXTURE0: u64 = 0x84c0;
                                                                             const GL_TEXTURE_2D: u64 = 0x0de1;
@@ -10284,9 +10276,8 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                                                             let _ = gcall(plt_tex_parameteri, GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST, 0, 0, 0);
                                                                             let _ = gcall(plt_tex_parameteri, GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST, 0, 0, 0);
                                                                             if mesh_tex.is_some() {
-                                                                                 // REAL Roblox material map: parse DDS R8 surface, expand to RGBA, upload via 9-arg
-                                                                                 // glTexImage2D (real APK pixels on real mesh geometry). R8 gray -> (v,v,v,255) in a
-                                                                                 // dedicated leaked RGBA buffer (studs atlas 128x2048 ~1 MiB rgba).
+                                                                                 // REAL Roblox material map: parse DDS R8, expand to RGBA, 9-arg
+                                                                                 // glTexImage2D (real APK pixels on real mesh geometry), gray ->(v,v,v,255).
                                                                                 let dds_bytes = std::fs::read(mesh_tex.as_ref().unwrap()).expect("read studs.dds");
                                                                                 let (tw, th, r8) = parse_roblox_dds_r8(&dds_bytes).expect("dds R8 parse");
                                                                                 eprintln!(
@@ -10312,9 +10303,8 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                                                                 stex.x[7] = GL_UNSIGNED_BYTE; // type
                                                                                 let _ = arm64jit::jit::jit_run(iimg, ibase, plt_tex_image_2d, &mut stex as *mut CpuState);
                                                                             } else if tex_mode {
-                                                                                // RGBA 2x2 checkerboard via 9-arg glTexImage2D. pixels (the 9th arg) rides the
-                                                                                // guest stack at [sp+0]; the PLT stub leaf (adrp/ldr/add/br, never pushes sp),
-                                                                                // fake sp whose [0] holds the pixels ptr is read bridge's gs_stack.
+                                                                                // RGBA 2x2 checkerboard via 9-arg glTexImage2D; the pixels (9th arg)
+                                                                                // rides the guest stack at [sp+0], read by the bridge's gs_stack.
                                                                                 const TEX: [u8; 16] = [
                                                                                     255, 0, 0, 255, // texel(0,0) RED
                                                                                     0, 255, 0, 255, // texel(1,0) GREEN
@@ -10337,9 +10327,9 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                                                                 stex.x[7] = GL_UNSIGNED_BYTE; // type
                                                                                 let _ = arm64jit::jit::jit_run(iimg, ibase, plt_tex_image_2d, &mut stex as *mut CpuState);
                                                                             } else {
-                                                                                 // ETC1/ETC2-RGB live-path: upload a REAL 8x8 ETC1 (4 solid 4x4 blocks = 32B) via
-                                                                                 // glCompressedTexImage2D; bridge decodes ETC1->RGBA (texture-codec) + re-uploads glTexImage2D.
-                                                                                 // Block: indiv mode, table cw0, sel 0 -> color=(c*0x11)+2. ETC2 mode1/2 == ETC1 bytes;
+                                                                                 // ETC1/ETC2-RGB live-path: upload a REAL 8x8 ETC1 (4 solid 4x4 blocks=32B) via
+                                                                                 // glCompressedTexImage2D; bridge decodes ETC1->RGBA (texture-codec)+re-uploads glTexImage2D.
+                                                                                 // Block: indiv mode, table cw0, sel 0 -> color=(c*0x11)+2. ETC2 mode1/2==ETC1 bytes;
                                                                                  // relabel internalformat to prove decode_etc2_rgb handles the real Android path.
                                                                                 const GL_ETC1_RGB8_OES: u64 = 0x8d64;
                                                                                 const GL_COMPRESSED_RGB8_ETC2: u64 = 0x9274;
@@ -11781,12 +11771,11 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
 
     // SH175 follow-on (--cookie-ingress): drive the pure-native cookie worker
     // 0x102203148 (native body under nativeSetMultipleCookies 0x102202ff8) as a
-    // STANDALONE top-level jit_run on main BEFORE StartApp, with JIT_ROUTEB_COOKIE=1
-    // so routeb_cookie_jar_guard seeds the jar [0x106ed7a20] + clears the two boot
-    // gates ([0x106dcfc30]/[0x1072739d4] bit0) — clearing the SH129/174 jar-CONSTRUCTION
-    // NULL fault at 0x220331c. ABI 6 args; w4(arg4)&1==1 REQUIRED (arg4=0 early-bails at
-    // 0x2203b20). Jar READ-ONLY here (local accumulator only). Standalone = first/only
-    // top-level jit_run on main (SH55/64-safe single top-level discipline).
+    // STANDALONE top-level jit_run on main BEFORE StartApp, with JIT_ROUTEB_COOKIE=1 so
+    // routeb_cookie_jar_guard seeds jar [0x106ed7a20] + clears the two boot gates
+    // ([0x106dcfc30]/[0x1072739d4] bit0) — clearing the SH129/174 jar-CONSTRUCTION NULL fault
+    // at 0x220331c. ABI 6 args; w4(arg4)&1==1 REQUIRED (arg4=0 early-bails @0x2203b20). Jar
+    // READ-ONLY here. Standalone = first/only top-level jit_run on main (SH55/64-safe).
     if std::env::args().any(|a| a == "--cookie-ingress") {
         const COOKIE_WORKER: u64 = 0x102203148;
         const COOKIE: &[u8] = b".ROBLESECURITY\t0xdeadbeef_0123456789abcdef";
@@ -11883,12 +11872,11 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
         const CFG: u64 = 0x10683d7e8; // config singleton
         const CFG_GATE: u64 = 0x10683d810; // gate byte
         const GATE_FLAGS: u64 = 0x1072739d4;
-        // SH177 recon (deleg_66d4cead + deleg_b11c2a89 + classifier 0x22035c0 disasm):
-        // Route-B em gated by keep/domain CLASSIFIER 0x22035c0 validating a DOTTED
-        // HOST (byte[pos-1]=='.', then '.'/':'; 1 only on valid dotted host). Route B
-        // reads the jar STRING (getter 0x21fce24), lowercases (21ff8fc), feeds it —
-        // jar must hold a pure DOTTED DOMAIN like ".roblox.com" (a '='/cookie
-        // line breaks the gate -> classifier 0 -> empty OUT). The RFC6265
+        // SH177 recon (deleg_66d4cead/b11c2a89 + classifier 0x22035c0 disasm): Route-B em is
+        // gated by keep/domain CLASSIFIER 0x22035c0 validating a DOTTED HOST (byte[pos-1]=='.';
+        // '.'/':'; 1 only on valid dotted host). Route B reads the jar STRING (getter 0x21fce24),
+        // lowercases (21ff8fc), feeds it — jar must hold a pure DOTTED DOMAIN like ".roblox.com"
+        // (a '='/cookie line breaks the gate -> classifier 0 -> empty OUT). The RFC6265
         // '#HttpOnly_.%s\tTRUE\t/\t%s\t0\t%s\t%s' line (rodata 0x100304d0e) is formatted
         // domain + env/class-JNI name/value backing (5feee7c/21ff8fc — Java CookieManager).
         let TOK: &[u8] = b".roblox.com";
@@ -12838,13 +12826,12 @@ mod sh79_tests {
 mod sh111_tests {
     use super::*;
     // SH111: empirical outcome — a widened dispatch-singleton vtable (0x60->0x580),
-    // whether filled with identity leaves (b19b1c2) or a stable-zeroed object leaf
-    // (SH111 attempt), REGRESSES nativeInitializeNativeFlags (exit 134). The vtable
-    // is SHARED; nativeInit stays clean ONLY because the 0x60 slots read-past into
-    // host bytes -> benign soft-return; growth that lets V2Start/V2Init resolve their
-    // +0xf8/+0x108/+0x548 gate slots makes nativeInit resolve deep slots + fault.
-    // Committed state = 0x60 baseline; the fix SCOPED patch three dispatch
-    // blr SITES (0x62517c4/0x6251aa8/0x6260948), not a vtable widening. Locks baseline.
+    // whether filled with identity leaves (b19b1c2) or a stable-zeroed object leaf (SH111 attempt),
+    // REGRESSES nativeInitializeNativeFlags (exit 134). The vtable is SHARED; nativeInit stays
+    // clean ONLY because the 0x60 slots read-past into host bytes -> benign soft-return; growth that
+    // lets V2Start/V2Init resolve +0xf8/+0x108/+0x548 gates makes nativeInit resolve deep slots +
+    // fault. Committed = 0x60 baseline; the fix SCOPED-patches the 3 blr SITES
+    // (0x62517c4/0x6251aa8/0x6260948), not a vtable widening. Locks baseline.
     #[test]
     fn sh111_singleton_vtable_stays_0x60_baseline() {
         // The committed vtable is 0x60 (the benchmarked clean milestone).
@@ -13192,12 +13179,11 @@ mod sh115_tests {
     fn sh251b_classdesc_register_advances_into_ctor_fencepost() {
         // SH251b (Route-B re-attack, fresh): under the class-desc-REGISTERED + genuine-DM
         // CONSUMER+DISPATCH path (JIT_ROUTEB_DM_SERVICES=1), the SH189 guard drives the
-        // REAL PlayerGui + ScreenGui class-register getters headlessly (SH189's
-        // "next unsynthesized object"), register continuation ADVANCES into a
-        // large ctor 0x102b9eca0 (sub sp,#0x480) whose `ldr x3,[x19,#16]` faults with
-        // this=NULL (fault=0x10) — a stable NEW downstream fencepost (repro 3/3 EXIT
-        // 134/139 at guestpc=0x102b9ecbc). Reachable ONLY via the class-desc path; a
-        // silent drift would false-negative it. Pin them (real-image, skip-if-absent).
+        // REAL PlayerGui + ScreenGui class-register getters headlessly (SH189's next
+        // unsynthesized object), the register continuation ADVANCES into large ctor
+        // 0x102b9eca0 (sub sp,#0x480) whose `ldr x3,[x19,#16]` faults this=NULL (fault=0x10)
+        // — a stable NEW downstream fencepost (repro 3/3 EXIT 134/139 @guestpc=0x102b9ecbc),
+        // reachable ONLY via the class-desc path. Pin them (real-image, skip-if-absent).
         let sites: [(usize, u32); 8] = [
             (0x201fce0, 0xd10103ff), // PlayerGui class-register getter entry (sub sp,#64)
             (0x201fce8, 0xf9001bf3), // PlayerGui getter +8 (stp x29,x30 / str x19,[sp,#24])
@@ -13231,13 +13217,12 @@ mod sh115_tests {
     }
     #[test]
     fn sh251c_getter_landingpad_cleanup_not_forward_ctor() {
-        // SH251b CORRECTION (SH251c): 0x102b9eca0 is NOT an indirect-only "next-unsynthesized-
-        // object" ctor. Its TRUE entry is 0x2b9ec9c (`paciasp`); the exec seg has 64,748 direct
-        // `bl 0x2b9ec9c` callers and ZERO `bl 0x2b9eca0`. Two callers inside the PlayerGui getter
-        // 0x10201fce0 are EXCEPTION LANDING PADS (each preceded by a __cxa call_once cleanup bl):
-        // the NULL-this crash at 0x102b9ecbc is unwind teardown (spawned-thread SIGTRAP), NOT forward
-        // Route-B construction — no fabricatable receiver. Pin true entry + 2 landing-pad bls + their
-        // cleanup bls + assert bl-imm26 targets 0x2b9ec9c (not 0x2b9eca0) +4 drift fails loudly.
+        // SH251b CORRECTION (SH251c): 0x102b9eca0 is NOT an indirect-only "next-unsynthesized"
+        // ctor. TRUE entry = 0x2b9ec9c (`paciasp`); exec seg has 64,748 `bl 0x2b9ec9c` + ZERO
+        // `bl 0x2b9eca0`. Two callers in PlayerGui getter 0x10201fce0 are EXCEPTION LANDING PADS
+        // (each preceded by a __cxa cleanup bl): NULL-this crash @0x102b9ecbc = unwind teardown
+        // (spawned-thread SIGTRAP), not Route-B construction. Pin true entry + 2 landing pads + bls;
+        // assert bl-imm26 targets 0x2b9ec9c so +4 drift fails loudly.
         fn bl_target(pc: usize, img: &[u8]) -> u64 {
             let w = u32::from_le_bytes([img[pc], img[pc + 1], img[pc + 2], img[pc + 3]]);
             assert_eq!(w & 0xfc00_0000, 0x9400_0000, "word at 0x{pc:x} must be a BL");
@@ -13811,13 +13796,11 @@ mod sh115_tests {
     #[test]
     fn sh222_recon_v3_json_append_check_site_anchored() {
         // recon-selfdrive-seed-jsonfix.md: the recon-v3 "JSON-ABORT" immediate-priority
-        // deliverable is JIT_JSON_ZERO_FIX — a pc-gated hook that fires at guest
-        // 0x102355d40 to force the leaking guest-stack libc++ std::string length to 0
-        // (SSO empty) RBX::json::Writer throwing "string length overflow".
-        // That block-entry pc is load-bearing but had no real-image byte-pin; a drifted
-        // constant would silently stop the fix. Pin fn prologue `stp x29,x30,[sp,#-48]!`
-        // (file 0x2355d40) + the cap-cell guest 0x107275648 it compares against, so a
-        // shift fails loudly (skip-if-absent, family as sh219/213/211).
+        // deliverable is JIT_JSON_ZERO_FIX — a pc-gated hook at guest 0x102355d40 forcing the leaking
+        // guest-stack libc++ std::string length to 0 (SSO empty) so RBX::json::Writer doesn't throw
+        // "string length overflow". That block-entry pc had no real-image byte-pin; a drifted
+        // constant would silently stop the fix. Pin fn prologue stp x29,x30,[sp,#-48]! (file
+        // 0x2355d40) + cap-cell guest 0x107275648, so a shift fails loudly (skip-if-absent).
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
@@ -13930,11 +13913,11 @@ mod sh115_tests {
         // SH225: pin the ONE reachable DM-touching path (StartLuaAppDM 0x1023efe2c ->
         // 0x102baeeec -> do-init 0x102206c40). do-init acquire-loads once-guard
         // [0x106a68410] (ldar 0x2206c7c / tbz -> 0x102206d10), __call_once 0x284ce54,
-        // closure-build 0x102206db8; dispatch reads x0=[x19,#32] (union+0x30 slot, LDR
-        // word 0xf9401260 imm12=4 = #32, NOT #4), x8=[x0], x1=[x8,#0x30], br x1 = DM
-        // ctor entry. MEASURED GATE: b.ne (pthread_self-vs-main-id) @0x206df0 TAKEN ->
-        // 0x206e28 (LSM path), so binder-dispatch 0x206df4..0x206e24 NEVER runs (3/3) —
-        // "fabricate a binder at [union+4]" dead-end. Second fork bl 0x10221942c.
+        // closure-build 0x102206db8; dispatch reads x0=[x19,#32] (LDR 0xf9401260 imm12=4=#32,
+        // NOT #4), x8=[x0], x1=[x8,#0x30], br x1 = DM ctor entry. MEASURED GATE: b.ne
+        // (pthread_self-vs-main-id) @0x206df0 TAKEN -> 0x206e28 (LSM path), so binder-dispatch
+        // 0x206df4..0x206e24 NEVER runs (3/3) — "fabricate a binder at [union+4]" dead-end.
+        // Second fork bl 0x10221942c.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
@@ -13980,14 +13963,12 @@ mod sh115_tests {
 
     #[test]
     fn sh226_doinit_binder_dispatch_chain_reconciled() {
-        // SH226: do-init closure-build dispatch offset #32 (SH156 right, SH225 wrong):
-        // 0xf9401260 imm12=4*size8=#32. Runtime BYPASSES binder dispatch via thread-id
-        // `b.ne` @0x206df0 (0x206df4..0x206e24 never runs headlessly, region-watch
-        // 3/3) so SH225's "binder at [union+4]" is FALSIFIED. Chain: StartLuaAppDM
-        // 0x1023efe2c {[sp]=table,[sp+32]=sp} -> dispatcher 0x102baeeec -> do-init
-        // 0x102206c40 -> closure-build 0x102206db8; dispatch x0=[union+32]=[sp+32]=sp.
-        // Pins DMCONT anchors (continueAfterFlagsLoaded_ 0x102bd1d68 -> app-shell
-        // ctor 0x2207b54) for a future vt[+0x1f0] drive. Real-image guard family.
+        // SH226: do-init closure-build dispatch offset #32 (SH156 right, SH225 wrong); 0xf9401260
+        // imm12=4*8=#32. Runtime BYPASSES binder dispatch via thread-id `b.ne` @0x206df0 (never
+        // runs headlessly, 3/3) so SH225's "binder at [union+4]" is FALSIFIED. Chain: StartLuaAppDM
+        // 0x1023efe2c {[sp]=table,[sp+32]=sp} -> dispatcher 0x102baeeec -> do-init 0x102206c40 ->
+        // closure-build 0x102206db8; dispatch x0=[union+32]=[sp+32]=sp. Pins DMCONT anchors
+        // (continueAfterFlagsLoaded_ 0x102bd1d68 -> app-shell ctor 0x2207b54) for a vt[+0x1f0] drive.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
@@ -14446,12 +14427,10 @@ mod sh115_tests {
     fn sh259_settings_factory_once_guard_endpoint() {
         // SH259 (Route-B): pin the once-guarded settings/registry singleton factory 0x21dac2c —
         // the DEEPEST app-start reach 0x102339d44 (`bl 0x21dac2c`). Its prologue reads the
-        // once-guard byte at [0x106a6f430]: entry 0xa9bf7bfd / base 0xb00244a8 / guard addr
-        // 0x9110c108 / ldar 0x08dffd08 / tbz 0x360000a8. SH259 guard ORs [0x106a6f430].bit0=1
-        // factory returns 0x6a6f3f0 (zeroed .bss registry) without running builder
-        // 0x21dac80 -> avoids the map wall 0x1021dde34 + lets the orchestrator walk its own
-        // app-start body (0x233a804..0x233d2bc). Pins endpoint; drift fails loudly.
-        // env+pc-guarded, inert.
+        // once-guard at [0x106a6f430]: entry 0xa9bf7bfd/base 0xb00244a8/guard 0x9110c108/ldar
+        // 0x08dffd08/tbz 0x360000a8. SH259 ORs [0x106a6f430].bit0=1 -> factory returns 0x6a6f3f0
+        // (zeroed .bss registry) WITHOUT running builder 0x21dac80 -> avoids map wall 0x1021dde34
+        // + lets the orchestrator walk its app-start body (0x233a804..0x233d2bc). env+pc gated.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
@@ -14553,13 +14532,11 @@ mod sh115_tests {
     #[test]
     fn sh276_engine_settings_receive_transition_pinned() {
         // SH276: engine-settings RECEIVE nativeActivity_onEngineSettingsReceived
-        // (0x2bd1c38) — the SEP-17 directive's OTHER named primitive — never driven
-        // (SH264-275 drove lifecycle + client-settings). --v2boot-session-engine drives
-        // it on a fabricated zeroed manager. Pins drive + downstream reads of
-        // [this+648]/[this+16] can't drift: prologue sub sp,#0x40; version [0x10683d8f8];
-        // gate cmp w9,#0x6/ccmp/b.eq; FLog-0x4997a7 (0x2bd1c7c); mutex lock bl 2b53a68
-        // @0x2bd1ca8/unlock 2b53abc @0x2bd1cc8 (x0=this+0x14); LATCH strb w1,[this+0x288]
-        // (0x2bd1cb4); state-3 store str w8,[this,#16] (0x2bd1cc0).
+        // (0x2bd1c38) — SEP-17's OTHER named primitive — never driven (SH264-275 covered lifecycle +
+        // client-settings). --v2boot-session-engine drives it on a fabricated zeroed manager. Pins:
+        // prologue sub sp,#0x40; version [0x10683d8f8]; gate cmp/ccmp/b.eq; FLog 0x2bd1c7c; mutex
+        // lock 2b53a68 @0x2bd1ca8 / unlock @0x2bd1cc8; LATCH strb [this+0x288] @0x2bd1cb4;
+        // state-3 store str w8,[this,#16] @0x2bd1cc0.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -14821,13 +14798,12 @@ mod sh115_tests {
 
     #[test]
     fn sh279_settings_serializer_worldbuild_gates_pinned() {
-        // SH279: cross the SH278 settings-serializer (continueAfterFlagsLoaded_ 0x2bd1d68)
-        // internal world-build gates. Gate 1: serializer reads [this+0x40]=0 -> 0x2bcdfc4
-        // `add x0,#0x300; bl mutex_lock` = lock(0x300) -> SIGSEGV fault=0x300. Seeded
-        // [this+0x40]=zeroed 0xc00 config obj. Gate 2: app-name guard 0x2bd1f64 reads [x19+0x48];
-        // empty -> NULL-store @0x2bd1fd4. Fixed: pre-seed [this+0x48] LONG "Home" + appname-guard
-        // re-seeds live x19 [this+0x50]=5. MEASURED 3/3: serializer runs WHOLE body and self-drives
-        // into app-start, reaching LSM wall 0x101db1d04 (SH260). Guest = file vaddr + 0x1_0000_0000.
+        // SH279: cross the SH278 settings-serializer (continueAfterFlagsLoaded_ 0x2bd1d68) world-
+        // build gates. Gate 1: serializer reads [this+0x40]=0 -> 0x2bcdfc4 lock(0x300) SIGSEGV;
+        // seed [this+0x40]=zeroed 0xc00 config. Gate 2: app-name 0x2bd1f64 reads [x19+0x48];
+        // empty -> NULL-store @0x2bd1fd4; pre-seed [this+0x48] "Home" + appname-guard re-seeds
+        // [this+0x50]=5. MEASURED 3/3: serializer runs WHOLE body, self-drives into app-start
+        // to LSM wall 0x101db1d04 (SH260). Guest = file vaddr + 0x1_0000_0000.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15169,6 +15145,34 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh317_ctor_lookup_controller_table_two_tier_pinned() {
+        // SH317 (new tier): ctor name->service lookup (bl 0x2168798) is TWO-TIER. tier-1
+        // strncasecmp(x1-arg "secondary",[entry],0x3f); tier-2 (on tier-1 match):
+        // w8=[x24]; umaddl x8,w8,0x5c,0x106fe2f00; strcasecmp(x0-arg "primary", x8+0x2078),
+        // x24=fixed byte [0x1070271d0]. So primary "App" must ALSO resolve via
+        // cell=[0x1070271d0]*0x5c+0x106fe2f00+0x2078. MEASURED (bus route): fixidx=0 ->
+        // cell[0x106fe4f78]="Runtime0" (NOT "App"), so fast-path fails even though tier-1 matched
+        // "Execute" (once-slot 0x400000b, SH316). Fix is live-session work, not a .bss seed.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            assert_eq!(word(0x102_1687f0), 0x913fc118, "sh317 tier-2 x24 addr add x24,x8,#0xff0");
+            assert_eq!(word(0x102_1687f4), 0x52840f1a, "sh317 w26 mov #0x2078 name-offset");
+            assert_eq!(word(0x102_16880c), 0x39400308, "sh317 ldrb w8,[x24] fixed index byte");
+            assert_eq!(word(0x102_168814), 0x9bb76508, "sh317 umaddl x8,w8,0x5c,0x106fe2f00");
+            assert_eq!(word(0x102_168818), 0x8b1a0101, "sh317 add x1,x8,w26 (controller cell)");
+            assert_eq!(word(0x102_168820), 0x34000200, "sh317 cbz w0 -> match (ldur [x21,#-16])");
+            eprintln!("sh317 ctor lookup controller-name table two-tier pinned (6 bytes; SESSION-CTOR live-session gate).");
+        } else {
+            eprintln!("sh317 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh314_appstart_map_header_is_liveobj_not_fixed_cell() {
         // SH314 (do-not-re-tread closure): app-start map wall 0x1021dde34 (`ldr x23,[x21,#8]`,
         // x21 container=0x100548ca9) is fed by the ADDRESS OF A RODATA STRING
@@ -15294,13 +15298,11 @@ mod sh115_tests {
     #[test]
     fn sh265_gameloaded_binder_receive_pinned() {
         // SH265: pin the dataModel-bindings live-binder receive
-        // nativeAppBridgeV2SendAppEventOnGameLoaded (guest 0x102bb429c) — OnAppReady's sibling.
-        // --v2boot-send-game-loaded drives it real guest entry. Pin (docs detail):
-        // entry 0x102bb429c = sub sp,#0x110 (0xd10443ff)
-        // event vtable slots [+0x20/+0x28] — MEASURED loader-populated with REAL teardown
-        // code (0x102bb782c/0x102bb7834), NOT the all-zero SH126 class (readelf can't decode
-        // packed-RELA; on-disk zeros but load_elf_image applies RELATIVE addends -> real
-        // destructor leaves at load). Route-B gate UNCHANGED; SH174 latch stays forward hook.
+        // nativeAppBridgeV2SendAppEventOnGameLoaded (guest 0x102bb429c) — OnAppReady's sibling;
+        // --v2boot-send-game-loaded drives it as a real guest entry. entry 0x102bb429c = sub sp,#0x110.
+        // event vtable [+0x20/+0x28] measured loader-populated with REAL teardown (0x102bb782c/7834),
+        // not the all-zero SH126 class (packed-RELA: on-disk zeros, load_elf_image applies addends).
+        // Route-B gate UNCHANGED; SH174 latch stays forward hook.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15852,12 +15854,11 @@ mod sh115_tests {
     fn sh298_registration_ec_world_reach_pinned() {
         // SH298 (--v2boot-session-dmfn + JIT_ROUTEB_DMFN_REGISTER): construction body calls
         // registration fn 0x21e45c8 @0x23f05b8 with x0=[arg1[8]] (DOUBLE deref). SH297
-        // (arg1[8]=singleton) -> x0=singleton VTABLE ([+8]=host-leaf) -> faults at [x22+24].
-        // SH298: arg1[8]=CELL->registration obj R ([R+8]=singleton, valid host obj) ->
-        // 0x21e45c8 COMPLETES + falls through SH297's wall EC world: 3/3 terminal
-        // SIGSEGV guestpc=0x102e245f4 (EC-world entry 0x102e24598 = stp x29,x30,[sp,#-96]!
-        // = SH235's genuine DM-creation world) inside 0x1023f1354 at a NULL+0x48 live-object
-        // deref. First headless penetration EC world.
+        // (arg1[8]=singleton)->x0=singleton VTABLE -> faults @[x22+24]. SH298: arg1[8]=CELL->obj R
+        // ([R+8]=singleton host obj) -> 0x21e45c8 COMPLETES, falls past SH297's wall into EC world:
+        // 3/3 terminal SIGSEGV guestpc=0x102e245f4 (EC entry 0x102e24598 = stp x29,x30,[sp,#-96]! =
+        // SH235 genuine DM-creation world) in 0x1023f1354 at NULL+0x48 live-object deref. First
+        // headless penetration EC world.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
@@ -16032,12 +16033,11 @@ mod sh115_tests {
     fn sh236_startluaappdm_receivecall_dispatch_softreturns_before_marshaler() {
         // SH236 (Route-B): EC world's only headless front-door (StartLuaAppDM -> bl
         // marshaler 0x1023f1210 @0x1023f075c) is gated by receiveCall's dispatch.
-        // Measured: region-watch on [0x1023efe2c,0x1023f0800) fires 14 block pcs, last
-        // 0x1023f01e4; StartLuaAppDM benign-soft-returns Ok; marshaler block 0x1023f075c
-        // NEVER entered. Dispatch terminates inside helper 0x1023f00f8 (sub sp,#0x70,
-        // reads [sp+8]/[sp+32]) before building StartAppParams. Pins: entry d10183ff;
-        // dispatch d63f0100; helpers 0x1023eff4c=d10603ff, 0x1023f00f8=d101c3ff; last
-        // block 0x1023f01e4=394023e8; marshaler-call 0x1023f075c. Next drive 0x1023f00f8.
+        // Measured: [0x1023efe2c,0x1023f0800) fires 14 block pcs, last 0x1023f01e4;
+        // StartLuaAppDM benign-soft-returns; marshaler 0x1023f075c NEVER entered.
+        // Dispatch terminates in helper 0x1023f00f8 before building StartAppParams.
+        // Pins: entry d10183ff; dispatch d63f0100; helpers 0x1023eff4c=d10603ff,
+        // 0x1023f00f8=d101c3ff; last 0x1023f01e4=394023e8; marshaler 0x1023f075c.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
@@ -16192,12 +16192,12 @@ mod sh115_tests {
     #[test]
     fn sh240_dmcont_dispatch_chain_pinned_fresh_negative() {
         // SH240: DMCONT continuation fresh-at-HEAD block-entry-definitive negative. The engine-init
-        // dispatcher 0x102bd8ce8 is entered block completing --v2boot ladder under
-        // DMFORCE+DMCONT (holder 0x102727550 -> vt[+0x1f0] = real continueAfterFlagsLoaded_
-        // 0x102bd1d68) yet the guest NEVER resumes past the first call-boundary: REGION_WATCH on
-        // interior pcs (0x2bd8d30/0x2bd8d54), sub_2bd8dac, AND continueAfterFlagsLoaded_ all 0 hits
-        // across 3/3 clean EXIT 124; JIT_DUMP fired once at entry 0x102bd8ce8 only. DMCONT stays
-        // WIRED+ARMED but LATENT (fires only on real flags-loaded state). Pins (docs detail):
+        // dispatcher 0x102bd8ce8 entered as block on a completing --v2boot ladder under
+        // DMFORCE+DMCONT (holder 0x102727550 -> vt[+0x1f0]=real continueAfterFlagsLoaded_
+        // 0x102bd1d68), yet the guest NEVER resumes past the first call-boundary: interior pcs
+        // (0x2bd8d30/0x2bd8d54), sub_2bd8dac, continueAfterFlagsLoaded_ all 0 hits across 3/3 clean
+        // EXIT 124; JIT_DUMP fired once at entry 0x102bd8ce8 only. DMCONT WIRED+ARMED but LATENT
+        // (fires only on real flags-loaded state).
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
@@ -16401,14 +16401,12 @@ mod sh115_tests {
     }
     #[test]
     fn sh121_taskscheduler_flags_gate_tbz_nop() {
-        // SH121: the TaskScheduler ctor's "flags loaded" gate (guest 0x10224fa20
-        // `ldrb w8,[x8,#2516]`; 0x10224fa24 `tbz w8,#0,0x224fc80` fatal -> guest
-        // raise(SIGTRAP)=exit 133) fires the moment setTaskSchedulerBM lazily
-        // constructs the scheduler — the FIRST flags gate the [SH115] opt-in ladder
-        // hits (gameGlobalInit returns via the SH82 thread-id trick, never loading
-        // flags, so [0x72739d4].bit0 stays 0). NOP the tbz ctor proceeds.
-        // Verify the encodings + guest/file transform + imm14 math (0x97 words ->
-        // +0x25c -> guest 0x10224fc80).
+        // SH121: the TaskScheduler ctor's "flags loaded" gate (0x10224fa20 `ldrb w8,[x8,#2516]`;
+        // 0x10224fa24 `tbz w8,#0,0x224fc80` fatal -> guest raise(SIGTRAP)=exit 133) fires the
+        // moment setTaskSchedulerBM lazily constructs the scheduler — the FIRST flags gate the
+        // [SH115] ladder hits (gameGlobalInit returns via the SH82 thread-id trick, never loading
+        // flags, so [0x72739d4].bit0 stays 0). NOP the tbz so the ctor proceeds.
+        // Verify encodings + guest/file transform + imm14 math (0x97 words -> +0x25c -> guest 0x10224fc80).
         // bytes at file 0x224fa24: e8 12 00 36 = LE u32 0x360012e8 = TBZ W8,#0
         assert_eq!(0x3600_12e8u32, 0x3600_12e8u32, "guest tbz word");
         // NOP is 0xd503201f (d5 03 20 1f).
