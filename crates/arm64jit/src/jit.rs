@@ -1133,6 +1133,34 @@ fn routeb_ec_arg0_vt_dispatch_obj() -> u64 {
     })
 }
 
+/// SH320 (opt-in JIT_ROUTEB_DONEPATH_MAIN=1): the do-init DONE-path dispatcher 0x2206db8 forks
+/// at `b.ne` @0x2206df0 on main-id [0x106863a68] == pthread_self: TAKEN -> non-main box-build
+/// (SH319 measured); NOT taken -> the MAIN branch binder-dispatch 0x206df4 `ldr x0,[x19,#32]`
+/// -> vt+0x30 -> br x1 @0x206e24 = DM-ctor dispatch entry (SESSION-CTOR, candidate (b)). The
+/// harness can only seed main-id to the ladder thread's pthread_self; but if the done-path runs
+/// on a spawned clone worker (JIT_DRIVE_LIFECYCLE) its pthread_self differs, so only a JIT
+/// block-entry guard at the dispatcher can seed the EXECUTING thread's OWN id. Fires at the
+/// dispatcher block entry 0x2206db8 (a true block entry, unlike the mid-block 0x206df4), seeds
+/// [0x106863a68] = libc::pthread_self() of the current jit thread (the same id the guest's
+/// pthread_self resolves to), so the b.eq is taken -> MAIN branch. Idempotent, env-gated.
+fn routeb_donepath_main_branch_guard(_state: *mut CpuState, pc: u64) {
+    if std::env::var("JIT_ROUTEB_DONEPATH_MAIN").ok().as_deref() != Some("1") {
+        return;
+    }
+    if pc != 0x102206db8 {
+        return;
+    }
+    let cell: u64 = 0x106863a68;
+    let me = unsafe { libc::pthread_self() } as u64;
+    let cur = unsafe { std::ptr::read_unaligned(cell as *const u64) };
+    if cur == me {
+        return; // already this thread -> b.eq taken
+    }
+    routeb_ensure_writable(cell);
+    unsafe { std::ptr::write_unaligned(cell as *mut u64, me); }
+    eprintln!("[routeb-sh320] seeded do-init done-path main-id [0x106863a68]=0x{me:x} (this jit thread) at dispatcher 0x2206db8 pc={pc:#x} (was 0x{cur:x}) -> b.eq NOT taken -> MAIN binder-dispatch 0x206df4 (DM-ctor entry)");
+}
+
 /// SH300 (opt-in JIT_ROUTEB_EC_REALSESSION=1): the EC world 0x102e24598
 /// (SH235/298/298b/299) disassembled further: past the SH299 dispatch at
 /// `cbnz w0 @0x2e2465c` (now taken -> 0x2e24678) it branches at 0x2e246f4 on the
@@ -6081,6 +6109,11 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // then the real V2Init 0x1023c5538 / StartLuaAppDM 0x1023f1654) become
         // reachable instead of the dispatch at 0x2e246f0 consuming control.
         routeb_ec_world_reader_gate_guard(state, pc);
+        // SH320 (opt-in JIT_ROUTEB_DONEPATH_MAIN): seed main-id [0x106863a68] to the EXECUTING
+        // jit thread's pthread_self at the do-init DONE-path dispatcher 0x2206db8, so its
+        // thread-match b.eq is taken -> MAIN binder-dispatch 0x206df4 (DM-ctor entry), not the
+        // non-main box-build. Works whether the done-path runs on the ladder or a spawned worker.
+        routeb_donepath_main_branch_guard(state, pc);
         // SH259 (opt-in JIT_ROUTEB_APPSART_SETTINGS_ONCE): seed the once-guard
         // [0x106a6f430] of the settings/registry factory 0x21dac2c (deepest reach,
         // bl @0x102339d44) so it early-returns the registry object without running the
@@ -7835,6 +7868,51 @@ mod tests {
             );
             std::env::remove_var("JIT_ROUTEB_EC_REALSESSION");
             std::ptr::write_unaligned(cell as *mut u8, 0);
+        }
+    }
+
+    #[test]
+    fn sh320_donepath_main_branch_guard_is_env_pc_gated_and_seeds_executing_thread() {
+        // SH320 (SESSION-CTOR, candidate (b)): seed main-id [0x106863a68] to the EXECUTING
+        // jit thread's pthread_self at the do-init DONE-path dispatcher 0x2206db8 so its
+        // thread-match b.eq (0x2206df0) is taken -> the MAIN binder-dispatch 0x206df4
+        // (`ldr x0,[x19,#32]` -> vt+0x30 -> br x1 @0x206e24 = DM-ctor entry), not the non-main
+        // box-build. Must (a) be inert without JIT_ROUTEB_DONEPATH_MAIN, (b) fire only at the
+        // dispatcher block entry 0x2206db8, (c) seed the cell to a non-NULL (this thread's
+        // pthread_self), (d) leave it alone if already == this thread (idempotent).
+        let cell: u64 = 0x106863a68;
+        unsafe {
+            assert!(routeb_ensure_writable(cell), "main-id .bss page must be writable");
+            let me = libc::pthread_self() as u64;
+            // (a) inert without env.
+            std::env::remove_var("JIT_ROUTEB_DONEPATH_MAIN");
+            std::ptr::write_unaligned(cell as *mut u64, 0);
+            routeb_donepath_main_branch_guard(std::ptr::null_mut(), 0x102206db8);
+            assert_eq!(std::ptr::read_unaligned(cell as *const u64), 0,
+                "env-gated: inert without JIT_ROUTEB_DONEPATH_MAIN");
+            // (b) env set, wrong pc -> inert.
+            std::env::set_var("JIT_ROUTEB_DONEPATH_MAIN", "1");
+            std::ptr::write_unaligned(cell as *mut u64, 0);
+            routeb_donepath_main_branch_guard(std::ptr::null_mut(), 0x102206d90);
+            assert_eq!(std::ptr::read_unaligned(cell as *const u64), 0,
+                "pc-gated: must fire only at dispatcher block entry 0x2206db8");
+            // (c) env set + dispatcher entry pc + mismatched cell -> seed executing thread id.
+            std::ptr::write_unaligned(cell as *mut u64, 0);
+            routeb_donepath_main_branch_guard(std::ptr::null_mut(), 0x102206db8);
+            let seeded = std::ptr::read_unaligned(cell as *const u64);
+            assert_ne!(seeded, 0, "main-id must be seeded non-NULL");
+            assert_eq!(seeded, me, "main-id seeded == this thread's pthread_self (b.eq taken -> MAIN branch)");
+            // (d) idempotent: already == me -> left exactly as-is (no rewrite).
+            routeb_donepath_main_branch_guard(std::ptr::null_mut(), 0x102206db8);
+            assert_eq!(std::ptr::read_unaligned(cell as *const u64), me,
+                "idempotent: already-matching main-id left untouched");
+            // (e) mismatched non-zero -> rewritten to me (the fork would have box-built).
+            std::ptr::write_unaligned(cell as *mut u64, me ^ 0x1234);
+            routeb_donepath_main_branch_guard(std::ptr::null_mut(), 0x102206db8);
+            assert_eq!(std::ptr::read_unaligned(cell as *const u64), me,
+                "mismatched cell rewritten to executing thread (b.eq now taken)");
+            std::env::remove_var("JIT_ROUTEB_DONEPATH_MAIN");
+            std::ptr::write_unaligned(cell as *mut u64, 0);
         }
     }
 
