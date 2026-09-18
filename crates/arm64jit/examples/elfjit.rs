@@ -1731,11 +1731,10 @@ fn routeb_seed_dispatcher_node() {
 
 // -- SH121: TaskScheduler ctor "flags-loaded" gate -> raise(SIGTRAP) ----
 // setTaskSchedulerBackgroundMode lazily constructs the TaskScheduler via
-// once-guard [0x10726a488]. Its ctor (file 0x224f810) starts with the flags gate
-// at guest 0x10224fa20: `ldrb w8,[x8,#2516]` reads flags-loaded byte [0x72739d4]
-// (tbz w8,#0,0x224fc80). BSS leaves bit0==0 -> fatal path (bl 0x626d1d0 ->
-// raise(SIGTRAP)=exit 133). The recon proved the SIGTRAP guest's own
-// raise(5), not a JIT trap. NOP the tbz ctor proceeds regardless.
+// once-guard [0x10726a488]. Its ctor (file 0x224f810) starts with flags gate
+// 0x10224fa20 `ldrb w8,[x8,#2516]` (flags-loaded byte [0x72739d4]; tbz w8,#0,
+// 0x224fc80). BSS -> bit0==0 -> fatal (bl 0x626d1d0 = raise(SIGTRAP)=exit 133).
+// NOP the tbz so the ctor proceeds regardless.
 static ROUTEB_TASKSCHED_FLAGSGATE_PATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 fn routeb_patch_taskscheduler_flags_gate() {
     if ROUTEB_TASKSCHED_FLAGSGATE_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
@@ -1846,12 +1845,10 @@ const SH201_LDR_X8_X0: u32 = 0xf940_0008; // ldr x8,[x0]
 const SH201_BLR_X8: u32 = 0xd63f_0100; // blr x8
 
 /// Pure SH201 classifier over raw image bytes (link-vaddr space; guest =
-/// link + 0x100000000, identity-loaded). Returns guest `(start, blr)` site
-/// pairs where `start` `ldr x8,[x0]` and `blr` dispatch, each
-/// gated by a preceding `bl 0x6249eb8` objB-getter within 16 slots and a
-/// vtable slot-load with byte offset >= 0x60 (past the seeded leaf).
-/// Unit-tested; the runtime `routeb_patch_v2_family` patches each returned
-/// site with the SH200 window.
+/// link + 0x100000000, identity-loaded). Returns guest `(start, blr)` pairs where
+/// `start` `ldr x8,[x0]` + `blr` dispatch, gated by a preceding `bl 0x6249eb8`
+/// objB-getter within 16 slots and a vtable slot-load byte offset >= 0x60.
+/// Unit-tested; `routeb_patch_v2_family` patches each site with the SH200 window.
 pub fn sh201_v2_family_scan(image: &[u8]) -> Vec<(u64, u64)> {
     let n = image.len() / 4;
     let mut out = Vec::new();
@@ -3442,13 +3439,11 @@ fn mesh_compose_mvp_shared(center: &[f32; 3], scene_ext: f32, origin: [f32; 3], 
     mat4_mul(p, mat4_mul(v, m))
 }
 
-/// Parse a DDS file that plain single-channel R8 (LUMINANCE) surface -
-/// the format Roblox's MaterialManager material maps ship as (e.g.
-/// `android/textures/studs.dds`: DDS, 2048x128, mips=12, DDPF_LUMINANCE,
-/// rmask=0xff, custom UVER/NVTT markers). Returns (width, height, base-mip R8
-/// bytes). Bounds-checked. Only DDPF_LUMINANCE 8-bit surfaces are accepted; any
-/// compressed/EAC/ASTC-skipping surface returns None (those need the texture
-/// codec, not an R8 expand).
+/// Parse a DDS file that plain single-channel R8 (LUMINANCE) surface - the
+/// format Roblox's MaterialManager material maps ship as (e.g. `studs.dds`:
+/// DDS 2048x128 mips=12 DDPF_LUMINANCE rmask=0xff UVER/NVTT). Returns (w,h,R8
+/// bytes), bounds-checked. Only 8-bit LUMINANCE accepted; compressed surfaces
+/// return None (need the texture codec).
 fn parse_roblox_dds_r8(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     if data.len() < 128 || &data[0..4] != b"DDS " {
         return None;
@@ -5993,12 +5988,9 @@ fn wire_real_window() -> u64 {
 }
 
 /// Arm the guest-persistence root for a real run: if `SOBER_ANDROID_ROOT` is
-/// not already set, create a stable host directory under the runtime's data
-/// dir and export it, so guest `/data`/`/sdcard`/`/cache` writes (the client's
-/// datastore / login-session store) land on persistent host disk via
-/// `arm64jit::fsmap` the nonexistent host root. Verified not to
-/// disturb the boot (stable idle exit 124 with the root armed); it only gains
-/// effect when the client opens a `/data` sink.
+/// not set, create a stable host dir under the runtime data dir and export it, so
+/// guest `/data`/`/sdcard`/`/cache` writes (datastore / login-session store) land
+/// on persistent host disk via `arm64jit::fsmap`. Verified not to disturb boot.
 fn arm_persist_root() {
     if std::env::var_os("SOBER_ANDROID_ROOT").is_some() {
         return;
@@ -6688,10 +6680,9 @@ fn main() {
                 eprintln!("[elfjit:v2boot] SH109 seeded version-gate [0x10683d350]=6 so V2Init/V2Start keep the clean main path");
                 let _ = (iimg, ib);
                 // SEP-17 SESSION DRIVE (--v2boot-session): drives the REAL Android Activity/AppBridge
-                // lifecycle natives the engine asserts on (SH184). All JNI-RECEIVE (zero in-image bl
-                // callers) - harness MUST drive them. Fresh guest jit_runs on ONE ladder thread
-                // (SH55/64), reusing boot_sp/tpidr + fabricated thiz. setActive reads the SH248f
-                // adapter triplet [0x106b0bde0]. Ref: recon-routeB.
+                // lifecycle natives (SH184). All JNI-RECEIVE (zero in-image bl callers) - harness MUST
+                // drive them. Fresh guest jit_runs on ONE ladder thread (SH55/64), reusing boot_sp/tpidr
+                // + fabricated thiz. setActive reads SH248f adapter triplet [0x106b0bde0]. Ref recon-routeB.
                 if std::env::args().any(|a| a == "--v2boot-session") {
                     let mut lifecycle: Vec<(&str, u64, [u64; 8])> = vec![
                         ("initAppShellReporter", 0x1021f53b8, [env_ptr, thiz, 0, 0, 0, 0, 0, 0]),
@@ -6699,11 +6690,9 @@ fn main() {
                         ("SetInitParams",        0x102bcc814, [env_ptr, thiz, init_params, 0, 0, 0, 0, 0]),
                     ];
                     // nativeInitClientSettings (0x1022265fc) feeds initEngine_'s "Engine settings
-                    // is null" hard-assert (SH184). String args (x2/x3/x4 jstrings) resolve via
-                    // 0x21e1fec (jstring->RBX-string, JNIEnv GetStringUTFChars; SH186 slot-169 identity
-                    // shim => empty jstrings resolve). Gates on version [0x10683cff8]. Opt-in
-                    // --v2boot-session-set; measures if real client-settings feed advances initEngine_
-                    // (consumer, nil-milestone either way).
+                    // is null" (SH184). String args (x2/x3/x4) resolve via 0x21e1fec (SH186 slot-169
+                    // identity shim => empty jstrings resolve). Gates on version [0x10683cff8].
+                    // Opt-in --v2boot-session-set; consumer, nil-milestone either way.
                     if std::env::args().any(|a| a == "--v2boot-session-set") {
                         // version gate for the readLocalFlags path (SH109/121-style; clear bits)
                         unsafe { *(0x10683cff8u64 as *mut u64) = 0; }
@@ -6712,11 +6701,10 @@ fn main() {
                         let s3 = arm64jit::jni::new_string_utf_handle(b"");
                         lifecycle.push(("InitClientSettings", 0x1022265fc, [env_ptr, thiz, s1, s2, s3, 0, 0, 0]));
                     }
-                    // nativeOnResumed (0x1021f5db8) tail-branches SHARED Activity lifecycle-notifier
-                    // 0x21f15a4 whose body derefs a real callback-registry obj at +0x50
-                    // (fault=0x50 @ 0x1021f3748) - SH184 live-object class, never seedable. It hard-
-                    // aborts, so AMBULATORY: driven ONLY under --v2boot-session-resumed (diagnostic),
-                    // never in the default clean drive (must leave app-start ladder reachable).
+                    // nativeOnResumed (0x1021f5db8) tail-branches SHARED lifecycle-notifier 0x21f15a4
+                    // whose body derefs a real callback-registry obj at +0x50 (fault=0x50 @0x1021f3748,
+                    // SH184 live-object class, never seedable). Hard-aborts; AMBULATORY: driven ONLY
+                    // under --v2boot-session-resumed (diagnostic), never in the default clean drive.
                     if std::env::args().any(|a| a == "--v2boot-session-resumed") {
                         lifecycle.push(("nativeOnResumed", 0x1021f5db8, [env_ptr, thiz, 0, 0, 0, 0, 0, 0]));
                     }
@@ -7597,8 +7585,8 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                     let b4 = arm64jit::jni::new_string_utf_handle(b"");
                     // SH320 (opt-in --v2boot-bus-mainid): do-init DONE-path dispatcher 0x2206db8
                     // reads main-id [0x106863a68]; b.ne @0x2206df0 -> non-main box-build (SH319 reach).
-                    // MAIN (DM-ctor) branch = 0x206df4 `ldr x0,[x19,#32]` -> vt+0x30 -> br x1 @0x206e24.
-                    // Ladder restores main-id to 0 after rung 1, so the late bus do-init box-builds.
+                    // MAIN (DM-ctor) = 0x206df4 ldr x0,[x19,#32] -> vt+0x30 -> br x1. Ladder
+                    // restores main-id to 0 after rung1, so late bus do-init box-builds.
                     if std::env::args().any(|a| a == "--v2boot-bus-mainid") {
                         let me = unsafe { libc::pthread_self() };
                         unsafe { *(0x106863a68u64 as *mut u64) = me as u64; }
@@ -7640,8 +7628,8 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                         dm(),
                         ogb()
                     );
-                    // (1) Drive the real MessageBus.subscribe binder receive to run app-start's
-                    // session registration walk (populates the registry from 0).
+                    // (1) Drive real MessageBus.subscribe to run app-start's session registration
+                    // walk (populates the registry from 0).
                     let b1 = arm64jit::jni::new_string_utf_handle(b"experience-launch");
                     let b2 = arm64jit::jni::new_string_utf_handle(b"");
                     let b3 = arm64jit::jni::new_string_utf_handle(b"");
@@ -7691,11 +7679,10 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                     );
                     dump("SH315-postbus-doinit");
                 }
-                // SH131 (disasm 21f7654): seed the engine's OWN files-dir global. Real client stores it via
-                // nativeSetFilesDirectory (0x1021f7654) - 24-byte libc++ std::string at 0x10726d600 (file 0x726d600,
-                // NOT 0x1026d600). Without it the SQLite datastore gets no base path -> fsmap unreached;
-                // the native STORE dead-ends (GetStringUTFChars expects a real Java-arena jstring), so
-                // seed LONG form ([0..7]=data,[8]=size,[16]=cap bit0=0). Opt-in --v2boot-set-filesdir.
+                // SH131 (disasm 21f7654): seed engine's OWN files-dir global. Real client stores it via
+                // nativeSetFilesDirectory (0x1021f7654) - 24-byte libc++ std::string at 0x10726d600.
+                // Without it the SQLite datastore gets no base path -> fsmap unreached. Seed LONG
+                // form ([0..7]=data,[8]=size,[16]=cap bit0=0). Opt-in --v2boot-set-filesdir.
                 if std::env::args().any(|a| a == "--v2boot-set-filesdir") {
                     const FILES_DIR_GLOBAL: u64 = 0x10726d600;
                     const DIR: &[u8] = b"/data/user/0/com.roblox.client/files";
@@ -7746,12 +7733,10 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                     eprintln!(
                         "[elfjit:v2boot] SH122 session-advance probe: MH_FLAGS_LOADED={nf} MH_ENGINE_INITIALIZED={ni} MH_APP_READY={ar} once-guard[0x6a68410]={og:#x}"
                     );
-                    // SH155 REcon-verified DM-root markers (do-init __call_once result):
-                    // (a) once-guard bit0==1 (lambda completed); (b) DM-root
-                    // [0x106a68818] non-NULL AND [[0x106a68818]+0x20] vt+0x30 sane image
-                    // code addr (a live DataModel the match path would `br` into); (c) the
-                    // app-data-model counter [0x106dca000+0xe88] advanced from 0 (the JSON
-                    // serialization wrote once). Print all three so the
+                    // SH155 DM-root markers (do-init __call_once): (a) once-guard bit0==1 (lambda done);
+                    // (b) DM-root [0x106a68818] non-NULL + [[..]+0x20] vt+0x30 sane image addr
+                    // (live DM the match path would br into); (c) app-data-model counter
+                    // [0x106dca000+0xe88] advanced from 0 (json wrote once). Print all three.
                     let dm_root = unsafe { *(0x106a68818u64 as *const u64) };
                     let (mark_b, vt30) = if (0x100000000..0x107333c3c).contains(&dm_root) {
                         let obj20 = unsafe { *((dm_root + 0x20) as *const u64) };
@@ -7766,20 +7751,15 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                         (false, 0)
                     };
                     let adc = unsafe { *(0x106dca000u64 as *const u64).add(0xe88 / 8) };
-                    // SH316: ONCE-SLOT [0x106a68408] (str x0,[x23,#1032] @0x2206d74, x23=adrp 6a68000)
-                    // is a DISTINCT cell from DM-root [0x106a68818] (+0x410; no static/once writer,
-                    // SH155). On a populated registry the once-lambda's ctor fast-path stores the
-                    // matched "Execute" service handle (0x400000b) here - do-init's once now completes
-                    // with a real non-NULL result, while the live-DM cell stays 0.
+                    // SH316: ONCE-SLOT [0x106a68408] (str x0,[x23,#1032] @0x2206d74, x23=adrp 6a68000) = DISTINCT
+                    // cell from DM-root [0x106a68818] (+0x410). On a populated registry the once-lambda's
+                    // ctor fast-path stores the matched "Execute" handle (0x400000b) here - not a DM.
                     let once_slot = unsafe { *(0x106a68408u64 as *const u64) };
-                    // SH315: read back the service-registry COUNT [0x106fe2f08] (w22) - the DM-controller
+                    // SH315: read back the service-registry COUNT [0x106fe2f08] (w22)
                     let srv_reg_count = unsafe { *(0x106fe2f08u64 as *const u32) };
-                    // SH315: dump the first ~16 registered service NAMES (lookup walks
-                    // array base 0x106fe6180, stride 0x60, name string AT the entry addr,
-                    // service ptr at entry-16 = [ret_lookup]=[0x106fe6000+0x180..]). Read each
-                    // entry's leading up-to-0x3f bytes as ASCII to see which services the
-                    // SESSION-CTOR binder route registered (is 'App'/'Execute' among them -> the
-                    // DM-controller fast-path could then yield a live DM-root under do-init).
+                    // SH315: dump first 16 reg NAMES (array base 0x106fe6180, stride 0x60,
+                    // name AT entry, service ptr at entry-16) - is 'App'/'Execute' present ->
+                    // could the DM-controller fast-path yield a live DM-root under do-init?
                     let mut srv_names: Vec<String> = Vec::new();
                     for i in 0..srv_reg_count.min(16) as u64 {
                         let base = 0x106fe6180u64 + i * 0x60;
@@ -7804,9 +7784,9 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                     );
                     // SH317: ctor name->service lookup (bl 0x2168798) is TWO-TIER.
                     // tier-1 strncasecmp(OTHER,[entry],0x3f) walks the array; tier-2 strcasecmp
-                    // (PRIMARY, [0x1070271d0]*92+0x106fe2f00+0x2078) resolves the PRIMARY "App"
-                    // through a controller-name cell. Measured: fixidx=0 -> "Runtime0" (not "App"),
-                    // so the fast-path fails though tier-1 matched "Execute" (0x400000b, SH316).
+                    // (PRIMARY, [0x1070271d0]*92+0x106fe2f00+0x2078) resolves PRIMARY "App" via a
+                    // controller-name cell. Measured fixidx=0 -> "Runtime0" (not "App"), so the
+                    // fast-path fails though tier-1 matched "Execute" (0x400000b, SH316).
                     let sh317_idx = unsafe { *(0x1070271d0u64 as *const u8) };
                     let cc_base = 0x106fe2f00u64 + (sh317_idx as u64) * 0x5c + 0x2078;
                     let mut cc = String::new();
@@ -7836,11 +7816,9 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                         "[elfjit:v2boot] SH317b controller-name table[0..7]={}",
                         tbl.join("|")
                     );
-                    // SH318 (correct SH317): the tier-2 index byte is PER-ENTRY.
-                    // x24=0x107027170 (base) then `add x24,x24,#1` per loop iter, so
-                    // fixidx[i]=[0x107027170+i]; SH317's fixed [0x1070271d0]=entry 0x60 (beyond
-                    // count) -> stale 0. Dump fixidx+selected cell per entry to see if any
-                    // resolves "App" (SESSION-CTOR lever) or all resolve "Runtime0" (invariant).
+                    // SH318 (correct SH317): tier-2 index byte is PER-ENTRY.
+                    // x24=[0x107027170] then +1/iter (SH317's fixed [0x1070271d0] is beyond count).
+                    // Dump fixidx+cell per entry: any "App", or all "Runtime0" invariant?
                     let mut rows: Vec<String> = Vec::new();
                     for i in 0..srv_reg_count.min(16) as u64 {
                         let f = unsafe { *(0x107027170u64.wrapping_add(i) as *const u8) };
@@ -7854,10 +7832,9 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                         rows.push(format!("[e{i}]{:x}->{cs}", f));
                     }
                     eprintln!("[elfjit:v2boot] SH318 per-entry fixidx[0x107027170+i]->controller-cell: {}", rows.join(" "));
-                    // SH325: done-path enqueues a REAL app-shell construct onto the fixed session queue
-                    // [0x106863a70] (mutex [0x106863aa0]) via enqueue-construct 0x2207118; dump the cells
-                    // + pointed item to see if a driver-able app-shell construct is present post-ladder
-                    // (feeds the never-run consumer 0x10220778c).
+                    // SH325: done-path enqueues a REAL app-shell construct onto session queue [0x106863a70]
+                    // (mutex [0x106863aa0]) via enqueue-construct 0x2207118; dump cells + item to
+                    // see if a driver-able app-shell construct is present (feeds 0x10220778c).
                     for q in [0x106863a60u64, 0x106863a70u64, 0x106863a80u64, 0x106863aa0u64] {
                         let qv = unsafe { *(q as *const u64) };
                         let mut qe = String::new();
@@ -15232,13 +15209,14 @@ mod sh115_tests {
     }
 
     #[test]
-    fn sh314_appstart_map_header_is_liveobj_not_fixed_cell() {
-        // SH314 (do-not-re-tread closure): app-start map wall 0x1021dde34 (`ldr x23,[x21,#8]`,
-        // x21 container=0x100548ca9) is fed by the ADDRESS OF A RODATA STRING
-        // (file 0x548ca9="Id\0assetTypeId\0avatar_load_start\0...") - a map slot type-punned
-        // with a string ptr. 5 STATIC walkers (of 0x21ddbc8) build STACK containers
-        // (x0=sp+0xc48, x1=sp+0xa70, w2=1) from table 0x66e7000 -> benign, not the crash
-        // (x22=0x11!=1). No count-clamp/fixed-cell/repair crosses it; real session ctor needed.
+    fn sh329_appstart_afterfork_two_arm_closure_pinned() {
+        // SH329 (A/B measured, real so): the SH328 continuation has a TWO-ARM fork at
+        // 0x25f503c `cbz w8,0x25f504c` on governor-flag byte [0x6a64da0] (x9=adrp 0x6a64000,#3488).
+        // Arm-1 (flag CLEAR, SH328 default): `ldr x0,[x19,#1032]` = [AppStarted+0x408] -> x0=0.
+        // Arm-2 (flag SET, --v2boot-session + JIT_ROUTEB_APPSART_GOVFLAG): `bl 0x2ea3a84`
+        // nativePreloadFlagOverrides(x19) -> ALSO returns x0=0. BOTH converge on `ldr x8,[x0]`
+        // @0x25f5050 (guestpc fault 0x1025f501c, fault=0x0). So the AppStarted live-member gate
+        // is fork-independent: no governor-flag byte value yields a non-null object. SESSION-CTOR.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15246,8 +15224,34 @@ mod sh115_tests {
                 let host = el.host_addr_of(guest).unwrap_or(0);
                 if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
             };
-            assert_eq!(word(0x102_1ddbc8), 0xa9bd7bfd, "walker prologue");
-            assert_eq!(word(0x102_1ddc00), 0x9400000d, "walker bl 0x21ddc34");
+            assert_eq!(word(0x1025f_502c), 0x3976_8128, "sh329 governor-flag ldrb w8,[x9,#3488]");
+            assert_eq!(word(0x1025f_503c), 0x3400_0088, "sh329 fork cbz w8,0x25f504c");
+            assert_eq!(word(0x1025f_5044), 0x9422_ba90, "sh329 arm-2 bl 0x2ea3a84 (nativePreloadFlagOverrides)");
+            assert_eq!(word(0x1025f_504c), 0xf942_0660, "sh329 arm-1 ldr x0,[x19,#1032] ([AppStarted+0x408])");
+            assert_eq!(word(0x1025f_5050), 0xf940_0008, "sh329 both-arms ldr x8,[x0] fault site");
+            assert_eq!(word(0x1025f_5058), 0xf940_4508, "sh329 vt[+136] ldr x8,[x8,#136]");
+            eprintln!("sh329 appstart two-arm fork closure pinned (both arms -> [AppStarted+0x408] wall).");
+        } else {
+            eprintln!("sh329 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
+    fn sh314_appstart_map_header_is_liveobj_not_fixed_cell() {
+        // SH314 (do-not-re-tread closure): app-start map wall 0x1021dde34 (`ldr x23,[x21,#8]`,
+        // x21 container=0x100548ca9) is fed by the ADDRESS OF A RODATA STRING (file 0x548ca9
+        // ="Id\0assetTypeId\0avatar_load_start\0...") - a map slot type-punned with a string ptr.
+        // 5 STATIC walkers (of 0x21ddbc8) build STACK containers (x0=sp+0xc48,x1=sp+0xa70,w2=1)
+        // from table 0x66e7000 -> benign, not the crash (x22=0x11!=1). No seed crosses it; real ctor.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            assert_eq!(word(0x102_1ddbc8), 0xa9bd7bfd, "sh314 walker prologue");
+            assert_eq!(word(0x102_1ddc00), 0x9400000d, "sh314 walker bl 0x21ddc34");
             assert_eq!(word(0x102_1dde34), 0xf94006b7, "fault ldr x23,[x21,#8]");
             assert_eq!(word(0x102_1dccf8), 0xf0022848, "static-caller adrp x8,0x66e7000");
             assert_eq!(word(0x102_1dcd14), 0x9101e2e0, "static-caller add x0,x23,#0x78");
@@ -15261,11 +15265,10 @@ mod sh115_tests {
 
     #[test]
     fn sh315_sessionctor_registry_populates_headlessly() {
-        // SH315 (5/5, real so, skip-appstart + session-bus): registry count [0x106fe2f08]=12
-        // after MessageBus.subscribe drives app-start's session registration - FIRST headless
-        // non-zero (was 0). Array [0x106fe6180] (0x60 stride) holds DM-task services
-        // ('Thread','Spawn','Yield','Close','Sleep','Sched','Execute') but NOT the ctor's
-        // 'App' pair, so the fast-path misses and DM-root stays 0. SESSION-CTOR advance, not a DM.
+        // SH315 (5/5, real so, skip-appstart + session-bus): registry count [0x106fe2f08]=12 after
+        // MessageBus.subscribe drives app-start's session registration - FIRST headless non-zero.
+        // Array [0x106fe6180] (0x60 stride) holds DM-task services but NOT the ctor's 'App' pair,
+        // so the fast-path misses and DM-root stays 0. SESSION-CTOR advance, not a DM.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
