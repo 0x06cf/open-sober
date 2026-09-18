@@ -34,9 +34,25 @@ field-copy source pin):
 - 0x1025f52f8 = 0xf9400e60  `ldr x0,[x19,#24]`  (the field-copy source object)
 
 **The cross is `[appstart_obj+24] != NULL`** — a genuine session-constructed AppStarted field, the
-SEP-17 real-session construct. A host seed there is the SH324-PROVED dead-end class (fn consumes the
+SEP-17 real-session construct. A host seed there is the SH324-PROVEN dead-end class (fn consumes the
 x8 out-param a host leaf cannot write); only the real session drive builds it. This sharpens, not
 relocates, the standing SEP-17 lever.
+
+## 2b. The cross IS constructible (recon): [appstart+24] = [0x106a6f480] written by a REAL ctor
+
+Full forwarding of the gate's object chain reveals the cross is a DRIVABLE ctor output, not a
+fabricate-only cell:
+- nativeAppBridgeAppStart (0x233bf20, bl @0x25f52ec) is once-guarded on [0x106a6f490]. When
+  [0x106a6f490].bit0==1 it calls `x0=0x106a6f468; bl 2e890c4` (the AppStarted factory; x0 = the AppStarted
+  object) and stores the result to the out-param `[sp+328]` = x19. When bit0==0 it takes the call_once
+  path (bl 284ce54) first.
+- 0x2e890c4's construction branch (reached after its counter/flag checks) computes
+  `str x0,[x19,#24]` @0x2e89150 — i.e. **writes [AppStarted+24] = the exact cross cell**. x0 there is the
+  return of `bl 35d0608` (a build helper) after `bl 21daef8` (a co-initializer on obj+0x8/+0x30). The
+  branch is gated: `ldr x8,[x19,#24]; cbnz x8, skip` @0x2e89130 (already-set short-circuit).
+- Net: the SEP-17 drive that clears this gate = make the once-guard path run, drive `bl 21daef8` and
+  `bl 35d0608` to return a valid object so 0x2e89150 stores a non-NULL [AppStarted+24]. This is REAL
+  ctor logic (state-machine, not a seed), consistent with the operator's cause-not-symptom SEP-17 line.
 
 ## 3. New observation: SetInitParams drives the real type-4 TaskScheduler drain (NONDETERMINISTIC)
 
