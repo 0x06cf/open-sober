@@ -1,24 +1,19 @@
 # Open Sober — Agent Handoff
-## SH330 (Sep 18, 2026, hermes-worker): crossed the SH329 app-start fork gate one deterministic step —
-## a block-entry guard seeds AppStarted+0x408 with a benign vt[+136]-leaf object -> 0x25f5050 no longer SIGSEGVs;
-## downstream is run-variable (SH320-class host-ptr leak / FMOD AAudio), NOT a stable gate. recon-v3 green at HEAD.
-Measured (real libroblox.so, full SH328 seed set + JIT_ROUTEB_APPSART_408SEED=1, 3/3): the SH329 fork at
-0x25f503c converges on `ldr x0,[x19,#1032]` = [AppStarted+0x408] (runtime heap x19) = 0 -> `ldr x8,[x0]`
-@0x25f5050 SIGSEGV. SH329 closed only the fork (no govflag value yields non-null). SH330 discovered the
-+0x408 dispatch @0x25f5058/5c is a PLAIN `ldr x8,[x8,#136]; blr x8` — NOT the x8-out-param ABI SH324
-proved un-crossable. New default-inert guard (env JIT_ROUTEB_APPSART_408SEED) fires at block-entry
-[0x1025f501c,0x1025f5060] and seeds the RUNTIME-[x19+0x408] with a leaked benign object whose vt[+136]
-is a host leaf. 3/3: gate deterministically passed. Downstream run-variable on 3 runs: clean EXIT 0
-(vt[+136] leaf -> canary epilogue + ret) / FMOD AAudio SIGSEGV guestpc=0x106240cb8 (SH212-crash-A) /
-leaked-host-pc (SH320 ASLR-flaky). So the next wall is run-variable, not stable. This answers SH326's
-open "sync/determinism gap" question: seeding the member deterministically crosses the gate.
-+sh330 hermetic guard (5 pins: 0x25f504c ldr x0,[x19,#1032], 0x25f5050 ldr x8,[x0], 0x25f5058 ldr
-x8,[x8,#136], 0x25f505c blr, 0x25f5080 ret) + frontier doc. elfjit examples 154/0 (152+sh329+sh330),
-arm64jit lib 408/0, workspace green; elfjit.rs 1048570 B under 1MB hook (SH320-329 prose condensed,
-facts preserved). recon-v3 re-verified green (24 frames, present #21..#23 swap Ok(0x1), 0 json abort,
-EXIT 124).
-HONEST: no DM (DM-root 0, MH_* false); Route-B live-DM gate UNCHANGED. SH330 is a fencepost advance
-(crosses one deterministic app-start gate) + documents the next wall is run-variable (host-ptr leak /
-FMOD AAudio — SH320/SH212 class), NOT a session boot or rendered screen. NEXT = drive the REAL
-Activity/AppBridge session so the upstream ctor builds a REAL +0x408 object (real vt[+136] work), not
-a fabricated leaf (SEP-17 SESSION-CTOR PRIMARY LEVER, ref SH184).
+## SH331 (Sep 19, 2026, hermes-worker): characterized the SH330 app-start +0x408 gate (8-run A/B: guard
+## 100% deterministic, downstream run-variable 7/8-clean) + SH348 once-slot DM-ctor lever measured-negative (reverted).
+Measured (real libroblox.so, full SH330 recipe + JIT_ROUTEB_APPSART_408SEED, 8 runs): the guard fires
+100% (8/8) and the gate crosses 100% (8/8, DUMPPC 0x1025f5060), but the DOWNSTREAM is genuinely
+run-variable — 7/8 clean EXIT 0, 1/8 abort (host-pc/AAudio, SH320/SH212-class). So the crossed gate is
+crossed-but-not-completed; the next wall is a run-variable host-pc leak, NOT a stable gate — matching
+SH330's original doc exactly. SH330b (defensive epilogue x21 reseed) tested-and-reverted: 0 firings +
+no distribution change = a no-op against an empty endpoint (the host vt[+136] leaf preserves CpuState
+callee-saved regs, x21 === guardGOT already); SH184/SH186 no-cruft. +probe_sh330_repro.sh (canonical
+8-run repro). recon-v3 re-verified green (24 frames, present #21..#23 swap Ok(0x1), 0 json abort, EXIT
+124). Withdrawn probe runs for app-start forward + SetInitParams host-pc leak = same already-documented
+SH320-class family (do-not-re-derive).
+HONEST: no DM (DM-root [0x106a68818]=0, MH_* false); Route-B live-DM gate UNCHANGED; the +0x408
+fencepost is stable at the fork only, downstream run-variable. NEXT = SESSION-CTOR real
+Activity/AppBridge session drive so the upstream ctor builds a REAL +0x408 (SEP-17 PRIMARY LEVER,
+ref SH184); App service registration (SH313/316/317/318) is the precise route — do NOT seed once-slot
+[0x106a68408] (SH348 negative: the done-path dispatcher 0x2206db8 consumes do-init's original arg1,
+not the once-slot; guard never fired, A/B crash-site changed run-variably = noise).
