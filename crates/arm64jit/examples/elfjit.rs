@@ -1318,13 +1318,11 @@ fn routeb_patch_gov_router() {
     arm64jit::jit::block_cache_drop_region(0x102e9fa80, 0x102e9fb30);
 }
 
-/// SH159d: the governor's MODERN ROUTER path derefs `impl[+0x408]` (DISPATCH) via
-/// `ldr x0,[x19,#1032]; ldr x8,[x0]; ldr x9,[x8,#24]; blr x9`. Partial do-init has
-/// impl[+0x408]==0 -> `ldr x8,[x0]` derefs NULL (guestpc=0x102e9fa84). The DISPATCH
-/// return is DISCARDED (x0 re-set at 0x2e9fb5c), so substitute a stable inert dispatch:
-/// patch 0x2e9fb44..0x2e9fb50 -> movz/movk/movk (x0=fixed DISPATCH 0x106a72000) +
-/// `ldr x9,[x0,#0x18]` (leaf), so `blr x9` @0x2e9fb54 calls the benign leaf and the
-/// governor continues to `bl 0x258c6e4`. Leaf written into [0x106a72000]+0x18.
+/// SH159d: governor MODERN ROUTER derefs impl[+0x408] (DISPATCH) via blr; partial do-init
+/// has it ==0 -> NULL deref (guestpc=0x102e9fa84). Dispatch return DISCARDED (re-set at
+/// 0x2e9fb5c), so patch 0x2e9fb44..0x2e9fb50 -> movz/movk/movk (x0=0x106a72000) + ldr
+/// x9,[x0,#0x18] (leaf) so blr @0x2e9fb54 calls a benign leaf; governor continues to
+/// `bl 0x258c6e4`. Leaf written into [0x106a72000]+0x18.
 fn routeb_patch_gov_dispatch() {
     const DISPATCH: u64 = 0x106a72000; // fixed .bss fake-DISPATCH (RW LOAD, buildable in 3 movk)
     const WINDOW: u64 = 0x102e9fb44;   // `ldr x0,[x19,#1032]` (0xf9420660)
@@ -1487,10 +1485,9 @@ fn routeb_patch_gov_tail_cont() {
     arm64jit::jit::block_cache_drop_region(0x102e9fdc8, 0x102ea3b40);
 }
 
-/// SH159e (recon deleg_9ea3f752): nativeAppBridgeV2StartAppWithParams (0x24258c6e4)
-/// reads the param union: x22=[x0+8]=capacity, count=[x19+24], float=[x19+32].
-/// The governor passes x0=sp+0x198 whose union we never initialized (we skip the
-/// appendix that fills it), so garbage -> hash-walk NULL deref. Make these inputs
+/// SH159e: nativeAppBridgeV2StartAppWithParams (0x24258c6e4) reads the param union:
+/// x22=[x0+8]=capacity, count=[x19+24], float=[x19+32]. Governor passes x0=sp+0x198 whose
+/// union we never init (skip the appendix) -> garbage -> hash-walk NULL deref. Make them
 /// deterministic: cap=0 (allocate path), count=0, float=1.0.
 fn routeb_patch_startapp_params() {
     let sites: [(u64, u32, u32); 3] = [
@@ -2161,8 +2158,7 @@ fn sh245_getter_tail_words(ret: bool) -> u32 {
 /// UNCONDITIONAL tail `b 0x624e6c0` (FMOD audio) that never returns to the dispatcher
 /// (0x2bd8d18 stays 0; getter tails into FMOD). x30 was already restored to 0x2bd8d18 at
 /// 0x2174c7c, so patching tail `b`->`ret` returns STRAIGHT to the dispatcher, which then
-/// reaches `bl sub_2bd8dac` -> vt[+0x1f0]: with DMCONT that is REAL continueAfterFlagsLoaded_
-/// (0x102bd1d68) — first headless execution. Getter shared by ~3 callers, all FMOD-tailing.
+/// reaches `bl sub_2bd8dac` -> vt[+0x1f0]: with DMCONT that is REAL continueAfterFlagsLoaded_.
 /// Default INERT, idempotent.
 fn routeb_patch_getter_fmod_tail_ret() {
     if ROUTEB_GETTER_FMOD_TAIL_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
@@ -2198,7 +2194,7 @@ static ROUTEB_PRELOAD_VALUE_PATCHED: core::sync::atomic::AtomicBool = core::sync
 /// x20=nativePreloadFlagOverrides return=0. Getter 0x2dae5f0 is a Meyers once; SH270 wired
 /// value cell [0x106a64d78] but guard routes to CONSTRUCT (returns 0) — wire never read.
 /// Fresh lever: NOP tbz @0x2dae5fc to force the VALUE branch dispatching [0x106a64d78].vt[+16],
-/// seeded to the all-leaf obj -> getter returns non-NULL -> wall dispatches a leaf -> advances.
+/// seeded to the all-leaf obj -> getter non-NULL -> wall dispaches a leaf -> advances.
 /// Word-guarded + block_cache drop. Default-inert.
 fn routeb_patch_preload_valuecell() {
     if ROUTEB_PRELOAD_VALUE_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
@@ -2312,12 +2308,11 @@ fn routeb_patch_cont_opnew_box() {
 }
 static ROUTEB_CONT_OPNEW_BOX_PATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static ROUTEB_OPNEW_SIZEGATE_PATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// SH246/247: the activated continuation (0x102bd1d68) NULL-allocs — BOTH op_new
-/// variants (0x1db1a38/0x1d96768) return NULL for size>0xa when [0x10727570c].bit0 is
-/// clear (headless). Broad fix (bit0=1) is a MEASURED regression (SH245 #4). This
-/// routes EVERY size through the SAME ≤0xa "small path" (0x1db1ab4/0x1d96824) that
-/// builds a scudo size-class descriptor and calls the real allocator 0x1db1c60. Single
-/// word per variant: size-gate `b.ls SMALL` -> UNCONDITIONAL `b SMALL`, no bit0 touch.
+/// SH246/247: the activated continuation (0x102bd1d68) NULL-allocs — both op_new
+/// variants return NULL for size>0xa when [0x10727570c].bit0 clear (headless). Broad
+/// bit0=1 fix is a MEASURED regression (SH245 #4). Route every size through the same
+/// ≤0xa "small path" (builds a scudo size-class descriptor, calls real alloc 0x1db1c60).
+/// Single word per variant: size-gate `b.ls SMALL` -> unconditional `b SMALL`, no bit0.
 /// Opt-in JIT_ROUTEB_OPNEW_SIZE_GATE, byte-guarded, whole-fn block-cache drop.
 fn routeb_patch_opnew_size_gate() {
     if ROUTEB_OPNEW_SIZEGATE_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
@@ -6627,24 +6622,21 @@ fn main() {
             // SendAppEventOnAppReady advances past its standing 0x102bb803c terminal.
             // Self-guards on its own env (inert by default).
             routeb_patch_preload_valuecell();
-            // SH245-candidate-1 (Route-B, opt-in JIT_ROUTEB_DM_CONT_OPNEW_BOX):
-            // once the continuation runs it reaches `bl op_new(0x28)` which returns
-            // NULL headlessly (allocator-activation gate clear, size>0xa) -> box a
-            // leaked 0x40 object instead. Self-guards on its own env (inert by default).
+            // SH245-candidate-1 (opt-in JIT_ROUTEB_DM_CONT_OPNEW_BOX): once the continuation
+            // runs it reaches `bl op_new(0x28)` which NULL-allocs headlessly (alloc-activation
+            // clear, size>0xa); box a leaked 0x40 object instead.
             routeb_patch_cont_opnew_box();
-            // SH247 (Route-B, opt-in JIT_ROUTEB_OPNEW_SIZE_GATE): the continuation
-            // pervasively NULL-allocs (bad_alloc from MANY op_new sites, SH246). Route
-            // EVERY size through the working ≤0xa descriptor/allocator path by
-            // making both op_new variants' size-gate branch unconditional. Self-guards
-            // on its own env (inert by default).
+            // SH247 (opt-in JIT_ROUTEB_OPNEW_SIZE_GATE): the continuation pervasively
+            // NULL-allocs (bad_alloc, SH246). Route every size through the working ≤0xa
+            // descriptor/allocator path by making both op_new variants' size-gate
+            // branch unconditional. Self-guards on its own env.
             routeb_patch_opnew_size_gate();
-            // SH115: the three nullable-singleton dispatch accessors soft-return because their
+            // SH115: the nullable-singleton dispatch accessors soft-return because their
             // `blr` reads past the 0x60 vtable. Scoped-patch each site to materialize the
-            // stable zeroed singleton object so those bodies COMPLETE (session advance),
-            // leaving nativeInit's own 0x60 reads + the shared vtable untouched. OPT-IN
-            // (JIT_SH115_SINGLETON_PATCH=1) until the deeper nativeInit rung-0 getter gate is
-            // cleared: the patch makes the render pipeline run but advances nativeInit PAST
-            // its former soft-return into a 0x28-getter fault (SH116), so inert by default.
+            // stable zeroed singleton so those bodies COMPLETE (session advance), leaving
+            // nativeInit's own 0x60 reads + shared vtable untouched. OPT-IN
+            // (JIT_SH115_SINGLETON_PATCH=1): makes the render pipeline run but advances
+            // nativeInit past its soft-return into a 0x28-getter fault (SH116), inert by default.
             if std::env::var("JIT_SH115_SINGLETON_PATCH").ok().as_deref() == Some("1") {
                 routeb_patch_singleton_dispatch();
                 // SH116: the advanced nativeInit path locks an unmapped .bss
@@ -6655,47 +6647,42 @@ fn main() {
                 // bucket-array; leaf-rewrite it to `ret` so the caller takes the
                 // 'found' path and the flag-registration loop advances.
                 routeb_patch_nativeinit_flagmap_helper();
-                // SH116b: after SH115/116/117 the nativeInit path advances into a SECOND
-                // read site (file 0x2320a24: `adrp x8,7273000; ldr x8,[x8,#2480]` =
-                // *(0x10672739b0), sibling of SH116's helper reading the SAME global).
-                // The flag-manager global reads 0 headlessly; `bl pthread_mutex_lock`
-                // locks &0+0x28 = faults. Seed the global with a stable zeroed object
-                // (valid mutex at +0x28) when 0, mirroring SH116. Also *0x10672739c0.
+                // SH116b: after SH115/116/117 nativeInit advances into a SECOND read site
+                // (file 0x2320a24 = *(0x10672739b0), sibling of SH116's helper). The
+                // flag-manager global reads 0; `bl pthread_mutex_lock` locks &0+0x28 ->
+                // faults. Seed a stable zeroed object (valid mutex at +0x28) when 0; also
+                // *0x10672739c0.
                 routeb_patch_nativeinit_flagmanager();
                 // SH119: SendAppEventOnAppReady's two ungated singleton lambdas
                 // (0x6251610 off 0xf0, 0x6260a68 off 0x550) still soft-return;
-                // materialize the stable object into x0 at both so the body
-                // completes towards the app-data-model / GuiObjects.
+                // materialize the stable object into x0 at both.
                 routeb_patch_sendapp_singleton_lambdas();
                 // SH200: the V2Init/V2Start run-variable "outside image" stop is
-                // a 4th singleton-dispatch site (fn 0x6251e0c reads objB vtable
-                // slot +0x118 past the 0x60 seed -> blr into host bytes). Patch
-                // it like SH115/119 so V2Init/V2Start reach the SH199 world-build
-                // gate block 0x102368100 instead of soft-returning first.
+                // a 4th singleton-dispatch site (fn 0x6251e0c reads objB vtable slot
+                // +0x118 past the 0x60 seed -> blr into host bytes). Patch it like
+                // SH115/119 so V2Init/V2Start reach the SH199 world-build gate block
+                // 0x102368100 instead of soft-returning first.
                 routeb_patch_v2_dispatch();
-                // SH201: the ~365-site objB-getter singleton-dispatch family is
-                // LOCATED (sh201_v2_family_scan, precise getter+past-0x60+blr
-                // discriminator) but its runtime patch is NOT wired: the naive
-                // family-wide scribble crash-loops the run (SH55/64 region,
-                // over-patch — the exact restart SH200 warned about). Kept as a
+                // SH201: the ~365-site objB-getter singleton-dispatch family is LOCATED
+                // (sh201_v2_family_scan) but its runtime patch is NOT wired: the naive
+                // family-wide scribble crash-loops the run (over-patch). Kept as a
                 // characterized lever + hermetic scanner, not a shipped patch.
                 // (Do NOT re-enable routeb_patch_v2_family at runtime.)
-                // SH120: the app-bridge event dispatch reads the shared dispatcher-
-                // node .bss global (0x10683a460) with an unseeded self-link; seed
-                // the DATA (NOT the generic shared leaf) to the benign empty state.
+                // SH120: the app-bridge event dispatch reads the shared dispatcher- node
+                // .bss global (0x10683a460) with an unseeded self-link; seed the
+                // DATA (NOT the generic shared leaf) to the benign empty state.
                 routeb_seed_dispatcher_node();
-                // SH126-r0: the rung-0 nativeInit null-map dispatch (vt[+232] ->
-                // flag-recorder 0x101d97c70, null map store). Leaf-rewrite the
+                // SH126-r0: the rung-0 nativeInit null-map dispatch (vt[+232] -> flag-recorder
+                // 0x101d97c70, null map store). Leaf-rewrite the
                 // callee so the store no-ops (residual 1/3 crash w/ serialized render).
                 routeb_patch_rung0_flag_recorder();
-                // SH121: setTaskSchedulerBM lazily constructs the TaskScheduler whose
-                // ctor asserts [0x72739d4].bit0 ("flags loaded") -> raise(SIGTRAP)
-                // (exit 133). NOP the tbz + seed the REAL setTaskSchedulerBM version-gate
+                // SH121: setTaskSchedulerBM lazily constructs the TaskScheduler whose ctor
+                // asserts [0x72739d4].bit0 ("flags loaded") -> raise(SIGTRAP) (exit 133).
+                // NOP the tbz + seed the REAL setTaskSchedulerBM version-gate
                 // [0x10683cff8] (SH109's [0x10683d350] belongs to V2Init/V2Start). KEEP
-                // OPT-IN like the rest of the SH115-121 chain: defaulting it ON makes the
-                // default ladder proceed deeper into setTaskSchedulerBM and fault at the
-                // NEXT unseeded gate (guestpc 0x106241c70) instead of the safe pre-existing
-                // run-variable exit — a default-path regression. Inert without the flag.
+                // OPT-IN: defaulting ON advances the ladder deeper into setTaskSchedulerBM
+                // and faults at the next unseeded gate (guestpc 0x106241c70) — a
+                // default-path regression. Inert without the flag.
                 routeb_patch_taskscheduler_flags_gate();
                 unsafe {
                     *(0x10683cff8u64 as *mut u64) = 0x0306u64; // low byte 6, byte1 3
@@ -14973,16 +14960,14 @@ mod sh115_tests {
 
     #[test]
     fn sh270_preload_wall_is_canary_cell_pinned() {
-        // SH270 (CORRECTED attribution). The SendAppEventOnAppReady wall
-        // guestpc=0x102bb803c = `ldr x8,[x20]`; enclosing fn entry 0x102bb7fd4:
-        // 0x102bb801c bl 0x102dae640 (nativePreloadFlagOverrides), 0x102bb8024
-        // mov x20,x0, 0x102bb803c ldr x8,[x20] (faults when getter returns 0).
-        // 0x102dae640 = `b 0x2dae5f0` lazy Meyers singleton (get-or-construct
-        // 0x101df8ff8 -> base 0x106d2dd20, or load [0x106a64d78]). So SH269's
-        // attribution (x20 = preload-overrides return) was CORRECT. Do-not-re-tread
-        // (a) a preload-overrides seed into [0x106a64d78]/[0x106a64d98] — MEASURED
-        // inert, or (b) the canary cell (SH256 __stack_chk_fail proof). Route-B
-        // gate UNCHANGED; SH174 latch stays forward hook.
+        // SH270 (CORRECTED). SendAppEventOnAppReady wall guestpc=0x102bb803c =
+        // `ldr x8,[x20]`; enclosing fn entry 0x102bb7fd4: bl 0x102bb801c
+        // (nativePreloadFlagOverrides) / mov x20,x0 / ldr x8,[x20] (faults when getter
+        // returns 0). 0x102dae640 = b 0x2dae5f0 lazy Meyers singleton (get-or-construct
+        // 0x101df8ff8 -> base 0x106d2dd20, or load [0x106a64d78]). SH269 attribution
+        // correct. Do-not-re-tread (a) preload-overrides seed into [0x106a64d78/0x106a64d98]
+        // — MEASURED inert, or (b) the canary cell (SH256 __stack_chk_fail). Route-B gate
+        // UNCHANGED; SH174 latch stays forward hook.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -14990,18 +14975,18 @@ mod sh115_tests {
                 let host = el.host_addr_of(guest).unwrap_or(0);
                 if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
             };
-            // True wall-window fn prologue + the wall chain (bl getter -> mov x20,x0 -> ldr [x20]).
+            // Wall-window fn prologue + the wall chain (bl getter -> mov x20,x0 -> ldr [x20]).
             assert_eq!(word(0x102_bb7fd4), 0xd10183ff, "sh270-cor wall enclosing fn sub sp,#96");
             assert_eq!(word(0x102_bb801c), 0x9407d989, "sh270-cor wall bl 0x102dae640 (nativePreloadFlagOverrides)");
             assert_eq!(word(0x102_bb8024), 0xaa0003f4, "sh270-cor mov x20,x0 (getter return)");
             assert_eq!(word(0x102_bb803c), 0xf9400288, "sh270-cor wall ldr x8,[x20]");
             assert_eq!(word(0x102_bb8044), 0xf9405108, "sh270-cor post-wall ldr x8,[x8,#20]");
-            // nativePreloadFlagOverrides entry (thunk 0x102dae640 b->0x2dae5f0) + its own ctor.
+            // nativePreloadFlagOverrides entry (thunk 0x102dae640 b->0x2dae5f0).
             assert_eq!(word(0x102_dae640), 0x17ffffec, "sh270-cor 0x2dae640 b-thunk -> 0x2dae5f0");
-            assert_eq!(word(0x102_dae5f0), 0xa9bf7bfd, "sh270-cor getter nativePreloadFlagOverrides stp x29,x30,#-16");
-            assert_eq!(word(0x102_dae5fc), 0x36000140, "sh270-cor getter tbz w0,#0 (guard-acquire branch)");
-            assert_eq!(word(0x102_dae624), 0x97c12a75, "sh270-cor getter construct path bl 0x101df8ff8");
-            assert_eq!(word(0x101_df8ff8), 0xa9be7bfd, "sh270-cor preload-overrides ctor prologue stp x29,x30,#-32");
+            assert_eq!(word(0x102_dae5f0), 0xa9bf7bfd, "sh270-cor getter stp");
+            assert_eq!(word(0x102_dae5fc), 0x36000140, "sh270-cor getter tbz (guard-branch)");
+            assert_eq!(word(0x102_dae624), 0x97c12a75, "sh270-cor getter construct bl");
+            assert_eq!(word(0x101_df8ff8), 0xa9be7bfd, "sh270-cor preload ctor stp");
             for (guest, name) in [
                 (0x102_bb7fd4u64, "wall-fn-prologue"), (0x102_bb801cu64, "wall-bl-getter"),
                 (0x102_bb8024u64, "wall-mov-x20"), (0x102_bb803cu64, "wall-ldr-x20"),
@@ -15011,7 +14996,7 @@ mod sh115_tests {
                 assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh270-cor {name} {guest:#x} in window");
                 assert!(guest & 3 == 0, "sh270-cor {name} {guest:#x} 4-aligned");
             }
-            eprintln!("sh270c CORRECTED: wall x20 = nativePreloadFlagOverrides return (bl 0x102bb801c->0x102dae640->0x2dae5f0), NOT the stack-canary; getter + its ctor pinned on libroblox.so");
+            eprintln!("sh270c CORRECTED: wall x20 = nativePreloadFlagOverrides return (bl 0x102bb801c->0x102dae640), NOT stack-canary; pinned");
         } else {
             eprintln!("sh270 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -15019,14 +15004,12 @@ mod sh115_tests {
 
     #[test]
     fn sh306_governor_null_controller_terminal_pinned() {
-        // SH306: anchor the CURRENT SendAppEventOnAppReady no-regression terminal
-        // (the operator's remote-AVP SESSION-CTOR frontier). Baseline GOVFLAG-off
-        // dies at governor NULL app-DM-controller guestpc=0x102ea0b9c
-        // (`ldr x8,[x0]` where x0=[app-governor+1032]=0 when flag [0x106a64da0]
-        // clear). GOVFLAG=1 advances to the sh270-pinned preload-overrides wall
-        // 0x102bb803c. These two cells are the standing Route-B wall — pin the
-        // governor fn prologue + the flag cell + the dispatch chain so a future
-        // session-drive either registers on the SAME terminal or fails loudly.
+        // SH306: anchor the CURRENT SendAppEventOnAppReady no-regression terminal.
+        // Baseline GOVFLAG-off dies at governor NULL app-DM-controller guestpc=0x102ea0b9c
+        // (`ldr x8,[x0]` where x0=[app-governor+1032]=0 when flag [0x106a64da0] clear).
+        // GOVFLAG=1 advances to the sh270-pinned preload-overrides wall 0x102bb803c.
+        // Pin the governor fn prologue + flag cell + dispatch chain so a future
+        // session-drive registers on the SAME terminal or fails loudly.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15056,12 +15039,9 @@ mod sh115_tests {
     fn sh307_preload_valuecell_branch_forced_pinned() {
         // SH307: SH270's preload-overrides value-cell wire was INERT because the guard
         // helper (bl 0x57816f0, once [0x6d2df30]) routes getter 0x2dae5f0 to the CONSTRUCT
-        // branch (returns 0), so [0x106a64d78] was never read. This cycle forces the VALUE
-        // branch: NOP `tbz w0,#0,0x2dae624` @0x2dae5fc (0x36000140->0xd503201f) so the getter
-        // falls through to `ldr x0,[0x106a64d78]; ldr x8,[x0]; ldr x2,[x8,#16]; br x2` and
-        // returns that vt[+16]'s result; seeded to the fabricated all-leaf obj it returns
-        // non-NULL -> x20!=0 -> terminal 0x102bb803c dispatches a benign leaf -> ADVANCES.
-        // Pin the tbz we patch, the NOP, the value-cell dispatch words, and RW-window.
+        // branch (returns 0), so [0x106a64d78] was never read. Forced here: NOP the tbz
+        // @0x2dae5fc so the getter falls to the value-cell dispatch; seeded all-leaf obj ->
+        // getter returns non-NULL -> terminal 0x102bb803c dispatches a leaf -> ADVANCES.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15080,6 +15060,44 @@ mod sh115_tests {
             eprintln!("sh307 preload-getter value-branch forced (tbz->nop @0x102dae5fc + value-cell [0x106a64d78]=fabricated obj) pinned on libroblox.so — forward lever on SendAppEventOnAppReady terminal 0x102bb803c");
         } else {
             eprintln!("sh307 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
+    fn sh308_sendappevent_doinit_ctor_audio_tail_reach_pinned() {
+        // SH308 (measured on real libroblox.so, SH307-forward A/B): with
+        // JIT_ROUTEB_PRELOAD_VALUECELL the SendAppEventOnAppReady pipe drives the
+        // do-init app-shell ctor (0x102207b50, ~31 blocks) through its FMOD/AAudio
+        // audio-iterate tail (0x105fb30b4) AND reaches StartAppWithParams
+        // (0x10258b144) — firsts on this path (A baseline dies at 0x102bb803c).
+        // Pin the ctor entry + FMOD-tail jump + iterate entry/empty-check +
+        // audio-init body + StartAppWithParams entry (A/B-contrast anchors).
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            assert_eq!(word(0x102_207b50), 0x14000001, "sh308 app-shell ctor entry 0x102207b50");
+            assert_eq!(word(0x102_208ebc), 0x14f6a87e, "sh308 app-shell ctor tail `b 0x5fb30b4` (audio-iterate)");
+            assert_eq!(word(0x105_fb30b4), 0xd10183ff, "sh308 FMOD iterate entry 0x105fb30b4 (sub sp,#0x60)");
+            assert_eq!(word(0x105_fb30e0), 0x540002a0, "sh308 FMOD iterate empty-early-return b.eq 0x5fb3134");
+            assert_eq!(word(0x105_fb3174), 0xd100c3ff, "sh308 FMOD audio-init body (sub sp,#0x30) — reached headlessly");
+            assert_eq!(word(0x102_58b144), 0xd103c3ff, "sh308 StartAppWithParams entry 0x10258b144 (sub sp,#0xf0)");
+            for (guest, name) in [
+                (0x102_207b50u64, "app-shell-ctor"),
+                (0x102_208ebcu64, "appshell-fmod-tail"),
+                (0x105_fb30b4u64, "fmod-enter"),
+                (0x105_fb3174u64, "fmod-audio-body"),
+                (0x102_58b144u64, "startapp-v2"),
+            ] {
+                assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh308 {name} {guest:#x} in window");
+                assert!(guest & 3 == 0, "sh308 {name} {guest:#x} 4-aligned");
+            }
+            eprintln!("sh308 pin: SendAppEventOnAppReady pipe (SH307-on) drives do-init app-shell ctor 0x102207b50 through its FMOD tail 0x105fb30b4 + reaches StartAppWithParams 0x10258b144 (A dies at 0x102bb803c, no ctor). DM-root stays 0; Route-B live-DM gate UNCHANGED.");
+        } else {
+            eprintln!("sh308 real-image guard: no real libroblox.so, skipping anchors");
         }
     }
 
