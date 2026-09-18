@@ -1,9 +1,8 @@
-//! Integration spike: load an aarch64 ELF with libloader's `load_elf_image`
-//! (every PT_LOAD in one contiguous kernel-chosen mapping, **guest vaddr == host
-//! addr**), then run the entry in-process arm64jit translator - NO QEMU.
-//! Run with: cargo run -p arm64jit --example elfjit /path/to/tiny.elf [entry-guest-hex]
-//! Because guest==host, the `entry` is BOTH the guest vaddr and (==) its host
-//! address; ADRP/ADR of globals + guest loads/stores deref the right host ptrs.
+//! Integration spike: load an aarch64 ELF with libloader's `load_elf_image` (every PT_LOAD
+//! in one contiguous kernel-chosen mapping, guest vaddr == host addr), then run the entry
+//! in-process arm64jit translator - NO QEMU. Run: cargo run -p arm64jit --example elfjit
+//! /path/to/tiny.elf [entry-guest-hex]. Because guest==host, entry is BOTH guest vaddr AND
+//! host addr; ADRP/ADR + guest loads/stores deref the right host ptrs.
 
 use arm64jit::jit::{CpuState, jit_run};
 use arm64jit::shims::set_anativewindow_xid;
@@ -440,14 +439,12 @@ fn render_scene_base(node_count: u64) -> u64 {
     r
 }
 
-/// Drive the engine's REAL scene renderer (guest 0x105b2ead4) current
-/// (currency-owning renderinit) thread with the fabricated-but-engine-native R from
-/// `render_scene_base`. Binds ctx, then lets the ENGINE's own frame-desc ctor +
-/// linker construct + register a real 0x98 frame item into R+0x170 AND, when
-/// node_count>0, one real frame per populated 0x28-stride scene node (SH63), then
-/// swaps. Returns swap result (1 == genuine present). Verifies real frame-descs
-/// (R+0x170 + each node's container point at non-zero frames with [+140] set,
-/// [+144]==1 byte).
+/// Drive the engine's REAL scene renderer (guest 0x105b2ead4) current thread with the
+/// fabricated-but-engine-native R from `render_scene_base`. Binds ctx, lets the ENGINE's
+/// frame-desc ctor + linker build a real 0x98 frame item into R+0x170 AND, when
+/// node_count>0, one real frame per populated 0x28-stride scene node (SH63), then swaps.
+/// Returns swap result (1 = genuine present). Verifies real frame-descs (R+0x170 + each node
+/// point at nonzero frames with [+140] set, [+144]==1).
 fn render_engine_scene(ctx: u64, n: u64, node_count: u64) -> u64 {
     if !(ctx >= 0x100000000 && ctx >> 56 == 0) {
         return 0;
@@ -4868,14 +4865,12 @@ fn real_ui_textures() -> Vec<RealSprite> {
     .clone()
 }
 
-/// SH72 - the engine's REAL geometry emitter 0x105b35288 draws a FULL
-/// MULTI-SPRITE "login/home" composite frame in ONE top-level jit_run: a dark
-/// backdrop + one aspect-correct box per REAL Roblox UI sprite (spinner, robux
-/// icon, jump button), sampled from a single shared vertical atlas (row 0 =
-/// solid backdrop strip, then each sprite in memory-row block),
-/// composited with GL_BLEND. Verified per-sprite: expected color read from the
-/// DECODED sprite rgba (not hard-coded) via imgpix_rect (vUV-linear shader
-/// mapping) - a present sprite proves its real pixels landed.
+/// SH72 - the engine's REAL geometry emitter 0x105b35288 draws a FULL MULTI-SPRITE
+/// "login/home" composite frame in ONE top-level jit_run: dark backdrop + one
+/// aspect-correct box per real Roblox UI sprite (spinner, robux icon, jump button) from
+/// a shared vertical atlas, composited GL_BLEND. Per-sprite verified from the DECODED
+/// sprite rgba (not hard-coded) via imgpix_rect (vUV-linear shader mapping) — a present
+/// sprite proves its real pixels landed.
 pub fn render_engine_emitter_multi(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) -> u64 {
     if !(ctx >= 0x100000000 && ctx >> 56 == 0) {
         return 0;
@@ -5635,14 +5630,11 @@ fn present_one_task_frame(ctx: u64, n: u64, iimg: &[u8], ibase: u64, isp: u64) -
             return if r == 0 { 1 } else { r };
         }
     }
-    // SH152: real-content task frame. Draw a home surface live ctx and
-    // swap via the SAME real ctx-vt[+24] - a genuine present. Both emitters run
-    // as their OWN top-level jit_run (desync-safe) using the CACHED textured
-    // program + pre-uploaded texture (no nested guest-bridge GLSL compile, the
-    // SH151 SIGABRT class). Selector ENV (engine callbacks return
-    // Ok(ret)=0 on success) - we pick
-    // real-artwork multi-emitter when RENDEREMITTER_HOME=1, else the palette
-    // home emitter). Returns 1 = present succeeded, crash-free.
+    // SH152: real-content task frame. Draw a home surface live ctx and swap via the SAME
+    // real ctx-vt[+24] - a genuine present. Emitters run as their OWN top-level jit_run
+    // (desync-safe) using the CACHED textured program + pre-uploaded texture (no nested
+    // guest-bridge GLSL compile, the SH151 SIGABRT class). Selector: RENDEREMITTER_HOME=1 =>
+    // real-artwork multi-emitter, else the palette home emitter. Returns 1 = present.
     if std::env::var_os("RENDER_TASKFRAME_HOME").is_some() {
         let real_home = std::env::var_os("RENDEREMITTER_HOME").is_some();
         let r = if real_home {
@@ -6161,13 +6153,11 @@ fn main() {
         .expect("no executable segment");
     let base = seg.guest_vaddr; // == host addr of image[0] (guest==host)
 
-    // Use the FULL mapped span (every PT_LOAD + inter-segment gaps, which
-    // load_elf_image lays into ONE contiguous anonymous region fixed
-    // base) as the valid-pc extent. The guest may legitimately branch/call
-    // into higher sections (data-backed trampolines, .bss-slotted function
-    // pointers) that live past the r-x slice; bounding `run_loop` to only the
-    // text slice wrongly flags those as "outside image". Compute the extent as
-    // the largest guest_vaddr+memsz across segments (the whole mmap is zero-
+    // Use the FULL mapped span (every PT_LOAD + gaps, laid in ONE contiguous anon
+    // region) as the valid-pc extent — the guest can branch/call into higher sections
+    // (data-backed trampolines, .bss-slotted fn ptrs) past the r-x slice; bounding run_loop
+    // to only the text slice wrongly flags those as "outside image". Extent = largest
+    // guest_vaddr+memsz across segments (the whole mmap is zero-
     // filled), relative to this text-segment base.
     let full_end = el
         .segments
@@ -6204,13 +6194,10 @@ fn main() {
         Err(e) => eprintln!("[lsm-map] warn: allocator route skipped: {e}"),
     }
 
-    // Disable the LSM map's lazy-init store that would clobber our seed. The init at
-    // 0x1d975f8 writes its routed allocator result into global 0x726f8c0, memsets +
-    // builds a two-level bucket structure into that discarded buffer. The reader
-    // (0x1d99e40) instead requires the global to point at a bucket array whose every
-    // (key>>29) slot points to a zeroed sub-array ((key>>16)&0x1fff); a bare calloc
-    // leaves slots NULL and the reader derefs NULL. `seed_static_empty_map` builds
-    // that layout, so NOP the init store to keep the seed authoritative.
+    // Disable the LSM map's lazy-init store (0x1d975f8 writes into routed buffer global
+    // 0x726f8c0); reader 0x1d99e40 needs that global to point at a (key>>29) slot array of
+    // (key>>16)&0x1fff sub-arrays — `seed_static_empty_map` builds it, so NOP init store to
+    // keep the seed authoritative.
     // Guest -> NOP (0xd503201f).
     let init_store = el.guest_of(0x1d975f8);
     {
@@ -6987,13 +6974,11 @@ fn main() {
                         // controller; the match path then reads the appbridge obj's
                         // +0x20 field [0x106a68818]. Report both.
                         let once_ok = (0x100000000..0x107333c3c).contains(&once_slot);
-                        // SH156: the real GlobalInit dispatch ctor 0x102207b50 (the
-                        // match's `br` target once DM-root is live) runs its OWN
-                        // __call_once latched on once-guard [0x6a64d70] (`ldarb
-                        // w8,[0x6a64d70]` at 0x2207b68, self-set via stlrb) and reads a
-                        // flags byte [0x7285fb0]. Reading both post-rung tells whether
-                        // the ctor chain ENGAGED (guard self-set 0->1) without JIT_TRACE.
-                        // Guarded so an unmapped page can never crash the probe.
+                        // SH156: the real GlobalInit dispatch ctor 0x102207b50 (the match's br target once
+                        // DM-root live) runs its OWN __call_once latched on once-guard [0x6a64d70]
+                        // (`ldarb w8,[0x6a64d70]` @0x2207b68, self-set via stlrb) and reads a flags
+                        // byte [0x7285fb0]. Reading both post-rung shows whether the ctor chain ENGAGED
+                        // (guard self-set 0->1) without JIT_TRACE. Guarded so unmapped pages can't crash.
                         let _ctor_guard = if guest_page_mapped(0x106a64d70u64) {
                             Some(unsafe { *(0x106a64d70u64 as *const u8) })
                         } else {
@@ -7229,13 +7214,11 @@ fn main() {
                     eprintln!("[elfjit:v2boot] InitClientSettingsSigned post: MH_FLAGS_LOADED={nfv} MH_APP_READY={arv}");
                     dump("InitClientSettingsSigned");
                 }
-                // SEP-17 SESSION-CTOR engine-settings receive: SH275 fed the CLIENT-settings input
-                // that initEngine_ consumes, but the OTHER named primitive - engine-settings
-                // RECEIVE nativeActivity_onEngineSettingsReceived (0x2bd1c38) - was never
-                // driven. Body: reads version [0x10683d8f8], mutex_lock [this+0x14] 2b53a68,
-                // ldrb [x19,#649]; LATCH [this+648]; if [this+649]!=0 state->3, unlock+
-                // ret. Opt-in --v2boot-session-engine. Consumer state-transition on fabricated
-                // `this`, NOT a DM ctor.
+                // SEP-17 SESSION-CTOR engine-settings receive: initEngine_ consumed CLIENT
+                // settings (SH275) but engine-settings RECEIVE nativeActivity_onEngineSettingsReceived
+                // (0x2bd1c38) was never driven. Body: read version [0x10683d8f8], mutex_lock
+                // [this+0x14] 2b53a68, ldrb [x19,#649]; LATCH [this+648]; state->3, unlock+ret.
+                // Opt-in --v2boot-session-engine. State-transition on fabricated `this`.
                 if std::env::args().any(|a| a == "--v2boot-session-engine") {
                     // version word THIS method reads ([adrp 683d000 + #2296] =
                 // [0x10683d8f8]). Seed 6 (low byte==6, 0xfc00 clear) for the
@@ -7974,23 +7957,19 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
         } else {
             s2.x[2] = params;
         }
-        // Concurrent guest-thread state sampler (JIT_THREADS=1). StartApp's
-        // `jit_run` parks the main thread forever (the engine main-loop
-        // lifecycle-await), post-run sampler would never run. Instead
-        // spawn a detached host sampler that polls `snapshot_threads()`
-        // every ~200 ms for a bounded window, dumping each parked thread's
-        // hostcall slot (pc), guest call-site (x30/lr) and wait-object args
-        // (x0..x2). This pins the boot wall to the exact guest function that
+        // Concurrent guest-thread state sampler (JIT_THREADS=1): StartApp's jit_run parks main
+        // forever (engine lifecycle-await), so post-run sampler never runs. Instead spawn a
+        // detached host sampler polling `snapshot_threads()` every ~200ms for a bounded window,
+        // dumping each parked thread's hostcall slot (pc), guest call-site (x30), wait-object
+        // args (x0..x2) — pins the boot wall to the exact guest fn that
         // blocks and what it awaits. Runs concurrently with the jit_run.
         if std::env::var_os("JIT_THREADS").is_some() {
             std::thread::spawn(|| {
-                // SH196 (JIT_DMCELLS=1): in-run observable for the GlobalInit do-init
-                // __call_once completion. StartLuaAppDM's jit_run never returns (parks in
-                // the NS-poll), post-rung probe never fires. When the once-lambda
-                // runs it self-latches once-guard[0x106a68410].bit0 and stores an interned
-                // result into once-slot[0x106a68408] (str x0,[x23,#1032] @0x2206d74) - a
-                // status/hash (0x400000b), NOT a live DM. Polled once per sampler tick;
-                // page-guarded so an unmapped boot never crashes.
+                // SH196 (JIT_DMCELLS=1): in-run observable for do-init __call_once completion. The
+                // StartLuaAppDM jit_run never returns (parks in NS-poll), so post-rung probe never
+                // fires; once-lambda self-latches once-guard [0x106a68410].bit0 + stores interned
+                // result into once-slot [0x106a68408] (str x0,[x23,#1032] @0x2206d74) = a status/hash
+                // (0x400000b), NOT a live DM. Polled per sampler tick; page-guarded (no crash post-boot).
                 let dmcells = std::env::var_os("JIT_DMCELLS").is_some();
                 let rd8 = |a: u64| -> u64 { if guest_page_mapped(a) { unsafe { *(a as *const u64) } } else { u64::MAX } };
                 let rd1 = |a: u64| -> u64 { if guest_page_mapped(a) { (unsafe { *(a as *const u8) }) as u64 } else { u64::MAX } };
@@ -8263,13 +8242,11 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                 .and_then(|i| args.get(i + 1).cloned())
         } {
             let period_ms: u64 = hex.trim().parse().expect("--futex-kick needs integer period-ms");
-            // Optional --futex-set <hex>: write a SPECIFIC latch value each tick
-            // (the awaited token) the free-running old+1. This tests
-            // whether the idle barrier fixed "go" token (0xF4240) that the
-            // producer must write verbatim, vs a pure version-counter (wait-until-
-            // changed) where any new value works. `old.wrapping_add(1)` cannot
-            // distinguish: if the waiter re-arms to a constant each cycle, a fixed
-            // write correct producer signal and a version increment is a
+            // Optional --futex-set <hex>: write a SPECIFIC latch value each tick (the awaited
+            // token) vs free-running old+1. Tests whether the idle barrier's fixed "go" token
+            // (0xF4240) must be written verbatim by the producer, vs a pure version-counter
+            // (wait-until-changed) where any new value works. `old+1` can't distinguish: if the
+            // waiter re-arms to a constant each cycle, a fixed
             // stray number the loop ignores.
             let set_val: Option<i32> = {
                 let args: Vec<String> = std::env::args().collect();
@@ -8279,11 +8256,10 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                     .map(|v| i32::from_str_radix(v.trim_start_matches("0x"), 16).expect("--futex-set needs hex i32"))
             };
             const IDLE_FUTEX_CALLSITE: u64 = 0x10284d134; // guest lr when parked in the idle barrier
-            // --futex-bump: the engine idle barrier waits on a VERSIONED object;
-            // the parked consumer gates on `ldar x8,[Q]; cmp x21, x8 lsr#32`
-            // (0x2856ef4/efc), Q=t.x19, [Q+4](==t.x1)=futex latch. It only proceeds
-            // when [Q] high-32 CHANGES - a bare latch poke is not a producer.
-            // --futex-bump increments [Q] high-32 proceed-gate opens.
+            // --futex-bump: idle barrier waits on a VERSIONED object; parked consumer gates on
+            // `ldar x8,[Q]; cmp x21, x8 lsr#32` (0x2856ef4/efc), Q=t.x19, [Q+4](=t.x1)=futex
+            // latch. Proceeds only when [Q] high-32 CHANGES - a bare latch poke isn't a producer.
+            // --futex-bump increments [Q] high-32 to open the proceed-gate.
             let bump = {
                 let args: Vec<String> = std::env::args().collect();
                 args.iter().any(|a| a == "--futex-bump")
@@ -8352,12 +8328,12 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                 }
             });
         }
-        // Host-side task-deque PRODUCER (--deque-node <vtable-hex>): SH5 parked threads are CONSUMERS of
-        // a per-CPU lock-free task-deque (0x285682c/0x2856e40) parked in the epoch futex wait
-        // 0x10284d018 because the head ([0x10682a638]/0x10682b338) is the self-referential SENTINEL.
-        // CAS a fresh NODE head linking to the old sentinel, set [node+112]=<vtable> so drain
-        // ([node+112]&~0x3f -> [vt+40]) reaches a real handler, then bump [Q']>>32 + FUTEX_WAKE Q'+4.
-        // Zeroed node trips drain at [vt+40]; sentinel vtable 0x106829f00 -> handler 0x10285371c.
+        // Host-side task-deque PRODUCER (--deque-node <vtable-hex>): SH5 parked threads are
+        // CONSUMERS of a per-CPU lock-free task-deque (0x285682c/0x2856e40) parked in the epoch
+        // futex wait 0x10284d018 because the head ([0x10682a638]/0x10682b338) is the self-ref
+        // SENTINEL. CAS a fresh NODE head linking to the old sentinel, set [node+112]=<vtable> so
+        // drain ([node+112]&~0x3f -> [vt+40]) reaches a real handler, then bump [Q']>>32 +
+        // FUTEX_WAKE Q'+4. Zeroed node trips drain at [vt+40]; sentinel vt 0x106829f00 -> 0x10285371c.
         if let Some(vt) = {
             let args: Vec<String> = std::env::args().collect();
             args.iter()
@@ -9237,13 +9213,11 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
             // the real 0x48-byte guest ctx (callers 0x5b2b214/0x5b2ea90 `bl 0x105b3a280; ldr x8,[x0];
             // ldr x8,[x8,#16]; blr x8`). Correct drive: thunk(x0=win=XID, x1=parent=0).
             let render_thunk = renderframe_args.iter().any(|a| a == "--renderthunk");
-            // SH112 (recon deleg_9935787c): the renderinit thread must NOT reuse the boot
-            // ANativeWindow XID - the boot/ladder path already created an EGL surface on it,
-            // second eglCreateWindowSurface returns EGL_BAD_SURFACE (0x300b) ->
-            // `std::runtime_error: Error creating context: eglCreateWindowSurface` ->
-            // whole-process abort EXIT 139, killing the combined ladder. Give the renderinit
-            // thread a FRESH, never-surfaced X11 window XID (framebuffer-sized) so Mesa x11
-            // EGL can build a real window surface there.
+            // SH112: renderinit thread must NOT reuse the boot ANativeWindow XID — the boot/ladder
+            // path already made an EGL surface on it; a second eglCreateWindowSurface returns
+            // EGL_BAD_SURFACE (0x300b) -> runtime_error "Error creating context: eglCreateWindowSurface"
+            // -> process abort EXIT 139, killing the combined ladder. Give renderinit a FRESH,
+            // never-surfaced X11 window XID (framebuffer-sized) so Mesa x11 EGL builds a real surface.
             let fresh_xid = || -> u64 {
                 let display = std::env::var("DISPLAY").unwrap_or_default();
                 if display.is_empty() {
@@ -9454,13 +9428,11 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                         "[elfjit:renderscene] drained: {presented} real engine-scene-renderer frames presented (engine-built frame-desc) on the currency-owning thread"
                     );
                 }
-                // --renderwalker (opt-in, needs --renderinit/+renderthunk for real_ctx and
-                // --renderscene to lay the scene-list R): drive the engine's REAL per-node
-                // PRESENT walker (mid-loop 0x105b2eec0) so each 0x28-stride scene node DRAWS
-                // through its render-obj vt[+24] via a REGISTERED HOST THUNK
-                // (walker_item_draw_thunk, host_call_at) - ZERO block-cache mutation, so the
-                // SH64 nested-jit_run desync SIGSEGV is closed. Walker swaps via real ctx-vt[+24].
-                // Bounded window run exits 124 cleanly.
+                // --renderwalker (opt-in, needs --renderinit/+renderthunk real_ctx + --renderscene to lay R):
+                // drive the engine's REAL per-node PRESENT walker (mid-loop 0x105b2eec0) so each
+                // 0x28-stride scene node DRAWS through its render-obj vt[+24] via a REGISTERED HOST
+                // THUNK (walker_item_draw_thunk) - ZERO block-cache mutation closes the SH64
+                // nested-jit_run desync SIGSEGV. Walker swaps via real ctx-vt[+24]. Bounded run = 124.
                 if renderframe_args.iter().any(|a| a == "--renderwalker") {
                     let t0 = std::time::Instant::now();
                     let max_window = std::time::Duration::from_millis(
@@ -9470,24 +9442,22 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                         .ok().and_then(|v| v.parse().ok()).unwrap_or(3);
                     let walker_nodes: u64 = std::env::var("RENDERWALKER_NODES")
                         .ok().and_then(|v| v.parse().ok()).unwrap_or(3);
-                    // --renderemitter (SH66): additionally drive the engine's REAL
-                    // geometry emitter 0x105b35288 with a fabricated geometry ctx G
-                    // so an authored quad draws ENGINE's own GL stack
-                    // (primitive-setup -> glDrawArrays @plt -> real Mesa), pixel-
-                    // verified. Desync-safe: the emitter is its OWN top-level
-                    // jit_run (not nested in the walker block).
+                    // --renderemitter (SH66): also drive the engine's REAL geometry emitter
+                    // 0x105b35288 with a fabricated geometry ctx G so an authored quad draws the
+                    // ENGINE's own GL stack (primitive-setup -> glDrawArrays @plt -> real Mesa),
+                    // pixel-verified. Desync-safe: emitter = own top-level jit_run.
                     let emit: bool = renderframe_args.iter().any(|a| a == "--renderemitter");
                     let mut presented: u64 = 0;
                     while presented < max_frames && t0.elapsed() < max_window {
                         let ret =
                             render_engine_present_walker(real_ctx, presented, walker_nodes, iimg, ibase, tpidr, isp);
                         if emit {
-                            // The emitter draws onto live ctx; drive it AFTER this frame's walker
-                            // so its swap shows the engine-emitted quad (the walker's swap precedes).
-                            // RENDEREMITTER_QUADS=N (SH67d): draw a POPULATED N-quad 2D frame in ONE
-                            // engine-emitter jit_run (single pre-uploaded VBO, GL_TRIANGLES) - closes
-                            // the SH67c per-drive glBufferData orphan blocker, proves a populated
-                            // multi-element engine-emitted frame headlessly. Default (unset) = SH67b.
+                            // Emitter draws onto live ctx; drive it AFTER this frame's walker so its swap
+                            // shows the engine-emitted quad (walker's swap precedes).
+                            // RENDEREMITTER_QUADS=N (SH67d): POPULATED N-quad frame in ONE engine-emitter
+                            // jit_run (pre-uploaded VBO, GL_TRIANGLES) - closes SH67c glBufferData orphan
+                            // blocker, proves populated multi-element engine-emitted frames headlessly.
+                            // Default (unset) = SH67b.
                             let nq: usize = std::env::var("RENDEREMITTER_QUADS")
                                 .ok().and_then(|v| v.parse().ok()).unwrap_or(0);
                             // RENDEREMITTER_TEX=1 (SH67e): 3rd per-vertex texcoord attrib (aTex loc2)
@@ -9528,21 +9498,19 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                 }
             }
             let _ = &real_ctx;
-            // --renderframe (opt-in, with --renderinit): after real render-init ran, present the
-            // engine's LIVE EGL context. Reverse (SH17): render-init inner 0x105b3a2d8 wrote
-            // live EGL handles into `scratch` ([+32]=display,[+40]=surface,[+48]=context).
-            // Swap fn 0x105b3b408 tail `ldp x8,x1,[x0,#32]; mov x0,x8; b eglSwapBuffers` =
-            // eglSwapBuffers([x0+32],[x0+40]); x0=scratch makes the engine's own swap present
-            // the current surface headlessly (llvmpipe+Xvfb) WITHOUT re-running init.
-            // The thread keeps the EGL context current.
+            // --renderframe (opt-in, +--renderinit): after real render-init, present the engine's
+            // LIVE EGL ctx. Reverse (SH17): init inner 0x105b3a2d8 wrote live handles into
+            // `scratch` ([+32]=display,[+40]=surface,[+48]=context). Swap fn 0x105b3b408 tail
+            // `ldp x8,x1,[x0,#32]; mov x0,x8; b eglSwapBuffers` = eglSwapBuffers([x0+32],[x0+40]);
+            // x0=scratch makes the engine's own swap present headlessly (llvmpipe+Xvfb) without
+            // re-running init (thread keeps ctx current).
             if renderframe_args.iter().any(|a| a == "--renderframe") {
                 // --renderbind (opt-in): drive the engine's OWN make-current
                 // method (ctx vtable [vt+16] = 0x105b3b358) before presenting, the exact
                 // code engine frame-render callers dispatch (0x5b2b214 -> [vt+16] -> blr)
-                // to (re)bind GL before swap/draw: reads eglGetCurrentContext, and when
-                // not == [ctx+48] calls eglMakeCurrent([+32]display,[+40]surface,
-                // [+40]surface,[+48]context). Proves the engine's own rebind executes on
-                // the recovered ctx (host thread keeps it current for the following swap).
+                // to (re)bind GL before swap/draw: reads eglGetCurrentContext, when not ==
+                // [ctx+48] calls eglMakeCurrent([+32]display,[+40]surface,[+40]surface,[+48]ctx) —
+                // proves the engine's own rebind runs on the recovered ctx.
                 if renderframe_args.iter().any(|a| a == "--renderbind") {
                     let mut sb = arm64jit::jit::CpuState::new();
                     sb.tpidr = tpidr;
@@ -9578,21 +9546,17 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                     Err(e) => eprintln!("[elfjit:renderframe] swap stopped: {e}"),
                     Ok(ok) => eprintln!("[elfjit:renderframe] swap returned Ok({ok:#x}) (eglSwapBuffers)"),
                 }
-                // --renderframe-drive: probe how FAR the engine's OWN frame-render fn
-                // 0x105b32c00 gets real ctx with a fabricated renderer/view. From SH18:
-                // frame sets [renderer+16]=1, bl 0x5b2e98c, glBindFramebuffer(0x8d40,[view+140])
-                // glGetError, glViewport(0,0,[view+128],[view+132]); fabricate renderer(+16,
-                // +24->objA,+40->objB), objA(+552=1,+368=view), objB(+140=0,+124=1), view
-                // (+128=1280,+132=720,+140=0). Alloc 8K so deep writes stay in-bounds
-                // (else "free(): invalid next size" at shutdown).
+                // --renderframe-drive: probe how FAR the engine's OWN frame-render fn 0x105b32c00 gets
+                // with real ctx + fabricated renderer/view. SH18: frame sets [renderer+16]=1, bl
+                // 0x5b2e98c, glBindFramebuffer(0x8d40,[view+140]), glGetError,
+                // glViewport(0,0,[view+128],[view+132]); renderer(+16,+24->objA,+40->objB), objA
+                // (+552=1,+368=view), objB(+140=0,+124=1), view(+128=1280,+132=720,+140=0).
+                // Alloc 8K (else free(): invalid next size at shutdown).
                 if renderframe_args.iter().any(|a| a == "--renderframe-drive") {
-                    // Guest-visible scratch for the objects (guest==host, low48).
-                    // The engine writes deep into these (objA[+552/608],
-                    // renderer[+224/232/236/238], view[+124..140]) - MUST be large
-                    // enough that every fabricated struct (renderer/base, objA +0x100,
-                    // objB +0x200, view +0x300, plus engine writes past those) stays
-                    // inside the allocation, else the drive heap-corrupts at shutdown
-                    // ("free(): invalid next size").
+                    // Guest-visible scratch (guest==host, low48): engine writes deep (objA[+552/608],
+                    // renderer[+224..238], view[+124..140]) — must be large enough that every
+                    // fabricated struct (renderer/base, objA +0x100, objB +0x200, view +0x300 + engine
+                    // writes past) stays in-bounds, else shutdown heap-corrupts ("free(): invalid next size").
                     let objs = Box::leak(vec![0u8; 8192].into_boxed_slice());
                     let base = objs.as_ptr() as u64;
                     // view: +128=w(1280) +132=h(720) +140=default framebuffer(0)
@@ -9682,10 +9646,10 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                         );
                         // --renderframe-seedgles (opt-in): overwrite the 8 engine GLES dispatch slots (BSS
                         // 0x106d3b2f0..0x106d3b328) with host-thunk GLES bridge slots (resolve_gles_mixed)
-                        // so frame clear + geometry dispatch bridge. 16-slot table (stub 0x5b3a1c0+0xc*N);
-                        // 0-7 clear (slot0=glDrawBuffers, slot2=glClearBufferfv); 8-15 geometry (draw
-                        // wrapper 0x5b35288 -> slot9=glDrawElements @0x5b352f4, slot10=glDrawArrays
-                        // @0x5b35368, prim-setup 0x5b353d0). Seed EVERY slot.
+                        // so frame clear + geometry bridge. 16-slot table (stub 0x5b3a1c0+0xc*N): 0-7 clear
+                        // (slot0=glDrawBuffers, slot2=glClearBufferfv); 8-15 geometry (wrapper 0x5b35288 ->
+                        // slot9=glDrawElements @0x5b352f4, slot10=glDrawArrays @0x5b35368, prim-setup
+                        // 0x5b353d0). Seed every slot.
                         let seed_slots: [(usize, &str); 10] = [
                             (0, "glDrawBuffers"),
                             (1, "glClearBufferiv"),
@@ -9876,9 +9840,9 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                     "[elfjit:renderframe-drawprobe] geometry wrapper 0x5b35288 returned Ok({ok:#x})"
                                 ),
                             }
-                            // --renderframe-triangle: fabricate a COHERENT renderer - a real 1-prim
-                            // list/base tables, IBO, vertex/index buffers (uploaded via JIT bridge) + a real
-                            // compiled+linked shader: drive the engine's geometry wrapper 0x5b35288. Its
+                            // --renderframe-triangle: fabricate a COHERENT renderer - 1-prim list/base tables, IBO,
+                            // vertex/index buffers (via JIT bridge) + compiled+linked shader: drive the
+                            // engine's geometry wrapper 0x5b35288. Its
                             // primitive-setup 0x5b353d0 runs its REAL loop (bind ARRAY_BUFFER, enable
                             // attrib 0, glVertexAttribPointer) + dispatches REAL indexed glDrawElements
                             // via GLES slot 9 (count=3): a visible triangle.
@@ -10165,11 +10129,11 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                         "[elfjit:renderframe-triangle] linked program={program:#x} current"
                                     );
                                     // --renderframe-tex: create + upload a 2x2 RGBA checkerboard
-                                    // texture and assign it to the program's uTex sampler (unit 0),
-                                    // all GLES bridge (@plt). Every call here exercises the texture/uniform/shader bridge surface
-                                    // the engine's real textured draws will need. glTexImage2D has 9 args
-                                    // (pixels on guest stack), so drive it with a CpuState whose sp=tex_sp
-                                    // points at a slot holding the pixels pointer.
+                                    // texture and bind to program uTex sampler (unit 0), all via GLES
+                                    // bridge (@plt) — exercises the texture/uniform/shader bridge the
+                                    // engine's real textured draws need. glTexImage2D has 9 args (pixels
+                                    // on guest stack), so drive it with a CpuState whose sp=tex_sp points at
+                                    // a slot holding the pixels pointer.
                                     if tex_mode || comp_mode || mesh_tex.is_some() {
                                                                             const GL_TEXTURE0: u64 = 0x84c0;
                                                                             const GL_TEXTURE_2D: u64 = 0x0de1;
@@ -10444,9 +10408,8 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                     // REFERENCE DRAW (opt-in: SH25_REF=1): drive the
                                     // draw directly (not engine wrapper) with
                                     // our own glVertexAttribPointer, to cross-check the
-                                    // engine-path result. Now that the engine wrapper's
-                                    // primitive-setup renders the full triangle (format
-                                    // index fixed 5->3 = GL_FLOAT), the reference is
+                                    // engine-path result. Now that the engine wrapper's primitive-setup renders the full
+                                    // triangle (format index fixed 5->3 = GL_FLOAT), the reference is
                                     // redundant; default OFF (SH25_REF=1 re-enables).
                                     if std::env::var("SH25_REF").map(|v| v == "1").unwrap_or(false) {
                                     // With a VBO bound, the attrib pointer's 6th arg is a
@@ -11074,24 +11037,21 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                 ),
                             }
                         }
-// --renderframe-quad: scale the (now fully reversed) coherent renderer to a real
-            // TWO-ATTRIB textured QUAD - the shape of real Roblox geometry. primitive-setup
-            // 0x5b353d0 loops the primitive list, ONE attrib per primitive (slice 0x5b35420);
-            // two primitives -> two attribs: prim[0] vb=0 off=0 fmt[3]=aPos; prim[1] vb=0
-            // off=16 fmt[1]=aUV. VBO interleaved [pos.xyzw,uv.xy] stride 24. Fragment shader
-            // samples a 2x2 texture REAL interpolated UV (proving per-texel UV mapping).
-            // Readback: 4 quadrants = the 4 texel colors.
+// --renderframe-quad: scale the coherent renderer to a real TWO-ATTRIB textured
+            // QUAD (the shape of real Roblox geometry). primitive-setup 0x5b353d0 loops the
+            // primitive list, ONE attrib per primitive (slice 0x5b35420): prim[0] vb=0 off=0
+            // [3]=aPos; prim[1] vb=0 off=16 [1]=aUV. VBO interleaved [pos.xyzw,uv.xy] stride 24.
+            // Fragment shader samples a 2x2 texture @ REAL interpolated UV. Readback: 4 quadrants.
                         if renderframe_args.iter().any(|a| a == "--renderframe-quad") {
                             // --renderframe-etc2a: like the quad RGBA path but upload a REAL ETC2-RGBA8/EAC
                             // texture (0x9278) via glCompressedTexImage2D, mapping decoded alpha to
                             // fragment RGB; 4 quadrant readbacks read the 4 EAC block alphas as gray
                             // (255/190/128/64) - robust proof EAC alpha decodes live.
                             let etc2a_mode = renderframe_args.iter().any(|a| a == "--renderframe-etc2a");
-                            // --renderframe-astc: like --renderframe-etc2a but upload the texture
-                            // REAL ASTC 4x4 LDR void-extent texture (0x93B0 - the load-bearing
-                            // Android format desktop GL cannot native-decode, so our interception is
-                            // REQUIRED there). Same gray-scale alpha->RGB proof: the 4 blocks' EAC-free
-                            // ASTC void-extent alphas (255/190/128/64) render as 4 gray lobes.
+                            // --renderframe-astc: like etc2a but upload REAL ASTC 4x4 LDR void-extent texture (0x93B0,
+                            // the load-bearing Android format desktop GL can't native-decode, so our
+                            // interception is REQUIRED there). Same gray-scale alpha->RGB proof: the 4
+                            // blocks' EAC-free ASTC void-extent alphas (255/190/128/64) = 4 gray lobes.
                             let astc_mode = renderframe_args.iter().any(|a| a == "--renderframe-astc");
                             let comp_gray = etc2a_mode || astc_mode;
                             // --renderframe-quad-loop <N>: SUSTAINABLE textured-quad rendering -
@@ -11671,12 +11631,11 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
         }
     }
 
-    // SH175 follow-on (--cookie-ingress): drive the pure-native cookie worker
-    // 0x102203148 (native body under nativeSetMultipleCookies 0x102202ff8) as a
-    // STANDALONE top-level jit_run on main BEFORE StartApp, with JIT_ROUTEB_COOKIE=1 so
-    // routeb_cookie_jar_guard seeds jar [0x106ed7a20] + clears the two boot gates
-    // ([0x106dcfc30]/[0x1072739d4] bit0) - clearing the SH129/174 jar-CONSTRUCTION NULL fault
-    // at 0x220331c. ABI 6 args; w4(arg4)&1==1 REQUIRED (arg4=0 early-bails @0x2203b20). Jar
+    // SH175 follow-on (--cookie-ingress): drive pure-native cookie worker 0x102203148
+    // (under nativeSetMultipleCookies 0x102202ff8) as a STANDALONE top-level jit_run on main
+    // BEFORE StartApp, JIT_ROUTEB_COOKIE=1 seeds jar [0x106ed7a20] + clears boot gates
+    // ([0x106dcfc30]/[0x1072739d4] bit0) - closing the SH129/174 jar-CONSTRUCTION NULL fault at
+    // 0x220331c. ABI 6 args; w4(arg4)&1==1 REQUIRED (arg4=0 early-bails @0x2203b20). Jar
     // READ-ONLY here. Standalone = first/only top-level jit_run on main (SH55/64-safe).
     if std::env::args().any(|a| a == "--cookie-ingress") {
         const COOKIE_WORKER: u64 = 0x102203148;
@@ -15180,6 +15139,40 @@ mod sh115_tests {
             eprintln!("sh323 settings SSO fencepost (fn 0x21f5078 -> [0x106ed7a18]) pinned.");
         } else {
             eprintln!("sh323 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
+    fn sh324_startluaappdm_this40_sessionctor_drive_point() {
+        // SH324 (STATUS candidate #1): terminal 0x102256510 (3/3 runs) = real StartLuaAppDM continuation
+        // fn 0x23f00f8 (=+0x2cc, beyond SH156's range). Fn 0x2256510 = this->vt[+32]() with
+        // this=[container+40]=NULL (container = x1 of fn 0x23f00f8; both call sites read it). It
+        // consumes the x8 indirect-result out-param post-dispatch + does LocalStorage init — a
+        // fabricated-obj seed can't satisfy it (AArch64 leaf gets x0-x7 only) => REAL session ctor
+        // is the only cross (SEP-17). Proof-of-dead-end HERE.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            // fn 0x2256510 prologue + dispatch:
+            assert_eq!(word(0x1022_56510), 0xd10183ff, "sh324 fn 0x2256510 sub sp,#0x60");
+            assert_eq!(word(0x1022_56548), 0xf9400009, "sh324 ldr x9,[x0] (this->vt; faults when this==0)");
+            assert_eq!(word(0x1022_56550), 0xd63f0120, "sh324 blr vt[+32] (virtual dispatch)");
+            // call site 1: this=[x1+40]
+            assert_eq!(word(0x1023_f012c), 0xf9401429, "sh324 call1 ldr x9,[x1,#40] (=this)");
+            assert_eq!(word(0x1023_f013c), 0x97f998f5, "sh324 call1 bl 0x2256510");
+            // call site 2: this=[x21+40] (x21 = saved x1 container)
+            assert_eq!(word(0x1023_f01a0), 0xf94016a0, "sh324 call2 ldr x0,[x21,#40] (=this)");
+            assert_eq!(word(0x1023_f01b0), 0x97f998d8, "sh324 call2 bl 0x2256510");
+            // post-dispatch real work: consumes x8 out-param + LocalStorage init
+            assert_eq!(word(0x1022_56554), 0xf94007e0, "sh324 ldr x0,[sp,#8] (consumes x8 out-param)");
+            assert_eq!(word(0x1022_56608), 0x97ed1caa, "sh324 bl LocalStorageManager_initStorageManagerNative 0x1d9d8b0");
+            eprintln!("sh324 StartLuaAppDM this=[container+40] SESSION-CTOR drive point pinned.");
+        } else {
+            eprintln!("sh324 real-image guard: no real libroblox.so, skipping anchors");
         }
     }
 
