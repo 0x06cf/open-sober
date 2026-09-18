@@ -2184,8 +2184,16 @@ mod tests {
     /// stable non-null handle that getWidth/getHeight answer (GRAPHICS_-
     /// RECOMMENDATION §5.3). A NULL window with a size was internally
     /// inconsistent and guaranteed eglCreateWindowSurface would never be reached.
+    /// Serializes the two ANativeWindow tests that both write the process-global
+    /// `ANATIVE_WINDOW_XID` static. `cargo test` runs tests in parallel, so the
+    /// real-X11-window test setting the global to 0x2c00000d races with the
+    /// sentinel-stability test's second call and makes it read back the other
+    /// test's XID (same pattern as CONT_MGR_TEST_LOCK for the fixed-.bss cells).
+    static ANATIVE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn anativewindow_fromsurface_returns_stable_nonnull_handle_with_size() {
+        let _g = ANATIVE_TEST_LOCK.lock().unwrap();
         // Default (no real window wired): stable non-null sentinel with a size.
         set_anativewindow_xid(0);
         let win = anativewindow_fromsurface(0, 0, 0, 0, 0, 0, 0, 0);
@@ -2205,6 +2213,7 @@ mod tests {
     /// fallback so a headless run stays coherent.
     #[test]
     fn anativewindow_fromsurface_returns_registered_real_x11_window() {
+        let _g = ANATIVE_TEST_LOCK.lock().unwrap();
         set_anativewindow_xid(0x2c00000du64); // some real X11 Window XID
         let handle = anativewindow_fromsurface(0, 0, 0, 0, 0, 0, 0, 0);
         assert_eq!(handle, 0x2c00000du64, "guest receives the real X11 Window XID");
