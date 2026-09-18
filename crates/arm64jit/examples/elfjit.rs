@@ -12905,12 +12905,11 @@ mod sh115_tests {
     }
     #[test]
     fn sh248_allocator_enabler_family_pinned() {
-        // SH248 (Route-B allocator-enabler): DMCONT continuation, op_new (both variants),
-        // and StartLuaAppDM's own construction ALL funnel through allocator-activation byte
-        // [0x10727570c].bit0 + size-class free-list allocator. Headlessly <=0xa sizes work but
-        // 0x28/0x20 fail (bad_alloc); SH247 proved the descriptor path can't serve >0xa. Pins
-        // (guest=file+0x100000000): op_new A 0x1db1a38/0x1db1a68/0x1db1a6c (flag->[0x10727570c]),
-        // op_new B 0x1d96768, tail 0x1db1c60, free-list 0x623fe1c, SLADM flag-read 0x23ff31c.
+        // SH248 (Route-B allocator-enabler): DMCONT continuation + StartLuaAppDM construction
+        // all funnel through allocator-activation [0x10727570c].bit0 + size-class free-list; <=0xa
+        // sizes work, 0x28/0x20 fail (SH247 descriptor path can't serve >0xa). Pins (guest=file+
+        // 0x100000000): op_new A 0x1db1a38/0x1db1a68/0x1db1a6c, op_new B 0x1d96768, tail 0x1db1c60,
+        // free-list 0x623fe1c, SLADM flag-read 0x23ff31c.
         let sites: [(usize, u32); 7] = [
             (0x1db1a38, 0xd10243ff),
             (0x1db1a68, 0x9002a628),
@@ -15994,6 +15993,7 @@ mod sh115_tests {
             eprintln!("sh268 real-image guard: no real libroblox.so, skipping anchors");
         }
     }
+    // SH341 LSM pool-pop key-attribution pin lives in the arm64jit LIB suite (elfjit 1MiB hook; pop bytes pinned by sh267/268).
 
     #[test]
     fn sh260_lsm_insert_wall_anchored() {

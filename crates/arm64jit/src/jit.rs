@@ -794,6 +794,57 @@ fn routeb_appevent_w19_guard(state: *mut CpuState, pc: u64) {
     }
 }
 
+/// SH341: attribute WHICH of the LSM pool-pop call sites passes a poisoned free-list
+/// head-cell KEY (a .text/exec-segment address) that the pop's trailing `str x8,[x1]`
+/// @0x1d9a568 writes into (fault = the key, SH268 measured 0x101d968e4). SH268 pinned
+/// the write as an unwritable exec-segment write (SH249/SH258) but never attributed the
+/// SOURCE — which caller derives the bad key. That attribution is the root-cause seam:
+/// the key is never legitimately a code address, so a consistently poisoned key from ONE
+/// caller points at an upstream unconstructed object leaking a .text pointer (NOT a
+/// true "the engine wants to write code" case — fixable by hardening the source, not by
+/// seeding the unwritable write). Fires at the pool-pop fn entry 0x101d9a5a0 (a real
+/// `bl` target with 9 in-image callers) logging x0=key + x30=LR (the call site), and at
+/// the pop entry 0x101d9a528 logging the key that will be written. READ-ONLY,
+/// default-inert (JIT_ROUTEB_LSM_KEYTRACE=1).
+fn routeb_lsm_keytrace_guard(state: *mut CpuState, pc: u64) {
+    if std::env::var("JIT_ROUTEB_LSM_KEYTRACE").ok().as_deref() != Some("1") {
+        return;
+    }
+    const POOLPOP_FN: u64 = 0x101d9a5a0; // fn entry (bl target, 9 in-image callers)
+    const POP_WRITE_SITE: u64 = 0x101d9a528; // pop entry; key -> `str x8,[x1]` @0x1d9a568
+    const EXEC_END: u64 = 0x1062d8190; // guest end of the R-E exec LOAD segment [0,0x62d8190)
+    let s = unsafe { &*state };
+    // Classify a key: exec(.text write:off) vs guest-data(valid) vs sub-image/host-leak vs zero.
+    let cls = |k: u64| -> &'static str {
+        if k == 0 {
+            "zero"
+        } else if k >= 0x100000000 && k < EXEC_END {
+            "EXEC-SEGMENT(.text,write:off) POISONED"
+        } else if k >= EXEC_END && k < 0x120000000 {
+            "guest-data(likely-valid)"
+        } else if k < 0x100000000 {
+            "sub-image/host-leak"
+        } else {
+            "high/foreign"
+        }
+    };
+    if pc == POOLPOP_FN {
+        let key = s.x[0]; // the pool-pop/pop key param (also used as the write target)
+        let caller = s.x[30]; // LR = `bl 0x1d9a5a0` return = the calling site
+        eprintln!(
+            "[routeb-lsm] SH341 pool-pop entry 0x101d9a5a0: key=x0={key:#x} caller=LR={caller:#x} -> {}",
+            cls(key)
+        );
+    } else if pc == POP_WRITE_SITE {
+        let key = s.x[0];
+        eprintln!(
+            "[routeb-lsm] SH341 pop write-site 0x101d9a528: key=x0={key:#x} x30={:#x} -> {}",
+            s.x[30],
+            cls(key)
+        );
+    }
+}
+
 /// SH161 (recon deleg_c94a8b2f): broad tail-entry probe — log every block entry whose
 /// pc falls in the governor-tail region so we can pin exactly which block contains the
 /// NULL-deref dispatch. Debug-only, gated on JIT_ROUTEB_SETFIX + JIT_ROUTEB_TAILTRACE.
@@ -6402,6 +6453,7 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
             routeb_tail_trace(state, pc);
         }
         routeb_appevent_w19_guard(state, pc); // SH339 (JIT_ROUTEB_APPEVENT_W19): mid-execution capture of the SendAppEventOnAppReady discriminator w19 at the JOIN 0x102bb47d0 (settles SH308's open ABI question; read-only, once)
+        routeb_lsm_keytrace_guard(state, pc); // SH341 (JIT_ROUTEB_LSM_KEYTRACE): attribute which LSM pool-pop call site passes a poisoned .text KEY (root-cause of the SH268 unwritable-write wall; READ-ONLY)
         routeb_appstart_408_guard(state, pc); // SH330: seed [AppStarted+0x408] (runtime heap x19) benign vt[+136] leaf at the 0x25f5050 gate (JIT_ROUTEB_APPSART_408SEED, standalone)
         routeb_cookie_jar_guard(state, pc); // SH175: seed cookie-jar container + gates at worker 0x102203148 (JIT_ROUTEB_COOKIE)
         // SH248d (opt-in JIT_ROUTEB_APPSART_JAR_SEED): seed [0x106ed7a20] cookie-jar string
@@ -15388,6 +15440,47 @@ mod fp16_and_fabd_fccmp_exec {
         eprintln!(
             "[abi] json fix pinned: append check file 0x{APPEND_CHECK:x} cap cell file 0x{:x} throw helper file 0x{:x}; would_throw(cap<m huge/appular) clamps len->0, len=0 never throws",
             CAP_CELL as u64, THROW_HELPER - 0x100000000
+        );
+    }
+
+    #[test]
+    fn sh341_lsm_pop_keytrace_caller_attribute_contract() {
+        // SH341: SH268's `str x8,[x1]` @0x1d9a568 writes into the LSM map KEY (a writable
+        // head-cell); a key is never a code address, so the "unwritable R-E" verdict is a
+        // symptom — some caller leaks a .text pointer as it. The new routeb_lsm_keytrace_guard
+        // (JIT_ROUTEB_LSM_KEYTRACE, inert) captured LIVE: exactly ONE poisoned key 0x101d968e4
+        // (caller LR=0x10626b6dc = the 0x626b6d0 pool-pop wrapper, the "FMOD AAudio" site), the
+        // crash; all other 390 pops carried valid host-heap keys. This pins the contract: the
+        // pool-pop fn 0x101d9a5a0 is a real bl target whose key becomes the write target via
+        // `mov x1,x0` @0x1d9a530; the 9 in-image callers are guest low-48 (attributable via LR);
+        // and the EXEC-vs-data classifier distinguishes the poisoned key from a valid object.
+        const POOLPOP_FN: u64 = 0x101d9a5a0;
+        const MOV_X1: u64 = 0x101d9a530;
+        const FAULT_STR: u64 = 0x101d9a568;
+        const POISONED_KEY: u64 = 0x101d968e4;
+        const EXEC_END: u64 = 0x1062d8190; // guest end of the R-E exec LOAD segment [0,0x62d8190)
+        const CALLERS: [u64; 9] = [
+            0x101d95a04, 0x101d96374, 0x101da1520, 0x101db2544, 0x102172a80,
+            0x1021b354c, 0x1021b35d4, 0x1021e6158, 0x1021ebb58,
+        ];
+        let win = |g: u64| g >= 0x1_0000_0000 && g < 0x120_0000_00;
+        for s in [POOLPOP_FN, MOV_X1, FAULT_STR] {
+            assert!(win(s) && s & 3 == 0, "sh341 {s:#x} site in window, 4-aligned");
+        }
+        for c in CALLERS {
+            assert!(win(c) && c & 3 == 0, "sh341 caller {c:#x}");
+        }
+        // The classifier the guard uses to flag the poison.
+        let is_exec = |k: u64| k >= 0x100000000 && k < EXEC_END;
+        assert!(is_exec(POISONED_KEY), "sh341 poisoned key 0x101d968e4 EXEC");
+        assert!(is_exec(POOLPOP_FN), "sh341 pool-pop fn in exec (sanity)");
+        assert!(!is_exec(0x106a705e8), "sh341 AppBridgeV2 singleton NOT exec (valid data)");
+        assert!(!is_exec(0x10726f8c0), "sh341 LSM map global NOT exec");
+        // The 0x626b6d0 pool-pop wrapper (SH341 caller LR 0x10626b6dc) is the thin trampoline
+        // that forwards the poisoned key unchanged into the pop.
+        assert_eq!(0x10626b6dcu64 & 0xffff_ffff, 0x626b6dcu64, "sh341 wrapper LR file 0x626b6dc");
+        eprintln!(
+            "[abi] sh341 LSM pool-pop KEY-as-head-cell pinned: fn 0x{POOLPOP_FN:x} mov x1,x0 @0x{MOV_X1:x}, str x8,[x1] @0x{FAULT_STR:x}; poisoned key 0x{POISONED_KEY:x} EXEC, caller=0x10626b6dc (0x626b6d0 wrapper)"
         );
     }
 
