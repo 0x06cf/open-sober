@@ -2601,18 +2601,11 @@ fn routeb_patch_v2_dispatch() {
         return;
     }
     let obj = routeb_singleton_obj_addr();
-    // Each site is a uniform objB-vtable accessor body: `bl 0x6249eb8` (objB
-    // singleton getter) -> `ldr x8,[x0]` (objB vtable) -> setup args ->
-    // `ldr x8,[x8,#N]` (slot PAST the harness-seeded 0x60 vtable, into host-alloc
-    // bytes) -> `blr x8` (outside image). The patch window is from the `ldr
-    // x8,[x0]` guard to the `blr` INCLUSIVE (kills the dispatch); the trailing
-    // `ldr x8,[x19]; str x0,[x8]` store (or `strb w0,[x8]`) is preserved and
-    // receives the materialized stable object. Window length per site is
-    // (blr-start)/4 + 1 slots: 4 movz/movk load x0 = obj, rest are nops.
-    //   site 1 fn 0x6251e0c slot +0x118 (V2Init/V2Start params accessor)
-    //   site 2 fn 0x62523ac slot +0x130 (V2Init-appendix helper)
-    //   site 3 fn 0x6258e88 slot +0x2f0 (V2Init-appendix helper)
-    //   site 4 fn 0x6258ffc slot +0x2f8 (V2Init-appendix helper)
+    // Each site is a uniform objB-vtable accessor body (`bl 0x6249eb8` getter ->
+    // ldr vtable -> ldr slotted fn -> `blr x8`). Patch window = guard-ldr..blr
+    // INCLUSIVE (kills dispatch); trailing store receives the stable object.
+    // sites: 1 fn 0x6251e0c +0x118, 2 fn 0x62523ac +0x130, 3 fn 0x6258e88 +0x2f0,
+    //        4 fn 0x6258ffc +0x2f8 (all V2Init/V2Start params accessors).
     let sites: [(u64, u64); 4] = [
         (0x106251e94u64, 0x106251eb4u64),
         (0x106252434u64, 0x106252454u64),
@@ -2653,13 +2646,11 @@ fn routeb_patch_v2_dispatch() {
     ROUTEB_V2_DISPATCH_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 /// Drive the engine's REAL per-node PRESENT walker so a populated 0x28-stride
-/// scene node DRAWS (closing SH63's "present side" gap). Entry `0x105b2eec0`
-/// (x19=R preset via CpuState; SH64 proved it runs the engine's real loop and blr's
-/// per-item draw but crashed on iteration 2 via the nested-jit_run desync). SH64
-/// fix: each node's render-obj vt[+24] is a REGISTERED HOST THUNK
-/// (walker_item_draw_thunk) via `host_call_at` with NO block-cache mutation — no
-/// desync; also patch the parked nativeGameGlobalInit bl + teardown tail to ret.
-/// ABI (0x5b2eec0): x19=R; ldp x20,x22,[R+0x180]=head/tail; per node x0=[node+8]
+/// scene node DRAWS (closing SH63's present-side gap). Entry `0x105b2eec0`
+/// (x19=R preset; SH64 ran the real loop but crashed iter-2 via nested-jit_run
+/// desync). SH64 fix: each node's render-obj vt[+24] = REGISTERED HOST THUNK
+/// (walker_item_draw_thunk) via host_call_at, no block-cache mutation. ABI
+/// (0x5b2eec0): x19=R; ldp x20,x22,[R+0x180]=head/tail; per node x0=[node+8]
 /// (render-obj); x8=[x0]->vt[+24]; blr draw; after last x0=[R+0x160]=ctx;
 /// ctx-vt[+24]=swap; blr swap. MUST run on the currency-owning renderinit thread
 /// (EGL current). Returns the walker's final x0 = real swap result (1 = genuine).
@@ -6349,16 +6340,12 @@ fn main() {
         for s in slots {
             *s = sub;
         }
-        // SH267 (default-inert, opt-in JIT_ROUTEB_APPSART_LSM_NODES=1): the LSM
-        // INSERT leaf (fn 0x1db1cc8, atomic-OR claim bl 0x2b9ea40 @0x1db1d44) reads
-        // slot `x1 = sub[idx]` and does `ldset x0,x0,[x1]` (OR bit1) into *x1. With the
-        // empty-map (all sub slots = 0) that is an atomic op on addr 0 -> SIGSEGV
-        // fault=0x0 at 0x101db1d04 (SH260 parked as persistence-detour live-object; SEP-17
-        // relabel makes SESSION-DRIVE primary, SH264-266 rungs latent because the ladder
-        // self-terminates here). Fix: point each of the 0x2000 sub-slots at its own leaked
-        // zeroed 0x60-byte node cell so the insert's atomic OR lands in real memory (node[0]
-        // bit1 = present) and the reader (0x1d99e50) returns node+40=0 (empty value) instead
-        // of faulting. Default OFF (keeps the all-zero empty-map behavior).
+        // SH267 (JIT_ROUTEB_APPSART_LSM_NODES=1): the LSM INSERT leaf (fn 0x1db1cc8,
+        // atomic-OR bl 0x2b9ea40 @0x1db1d44) reads slot x1=sub[idx], `ldset` bit1 into *x1.
+        // Empty map (sub=0) -> atomic on addr 0 -> fault=0x0 @0x101db1d04 (SH260 parked;
+        // SEP-17 relabel makes SESSION-DRIVE primary). Fix: point each 0x2000 sub-slot at
+        // its own leaked zeroed 0x60 node cell so the OR lands in real memory and the
+        // reader (0x1d99e50) returns node+40=0. Default OFF.
         let node_cells: bool =
             std::env::var("JIT_ROUTEB_APPSART_LSM_NODES").ok().as_deref() == Some("1");
         if node_cells {
@@ -6939,13 +6926,10 @@ fn main() {
                             // SH125 (recon deleg_5e2c8480 of do-init 0x102206c40): the
                             // do-init's flags-loaded GETTER (guest 0x10220671c) reads
                             // `ldrb w0,[0x106a683e8]` (file 0x2206738) before the
-                            // thread-dispatch worker. When bit0==0 it selects the
-                            // "fallback" dispatch-object slot [x21+0] instead of the
-                            // "live DM" slot [x21+8] — still host-garbage / unseeded.
-                            // Seed bit0=1 so the do-init consistently consumes the real
-                            // DM/app-config slot. Mirrors the SH82/122 data-seed pattern
-                            // (host byte-store, idempotent, NO .text patch — a NOP on the
-                            // getter's tbz would force the guard-init path instead).
+                            // thread-dispatch worker. bit0==0 -> "fallback" slot [x21+0]
+                            // (host garbage) instead of "live DM" [x21+8]. Seed bit0=1 to
+                            // consume the real DM/app-config slot (SH82/122 pattern, host
+                            // byte-store, no .text patch).
                             let flags_latch = 0x106a683e8u64 as *mut u8;
                             *flags_latch |= 1;
                             eprintln!("[elfjit:v2boot] SH125 seeded flags-loaded latch [0x106a683e8].bit0=1 so the do-init consumes the live DM slot (getter 0x102206738)");
@@ -7715,12 +7699,25 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                     let dmthis = Box::leak(vec![0u8; 0x200usize].into_boxed_slice()).as_mut_ptr() as u64;
                     unsafe { *(dmthis as *mut u64) = dv.as_ptr() as u64; }
                     let seeded = std::env::var("JIT_ROUTEB_DMFN_FIELDS").is_ok();
+                    let o = routeb_singleton_obj_addr();
                     if seeded {
-                        let o = routeb_singleton_obj_addr();
-                        for off in [120u64,128,136,144] { unsafe { *( (dmthis+off) as *mut u64) = o; } }
-                        eprintln!("[elfjit:v2boot] SH296 stage2 fields: this+120/128/136/144=routeb singleton {o:#x}");
+                        // SH297 correction: the construction body (0x23f0484) reads
+                        // `ldp x21,x24,[x22,#8]` (x22=arg1) then `stp x21,x24,[this,#136]`
+                        // — it CLOBBERS this+136/144 from arg1[8]/arg1[16], so SH296's
+                        // S2 seed of this+136/144 was a no-op (arg1 was a zeroed buffer,
+                        // [arg1+8]=0 -> the cbz x21 safety-epilogue fired before any this
+                        // field read). Real gates: arg1[8]/arg1[16] must be nonzero LIVE
+                        // objects AND [this+120] AND [this+128] (0x2b4ea48 refcount factory).
+                        for off in [120u64,128u64] { unsafe { *( (dmthis+off) as *mut u64) = o; } }
+                        eprintln!("[elfjit:v2boot] SH297 stage2 this+120/128=singleton {o:#x} (this+136/144 CLOBBERED from arg1)");
                     }
                     let a1 = Box::leak(vec![0u8; 0x100usize].into_boxed_slice()).as_mut_ptr() as u64;
+                    if seeded {
+                        // arg1 must be a coherent struct: [arg1+8]+[arg1+16] = live objs
+                        // (become this+136/144). Using the singleton (valid leaf-vtable).
+                        unsafe { *( (a1+8) as *mut u64) = o; *( (a1+16) as *mut u64) = o; }
+                        eprintln!("[elfjit:v2boot] SH297 arg1[8]/arg1[16]=singleton {o:#x}");
+                    }
                     let a2 = Box::leak(vec![0u8; 0x100usize].into_boxed_slice()).as_mut_ptr() as u64;
                     eprintln!("[elfjit:v2boot] SH296 driving DM-construction fn 0x1023f03b4 this={dmthis:#x} vt32=ret0={ret0:#x} fields_seeded={seeded}");
                     let mut dm = arm64jit::jit::CpuState::new();
@@ -8019,16 +8016,13 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
         // blocks and what it awaits. Runs concurrently with the jit_run.
         if std::env::var_os("JIT_THREADS").is_some() {
             std::thread::spawn(|| {
-                // SH196 (default-inert, JIT_DMCELLS=1): an in-run observable for
-                // the GlobalInit do-init __call_once completion. StartLuaAppDM's jit_run
-                // never returns (parks in the main-loop idle nanosleep poll), so the
-                // post-rung probe never fires. When the once-lambda runs headlessly it
-                // self-latches once-guard[0x106a68410].bit0 (0->1) and stores an interned
-                // result into once-slot[0x106a68408] (str x0,[x23,#1032] @file 0x2206d74) —
-                // a small status/hash (measured 0x400000b from strcmp GetOrCreate
-                // 0x2173b3c), NOT a live DM (which stays in the SH156 seed at
-                // [0x106a68818]). Polled once per sampler tick (cells all-zero at spawn,
-                // populated after do-init); page-guarded so an unmapped boot never crashes.
+                // SH196 (JIT_DMCELLS=1): in-run observable for the GlobalInit do-init
+                // __call_once completion. StartLuaAppDM's jit_run never returns (parks in
+                // the NS-poll), so the post-rung probe never fires. When the once-lambda
+                // runs it self-latches once-guard[0x106a68410].bit0 and stores an interned
+                // result into once-slot[0x106a68408] (str x0,[x23,#1032] @0x2206d74) — a
+                // status/hash (0x400000b), NOT a live DM. Polled once per sampler tick;
+                // page-guarded so an unmapped boot never crashes.
                 let dmcells = std::env::var_os("JIT_DMCELLS").is_some();
                 let rd8 = |a: u64| -> u64 { if guest_page_mapped(a) { unsafe { *(a as *const u64) } } else { u64::MAX } };
                 let rd1 = |a: u64| -> u64 { if guest_page_mapped(a) { (unsafe { *(a as *const u8) }) as u64 } else { u64::MAX } };
@@ -8045,20 +8039,15 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                         // probe wanted [0x106dca000+0xe88] advanced). Page-guarded.
                         let appdm = rd8(0x106dca0e88);
                         // SH196b: current-DM holder — if the do-init world-build
-                        // itself constructed a real DM, the genuine owner would
-                        // overwrite our SH156 seed here (never observed in ~30
-                        // recon angles; the holder is relocation/session-built).
+                        // itself constructed a real DM, the genuine owner would update our
+                        // SH156 seed (never observed ~30 angles; holder is session-built).
                         let holder = rd8(0x106391908);
-                        // SH197: now that the do-init -> app-shell ctor -> governor
-                        // continuation executes real code headlessly, its in-context
-                        // app-data-model register 0x2208354 -> bulk registrar 0x2208ae8
-                        // may populate the class-name RESOLVER map 0x106dca0e70 (the
-                        // map SH194 found EMPTY {0,0} when only driven standalone).
-                        // Probe its header {begin,end,count} + the REGISTER map
-                        // 0x106dca0f60 + resolver SOURCE 0x106dca0e90. These .bss pages
-                        // are left unmapped by the engine boot (SH116/SH196b class), so
-                        // map them first (SH156/SH194 pattern) or the read is meaningless
-                        // u64::MAX. begin!=0&&end!=0 => name->classid resolution is live.
+                        // SH197: the do-init -> app-shell ctor -> governor continuation
+                        // may populate the class-name RESOLVER map 0x106dca0e70 (SH194
+                        // found EMPTY standalone). Probe header + REGISTER 0x106dca0f60 +
+                        // SOURCE 0x106dca0e90 (.bss page-guarded).
+                        // are left unmapped by the engine boot (SH116/SH196b class); map
+                        // them (SH156/SH194 pattern) or the read is meaningless u64::MAX.
                         for mp in [0x106dca000u64, 0x106dca0f60, 0x106dca0e90] {
                             arm64jit::jit::routeb_ensure_writable(mp);
                         }
@@ -8619,17 +8608,11 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                 static ROOT: AtomicU64 = AtomicU64::new(0);
                 static PLACED: AtomicU64 = AtomicU64::new(0);
                 static HEADCELL: AtomicU64 = AtomicU64::new(0);
-                // SH44/SH11: the force-pop patches + block-cache eviction must run
-                // EXACTLY ONCE. The patches are idempotent and the eviction only
-                // needs to force the drain body to recompile from the now-patched
-                // guest bytes the first time; a cache drop on EVERY re-injection
-                // recompiles the pop-loop while the drain is mid-execution, and
-                // after ~40 re-injections the translated block desyncs (the crash
-                // at 0x102856f7c in runs/sh44-taskv4-plane.txt). Subsequent
-                // injections only SWAP the node into the head-cell (no code patch,
-                // no eviction), so a sustainable type-4 dispatch loop is possible
-                // — the prerequisite for seeding the vector with a real guest
-                // producer and observing sustained forwarding.
+                // SH44/SH11: the force-pop patches + block-cache eviction must run EXACTLY ONCE.
+                // A cache drop on EVERY re-injection recompiles the pop-loop mid-execution
+                // and desyncs after ~40 (crash 0x102856f7c). Subsequent injections only
+                // SWAP the node into the head-cell — the prerequisite for seeding the
+                // vector with a real guest producer + sustained forwarding.
                 static ARMED: AtomicBool = AtomicBool::new(false);
                 eprintln!(
                     "[elfjit:deque-node-live] inject into LIVE drainer's deque (vtable 0x{vt:x}); draining when pc in [0x{DRAIN_LO:x},0x{DRAIN_HI:x})"
@@ -9091,18 +9074,13 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                 eprintln!("[elfjit:deque-probe] gave up (probe count={}, repointed={})", PROBE_COUNT.load(Ordering::Relaxed), repointed.len());
             });
         }
-        // SH60 --taskv4-seed frame: force every drain dispatch through the
-        // type-4 vector. The drain's idle path (heartbeat) routes its per-
-        // iteration SENTINEL dispatch to w4=2/3 telemetry emitters
-        // (0x2856f24 / 0x2856f68), which never reach the type-4 vector
-        // [0x106829ea8]; the genuine w4=4 "popped task node" path (0x2856ffc)
-        // is only hit during an early init window, so a seeded probe fires only
-        // ~3× (all pre-RENDERCTX). Deterministic fix: rewrite the heartbeat's
-        // `mov w4,#2`/`mov w4,#3` to `mov w4,#4`, so EVERY idle dispatch calls
-        // the real dispatcher (0x10285371c) with w4=4 -> it loads the seeded
-        // vector and br's to the type4_frame_thunk -> a real task-driven frame
-        // per drain iteration, sustained (RENDERCTX self-guard no-ops the
-        // pre-recovery heartbeats).
+        // SH60 --taskv4-seed frame: force every drain dispatch through the type-4
+        // vector. The idle path's heartbeat sentinel dispatches (0x2856f24/8,
+        // w4=2/3 telemetry emitters) never reach vector [0x106829ea8]; w4=4
+        // popped-task path (0x2856ffc) hits only in an early-init window.
+        // Deterministic fix: rewrite heartbeat mov w4,#2/#3 -> mov w4,#4, so
+        // every idle dispatch calls the real dispatcher (0x10285371c) -> br to
+        // the seeded type4_frame_thunk -> a real task-driven frame per drain.
         if taskv4_frame_seed_active() {
             for (addr, name, word) in [
                 (0x102856f24u64, "heartbeat w4#2", 0x52800084u32), // mov w4,#4
@@ -11824,11 +11802,9 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
 
     // SH162 (deleg_f177139a task-2): the MAIN start_app top-level jit_run
     // (V2StartAppWithParams) runs CONCURRENTLY with the detached --v2boot ladder
-    // thread, sharing the single block cache AND boot guest stack (s2.x[31]=st.x[31])
-    // — the run-variable SH55/64 flake (crash at a different guestpc each run).
-    // Mirror the renderinit gate: when serialize on + --v2boot, wait for LADDER_DONE
+    // thread, sharing ONE block cache + boot stack -> run-variable SH55/64 flake.
+    // Mirror the renderinit gate: on serialize + --v2boot, wait for LADDER_DONE
     // (bounded) BEFORE start_app so only ONE top-level jit_run exists at a time.
-    // (Same gating as WORKER_ADMISSION_GATE: env + --v2boot.)
     // SH177 (deleg_26cb3b36 task-1): also fire on standalone JIT_LADDER_SERIALIZE=1
     // (without JIT_SERIALIZE_RENDER, which would re-arm WORKER_ADMISSION_GATE and
     // abort nativeGameGlobalInit EXIT 139 per SH170). Closes the SH55/64 dual-top-level
@@ -13155,14 +13131,9 @@ mod sh115_tests {
     }
     #[test]
     fn sh247_opnew_size_gate_routes_all_sizes_to_small_descriptor_path() {
-        // SH246 measured the activated continuation pervasively NULL-allocs: EVERY
-        // interior operator_new (BOTH variants 0x1db1a38, 0x1d96768) returns NULL for
-        // size>0xa when [0x10727570c].bit0 is clear. SH247 lever: make each variant's
-        // size-gate `b.ls SMALL` (taken ⇔ size<=0xa) an UNCONDITIONAL `b SMALL` so
-        // size>0xa ALSO walks the ≤0xa descriptor path (scudo size-class + real alloc
-        // tail 0x1db1c60) that works headlessly. This hermetic pin: (a) exact real-image
-        // gate word (B.cond cond=LS); (b) replacement is an unconditional B whose imm26
-        // lands on the documented SMALL path target (drift fails loudly); (c) word guard.
+        // SH247: make op_new size-gates (0x1db1a38/0x1d96768) unconditional `b SMALL`
+        // so >0xa ALSO walks the ≤0xa descriptor path that works headlessly. Pins:
+        // (a) exact B.cond LS word; (b) replacement B imm26 -> SMALL; (c) word guard.
         // Sites (guest = file + 0x100000000):
         //   A file 0x1db1a78 = 0x540001e9 b.ls 0x1db1ab4 -> b = 0x1400000f
         //   B file 0x1d967ec = 0x540001c9 b.ls 0x1d96824 -> b = 0x1400000e
@@ -15657,6 +15628,41 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh297_dmfn_construction_body_arg1_clobber_pinned() {
+        // SH297: SH296's stage-2 seed (this+136/144=singleton) was a NO-OP because the
+        // construction body 0x23f0484 reads `ldp x21,x24,[x22,#8]` (x22=ARG1=x1) then
+        // `stp x21,x24,[x20,#136]` — it CLOBBERS this+136/144 from arg1[8]/arg1[16].
+        // arg1 was a zeroed buffer in SH296 (-> cbz x21 safety-epilogue fired before any
+        // this-field was read). SH297 seeds coherent arg1[8]=[arg1+16]=singleton + this+120
+        // + this+128 (refcount factory 0x2b4ea48). Pins the body's arg1-read + clobber-store
+        // + the gates it bypasses past 0x23f04d0. Real-image anchored (skip-if-absent).
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |g: u64| -> u32 {
+                let h = el.host_addr_of(g).unwrap_or(0);
+                if h == 0 { 0 } else { unsafe { (h as *const u32).read_unaligned() } }
+            };
+            // body entry: ldp x21,x24,[x22,#8] (arg1[8]/arg1[16]); mov x22=x1
+            assert_eq!(word(0x102_3f0_484), 0xa940e2d5, "sh297 ldp x21,x24,[x22,#8] (arg1->x21/x24)");
+            assert_eq!(word(0x102_3f0_488), 0xb4000098, "sh297 cbz x24 (arg1[16])");
+            // clobber store: stp x21,x24,[x20,#136] -> this+136/144 = arg1[8]/arg1[16]
+            assert_eq!(word(0x102_3f0_49c), 0xa908e295, "sh297 stp x21,x24,[x20,#136] (clobber this+136/144)");
+            // the gate that fired in SH296 (arg1[8]==0): cbz x21 -> safety epilogue 0x23f0680
+            assert_eq!(word(0x102_3f0_4d0), 0xb4000d95, "sh297 cbz x21 (this+136) -> safety 0x23f0680");
+            // refcount factory 0x2b4ea48 bl (x0=[this+128]); must return nonzero to continue
+            assert_eq!(word(0x102_3f0_4e0), 0x941d795a, "sh297 bl factory 0x2b4ea48 ([this+128])");
+            // next-hop: nativeAppBridgeAppStart bl @0x23f05f8 (reached after box build)
+            assert_eq!(word(0x102_3f0_5f8), 0x97fdca28, "sh297 bl nativeAppBridgeAppStart 0x2362e98");
+            // the post-gate fault site (0x21e45c8 registration, one BL before app-start)
+            assert_eq!(word(0x102_1e4_60c), 0xf94006a0, "sh297 fault site ldr x0,[x21,#8] in 0x21e45c8");
+            eprintln!("sh297 dmfn construction-body arg1-clobber path pinned on libroblox.so");
+        } else {
+            eprintln!("sh297 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh268_lsm_freelist_terminal_mechanism_pinned() {
         // SH268 (single-agent): pin the NEW terminal after the SH267 insert-leaf crossing.
         // With JIT_ROUTEB_APPSART_LSM_NODES=1 the lane crosses the insert-leaf (fault=0x0
@@ -16228,16 +16234,11 @@ mod sh115_tests {
     }
     #[test]
     fn sh123_string_hashset_find_dangling_container_substitute() {
-        // SH123 (jit.rs, opt-in JIT_ROUTEB_SETFIX): the generic Roblox String-keyed
-        // hash-set `.find()` leaf (guest entry 0x10217582c, file 0x217582c) is called
-        // during the DM/app-shell construction with a DANGLING HOST container (the
-        // telemetry/stats singleton `parent->field_0x30` at +0xe8 never constructs under
-        // the JIT -> SH103-class host leak) -> `ldr x23,[x20,#8]` SIGSEGV at 0x102175854.
-        // The recon (deleg_c48fbbf5) pinned the layout: +0x00 bucket array, +0x08 count,
-        // +0x18 String needle (hashed by 0x1df644c BEFORE the count), +0x20 compare String.
-        // Fix: at the leaf block entry, if x0 is NOT in the image domain, substitute a
-        // leaked coherent EMPTY set (count=0 -> `cbz` returns NULL). Pin addresses + the
-        // empty-set layout invariant (count at +0x08 must be 0 for the cbz short-circuit).
+        // SH123 (jit.rs, JIT_ROUTEB_SETFIX): the generic String-keyed hash-set `.find()`
+        // leaf (0x10217582c) is called during DM/app-shell construction with a DANGLING
+        // HOST container (telemetry singleton, never constructed under JIT) -> SIGSEGV
+        // 0x102175854. Layout: +0 bucket array, +0x08 count, +0x18 String needle, +0x20
+        // compare String. Fix: substitute a leaked coherent EMPTY set (count=0) at entry.
         assert_eq!(0x217582cu64 + 0x1_0000_0000, 0x10217582cu64, "String-hash-set find leaf entry");
         assert_eq!(0x2175854u64 + 0x1_0000_0000, 0x102175854u64, "fault site (ldr x23,[x20,#8])");
         assert_eq!(0x1df644cu64 + 0x1_0000_0000, 0x101df644cu64, "String::hash (hashes +0x18, pre-count)");
