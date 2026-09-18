@@ -845,6 +845,50 @@ fn routeb_lsm_keytrace_guard(state: *mut CpuState, pc: u64) {
     }
 }
 
+/// SH341-cross (opt-in JIT_ROUTEB_LSM_KEYFIX): crossing the LSM poison fencepost that is
+/// the persistence-lane terminal wall (STATUS candidate #2). SH341 MEASURED that exactly
+/// ONE of the ~391 LSM free-list pool-pops on the full-ladder Route-B route feeds a
+/// poisoned .text KEY (0x101d968e4, caller LR=0x10626b6dc = the 0x626b6d0 pool-pop
+/// wrapper) into pool-pop 0x101d9a5a0; the pop then does `mov x1,x0` + `str x8,[x1]`
+/// (write target = the key), faulting exec-segment 0x101d968e4 -> SIGABRT at guestpc
+/// 0x101d9a528. Every other pop uses a VALID host-heap key and completes, so the LSM pop
+/// is well-behaved — the wall is a single stale-pointer passthrough from the run-variable
+/// FMOD/audio-init caller.
+///
+/// FIX: at the pop write-site block entry, if the key classifies EXEC-segment-poisoned
+/// (.text, write:off) — the key is NEVER legitimately a code address — substitute the
+/// WRITE TARGET (s.x[0], which the block's `mov x1,x0` copies into x1 for `str x8,[x1]`)
+/// with a leaked zeroed host-heap cell so the write lands in real writable memory and the
+/// pop completes instead of ABRTing. This is register-edit only (no real-memory data
+/// corruption from the write itself is distinguishable from what the engine would do with
+/// a valid key), lets the LSM pop finish, and lets the full ladder proceed INTO the
+/// post-ladder session-ctor rungs (SEP-17 SESSION-CTOR lever). Default-inert.
+fn routeb_lsm_keyfix_guard(state: *mut CpuState, pc: u64) {
+    if std::env::var("JIT_ROUTEB_LSM_KEYFIX").ok().as_deref() != Some("1") {
+        return;
+    }
+    const POP_WRITE_SITE: u64 = 0x101d9a528; // pop entry; key -> `str x8,[x1]` @0x1d9a568
+    if pc != POP_WRITE_SITE {
+        return;
+    }
+    let s = unsafe { &mut *state };
+    let key = s.x[0];
+    const EXEC_END: u64 = 0x1062d8190; // guest end of the R-E exec LOAD segment
+    let poisoned = key >= 0x100000000 && key < EXEC_END && key != 0;
+    if !poisoned {
+        return; // valid host-heap / guest-data key — let the pop run unchanged.
+    }
+    // Redirect the write target to a leaked zeroed cell so the pop completes.
+    static CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let cell = *CELL.get_or_init(|| {
+        Box::leak(vec![0u8; 8usize].into_boxed_slice()).as_mut_ptr() as u64
+    });
+    s.x[0] = cell;
+    eprintln!(
+        "[routeb-lsm-keyfix] SH341-cross: poisoned .text KEY {key:#x} at pop write-site {POP_WRITE_SITE:#x} -> write-target substituted to valid host-heap cell {cell:#x}; pop completes instead of ABRT (JIT_ROUTEB_LSM_KEYFIX=1)"
+    );
+}
+
 /// SH161 (recon deleg_c94a8b2f): broad tail-entry probe — log every block entry whose
 /// pc falls in the governor-tail region so we can pin exactly which block contains the
 /// NULL-deref dispatch. Debug-only, gated on JIT_ROUTEB_SETFIX + JIT_ROUTEB_TAILTRACE.
@@ -6454,6 +6498,7 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         }
         routeb_appevent_w19_guard(state, pc); // SH339 (JIT_ROUTEB_APPEVENT_W19): mid-execution capture of the SendAppEventOnAppReady discriminator w19 at the JOIN 0x102bb47d0 (settles SH308's open ABI question; read-only, once)
         routeb_lsm_keytrace_guard(state, pc); // SH341 (JIT_ROUTEB_LSM_KEYTRACE): attribute which LSM pool-pop call site passes a poisoned .text KEY (root-cause of the SH268 unwritable-write wall; READ-ONLY)
+        routeb_lsm_keyfix_guard(state, pc); // SH341-cross (JIT_ROUTEB_LSM_KEYFIX): redirect the LSM pop's write-target away from a poisoned .text key so the pop completes and the full-ladder Route-B route passes the persistence-lane terminal wall
         routeb_appstart_408_guard(state, pc); // SH330: seed [AppStarted+0x408] (runtime heap x19) benign vt[+136] leaf at the 0x25f5050 gate (JIT_ROUTEB_APPSART_408SEED, standalone)
         routeb_cookie_jar_guard(state, pc); // SH175: seed cookie-jar container + gates at worker 0x102203148 (JIT_ROUTEB_COOKIE)
         // SH248d (opt-in JIT_ROUTEB_APPSART_JAR_SEED): seed [0x106ed7a20] cookie-jar string
@@ -14173,6 +14218,58 @@ mod sh334_registry_live_guard_tests {
         routeb_registry_live_guard(&mut st as *mut CpuState, 0x1021687a0); // after anchor
         assert_eq!(st.x[0], 0, "non-anchor pc must not fire the live dump");
         unsafe { std::env::remove_var("JIT_ROUTEB_REG_LIVE") };
+    }
+}
+
+#[cfg(test)]
+mod routeb_lsm_keyfix_guard_tests {
+    use super::*;
+    // The guard reads the process-wide env var; Rust runs tests on parallel threads,
+    // so serialize the three env-mutating tests through a shared Mutex.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn lock() -> std::sync::MutexGuard<'static, ()> { ENV_LOCK.lock().unwrap() }
+
+    #[test]
+    fn inert_without_env() {
+        let _g = lock();
+        unsafe { std::env::remove_var("JIT_ROUTEB_LSM_KEYFIX") };
+        let mut st = CpuState::new();
+        st.x[0] = 0x101d968e4; // the SH341 poisoned .text key
+        routeb_lsm_keyfix_guard(&mut st as *mut CpuState, 0x101d9a528);
+        // Guard returns before any edit -> x0 must be untouched, no cell allocated.
+        assert_eq!(st.x[0], 0x101d968e4, "inert guard must not edit x0");
+    }
+
+    #[test]
+    fn valid_key_untouched_even_with_env() {
+        let _g = lock();
+        unsafe { std::env::set_var("JIT_ROUTEB_LSM_KEYFIX", "1") };
+        let mut st = CpuState::new();
+        st.x[0] = 0x7f81_1234_5678; // valid host-heap key (SH341: 0x7f81… completes)
+        routeb_lsm_keyfix_guard(&mut st as *mut CpuState, 0x101d9a528);
+        assert_eq!(st.x[0], 0x7f81_1234_5678, "valid host-heap key must be untouched");
+        // Poisoned .text key IS redirected to a writable host-heap cell (not exec, not 0).
+        let mut st2 = CpuState::new();
+        st2.x[0] = 0x101d968e4; // exact SH341 poisoned key
+        routeb_lsm_keyfix_guard(&mut st2 as *mut CpuState, 0x101d9a528);
+        let cell = st2.x[0];
+        assert!(cell != 0 && cell != 0x101d968e4 && (cell < 0x100000000 || cell >= 0x120000000),
+            "write-target must be a writable non-exec cell, got {cell:#x}");
+        // In-this-crate writability: the substituted cell is a real host-heap allocation.
+        unsafe { std::ptr::write_unaligned(cell as *mut u64, 0xdead_beef); }
+        unsafe { assert_eq!(std::ptr::read_unaligned(cell as *const u64), 0xdead_beef); }
+        unsafe { std::env::remove_var("JIT_ROUTEB_LSM_KEYFIX") };
+    }
+
+    #[test]
+    fn wrong_pc_misses_even_with_env() {
+        let _g = lock();
+        unsafe { std::env::set_var("JIT_ROUTEB_LSM_KEYFIX", "1") };
+        let mut st = CpuState::new();
+        st.x[0] = 0x101d968e4;
+        routeb_lsm_keyfix_guard(&mut st as *mut CpuState, 0x101d9a5a0); // pool-pop fn entry, not write-site
+        assert_eq!(st.x[0], 0x101d968e4, "non-write-site pc must not edit x0");
+        unsafe { std::env::remove_var("JIT_ROUTEB_LSM_KEYFIX") };
     }
 }
 

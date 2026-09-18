@@ -1,22 +1,18 @@
 # Open Sober — Agent Handoff
-## SH342 (Sep 18, 2026, hermes-worker): measured the SETWORLDBUILD world-build continuation (do-init -> fn 0x102ea3b14 -> nativeAppBridgeAppStart__) is UNREACHABLE from every driven rung — V2InitWithParams benign-soft-returns Ok(0x3e8) before its world-build gate block 0x102368100 executes, so the seed never lands; sending-appevent path 0 world-build hits (even with V2_ONDEMAND), full ladder dies at new live-object site 0x1026d63c0. Workspace green; recon-v3 frame plane re-verified green (real mesh, 0 crashes, EXIT 124).
+## SH343 (Sep 19, 2026, hermes-worker): CROSSED the SH341 LSM poison fencepost — the persistence-lane terminal wall (guestpc 0x101d9a528, the LSM free-list pop that SIGABRT'd every full-ladder Route-B run) now completes via routeb_lsm_keyfix_guard (JIT_ROUTEB_LSM_KEYFIX=1): the single poisoned .text KEY (0x101d968e4, from the 0x626b6d0 pool-pop wrapper) at the pop write-site is redirected to a valid host-heap write target, so `str x8,[x1]` lands in real memory. Measured real libroblox.so: keyfix fired once on the crashing iteration; the ladder advances ONE fencepost to guestpc 0x101db1b08 (SH285's LSM reader/pop terminal, fault=0xffffffffffffffff). Workspace green (arm64jit 414/0, +3 hermetic tests); recon-v3 deliverables re-verified present.
 
-Single-agent (cone suppressed). Measurement-only (region-watch, no production seed added). One new
-probe + frontier doc. No production path edited. Workspace green.
+Single-agent (cone suppressed). One new default-inert env-gated guard + 3 hermetic unit
+tests + frontier doc + repro capture script. No production path edited outside the new
+guard (which is opt-in and off by default). Workspace green.
 
-SH342 (committed): with JIT_ROUTEB_SETWORLDBUILD=1 + region-watch on the world-build body
-[0x102ea3b14,0x102ea3bf0) and nativeAppBridgeAppStart__ [0x102338510,0x102338700): the send-appevent
-reach (SH310-completing) shows `routeb-worldbuild` gate fired 0 times — SETWORLDBUILD seed at gate 0x102368100
-NEVER lands because the V2InitWithParams rung soft-returns Ok(0x3e8) without executing its gate block
-(0 world-build / 0 appstart hits; same with V2_ONDEMAND=1). Full ladder (--v2boot-skip-appstart, no
-send-appevent) with V2_ONDEMAND dies at NEW crash site guestpc=0x1026d63c0 fault=0x0 (StartLuaAppDM nested
-frame prologue, `ldr x0,[x0]` null-this — SH324-class live-object wall), 0 world-build hits. REFINES
-STATUS candidate #2: the world-build gate premise is BROKEN (gate block unreachable from the driven rung),
-not merely un-triggered; the nativeAppBridgeAppStart__ continuation is gated behind the live-DM/session-ctor
-wall (SH324/SH340) and NO seedable lever reaches it. DM-root 0, MH_* false, Route-B live-DM gate UNCHANGED;
-SH174 capture-latch stays the single forward hook.
+SH343 (committed): with JIT_ROUTEB_LSM_KEYFIX=1 the full-ladder send-appevent + session
+route no longer ABRTs at the SH341 terminal 0x101d9a528 (persistence-lane pop); instead it
+advances to the SH285 reader/pop terminal 0x101db1b08 (fault=0xffffffffffffffff, RBX-poisoned
+live-object pointer) — a concrete measured CROSS on STATUS candidate #2. Pre/post identical
+env except KEYFIX. This is a persistence-lane advance, NOT a session crossing: DM-root 0,
+MH_* all false, Route-B live-DM gate UNCHANGED; SH174 capture-latch stays the forward hook.
 
-## SH341 (Sep 19, 2026, hermes-worker): measured the LSM free-list `str x8,[x1]` write-off is a SINGLE poisoned pointer from the 0x626b6d0 pool-pop wrapper (the SH212 "FMOD AAudio" site), not an intrinsic unwritable-write — root-cause attribution, the SH268 verdict refined.
+## SH342 (Sep 19, 2026, hermes-worker): measured the SETWORLDBUILD world-build continuation (do-init -> fn 0x102ea3b14 -> nativeAppBridgeAppStart__) is UNREACHABLE from every driven rung — V2InitWithParams benign-soft-returns Ok(0x3e8) before its world-build gate block 0x102368100 executes so the seed never fires (0 world-build/appstart region hits w/ and w/o V2_ONDEMAND); full ladder dies at new live-object site 0x1026d63c0 (SH324-class). Refines STATUS candidate #2: world-build gate premise broken, continuation gated behind the live-DM/session-ctor wall (SH324/SH340). recon-v3 frame plane re-verified green (real mesh, 0 crashes, EXIT 124).
 
 Single-agent (cone suppressed). One default-inert READ-ONLY instrumentation guard + one
 hermetic lib pin + frontier doc + repro probe. No production path edited. Workspace green.
