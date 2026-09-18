@@ -1,4 +1,5 @@
 # Open Sober — Agent Handoff
+## SH299 (Sep 18, 2026, hermes-worker): CROSS the EC-world fault=0x10 wall — seed the EC arg0 +0x30 virtual-dispatch object so the DM-construction fn COMPLETES through the EC world (SH235/298/298b genuine DM-creation machine). SH298b left `fault=0x10` (guestpc 0x102e245f4, x8=0, x19=dmthis+0x30) in the EC marshaller app-request build. Body: 0x2e2464c `ldr x8,[x19,#48]` (x19=arg0 -> x8=[arg0+0x30]=0) -> 0x2e24650 `ldr x8,[x8,#16]` = [0+0x10] fault -> 0x2e24658 blr x8. SH299 (--v2boot-session-dmfn + JIT_ROUTEB_EC_ARG0VT=1): routeb_ec_world_arg0_vt_guard seeds [arg0+0x30]=coherent dispatch obj (vt[+16]=ret1 host leaf) on EC entry -> cbnz w0 @0x2e2465c TAKEN -> continue build. MEASURED 3/3 on real libroblox.so: `SH296 dmfn returned Ok(0x...53f0)` (was 3/3 SIGSEGV fault=0x10). New terminal = SEPARATE known SH285-B LSM live-object wall (guestpc=0x101db1b08, persistence detour), NOT the EC world. HONEST: no DM (MH_* false, DM-root 0); Route-B live-DM gate UNCHANGED; SH174 latch forward hook. +hermetic sh299. Verify: sh299+sh298 lib 2; cargo test --workspace EXIT 0 (576/0); elfjit examples 127/0. Doc docs/frontier-sh299-ec-arg0vt-dispatch-object.md, repro runs/sh299-ecarg0vt-r*.txt. Single-agent, default-inert.
 ## SH298 (Sep 18, 2026, hermes-worker): CROSS SH297's registration-fn wall FULLY — drives the DM-construction fn into the EC world (SH235's genuine DM-creation world 0x102e24598, FIRST headless penetration). SH297's bug: reg-fn 0x21e45c8 (bl@0x23f05b8) gets arg0 = `[this+136]` DOUBLE-deref. SH297 arg1[8]=singleton -> arg0=[singleton]=singleton's VTABLE (host-leaf); [arg0+8]=leaf 0x7f..d0 -> `ldr x8,[x22,#24]` derefs 0x7f..e8 -> SIGSEGV. SH298 (--v2boot-session-dmfn + JIT_ROUTEB_DMFN_REGISTER=1): arg1[8]=CELL -> coherent reg obj R ([R+0]=leaf-vt, [R+8]=singleton VALID host obj) -> arg0=R -> 0x21e45c8 COMPLETES -> falls to bl nativeAppBridgeAppStart. MEASURED (real so, full SH297 env, 3/3 det): SH297 wall GONE; NEW terminal SIGSEGV guestpc=0x102e245f4 (fault=0x48) in 0x1023f1354 via EC bl@0x102e245f0. HONEST: Route-B live-DM gate UNCHANGED (no DM, MH_* false, DM-root 0); new terminal = NULL+0x48 live-object (SH174/SH204 class); SH174 latch stays forward hook. Cause-not-symptom SESSION-CTOR. Verify: sh298 1; workspace EXIT 0. elfjit 1,048,408 + HANDOFF under 1MB hook. Doc docs/frontier-sh298-registration-ecworld.md, repro runs/capture_sh298_register.sh. Single-agent, default-inert.
 ## SH297 (Sep 17, 2026): CORRECT SH296's DM-construction-fn seed — the construction body 0x23f0484 reads `ldp x21,x24,[x22,#8]` (x22=ARG1=x1) then `stp x21,x24,[this,#136]`: it CLOBBERS this+136/144 from arg1[8]/arg1[16]. SH296 S2 seeded this+136/144 = NO-OP (overwritten from a ZEROED arg1; [arg1+8]=0 -> cbz x21 @0x23f04d0 safety-epilogue fired before any this-field read incl. this+128 factory) — its "blanket-singleton-insufficient" verdict rests on a MIS-SEEDED test. SH297 seeds the REAL gates: coherent arg1 ([arg1+8]=[arg1+16]=routeb singleton -> this+136/144, cbz passes) + this+120 + this+128 (refcount factory 0x2b4ea48 nonzero). MEASURED (real so, full SH296 env, region-watch): **construction body EXECUTES** (0x1023f0544/550/55c app-server box-build) then SIGSEGV **guestpc=0x1021e460c** (`ldr x0,[x21,#8]` in 0x21e45c8 reg-fn @0x23f05b8) — ONE BL before nativeAppBridgeAppStart (@0x23f05f8). 3/3 det. NEXT gate: coherent 0x21e45c8 reg obj ([+8] valid host obj) -> app-start (standing SH248-260 wall). HONEST: no DM (MH_* false, DM-root 0); Route-B gate UNCHANGED; SH174 latch single forward hook. +hermetic sh297 (7 pins). Verify: sh297 1; workspace EXIT 0. elfjit 1,048,302 under 1MB hook. Doc docs/frontier-sh297-dmfn-arg1-clobber.md, repro runs/capture_sh297_dmfn.sh + capture_sh297b_dmfn_region.sh. Single-agent, default-inert.
 ## SH296 (Sep 17, 2026): LOCATE + DRIVE DM-CONSTRUCTION handler 0x1023f03b4 (SH255: indirect-only) FIRST time. SOLE ref file 0x68ea538=entry[4] of table 0x73fa4d0 ({0x403,fn,tag}). New default-inert `--v2boot-session-dmfn` drives it (this.vt[32]=ret0 leaf). MEASURED: S1 empty recv 3/3 Ok(0x0) — executes first time, benign-return; S2 (fields this+136/144=singleton) still Ok(0x0) 0 hits — "needs distinct live sub-objects" **REVISED BY SH297** (seeded wrong fields; arg1 clobbers). +hermetic sh296. Verify: examples 125/0; workspace EXIT 0. Doc docs/frontier-sh296-dmfn-handler-table.md, repro runs/capture_sh296_dmfn.sh. Single-agent, default-inert.
@@ -10139,41 +10140,3 @@ FindClass/NewStringUTF/GetEnv stubs fire before the fault — it is pure guest
 code dispatching on an object its own init built. Real fix = JNI fake-object
 model (real vtable-backed handles the guest can dispatch on), a multi-session
 subsystem.
-
-### Environment / assets now on this box
-- `~/.cache/open-sober/apks/roblox-android.apk` — real Roblox 2.738.1397 (229MB)
-- `~/.cache/open-sober/robbox/libroblox.so` — extracted arm64 lib (109MB)
-- elfjit command: `cargo run -p arm64jit --example elfjit -- <lib> 0x2173ff4 --jni`
-
-### Status
-`cargo test --workspace` green (superseded — see newest entries top-of-file).
-
----
-
-## Session (Sep 11, continued) — REAL Roblox engine code now runs: MemoryPool + guest-threading fixed (387/0)
-
-The real `libroblox.so` 2.738.1397 boot (arm64jit + libloader, headless) crossed
-three walls this session and now executes **real engine code** before the next
-fault: JNI_OnLoad completed, TSAN/TLS-key once-init, a guest worker thread
-spawned, and `[roblox:JNIMain] TelemetryProtocol::setProcessTimeOverride` logged.
-Run log: `/home/hermes-worker/runs/real-boot-runlog.txt`.
-
-Three boot fixes (dev commits `9bf61e3`, `a3a8372`):
-
-1. **`body_contains_indirect()`** — a guest fn containing a `blr`/`br` (C++
-   vtable dispatch, computed GetEnv) is now *diverted*, not inlined. An inlined
-   `blr` `ret`s into the caller block instead of jit_run, silently skipping the
-   hostcall (GetEnv's *penv never written) and skipping the callee's x19-x28
-   restoring epilogue. This was the REAL cause of the long-standing "null
-   vtable" SIGSEGV: the vm was a corrupted register from a skipped inline GetEnv,
-   NOT a missing JNI stub (the vtable-backed-fake-objects theory is unnecessary.
-2. **`bionic_pthread_once()`** — real glibc pthread_once calls the guest
-   init_routine natively (SIGILL on `paciasp`). Interpose: run the guest
-   once-routine via jit_run (`run_guest_callback()`). Unblocked the TSAN /
-   TLS-key one-time init.
-3. **`route_mempool_big_alloc_to_host()`** — the TLS-block allocator's big
-   allocator (unseeded MemoryPool arena → NULL → guest abort) is patched
-   (adrp/br + thunk in a mapped segment gap) to route to host `calloc`. Then
-   `bionic_pthread_create/join` + `spawn_pthread()` — glibc pthread_create
-   called the guest worker start routine natively (SIGILL); now spawns a fresh
-   host thread running it through jit_run with its own guest stack+TLS.
