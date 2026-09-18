@@ -1143,6 +1143,57 @@ fn routeb_ec_arg0_vt_dispatch_obj() -> u64 {
 /// dispatcher block entry 0x2206db8 (a true block entry, unlike the mid-block 0x206df4), seeds
 /// [0x106863a68] = libc::pthread_self() of the current jit thread (the same id the guest's
 /// pthread_self resolves to), so the b.eq is taken -> MAIN branch. Idempotent, env-gated.
+/// SH322 (opt-in JIT_ROUTEB_LIFECYCLE_EARLYRET=1): cross the SH273 lifecycle-notifier
+/// live-object wall that the SH320/321 MAIN-path dispatch now reaches. Fn 0x21f3748
+/// (the SH273 SHARED lifecycle-notify body) reads `ldr x8,[x1]` @0x21f376c then
+/// `ldrb w8,[x8,#80]` @0x21f3770, faulting fault=0x50 because [x1]==[x22]==0 (the
+/// engine-settings controller arg's first word is 0 headlessly). But the next instruction
+/// `tbnz w8,#1,0x21f3870` @0x21f3774 means: IF byte[+80].bit1 is SET, control jumps STRAIGHT
+/// to 0x21f3870 = the epilogue canary-check + ret (a benign no-op) WITHOUT running the
+/// registry-build body that needs the live controller. This guard, firing at the callee
+/// block entry pc=0x1021f3748 (a real `bl` target -> opens a block entry, SH301 doctrine),
+/// reads x1 (the caller's sp+0x18 pair pointer) and, when [x1]==0, writes [x1] = a leaked
+/// object whose byte[+80] has bit1 SET -> the tbnz is taken -> fn 0x21f3748 returns cleanly
+/// and the caller `nativePostClientSettingsLoadedInitialization3` (the SH321 engine-settings
+/// init the MAIN bind-dispatch climbs into) COMPLETES instead of SIGSEGV'ing. Default-inert,
+/// idempotent (seeds only the measured NULL headless state, never corrupts a live ref).
+fn routeb_lifecycle_wall_earlyret_guard(state: *mut CpuState, pc: u64) {
+    if std::env::var("JIT_ROUTEB_LIFECYCLE_EARLYRET").ok().as_deref() != Some("1") {
+        return;
+    }
+    if pc != 0x1021f3748 {
+        return;
+    }
+    let x1 = unsafe { (*state).x[1] };
+    if x1 == 0 {
+        return; // no caller pair pointer to seed into
+    }
+    let cur = unsafe { std::ptr::read_unaligned(x1 as *const u64) };
+    if cur != 0 {
+        return; // already a live ref (or seeded) -> leave untouched (never corrupt a live object)
+    }
+    // routeb_ensure_writable maps .bss pages; caller-frame stack is already writable host RAM,
+    // but the call is idempotent-safe here.
+    routeb_ensure_writable(x1);
+    let obj = routeb_lifecycle_earlyret_obj();
+    unsafe { std::ptr::write_unaligned(x1 as *mut u64, obj) };
+    eprintln!("[routeb-sh322] seeded caller pair [x1]=[x1={x1:#x}] = lifecycle early-ret obj 0x{obj:x} (byte[+80].bit1=1 -> fn 0x21f3748 takes tbnz -> canary-check+ret no-op, NO registry-build -> close SGSEGV 0x50) at pc={pc:#x}");
+}
+
+/// Leaked object whose byte[+80].bit1 is SET, so fn 0x21f3748's `tbnz w8,#1` @0x21f3774
+/// jumps to the epilogue canary-check+ret (0x21f3870) — a benign no-op that bypasses the
+/// SH273 registry-build body (which needs a live session controller). 0x200 bytes zeroed
+/// except [+80]=0x02 (bit1). First word at [obj] is 0 (left NULL; only [+80] is read).
+fn routeb_lifecycle_earlyret_obj() -> u64 {
+    use std::sync::OnceLock;
+    static O: OnceLock<u64> = OnceLock::new();
+    *O.get_or_init(|| {
+        let b: &'static mut [u8] = vec![0u8; 0x200].leak();
+        b[0x50] = 0x02; // +0x50 == 0x50 bytes in, i.e. byte[+80]; bit1 set
+        b.as_ptr() as u64
+    })
+}
+
 fn routeb_donepath_main_branch_guard(_state: *mut CpuState, pc: u64) {
     if std::env::var("JIT_ROUTEB_DONEPATH_MAIN").ok().as_deref() != Some("1") {
         return;
@@ -6114,6 +6165,12 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // thread-match b.eq is taken -> MAIN binder-dispatch 0x206df4 (DM-ctor entry), not the
         // non-main box-build. Works whether the done-path runs on the ladder or a spawned worker.
         routeb_donepath_main_branch_guard(state, pc);
+        // SH322 (opt-in JIT_ROUTEB_LIFECYCLE_EARLYRET): cross the SH273 lifecycle-notifier
+        // live-object wall the SH320/321 MAIN-path reaches (fn 0x21f3748 faults 0x50 on
+        // [x1]==0). Seed the caller pair [x1] = obj with byte[+80].bit1=1 so the tbnz @0x21f3774
+        // jumps to the epilogue canary-check+ret (benign no-op) -> nativePostClientSettingsLoaded-
+        // Initialization3 completes instead of SIGSEGV'ing.
+        routeb_lifecycle_wall_earlyret_guard(state, pc);
         // SH259 (opt-in JIT_ROUTEB_APPSART_SETTINGS_ONCE): seed the once-guard
         // [0x106a6f430] of the settings/registry factory 0x21dac2c (deepest reach,
         // bl @0x102339d44) so it early-returns the registry object without running the
@@ -7913,6 +7970,62 @@ mod tests {
                 "mismatched cell rewritten to executing thread (b.eq now taken)");
             std::env::remove_var("JIT_ROUTEB_DONEPATH_MAIN");
             std::ptr::write_unaligned(cell as *mut u64, 0);
+        }
+    }
+
+    #[test]
+    fn sh322_lifecycle_wall_earlyret_guard_is_env_pc_gated_and_seeds_pair() {
+        // SH322 (SESSION-CTOR, crossing the SH273 lifecycle wall on the SH320/321 MAIN path):
+        // fn 0x21f3748 faults 0x50 on `ldrb [x8,#80]` when [x1]==0 (sh321 measured). This guard
+        // must (a) be inert without JIT_ROUTEB_LIFECYCLE_EARLYRET, (b) fire only at the callee
+        // block entry 0x1021f3748, (c) seed the caller pair [x1] (only when [x1]==0) to a leaked
+        // object with byte[+80].bit1 set (so the tbnz @0x21f3774 -> canary-check+ret no-op),
+        // (d) leave a non-zero [x1] untouched (never corrupt a live ref), (e) leave a NULL
+        // pair-pointer [x1] alone.
+        unsafe {
+            // (a) inert without env.
+            std::env::remove_var("JIT_ROUTEB_LIFECYCLE_EARLYRET");
+            let obj = routeb_lifecycle_earlyret_obj();
+            // Use a scratch cell to hold a fake pair pointer.
+            let pair_slot: u64 = 0x1063_1110;
+            routeb_ensure_writable(pair_slot);
+            std::ptr::write_unaligned(pair_slot as *mut u64, 0);
+            let mut st: CpuState = unsafe { std::mem::zeroed() };
+            st.x[1] = pair_slot;
+            routeb_lifecycle_wall_earlyret_guard(&mut st, 0x1021f3748);
+            assert_eq!(std::ptr::read_unaligned(pair_slot as *const u64), 0,
+                "env-gated: inert without JIT_ROUTEB_LIFECYCLE_EARLYRET");
+
+            // (b) env set, wrong pc -> inert.
+            std::env::set_var("JIT_ROUTEB_LIFECYCLE_EARLYRET", "1");
+            std::ptr::write_unaligned(pair_slot as *mut u64, 0);
+            routeb_lifecycle_wall_earlyret_guard(&mut st, 0x102206db8);
+            assert_eq!(std::ptr::read_unaligned(pair_slot as *const u64), 0,
+                "wrong pc: must fire only at callee entry 0x1021f3748");
+
+            // (c) env + right pc + [pair]==0 -> seed to a leaked object with byte[+80].bit1 set.
+            routeb_lifecycle_wall_earlyret_guard(&mut st, 0x1021f3748);
+            let seeded = std::ptr::read_unaligned(pair_slot as *const u64);
+            assert_ne!(seeded, 0, "[x1] pair must be seeded non-NULL");
+            assert_eq!(seeded, obj, "seeded to the SH322 early-ret object");
+            assert_eq!((seeded as *const u8).read(), 0, "obj first word NULL (only [+80] read)");
+            assert_eq!((seeded as *const u8).add(0x50).read(), 0x02,
+                "obj byte[+80].bit1 must be set -> tbnz taken -> canary-check+ret no-op");
+
+            // (d) already non-zero [x1] -> left untouched (never corrupt a live ref).
+            let live: u64 = 0x1063_2222;
+            std::ptr::write_unaligned(pair_slot as *mut u64, live);
+            routeb_lifecycle_wall_earlyret_guard(&mut st, 0x1021f3748);
+            assert_eq!(std::ptr::read_unaligned(pair_slot as *const u64), live,
+                "non-zero [x1] untouched (no live-object corruption)");
+
+            // (e) NULL pair-pointer -> no-op.
+            let mut st2: CpuState = unsafe { std::mem::zeroed() };
+            st2.x[1] = 0;
+            routeb_lifecycle_wall_earlyret_guard(&mut st2, 0x1021f3748); // must not fault
+
+            std::env::remove_var("JIT_ROUTEB_LIFECYCLE_EARLYRET");
+            std::ptr::write_unaligned(pair_slot as *mut u64, 0);
         }
     }
 

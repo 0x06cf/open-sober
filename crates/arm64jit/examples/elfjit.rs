@@ -110,8 +110,8 @@ fn routeb_dm_root_object(buf: u64) -> u64 {
 }
 
 /// True when `guest_addr`'s 0x1000-byte page appears in /proc/self/maps
-/// (guest==host guest address real host address). Non-mutating -
-/// used to decide whether a page is genuinely unmapped before MAP_FIXED.
+/// (guest==host guest address real host address). Non-mutating - decides
+/// whether a page is genuinely unmapped before MAP_FIXED.
 fn guest_page_mapped(guest_addr: u64) -> bool {
     let page = guest_addr & !0xfff;
     std::fs::read_to_string("/proc/self/maps")
@@ -128,8 +128,8 @@ fn guest_page_mapped(guest_addr: u64) -> bool {
 
 /// SH156 (NEXT GATE): ensure the guest page containing `guest_addr` is mapped readable. Some
 /// `.bss`/data pages the GlobalInit dispatch ctor (0x102207b50) touches - e.g. flags-byte latch
-/// [0x7285fb0] - are left UNMAPPED by the boot remapping (SH116 class); ctor's `ldr x0,[0x7285fb0]`
-/// SIGSEGVs at guest 0x1067285fb0. If already mapped (in /proc/self/maps) we leave it untouched
+/// [0x7285fb0] - are left UNMAPPED by boot remapping (SH116 class); `ldr x0,[0x7285fb0]` SIGSEGVs
+/// @0x1067285fb0. If already mapped leave untouched
 /// (never clobber file-backed content); only a genuinely-unmapped page gets a fresh zeroed anon RW
 /// mapping (MAP_FIXED, guest==host). Returns true if mapped+readable afterwards.
 fn routeb_map_guest_page(guest_addr: u64) -> bool {
@@ -8881,14 +8881,11 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                 eprintln!("[elfjit:deque-node-live] gave up after 400 ticks");
             });
         }
-        // --taskv4-seed <probe|guest-hex>: populate the dispatcher's TYPE-4
-        // popped-task handler vector at guest BSS 0x106829ea8
-        // (dispatcher 0x10285371c w4=4 path: `adrp x8,6829000; ldr x3,[x8,#3752];
-        // br x3` at file 0x2853788/0x28537b8). During headless boot this vector is
-        // 0 (a NULL .bss fn-ptr a real framework producer would install), type-4
-        // dispatch of ANY popped node returns at 0x285378c->0x2853af0 doing nothing.
-        // Seeding with a registered HOST-THUNK probe lets a sentinel-vtable node pop
-        // REAL dispatcher w4=4 plane and hit our vector.
+        // --taskv4-seed <probe|guest-hex>: populate the dispatcher's TYPE-4 popped-task
+        // handler vector at guest BSS 0x106829ea8 (dispatcher 0x10285371c w4=4 path:
+        // `adrp x8,6829000; ldr x3,[x8,#3752]; br x3` @file 0x2853788/0x28537b8). Headless
+        // boot leaves it 0 (a NULL .bss fn-ptr a real producer installs); seeding with a
+        // registered HOST-THUNK probe pops REAL dispatcher w4=4 plane nodes into the vector.
         if let Some(spec) = std::env::args()
             .position(|a| a == "--taskv4-seed")
             .and_then(|i| std::env::args().nth(i + 1))
@@ -13174,12 +13171,10 @@ mod sh115_tests {
     #[test]
     fn sh252_resolver_map_has_no_lazy_static_ctor() {
         // SH252 (Route-B class-registry closure): resolver map 0x106dca0e70 (name->classid,
-        // getService walker 0x105e09bc8 -> resolver 0x2373cec) is built ONLY in-ladder bulk
-        // registrar 0x2208ae8 iterating SOURCE vector 0x6dca0ea8 (SH193/194/207).
-        // Full-text lazy-static sweep (exec [0x0,0x62d8190)): 8,378 bl __cxa_guard_acquire;
-        // none constructs 0x6dca0e70 (no adrp 0x6dca000+#0xe70 in any guard-ctor body). =>
-        // NO lazy-static ctor; only the bulk registrar. Measured closure; a future resolver
-        // static ctor fails loudly. Real-image guard, skip-if-absent.
+        // getService 0x105e09bc8 -> resolver 0x2373cec) builds ONLY in-ladder registrar
+        // 0x2208ae8 over SOURCE vector 0x6dca0ea8 (SH193/194/207). Exec [0x0,0x62d8190)
+        // lazy-static sweep: 8,378 bl __cxa_guard_acquire, none constructs 0x6dca0e70.
+        // => NO lazy-static ctor; only the bulk registrar. Drift fails loudly. skip-if-absent.
         const PAGE: u64 = 0x6dca000;
         const RESOLVER_OFF: u64 = 0xe70;
         const GUARD: u64 = 0x284ce54; // __cxa_guard_acquire (file vaddr)
@@ -14201,13 +14196,11 @@ mod sh115_tests {
 
     #[test]
     fn sh255_marshaler_enclosing_fn_indirect_only_ec_selfcallers_in_world() {
-        // SH255 (Route-B): marshaler 0x1023f1210's enclosing fn 0x1023f03b4 (holds `bl
-        // 0x1023f1210` @0x1023f075c) has ZERO direct bl/b callers over the whole executable
-        // .text - reachable ONLY via indirect dispatch (blr/br, the live-this class). So no
-        // in-image static call site reaches the EC world except (a) StartLuaAppDM's dispatch
-        // switch (inert SH236/238) and (b) EC-world internal self-calls (gated world running).
-        // Mechanizes the "no headless seed reaches the genuine DataModel factory" verdict at
-        // enclosing-fn level; a drifted constant fails loudly.
+        // SH255 (Route-B): marshaler 0x1023f1210's enclosing fn 0x1023f03b4 (bl @0x1023f075c)
+        // has ZERO direct bl/b callers over .text - reachable ONLY via indirect dispatch
+        // (live-this class). No in-image static call site reaches the EC world except
+        // StartLuaAppDM's dispatch switch (inert SH236/238) + EC self-calls (gated world).
+        // Mechanizes the 'no headless seed reaches the genuine DM factory' at enclosing-fn level.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
@@ -14582,12 +14575,11 @@ mod sh115_tests {
 
     #[test]
     fn sh281_config56_seed_crosses_reentry_continuation() {
-        // SH281: the state=5 config dispatch -> GlobalInit-reentry faulted @0x10275a154 `ldr x0,[x21,x8]`
-        // because x21=[config+56]=0. The callee 0x275a23c DROPS the read value (overwrites x0 with
-        // operator_new(0x40)), so [config+56] only needs a valid buffer. Seeding it crosses the wall:
-        // MEASURED the state=5 body runs the FULL GlobalInit-reentry (hits 0x10275a148 -> 0x275a23c ->
-        // 0x2207118) with no SIGSEGV (EXIT 124 timeout park at 0x2207118 `add x0,#0xaa0; bl mutex_lock`,
-        // box+0xaa0 = junk heap beyond the 0x40 callee box). Guest = file vaddr + 0x1_0000_0000.
+        // SH281: state=5 config dispatch -> GlobalInit-reentry fault @0x10275a154 `ldr x0,[x21,x8]`
+        // (x21=[config+56]=0). Callee 0x275a23c DROPS the value (x0=operator_new(0x40)), so
+        // [config+56] only needs a valid buffer. Crossed: state=5 runs the FULL reentry
+        // (0x10275a148->0x275a23c->0x2207118) no SIGSEGV (EXIT 124 park @0x2207118 mutex_lock,
+        // box+0xaa0=junk heap past the 0x40 box). Guest=file+0x100000000.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -14626,12 +14618,11 @@ mod sh115_tests {
 
     #[test]
     fn sh282_entry_continuation_locks_fixed_bss_not_box() {
-        // SH282: corrects SH281's wrong premise. The state=5 GlobalInit-reentry continuation
-        // 0x2207118 does NOT lock [box+0xaa0] - it locks FIXED GLOBAL 0x106863aa0, TRUE zeroed
-        // .bss (static-init pthread_mutex_t that a plain lock returns immediately). So the
-        // 'supply a correctly-sized settings box' step SH281 proposed is a DEAD END
-        // (box never deref'd at +0xaa0). Real forward work = enqueue-construct on fixed
-        // object 0x106863a70 (0x2d9713c -> 0x22071ac), not the box size. Do-not-re-tread.
+        // SH282: corrects SH281. State=5 GlobalInit-reentry continuation 0x2207118 does NOT lock
+        // [box+0xaa0] - it locks FIXED GLOBAL 0x106863aa0, TRUE zeroed .bss (static-init mutex
+        // a plain lock returns immediately). 'supply a correctly-sized box' is a DEAD END
+        // (box never deref'd at +0xaa0). Real forward = enqueue-construct on fixed obj
+        // 0x106863a70 (0x2d9713c->0x22071ac), not the box size. Do-not-re-tread.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -14664,12 +14655,10 @@ mod sh115_tests {
     #[test]
     fn sh284_engine_settings_state9_body_last_never_driven() {
         // SH284: drive the LAST never-driven initEngine_ state body - state=9 (0x2bd2668).
-        // SH273/SH277 measured states 5 and 9 were NEVER driven; SH283 crossed state=5's
-        // reentry continuation (5->7). The state=9 body sets state->10 then `bl 0x2bce0d4`
-        // with w2=1 -> `b 275a0c4` (the SAME GlobalInit-reentry the JIT_ROUTEB_ENG5_QMUTEX_FREE
-        // steal carries through). MEASURED 3/3: body returns Ok + state->10, then self-drives
-        // into app-start and dies SH260 LSM wall (0x101db1d04) - parked detour, not a
-        // regression. Guest = file vaddr + 0x1_0000_0000.
+        // SH273/SH277 measured states 5+9 NEVER driven; SH283 crossed 5 (5->7). State=9 sets
+        // state->10 then `bl 0x2bce0d4` w2=1 -> `b 275a0c4` (same GlobalInit-reentry the
+        // JIT_ROUTEB_ENG5_QMUTEX_FREE steal carries). MEASURED 3/3: Ok + state->10, self-drives
+        // into app-start, dies SH260 LSM wall (0x101db1d04) - parked detour. Guest=file+0x100000000.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -14739,13 +14728,11 @@ mod sh115_tests {
 
     #[test]
     fn sh273_lifecycle_natives_converge_on_shared_dispatcher() {
-        // SH273: SEP-17 names JNIActivityLifecycleCallbacks nativeOn* as REAL session
-        // primitives; SH264 only measured OnResumed+setActive. All 12 public entries
-        // (PreCreated..Destroyed) are 44-byte JNI stubs (prologue stp x29,x30,[sp,#-16]!,
-        // GetStringUTFChars slot169/offset1352 = SH186 shim, final `b 0x21f15a4` tail).
-        // 0x102_21f15a4 = the SINGLE shared Activity-lifecycle dispatcher (sub sp,#0x1c0) whose
-        // downstream deref of a real lifecycle-registry object SH264 fault
-        // (0x1021f3748=0xd10243ff, fault=0x50). ONE closed wall; no fresh seed lever.
+        // SH273: all 12 JNIActivityLifecycleCallbacks nativeOn* are 44-byte JNI stubs
+        // (stp x29,x30,[sp,#-16]!, GetStringUTFChars slot169/offset1352=SH186 shim,
+        // tail `b 0x21f15a4`) -> ONE shared Activity-lifecycle dispatcher 0x10221f15a4
+        // whose downstream deref of a real lifecycle-registry obj faults 0x50
+        // (0x1021f3748=0xd10243ff). ONE closed wall; no fresh seed lever.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15145,11 +15132,11 @@ mod sh115_tests {
 
     #[test]
     fn sh321_donepath_main_reaches_engine_settings_init_lifecycle_wall() {
-        // SH321 (guard-gated, A/B 0 vs 2): with JIT_ROUTEB_DONEPATH_MAIN=1 the do-init done-path MAIN
-        // binder-dispatch (0x206df4 ldr x0,[x19,#32]->vt+0x30->br x1) climbs into real engine init
-        // (caller 0x2270024 stp->0x2270050 add->bl 0x21f3748) then faults at the SH273 lifecycle-registry
-        // live-object wall (fn 0x21f3748=0xd10243ff; ldrb [x8,#80]@0x21f3770=0x50 on [x22]=0, host-heap).
-        // Refines SH320 'vt+0x30->DM-ctor': it reaches ENGINE-SETTINGS-INIT, not a DM ctor.
+        // SH321 (guard-gated, A/B 0 vs 2): JIT_ROUTEB_DONEPATH_MAIN=1 makes the do-init MAIN
+        // binder-dispatch (0x206df4->vt+0x30->br x1) climb into real engine settings-init
+        // (caller 0x2270024->0x2270050 bl 0x21f3748) then fault at the SH273 lifecycle wall
+        // (fn 0x21f3748=0xd10243ff; ldrb [x8,#80]@0x21f3770=0x50 on [x22]=0). Refines SH320's
+        // 'vt+0x30->DM-ctor': it reaches ENGINE-SETTINGS-INIT, not a DM ctor.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15172,14 +15159,36 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh322_lifecycle_wall_earlyret_canary_pinned() {
+        // SH322 (SESSION-CTOR, crossing the SH273 lifecycle wall on the SH320/321 MAIN path):
+        // fn 0x21f3748 reads ldr x8,[x1] + ldrb [x8,#80] (fault 0x50, sh321), then tbnz w8,#1
+        // @0x21f3774 -> 0x21f3870 = epilogue canary-check+ret (benign no-op). SH322 seeds caller
+        // pair [x1]=obj with byte[+80].bit1=1 so the tbnz is taken (no registry-build).
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            assert_eq!(word(0x1021_f3774), 0x370807e8, "sh322 tbnz w8,#1,0x21f3870 (byte[+80].bit1 -> early canary-check+ret)");
+            assert_eq!(word(0x1021_f3870), 0xf94002c8, "sh322 early-ret: ldr x8,[x22] (canary-check)");
+            assert_eq!(word(0x1021_f3890), 0xd65f03c0, "sh322 early-ret: ret (benign no-op)");
+            assert_eq!(word(0x102_270024), 0xa901a3e9, "sh322 caller stp x9,x8,[sp,#24] (stores [x22],[x22+8])");
+            eprintln!("sh322 SH273 lifecycle wall early-ret (tbnz -> canary-check+ret) pinned.");
+        } else {
+            eprintln!("sh322 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh314_appstart_map_header_is_liveobj_not_fixed_cell() {
         // SH314 (do-not-re-tread closure): app-start map wall 0x1021dde34 (`ldr x23,[x21,#8]`,
         // x21 container=0x100548ca9) is fed by the ADDRESS OF A RODATA STRING
-        // (file 0x548ca9 = "Id\0assetTypeId\0avatar_load_start\0..."), not heap-garbage nor an
-        // unapplied reloc - a map slot type-punned with a string ptr. The 5 STATIC walkers
-        // (of 0x21ddbc8) build STACK containers (x0=sp+0xc48, x1=sp+0xa70, w2=1) from table
-        // 0x66e7000 → benign, NOT the crash (x22=0x11 != 1). No count-clamp/fixed-cell/repair
-        // crosses it; real session ctor needed.
+        // (file 0x548ca9="Id\0assetTypeId\0avatar_load_start\0...") - a map slot type-punned
+        // with a string ptr. 5 STATIC walkers (of 0x21ddbc8) build STACK containers
+        // (x0=sp+0xc48, x1=sp+0xa70, w2=1) from table 0x66e7000 -> benign, not the crash
+        // (x22=0x11!=1). No count-clamp/fixed-cell/repair crosses it; real session ctor needed.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15812,13 +15821,11 @@ mod sh115_tests {
 
     #[test]
     fn sh297_dmfn_construction_body_arg1_clobber_pinned() {
-        // SH297: SH296's stage-2 seed (this+136/144=singleton) NO-OP because the
-        // construction body 0x23f0484 reads `ldp x21,x24,[x22,#8]` (x22=ARG1=x1) then
-        // `stp x21,x24,[x20,#136]` - it CLOBBERS this+136/144 from arg1[8]/arg1[16].
-        // arg1 zeroed buffer in SH296 (-> cbz x21 safety-epilogue fired before any
-        // this-field was read). SH297 seeds coherent arg1[8]=[arg1+16]=singleton + this+120
-        // + this+128 (refcount factory 0x2b4ea48). Pins the body's arg1-read + clobber-store
-        // + the gates it bypasses past 0x23f04d0. Real-image anchored (skip-if-absent).
+        // SH297: SH296's stage-2 seed (this+136/144=singleton) NO-OP - construction body
+        // 0x23f0484 reads ldp x21,x24,[x22,#8] (x22=ARG1=x1) then stp them to [x20,#136]:
+        // it CLOBBERS this+136/144 from arg1[8]/arg1[16]. SH296's zeroed arg1 -> cbz x21
+        // safety-epilogue before any this-field read. SH297 seeds arg1[8]=[arg1+16]=singleton
+        // + this+120 + this+128 (refcount factory 0x2b4ea48). Pins arg1-read + clobber-store.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15848,12 +15855,11 @@ mod sh115_tests {
     #[test]
     fn sh298_registration_ec_world_reach_pinned() {
         // SH298 (--v2boot-session-dmfn + JIT_ROUTEB_DMFN_REGISTER): construction body calls
-        // registration fn 0x21e45c8 @0x23f05b8 with x0=[arg1[8]] (DOUBLE deref). SH297
-        // (arg1[8]=singleton)->x0=singleton VTABLE -> faults @[x22+24]. SH298: arg1[8]=CELL->obj R
-        // ([R+8]=singleton host obj) -> 0x21e45c8 COMPLETES, falls past SH297's wall into EC world:
-        // 3/3 terminal SIGSEGV guestpc=0x102e245f4 (EC entry 0x102e24598 = stp x29,x30,[sp,#-96]! =
-        // SH235 genuine DM-creation world) in 0x1023f1354 at NULL+0x48 live-object deref. First
-        // headless penetration EC world.
+        // reg-fn 0x21e45c8 @0x23f05b8 with x0=[arg1[8]] (DOUBLE deref). SH297 arg1[8]=singleton
+        // -> x0=singleton VTABLE -> faults [x22+24]. SH298 arg1[8]=CELL->obj R ([R+8]=singleton
+        // host obj) -> 0x21e45c8 COMPLETES past SH297's wall into EC world: 3/3 terminal SIGSEGV
+        // guestpc=0x102e245f4 (EC entry 0x102e24598=stp x29,x30,[sp,#-96]! = SH235 genuine
+        // DM-creation world) in 0x1023f1354 at NULL+0x48 live-object deref. FIRST EC penetration.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
