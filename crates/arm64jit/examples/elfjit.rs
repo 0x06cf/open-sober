@@ -38,11 +38,10 @@ fn taskv4_frame_seed_active() -> bool {
 }
 
 /// SH128: opt-in combined-frame re-drive (frontier-sh127-serial-combined-frame.md).
-/// When active, the main thread re-drives the engine's drain pop-loop
-/// 0x102856e40 bounded jit_run after the serialized ladder joins, and the
-/// renderinit presenter + --deque-node-live injector hold open for the duration
-/// so type-4 dispatches become REAL presented frames in the SAME run that
-/// constructs the session. Inert (default-unregressed) without the flag.
+/// When active, the main thread re-drives the engine's drain pop-loop 0x102856e40 bounded
+/// jit_run after the serialized ladder joins, and the renderinit presenter + --deque-node-live
+/// injector hold open for the duration so type-4 dispatches become REAL presented frames in the
+/// SAME run that constructs the session. Inert without the flag.
 fn redrive_enabled() -> bool {
     std::env::args().any(|a| a == "--deque-redrive")
 }
@@ -71,12 +70,10 @@ fn guest_arena_alloc(size: usize) -> u64 {
 }
 
 /// SH131: write `bytes` (+ NUL) into `buf` and lay out a libc++ `std::string`
-/// in LONG form at `global` (24-byte slot): [0..8]=__data_(buf ptr),
-/// [8..16]=__size_, [16..24]=__cap_ (bit0 clear => long; libc++ discriminates
-/// via `__cap_ & 1`). Seeds the engine's files-dir global (guest 0x10726d600)
-/// that nativeSetFilesDirectory would fill, de-gating the datastore base path
-/// Lua app-shell wall. `buf` must be guest-visible RW memory
-/// (guest==host identity in the runtime). Returns `global` (nonzero) or 0.
+/// in LONG form at `global` (24-byte slot): [0..8]=__data_(buf ptr), [8..16]=__size_,
+/// [16..24]=__cap_ (bit0 clear => long). Seeds the files-dir global (guest 0x10726d600)
+/// nativeSetFilesDirectory fills, de-gating the datastore base Lua app-shell wall.
+/// `buf` must be guest-visible RW memory (guest==host). Returns `global` or 0.
 fn seed_libcpp_long_string(global: u64, buf: u64, bytes: &[u8]) -> u64 {
     if global == 0 || buf == 0 || bytes.is_empty() || bytes.len() >= 4096 {
         return 0;
@@ -177,14 +174,11 @@ static RENDERSCENE_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::Ato
 
 static LADDER_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// SH128 combined re-drive: when StartApp RETURNS under the serialized ladder
-/// (combined run), no guest thread is resident in the engine's drain pop-loop
-/// 0x102856e40, --deque-node-live injector's type-4 nodes are never
-/// popped and the combined run presents 0 frames (frontier-sh127: structural
-/// drain-not-driven). --deque-redrive makes the MAIN thread re-run the drain
-/// bounded top-level jit_run AFTER the ladder joins, so injector -> type-4
-/// thunk -> PENDING_PRESENTS -> real frames currency thread. These
-/// statics coordinate all three parties around that window.
+/// SH128 combined re-drive: when StartApp RETURNS under the serialized ladder, no guest
+/// thread is in the drain pop-loop 0x102856e40, --deque-node-live type-4 nodes are never
+/// popped, and the combined run presents 0 frames (structural drain-not-driven). --deque-redrive
+/// makes the MAIN thread re-run the drain bounded jit_run AFTER the ladder joins, so injector ->
+/// type-4 thunk -> PENDING_PRESENTS -> frames. These statics coordinate all three parties.
 static REDRIVE_X1: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static REDRIVE_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static REDRIVE_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -2307,11 +2301,10 @@ fn routeb_patch_opnew_size_gate() {
     ROUTEB_OPNEW_SIZEGATE_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 static ROUTEB_RUNG0_DISPATCH_PATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// SH126-followup: with JIT_SERIALIZE_RENDER the drain overlap is gone, but the
-/// residual rung-0 crash null-store in `nativeInitializeNativeFlags`
-/// (0x10232048c): a virtual `blr x8` at 0x62514e0 (vt[+232]) enters the
-/// flag-recorder 0x101d97c70 with this/map === 0 (null-store). Same SendAppEvent
-/// family as SH115/119, but caller 0x6251438 is an UNPATCHED third site. Fix:
+/// SH126-followup: with JIT_SERIALIZE_RENDER drain overlap is gone, but the residual
+/// rung-0 null-store in nativeInitializeNativeFlags (0x10232048c): a virtual `blr x8`
+/// @0x62514e0 (vt[+232]) enters flag-recorder 0x101d97c70 with this/map===0. Same
+/// SendAppEvent family as SH115/119, but caller 0x6251438 is an UNPATCHED third site. Fix:
 /// leaf-rewrite callee entry 0x101d97c70 to materialize the singleton into x0 +
 /// ret (benign). Mirrors SH119 site-1 + SH117. Opt-in JIT_SH115_SINGLETON_PATCH.
 fn routeb_patch_rung0_flag_recorder() {
@@ -2365,12 +2358,12 @@ fn routeb_patch_rung0_flag_recorder() {
     ROUTEB_RUNG0_DISPATCH_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 static ROUTEB_GUARD_UNIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-/// SH118: guest 0x1067d16f0 is BOTH the `__stack_chk_guard` GOT slot (~48k stack-protected fns
-/// read the canary base from it) AND the engine render-ctx/singleton global (SH14/SH106 dual-use).
-/// SH106 seeded a canary VALUE, but StartApp/renderinit RE-PUBLISH the slot to the live ctx; a fn
-/// republishing mid-execution reads a mutated canary at epilogue vs prologue -> false stack-smash.
-/// Fix: seed the slot to the ADDRESS of a leaked stable u64 (cached at prologue, *guard stays
-/// constant despite mid-body re-publication). Run before each rung that can republish it.
+/// SH118: guest 0x1067d16f0 is BOTH the `__stack_chk_guard` GOT slot (~48k stack-protected
+/// fns read the canary base from it) AND the engine render-ctx/singleton global (SH14/106).
+/// SH106 seeded a canary VALUE, but StartApp/renderinit RE-PUBLISH the slot to the live ctx;
+/// a fn republishing mid-execution reads a mutated canary at epilogue vs prologue -> false
+/// stack-smash. Fix: seed the slot to the ADDRESS of a leaked stable u64 (cached at prologue,
+/// *guard stays constant despite mid-body re-publication). Run before each rung that republishes.
 fn routeb_reassert_canary_guard() {
     let unit = *ROUTEB_GUARD_UNIT.get_or_init(|| {
         let b: &'static mut u64 = Box::leak(Box::new(0x2f_2a_1a_0a_0e_0f_10_11u64));
@@ -6183,13 +6176,11 @@ fn main() {
     let len = (full_end - base) as usize;
 
     // Reserve a writable guest tail past the ELF's mapped span. Real Roblox
-    // `nativeInitCrashpad` walks a link-time `& bss` telemetry table base by a
-    // slot index that reaches tens of MB past the last PT_LOAD `.bss` end; on
-    // real Android that adjacent memory is mapped anonymous, our loader maps
-    // only the ELF span. Reserve 384MB of RW headroom deep table writes
-    // (and other large guest tables/arenas) have real backing instead of
-    // SIGSEGV. MAP_FIXED at a page-aligned address after base+len is safe
-    // (host heap/stack live elsewhere); must start page-aligned or mmap EINVALs.
+    // nativeInitCrashpad walks a link-time & bss table by a slot index reaching tens of MB
+    // past the last PT_LOAD .bss end; on real Android that's mapped anonymous, our loader maps
+    // only the ELF span. Reserve 384MB RW headroom so deep table writes have real backing
+    // instead of SIGSEGV. MAP_FIXED at a page-aligned addr after base+len is safe (host
+    // heap/stack live elsewhere); must be page-aligned or mmap EINVALs.
     let tail_start = (full_end as usize + 0xfff) & !0xfff;
     const TAIL_SIZE: usize = 384 * 1024 * 1024;
     match libloader::elf::reserve_guest_tail(tail_start, TAIL_SIZE) {
@@ -6413,14 +6404,11 @@ fn main() {
     if std::env::var("JIT_SERIALIZE_RENDER").ok().as_deref() == Some("1")
         && std::env::args().any(|a| a == "--v2boot")
     {
-        // SH170 pitfall: JIT_SERIALIZE_RENDER's WORKER_ADMISSION_GATE is only
-        // correct for the COMBINED render chain (gate + --renderinit +
-        // --taskv4-seed frame, capture_sh130.sh). Bolting it onto the DM-seed
-        // chain (JIT_ROUTEB_DM_SEED=1 / JIT_ROUTEB_DMFORCE=1) parks the clone
-        // worker that nativeGameGlobalInit's do-init depends on, do-init
-        // throws an unhandled guest C++ exception ('libc++abi: terminating',
-        // EXIT 139) EVERY run. Warn on that known-bad combo silently
-        // mis-running. Diagnostic only - no behavior change on valid paths.
+        // SH170 pitfall: JIT_SERIALIZE_RENDER's WORKER_ADMISSION_GATE is only correct for
+        // the COMBINED render chain (gate + --renderinit + --taskv4-seed frame, capture_sh130).
+        // Bolting it onto the DM-seed chain (JIT_ROUTEB_DM_SEED/DMFORCE=1) parks the clone
+        // worker nativeGameGlobalInit's do-init depends on -> unhandled guest C++ exception
+        // ('libc++abi: terminating', EXIT 139) every run. Warn on that known-bad combo.
         let dm_seed = std::env::var("JIT_ROUTEB_DM_SEED").ok().as_deref() == Some("1")
             || std::env::var("JIT_ROUTEB_DMFORCE").ok().as_deref() == Some("1");
         if dm_seed {
@@ -6930,8 +6918,8 @@ fn main() {
                                 // app-shell/do-init ctor SEGVs (thread-init 0x102207ef0, telemetry
                                 // 2b4cd1c park, map-page 0x102212838) need VALUE seeds. SH156 maps
                                 // the pages but never writes them; the block-entry guard is INERT
-                                // here (ctor blocks already JIT-cached), so seed the VALUES at the
-                                // synthesis point that maps them - the SH269 GOVFLAG seed pattern.
+                                // (ctor blocks JIT-cached), so seed the VALUES at the synthesis
+                                // point that maps them - the SH269 GOVFLAG seed pattern.
                                 if std::env::var_os("JIT_ROUTEB_DOINIT_NEXT3").is_some() {
                                     const TI: u64 = 0x1067333aa0; // thread-init singleton (clears 0x102207ef0)
                                     const TEL: u64 = 0x106dcd380; // telemetry once-cell (clears 2b4cd1c park)
@@ -7795,11 +7783,10 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                     );
                     // SH155 REcon-verified DM-root markers (do-init __call_once result):
                     // (a) once-guard bit0==1 (lambda completed); (b) DM-root
-                    // [0x106a68818] non-NULL AND [[0x106a68818]+0x20] vt+0x30 sane
-                    // image code address (a live DataModel/app-shell object the match path
-                    // would `br` into); (c) the app-data-model counter [0x106dca000+0xe88]
-                    // advanced from 0 (the JSON serialization wrote once). Print all three
-                    // route-B advance is observable without retro-instrumentation.
+                    // [0x106a68818] non-NULL AND [[0x106a68818]+0x20] vt+0x30 sane image
+                    // code addr (a live DataModel the match path would `br` into); (c) the
+                    // app-data-model counter [0x106dca000+0xe88] advanced from 0 (the JSON
+                    // serialization wrote once). Print all three so the
                     let dm_root = unsafe { *(0x106a68818u64 as *const u64) };
                     let (mark_b, vt30) = if (0x100000000..0x107333c3c).contains(&dm_root) {
                         let obj20 = unsafe { *((dm_root + 0x20) as *const u64) };
@@ -8579,12 +8566,11 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                     "[elfjit:deque-node-live] inject into LIVE drainer's deque (vtable 0x{vt:x}); draining when pc in [0x{DRAIN_LO:x},0x{DRAIN_HI:x})"
                 );
                 // SH126-serial: under JIT_SERIALIZE_RENDER + --v2boot the ladder holds
-                // guest_tid0, engine's live drain pop-loop never lands its pc in
-                // [DRAIN_LO,DRAIN_HI) during the ladder - the 400-tick capture budget burns
-                // in the pre-recovery window and the injector gives up before RENDERCTX
-                // publishes -> 0 frames. Do NOT start the budget at t=0 under the serialized
-                // ladder: wait for LADDER_DONE, THEN renderinit to publish RENDERCTX (same
-                // 300s bound) so injected nodes dispatch into a READY presenter.
+                // guest_tid0; the drain pop-loop pc never lands in [DRAIN_LO,DRAIN_HI) during
+                // the ladder - the 400-tick budget burns pre-recovery and the injector gives up
+                // before RENDERCTX publishes -> 0 frames. Don't start the budget at t=0 under
+                // the ladder: wait LADDER_DONE -> renderinit publishes RENDERCTX (300s bound)
+                // so injected nodes dispatch into a READY presenter.
                 let serialize = std::env::var("JIT_SERIALIZE_RENDER").ok().as_deref() == Some("1")
                     && std::env::args().any(|a| a == "--v2boot");
                 if serialize {
@@ -9543,8 +9529,8 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
             }
             let _ = &real_ctx;
             // --renderframe (opt-in, with --renderinit): after real render-init ran, present the
-            // engine's LIVE EGL context. Reverse (SH17): render-init inner fn 0x105b3a2d8 wrote
-            // live EGL handles into `scratch` ([+32]=display, [+40]=surface, [+48]=context).
+            // engine's LIVE EGL context. Reverse (SH17): render-init inner 0x105b3a2d8 wrote
+            // live EGL handles into `scratch` ([+32]=display,[+40]=surface,[+48]=context).
             // Swap fn 0x105b3b408 tail `ldp x8,x1,[x0,#32]; mov x0,x8; b eglSwapBuffers` =
             // eglSwapBuffers([x0+32],[x0+40]); x0=scratch makes the engine's own swap present
             // the current surface headlessly (llvmpipe+Xvfb) WITHOUT re-running init.
@@ -10254,9 +10240,9 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                                                                 let _ = arm64jit::jit::jit_run(iimg, ibase, plt_tex_image_2d, &mut stex as *mut CpuState);
                                                                             } else {
                                                                                  // ETC1/ETC2-RGB live-path: upload a REAL 8x8 ETC1 (4 solid 4x4 blocks=32B) via
-                                                                                 // glCompressedTexImage2D; bridge decodes ETC1->RGBA (texture-codec)+re-uploads
-                                                                                 // glTexImage2D. Indiv mode, table cw0, sel 0 -> color=(c*0x11)+2. ETC2
-                                                                                 // mode1/2==ETC1; relabel internalformat to prove decode_etc2_rgb handles real path.
+                                                                                 // glCompressedTexImage2D; the bridge decodes ETC1->RGBA (texture-codec)+re-uploads
+                                                                                 // glTexImage2D. Indiv mode cw0 sel0 -> color=(c*0x11)+2. ETC2 mode1/2==ETC1;
+                                                                                 // relabel internalformat to prove decode_etc2_rgb handles the real path.
                                                                                 const GL_ETC1_RGB8_OES: u64 = 0x8d64;
                                                                                 const GL_COMPRESSED_RGB8_ETC2: u64 = 0x9274;
                                                                                 let comp_fmt = if etc2_mode { GL_COMPRESSED_RGB8_ETC2 } else { GL_ETC1_RGB8_OES };
@@ -10827,12 +10813,11 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                             std::thread::sleep(std::time::Duration::from_millis(350));
                                         }
                                     }
-                                    // --renderframe-mesh-uv-orbit <N>: SH144 - render REAL studs-textured mesh N
-                                    // times from a camera ORBITING the model's +Y axis. Each frame re-uploads a
-                                    // yawed MVP to mesh-uv program, re-drives the engine's own geometry
-                                    // wrapper 0x105b35288 over stride-24 VBO/EBO, and swaps - a real
-                                    // rotating, textured 3D scene engine GLES path. Distinct studs-
-                                    // luminance centroid per yaw proves real rotation.
+                                    // --renderframe-mesh-uv-orbit <N>: SH144 - render a REAL studs-textured mesh N
+                                    // times from a camera orbiting +Y; each frame re-uploads a yawed MVP,
+                                    // re-drives the engine's own geometry wrapper 0x105b35288 over
+                                    // stride-24 VBO/EBO, and swaps - a real rotating textured 3D engine
+                                    // GLES path. Studs-luminance centroid per yaw proves rotation.
                                     let mesh_orbit_n: usize = if mesh_uv_active {
                                         renderframe_args
                                             .iter()
@@ -10899,10 +10884,9 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                         }
                                     }
                                     // --renderframe-mesh-compose <p1>,<p2>,...: SH146 - render N DISTINCT real
-                                    // Roblox .mesh objects (avatar torso/limbs/head) in ONE frame, each
-                                    // with VBO/EBO, per-object compose-MVP (translate+scale+yaw
-                                    // via mesh_compose_mvp) + SH145 diffuse light, ALL driven sequentially
-                                    // engine's own geometry wrapper 0x105b35288 - a composed
+                                    // Roblox .mesh objects (avatar torso/limbs/head) in ONE frame, each with
+                                    // VBO/EBO + per-object compose-MVP + SH145 diffuse light, ALL driven
+                                    // sequentially by engine's own geometry wrapper 0x105b35288 - a composed
                                     // real-avatar scene (row across world X; one clear, N draws, one swap).
                                     let compose_str: Option<std::path::PathBuf> = None;
                                     let compose_objs: Vec<String> = renderframe_args
@@ -11098,12 +11082,10 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
             // samples a 2x2 texture REAL interpolated UV (proving per-texel UV mapping).
             // Readback: 4 quadrants = the 4 texel colors.
                         if renderframe_args.iter().any(|a| a == "--renderframe-quad") {
-                            // --renderframe-etc2a: like the quad RGBA path but upload the texture REAL
-                            // ETC2-RGBA8/EAC texture (0x9278 - real Android RGBA-EAC) via
-                            // glCompressedTexImage2D, mapping the DECODED ALPHA to fragment RGB.
-                            // The 4 quadrant readbacks read the 4 distinct EAC block alphas as gray
-                            // levels (255/190/128/64) - robust proof the EAC alpha sub-block decodes
-                            // live (framebuffers often discard alpha, so gray-scale makes it capturable).
+                            // --renderframe-etc2a: like the quad RGBA path but upload a REAL ETC2-RGBA8/EAC
+                            // texture (0x9278) via glCompressedTexImage2D, mapping decoded alpha to
+                            // fragment RGB; 4 quadrant readbacks read the 4 EAC block alphas as gray
+                            // (255/190/128/64) - robust proof EAC alpha decodes live.
                             let etc2a_mode = renderframe_args.iter().any(|a| a == "--renderframe-etc2a");
                             // --renderframe-astc: like --renderframe-etc2a but upload the texture
                             // REAL ASTC 4x4 LDR void-extent texture (0x93B0 - the load-bearing
@@ -13265,12 +13247,11 @@ mod sh115_tests {
                 assert_eq!(sites[i], *e, "resolver-forming site {i} must be {e:#x}");
             }
             // (b): NO lazy-static ctor WRITES the resolver header. A true lazy-static ctor
-            // would store (str/stp) map object at PAGE+0xe70..+0xea0 (the 48-byte
-            // __bucket_list_/state header, exactly what in-ladder default-construct 0x2208418-
-            // 0x2208434 does). The 0x25f8fb8 guard ctor FORMS the addr but only passes
-            // &resolver to READ-ONLY probe 0x2373cec (classid cache) - never stores. Sweep
-            // every __cxa_guard_acquire ctor body for a store into [PAGE+0xe70, PAGE+0xea0);
-            // if a future edit adds a constructing lazy ctor, the store is caught.
+            // would store (str/stp) the map object at PAGE+0xe70..+0xea0 (the 48-byte
+            // __bucket_list_/state header, exactly what in-ladder default-construct
+            // 0x2208418-0x2208434 does). The 0x25f8fb8 guard ctor FORMS the addr but only
+            // passes &resolver to READ-ONLY probe 0x2373cec - never stores. Sweep every
+            // __cxa_guard_acquire ctor body for a store into [PAGE+0xe70,PAGE+0xea0).
             let mut guard_sites: u64 = 0;
             let mut ctor_header_write: Vec<u64> = Vec::new();
             let mut pc = 0usize;
@@ -13739,13 +13720,11 @@ mod sh115_tests {
 
     #[test]
     fn sh223_dm_creator_region_entries_pinned() {
-        // SH223 (Route-B re-attack): the operator's named re-attack target is the
-        // NativeDataModelManager DM-construction path - getFlagsFromEngine_/initEngine_
-        // [0x102bd1a30,0x102bd1d08) + initializeLuaApp_/startLuaApp_ [0x102bd21d4,
-        // 0x102bd2600). The SH209-style reachability re-measure (re-run post-SH217 =
-        // 3/3 clean, govtail 75 pcs, DM-creator 0 hits) reads these EXACT region-entry
-        // addresses; a shifted constant would report 0 hits + fabricate a false negative.
-        // Pin all six boundary words + govtail entry so drift fails loudly. sh219 family.
+        // SH223 (Route-B re-attack): the operator's named target is the NativeDataModelManager
+        // DM-construction path - getFlagsFromEngine_/initEngine_ [0x102bd1a30,0x102bd1d08) +
+        // initializeLuaApp_/startLuaApp_ [0x102bd21d4,0x102bd2600). The SH209 reachability
+        // re-measure (post-SH217: 3/3 clean, govtail 75 pcs, DM-creator 0 hits) reads these
+        // EXACT region-entry addrs; a shifted constant would fake a false negative.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
@@ -15182,6 +15161,29 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh323_settings_sso_fencepost_pinned() {
+        // SH323 (SH322 NEXT fencepost): after the SH273 wall clears, fn 0x21f5078
+        // (whitespace-check) reads global std::string [0x106ed7a18] (`adrp x8,6ed7000;
+        // ldr x8,[x8,#2584]` = [0x106ed7a18]) then ldrb [x8] fault=0x0 when NULL. Cell sits
+        // 8B below the SH248d cookie-jar global [0x106ed7a20]. Seed empty SSO string.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            assert_eq!(word(0x1021_f5078), 0xa9bf7bfd, "sh323 fn 0x21f5078 prologue stp x29,x30,[sp,#-16]!");
+            assert_eq!(word(0x1021_f5080), 0xd0026708, "sh323 adrp x8,0x6ed7000");
+            assert_eq!(word(0x1021_f5084), 0xf9450d08, "sh323 ldr x8,[x8,#2584] (=guest [0x106ed7a18])");
+            assert_eq!(word(0x1021_f5088), 0x3940010a, "sh323 ldrb w10,[x8] (fault=0x0 when [0x106ed7a18]==0)");
+            eprintln!("sh323 settings SSO fencepost (fn 0x21f5078 -> [0x106ed7a18]) pinned.");
+        } else {
+            eprintln!("sh323 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh314_appstart_map_header_is_liveobj_not_fixed_cell() {
         // SH314 (do-not-re-tread closure): app-start map wall 0x1021dde34 (`ldr x23,[x21,#8]`,
         // x21 container=0x100548ca9) is fed by the ADDRESS OF A RODATA STRING
@@ -15484,11 +15486,10 @@ mod sh115_tests {
 
     #[test]
     fn sh289_worker_consume_queue_cell_attribution_corrected() {
-        // SH288 left work-flag attribution open + mislabeled item-proc's 0x221942c a
-        // "GlobalInit sub". Fresh disasm assigns THREE cells, refuting both:
-        // cond-wait predicate = [queue 0x106863a70+0xa98] = [0x106864508];
-        // item-proc once-guard = [0x106a63b08] (ldarb 0x2207980) - the ACTUAL gate;
-        // the old probe [0x106863b08] is NEITHER (0x200000 apart) - explains SH288's
+        // SH288 left work-flag open + mislabeled item-proc 0x221942c as "GlobalInit sub".
+        // Fresh disasm: cond-wait predicate=[queue 0x106863a70+0xa98]=[0x106864508];
+        // item-proc once-guard=[0x106a63b08] (ldarb 0x2207980) - the ACTUAL gate;
+        // old probe [0x106863b08] is NEITHER (0x200000 apart) - explains SH288's
         // "work-flag read 0 yet consumer proceeded".
         // 0x22079e8 `bl 0x221942c` CLOCK helper (bl 0x6201fc8 clock_gettime
         // family), NOT a DM world-build. Pin the corrected contract.

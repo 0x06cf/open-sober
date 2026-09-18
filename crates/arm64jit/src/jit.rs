@@ -1161,9 +1161,14 @@ fn routeb_lifecycle_wall_earlyret_guard(state: *mut CpuState, pc: u64) {
     if std::env::var("JIT_ROUTEB_LIFECYCLE_EARLYRET").ok().as_deref() != Some("1") {
         return;
     }
-    if pc != 0x1021f3748 {
+    if pc != 0x1021f3748 && pc != 0x1021f4538 {
         return;
     }
+    // 0x1021f3748 = the SH273/SH321 lifecycle-notify body (nativePostClientSettingsLoadedInit3
+    // path). 0x1021f4538 = a SECOND copy of the SAME wall reached further along the same
+    // settings-init line (StartAppWithParams path): identical prologue (sub sp,#0x90), identical
+    // `ldr x8,[x1]; ldrb [x8,#80]; tbnz w8,#1` -> early canary-check+ret at 0x21f4638, faulting
+    // 0x50 on [x1]==0. Same benign early-ret seed applies to both.
     let x1 = unsafe { (*state).x[1] };
     if x1 == 0 {
         return; // no caller pair pointer to seed into
@@ -1178,6 +1183,48 @@ fn routeb_lifecycle_wall_earlyret_guard(state: *mut CpuState, pc: u64) {
     let obj = routeb_lifecycle_earlyret_obj();
     unsafe { std::ptr::write_unaligned(x1 as *mut u64, obj) };
     eprintln!("[routeb-sh322] seeded caller pair [x1]=[x1={x1:#x}] = lifecycle early-ret obj 0x{obj:x} (byte[+80].bit1=1 -> fn 0x21f3748 takes tbnz -> canary-check+ret no-op, NO registry-build -> close SGSEGV 0x50) at pc={pc:#x}");
+}
+
+/// SH323 (opt-in JIT_ROUTEB_SETTINGS_SSO_SEED=1): cross the SH322 NEXT fencepost — the
+/// whitespace-check fn reached after the SH273 wall clears. SH322 advanced the SIGSEGV from
+/// 0x1021f3748 to 0x1021f5078 (fault=0x0). Fn 0x21f5078 reads a GLOBAL std::string at
+/// `adrp x8,6ed7000; ldr x8,[x8,#2584]` @0x21f5080/84 (= guest [0x106ed7a18], the .bss cell
+/// 8 bytes BELOW the SH248d cookie-jar global [0x106ed7a20]) then `ldrb w10,[x8]` @0x21f5088 +
+/// a whitespace-scan loop. [0x106ed7a18]==0 headlessly -> `ldrb [0]` fault=0x0. Seed
+/// [0x106ed7a18] = routeb_empty_sso_string() (valid empty SSO libc++ string) so the ldrb reads
+/// size 0 / the whitespace loop short-circuits (empty) and the fn returns instead of faulting.
+/// Idempotent (only when slot==0), default-inert, never corrupts a live ref.
+fn routeb_settings_sso_seed_guard(_state: *mut CpuState, pc: u64) {
+    if std::env::var("JIT_ROUTEB_SETTINGS_SSO_SEED").ok().as_deref() != Some("1") {
+        return;
+    }
+    // SH323 root: fn 0x21f5078 (whitespace-check) reads [0x106ed7a18] (adrp 6ed7000+#2584).
+    // SH324 extension (same guard): after the SSO seed, the settings-init line reaches
+    // StartAppWithParams 0x1025f370c `bl 0x221364c` -> `ldrb [x0]` where fn 0x221364c returns
+    // x0=[0x106ed7a28] (adrp 6ed7000+#2600) = the SECOND SH248d cookie-jar slot (JAR_SLOTS[1]).
+    // NULL -> fault=0x0. Seed EITHER cell when its pc fires.
+    const CELL_A: u64 = 0x106ed7a18; // whitespace-check global (fn 0x21f5078)
+    const CELL_B: u64 = 0x106ed7a28; // second cookie-jar slot (StartAppWithParams 0x1025f370c)
+    let cell = match pc {
+        pc if pc == 0x1021f5078 => CELL_A,
+        // the bl 0x221364c (reads [0x106ed7a28] into x0) executes in an EARLIER block than the
+        // ldrb fault pc 0x1025f370c; seeding at 0x370c is too late (x0 already loaded 0). Fire at
+        // the confirmed block entry 0x1025f36ac (nativeAppBridgeV2StartAppWithParams path) so the
+        // cell is seeded before that bl runs.
+        pc if pc == 0x1025f36ac => CELL_B,
+        _ => return,
+    };
+    let cur = unsafe { std::ptr::read_unaligned(cell as *const u64) };
+    if cur != 0 {
+        return; // already live/seeded -> leave untouched
+    }
+    if !routeb_ensure_writable(cell) {
+        eprintln!("[routeb-sh323] WARN cannot make [0x{cell:x}] writable — skipping");
+        return;
+    }
+    let empty = routeb_empty_sso_string();
+    unsafe { std::ptr::write_unaligned(cell as *mut u64, empty) };
+    eprintln!("[routeb-sh323] seeded [0x{cell:x}] = empty SSO std::string 0x{empty:x} (was NULL -> would fault=0x0) at pc={pc:#x}");
 }
 
 /// Leaked object whose byte[+80].bit1 is SET, so fn 0x21f3748's `tbnz w8,#1` @0x21f3774
@@ -6171,6 +6218,10 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // jumps to the epilogue canary-check+ret (benign no-op) -> nativePostClientSettingsLoaded-
         // Initialization3 completes instead of SIGSEGV'ing.
         routeb_lifecycle_wall_earlyret_guard(state, pc);
+        // SH323 (opt-in JIT_ROUTEB_SETTINGS_SSO_SEED): cross the SH322 NEXT fencepost — the
+        // whitespace-check fn 0x1021f5078 (reached after the SH273 wall clears) reads global
+        // std::string [0x106ed7a18] (=NULL -> ldrb fault=0x0). Seed it = empty SSO string.
+        routeb_settings_sso_seed_guard(state, pc);
         // SH259 (opt-in JIT_ROUTEB_APPSART_SETTINGS_ONCE): seed the once-guard
         // [0x106a6f430] of the settings/registry factory 0x21dac2c (deepest reach,
         // bl @0x102339d44) so it early-returns the registry object without running the
@@ -8024,8 +8075,61 @@ mod tests {
             st2.x[1] = 0;
             routeb_lifecycle_wall_earlyret_guard(&mut st2, 0x1021f3748); // must not fault
 
+            // (f) the SECOND lifecycle-notify copy (0x1021f4538, StartAppWithParams path) also fires.
+            std::ptr::write_unaligned(pair_slot as *mut u64, 0);
+            let mut st3: CpuState = unsafe { std::mem::zeroed() };
+            st3.x[1] = pair_slot;
+            routeb_lifecycle_wall_earlyret_guard(&mut st3, 0x1021f4538);
+            assert_ne!(std::ptr::read_unaligned(pair_slot as *const u64), 0,
+                "[x1] pair seeded at second lifecycle-notify copy 0x1021f4538");
+
             std::env::remove_var("JIT_ROUTEB_LIFECYCLE_EARLYRET");
             std::ptr::write_unaligned(pair_slot as *mut u64, 0);
+        }
+    }
+
+    #[test]
+    fn sh323_settings_sso_seed_guard_is_env_pc_gated_and_seeds_cell() {
+        // SH323 (SH322 NEXT fencepost): fn 0x1021f5078 (whitespace-check, reached after the
+        // SH273 wall clears) reads global std::string [0x106ed7a18]; NULL -> `ldrb [x8]`
+        // fault=0x0. Guard must (a) be inert without JIT_ROUTEB_SETTINGS_SSO_SEED, (b) fire only
+        // at pc=0x1021f5078 (CELL_A) or pc=0x1025f370c (CELL_B, the StartAppWithParams second
+        // cookie-jar slot), (c) seed the matching cell = empty SSO string when NULL, (d) leave a
+        // non-NULL slot untouched.
+        const CELL_A: u64 = 0x106ed7a18;
+        const CELL_B: u64 = 0x106ed7a28;
+        unsafe {
+            std::env::remove_var("JIT_ROUTEB_SETTINGS_SSO_SEED");
+            assert!(routeb_ensure_writable(CELL_A), "settings .bss page must be writable");
+            std::ptr::write_unaligned(CELL_A as *mut u64, 0);
+            std::ptr::write_unaligned(CELL_B as *mut u64, 0);
+            // (a) inert without env.
+            routeb_settings_sso_seed_guard(std::ptr::null_mut(), 0x1021f5078);
+            assert_eq!(std::ptr::read_unaligned(CELL_A as *const u64), 0, "inert without env");
+            // (b) env set, wrong pc -> inert.
+            std::env::set_var("JIT_ROUTEB_SETTINGS_SSO_SEED", "1");
+            routeb_settings_sso_seed_guard(std::ptr::null_mut(), 0x1021f3748);
+            assert_eq!(std::ptr::read_unaligned(CELL_A as *const u64), 0, "wrong pc");
+            // (c) CELL_A at pc 0x1021f5078 -> seed empty SSO.
+            routeb_settings_sso_seed_guard(std::ptr::null_mut(), 0x1021f5078);
+            let a = std::ptr::read_unaligned(CELL_A as *const u64);
+            assert_ne!(a, 0, "CELL_A seeded non-NULL");
+            assert_eq!(a, routeb_empty_sso_string(), "CELL_A = empty SSO helper");
+            // (c2) CELL_B at pc 0x1025f36ac -> seed empty SSO.
+            routeb_settings_sso_seed_guard(std::ptr::null_mut(), 0x1025f36ac);
+            let b = std::ptr::read_unaligned(CELL_B as *const u64);
+            assert_ne!(b, 0, "CELL_B seeded non-NULL");
+            assert_eq!(b, routeb_empty_sso_string(), "CELL_B = empty SSO helper");
+            // (d) already non-NULL -> left untouched.
+            std::ptr::write_unaligned(CELL_A as *mut u64, 0xdeadbeef);
+            std::ptr::write_unaligned(CELL_B as *mut u64, 0xdeadbeef);
+            routeb_settings_sso_seed_guard(std::ptr::null_mut(), 0x1021f5078);
+            routeb_settings_sso_seed_guard(std::ptr::null_mut(), 0x1025f36ac);
+            assert_eq!(std::ptr::read_unaligned(CELL_A as *const u64), 0xdeadbeef, "CELL_A untouched");
+            assert_eq!(std::ptr::read_unaligned(CELL_B as *const u64), 0xdeadbeef, "CELL_B untouched");
+            std::env::remove_var("JIT_ROUTEB_SETTINGS_SSO_SEED");
+            std::ptr::write_unaligned(CELL_A as *mut u64, 0);
+            std::ptr::write_unaligned(CELL_B as *mut u64, 0);
         }
     }
 
