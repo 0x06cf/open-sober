@@ -1261,19 +1261,17 @@ pub fn routeb_seed_game_global_vector() -> u64 {
             for i in 0..(0x70 / 8) {
                 *((obj + i as u64 * 8) as *mut u64) = vtab;
             }
-            // x19 = singleton getter (0x106846970), do-init's dispatch-obj vtable
-            // (str @0x102208450) + the probe block's vector BEGIN; serves 3 roles:
-            // +0x00 end=nil, +0x08 begin=node (ldrb valid), +0x10/+0x18 vtable leaves.
-            // Getter 0x101dc4418 once-guard @0x106846ba0: seed bit0=1 -> cached return.
-            *(0x106846ba0u64 as *mut u8) = 1; // once-guard -> cached-path return 0x106846970
-            *(0x106846970u64 as *mut u64) = node; // +0x00 vector end
-            *(0x106846978u64 as *mut u64) = node; // +0x08 vector begin (readable probe)
-            *(0x106846980u64 as *mut u64) = disp1_leaf; // +0x10 vtable dispatch-1 (SH101: scratch-return leaf so guest memzero base hits scratch, not obj)
-            *(0x106846988u64 as *mut u64) = leaf; // +0x18 vtable dispatch-2
-            // SH99b: the do-init walk then iterates a SECOND 8-byte-pointer vector at
-            // [0x106dcaEA8] (end) / [0x106dcaEB0] (begin): `ldp x21,x22,[..]` @0x1022085c8
-            // skips the per-entry `ldrb [x23+8]` probe when begin==end. Point both at the
-            // same non-null zeroed node so the walk is an empty span (no per-entry deref).
+            // x19 = singleton getter (0x106846970, once-guard [0x106846ba0] bit0=1 -> cached),
+            // do-init dispatch-obj vtable + probe-vector BEGIN: +0x00 end=nil +0x08 begin=node
+            // +0x10/+0x18 vt leaves. Getter cached-return = node.
+            *(0x106846ba0u64 as *mut u8) = 1;
+            *(0x106846970u64 as *mut u64) = node;
+            *(0x106846978u64 as *mut u64) = node;
+            *(0x106846980u64 as *mut u64) = disp1_leaf; // +0x10 SH101 scratch-leaf
+            *(0x106846988u64 as *mut u64) = leaf; // +0x18 dispatch-2
+            // SH99b: do-init's SECOND 8-byte vector [0x106dcaEA8]end/[0x106dcaEB0]begin
+            // (ldp x21,x22 @0x1022085c8): point both at the same node -> empty span, no per-entry
+            // `ldrb [x23+8]` probe.
             *(0x106dcaea8u64 as *mut u64) = node; // second vector end
             *(0x106dcaeB0u64 as *mut u64) = node; // second vector begin
         }
@@ -6847,14 +6845,10 @@ fn main() {
                         "[elfjit:v2boot-session] post-lifecycle: MH_FLAGS_LOADED={nf} MH_ENGINE_INITIALIZED={ni} MH_APP_READY={ar} AppBridgeV2[0x106a705e8]=0x{abv_slot:x}"
                     );
                 }
-                // rung index 1 == nativeGameGlobalInit in the rungs array below.
                 // SH269 (--v2boot-skip-appstart): the two app-start self-driver rungs
                 // (StartLuaAppDM 0x1023efe2c via DMCONT, V2StartAppWithParams 0x10258b144)
-                // terminate the PROCESS (SIGABRT after LSM SIGSEGV) before the POST-LADDER
-                // session-ctor rungs run; skipping them lets the loop COMPLETE + the session
-                // rungs run FIRST time (SESSION-CTOR PRIMARY lever). Default (absent)= prior
-                // behavior; A/B isolates session rungs vs the app-start crash.
-                // Also skips the V1 AppStart__ fallback + surface-handoff block below.
+                // terminate the PROCESS before the POST-LADDER session-ctor rungs run; skipping
+                // them lets the loop COMPLETE + session rungs run (SESSION-CTOR PRIMARY lever).
                 for (name, guest, args) in rungs.iter() {
                     if std::env::args().any(|a| a == "--v2boot-skip-appstart")
                         && (*guest == 0x1023efe2c || *guest == 0x10258b144)
@@ -7016,12 +7010,10 @@ fn main() {
                                     }
                                     eprintln!("[elfjit:v2boot] SH159b seeded gov impl@[0x106a70608]=0x{impl_buf:x} impl[+0x408]=DISPATCH@0x{disptch_buf:x} DISPATCH.vt[+0x18]=benign leaf 0x{gov_leaf:x}");
                                 }
-                                // SH156 NEXT GATE: the ctor 0x102207b50's body reads
-                                // globals whose pages are LEFT UNMAPPED by the engine's
-                                // boot remapping (flags latch [0x7285fb0], once-guard2
-                                // [0x6c347c0], telemetry [0x6dcd380]/[0x6dca000]/[0x6dce218],
-                                // thread-mutex [0x7333aac], [0x6ed9000]). Map any such
-                                // pages fresh (guarded; only genuinely-unmapped pages).
+                                // SH156 NEXT GATE: ctor 0x102207b50 reads globals whose pages boot left unmapped
+                                // (flags [0x7285fb0], once-guard2 [0x6c347c0], telemetry
+                                // [0x6dcd380]/[0x6dca000]/[0x6dce218], thread-mutex [0x7333aac],
+                                // [0x6ed9000]). Map only genuinely-unmapped pages.
                                 for g in [
                                     0x1067285fb0u64, // flags byte gate @ ctor 2207bec
                                     0x1067285fb8u64, // loadLocalFlags arg
@@ -15059,10 +15051,9 @@ mod sh115_tests {
 
     #[test]
     fn sh311_doinit_once_lambda_fires_dmroot_ctornull() {
-        // SH311 (3/3): do-init ONCE-lambda 0x2206d10 FIRES (once-guard clear works) + its
-        // `str x0,[x23,#1032]` @0x2206d74 STORES DM-root [0x106a68818], yet DM-root reads 0
-        // after -> bl 0x2173b3c (strcmp arg0 -> tail 0x61e30bc) returns 0: the DM-ctor chain
-        // fails — the once-lambda DOES run. Pin dispatch + DM-root store.
+        // SH311 (3/3): do-init ONCE-lambda 0x2206d10 FIRES + `str x0,[x23,#1032]`
+        // @0x2206d74 stores DM-root [0x106a68818], yet DM-root reads 0 -> bl 0x2173b3c
+        // (-> tail 0x61e30bc DM ctor chain) returns 0: the once-lambda DOES run, ctor fails.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15071,7 +15062,7 @@ mod sh115_tests {
                 if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
             };
             assert_eq!(word(0x102_206c7c), 0x08dffd09, "sh311 ldarb once-guard");
-            assert_eq!(word(0x102_206c84), 0x36000469, "sh311 tbz->once 0x2206d10");
+            assert_eq!(word(0x102_206c84), 0x36000469, "sh311 tbz->once");
             assert_eq!(word(0x102_206d10), 0xd0024300, "sh311 once-head");
             assert_eq!(word(0x102_206d74), 0xf90206e0, "sh311 DM-root store");
             assert_eq!(word(0x102_173b3c), 0xa9bd7bfd, "sh311 DM-ctor");
@@ -15082,12 +15073,10 @@ mod sh115_tests {
 
     #[test]
     fn sh312_dmctor_null_is_service_registry_empty_pinned() {
-        // SH312 (3/3, SH311-forward): DM-controller ctor (0x61e30bc, tail of bl 0x2173b3c)
-        // returns 0 -> do-init stores NULL DM-root [0x106a68818]. First action
-        // `bl 0x2168798` (0x61e311c) = name->service lookup reading registry COUNT
-        // [0x106fe2f08] (ldr w22 @0x21687d0) + cbz->ret0 when empty, so headless
-        // lookup=0; fallback `cmp w8,#0xa7e` (0x61e3150) gated on count==0xa7e.
-        // SESSION-CTOR gate (see SH313 whole-image proof). Not a seed. Pins:
+        // SH312 (3/3): DM ctor (0x61e30bc, tail of bl 0x2173b3c) returns 0 -> NULL DM-root.
+        // First action `bl 0x2168798` = name->service lookup reading registry COUNT
+        // [0x106fe2f08] (ldr w22 @0x21687d0) + cbz->ret0 when empty => headless lookup=0;
+        // fallback `cmp w8,#0xa7e` (0x61e3150) gated on count==0xa7e. SESSION-CTOR gate. Pins:
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15095,12 +15084,12 @@ mod sh115_tests {
                 let host = el.host_addr_of(guest).unwrap_or(0);
                 if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
             };
-            assert_eq!(word(0x102_1687d0), 0xb94f0916, "sh312 lookup registry-count ldr w22,[x8,#3848]");
-            assert_eq!(word(0x102_1687d4), 0x34000316, "sh312 cbz w22 -> return 0 (empty registry)");
-            assert_eq!(word(0x106_1e311c), 0x96fe159f, "sh312 ctor bl 0x2168798 lookup");
-            assert_eq!(word(0x106_1e3124), 0xb5000d40, "sh312 cbnz x0 -> ret lookup result, else fallthrough");
-            assert_eq!(word(0x106_1e3150), 0x7129f91f, "sh312 fallback cmp w8,#0xa7e (registry version gate)");
-            assert_eq!(word(0x106_1e3154), 0x54000421, "sh312 b.ne -> skip 0xa7e build (count!=0xa7e)");
+            assert_eq!(word(0x102_1687d0), 0xb94f0916, "sh312 lookup count ldr w22,[x8,#3848]");
+            assert_eq!(word(0x102_1687d4), 0x34000316, "sh312 cbz w22 -> ret 0 empty registry");
+            assert_eq!(word(0x106_1e311c), 0x96fe159f, "sh312 ctor bl lookup");
+            assert_eq!(word(0x106_1e3124), 0xb5000d40, "sh312 cbnz x0 -> ret result else fallthrough");
+            assert_eq!(word(0x106_1e3150), 0x7129f91f, "sh312 fallback cmp w8,#0xa7e");
+            assert_eq!(word(0x106_1e3154), 0x54000421, "sh312 b.ne skip 0xa7e build");
         } else {
             eprintln!("sh312 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -15108,14 +15097,13 @@ mod sh115_tests {
 
     #[test]
     fn sh313_registry_no_static_writer_fastpath_needs_one_app() {
-        // SH313: service-registry is 100% SESSION-constructed; the DM-controller ctor FAST
-        // path needs ONE "App" entry (not 0xa7e). ctor 0x61e30bc entered with "App"(0x2d34ab)/
-        // "Execute"(0x3d1ba8); lookup bl 0x2168798 reads COUNT [0x106fe2f08](@0x21687d0)
-        // cbz->ret0 when empty; FAST `cbnz x0`@0x61e3124 returns the matched service as a
-        // LIVE DM-controller -> non-NULL DM-root. WHOLE-IMAGE scan: count cell written ONLY
-        // by the 0xa7e-gated ctor increment; array [0x106fe6180] ZERO static writers =>
-        // populated ONLY by app-start's own session run, which dies at 0x1021dde34.
-        // SESSION-CTOR gate; bar = 1 "App" reg.
+        // SH313: service-registry is 100% SESSION-constructed; ctor FAST path needs ONE "App"
+        // entry (not 0xa7e). ctor 0x61e30bc entered with "App"(0x2d34ab)/"Execute"(0x3d1ba8);
+        // lookup bl 0x2168798 reads COUNT [0x106fe2f08] cbz->ret0 when empty; FAST `cbnz x0`
+        // @0x61e3124 returns the matched service as a LIVE DM-controller -> non-NULL DM-root.
+        // WHOLE-IMAGE: count written ONLY by the 0xa7e-gated ctor increment; array [0x106fe6180]
+        // ZERO static writers => populated ONLY by app-start's own session run (dies at 0x1021dde34).
+        // bar = 1 "App" reg.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15123,18 +15111,42 @@ mod sh115_tests {
                 let host = el.host_addr_of(guest).unwrap_or(0);
                 if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
             };
-            // ctor fast-path / one-entry return + rodata names.
-            assert_eq!(word(0x106_1e3124), 0xb5000d40, "sh313 cbnz x0 (lookup found) -> fast ret");
-            assert_eq!(word(0x106_1e32cc), 0xf00067a0, "sh313 fast-path tail (returns matched service)");
-            assert_eq!(word(0x106_1e32c0), 0xb90f0b68, "sh313 fallback count++ str [x27,#3848]");
-            // For the ctor name arg, the once-lambda (0x2206d24..d64) builds "App"
-            // (rodata file 0x2d34ab) in x0 and "Execute" (file 0x3d1ba8) in x1 — confirmed
-            // by raw file byte read during recon; the container string transform through
-            // host_addr_of is loader-relocation dependent so not asserted here.
-            eprintln!("sh313 registry is session-constructed (count + array no static writer; ctor fast \
-                        path = ONE 'App' entry). Route-B SESSION-CTOR gate. UNCHANGED (no DM).");
+            assert_eq!(word(0x106_1e3124), 0xb5000d40, "sh313 cbnz x0 -> fast ret");
+            assert_eq!(word(0x106_1e32cc), 0xf00067a0, "sh313 fast-path tail returns service");
+            assert_eq!(word(0x106_1e32c0), 0xb90f0b68, "sh313 fallback count++ str");
+            // ctor name: once-lambda builds rodata "App"(file 0x2d34ab)/"Execute"(0x3d1ba8) in x0/x1.
+            eprintln!("sh313 registry session-constructed (no static writer; ctor fast path = ONE 'App' entry). SESSION-CTOR gate. UNCHANGED (no DM).");
         } else {
             eprintln!("sh313 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
+    fn sh314_appstart_map_header_is_liveobj_not_fixed_cell() {
+        // SH314 (do-not-re-tread closure): app-start map wall 0x1021dde34 (`ldr x23,[x21,#8]`,
+        // x21 container=0x100548ca9) is fed by a pointer that is the ADDRESS OF A RODATA STRING
+        // (file 0x548ca9 = "Id\0assetTypeId\0avatar_load_start\0..."), NOT heap-garbage nor an
+        // unapplied reloc — a map slot type-punned with a string ptr by an upstream init that never
+        // runs headlessly. The 5 STATIC walkers (of 0x21ddbc8) build STACK containers
+        // (x0=sp+0xc48, x1=sp+0xa70, w2=1) from table 0x66e7000 → benign, NOT the crash
+        // (x22=0x11 != 1). => no count-clamp/fixed-cell/repair crosses it; real session ctor needed.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            assert_eq!(word(0x102_1ddbc8), 0xa9bd7bfd, "walker prologue");
+            assert_eq!(word(0x102_1ddc00), 0x9400000d, "walker bl 0x21ddc34");
+            assert_eq!(word(0x102_1dde34), 0xf94006b7, "fault ldr x23,[x21,#8]");
+            assert_eq!(word(0x102_1dccf8), 0xf0022848, "static-caller adrp x8,0x66e7000");
+            assert_eq!(word(0x102_1dcd14), 0x9101e2e0, "static-caller add x0,x23,#0x78");
+            assert_eq!(word(0x102_1dcd18), 0x9129c3e1, "static-caller add x1,sp,#0xa70");
+            assert_eq!(word(0x102_1dcd1c), 0x52800022, "static-caller mov w2,#1");
+            assert_eq!(word(0x102_1dcd20), 0x940003aa, "static-caller bl walker");
+        } else {
+            eprintln!("sh314 real-image guard: no real libroblox.so, skipping anchors");
         }
     }
 
