@@ -5,7 +5,7 @@
 ## 0x1021f3748 -> 0x1021f5078 -> 0x1025f370c -> 0x102256510). STATUS candidate (a), continued.
 
 **State**: `cargo test --workspace` green (0 fail): arm64jit lib 408/0 + elfjit examples 148/0
-(147 + sh323) + fsmap + others. `cargo build` EXIT 0. Commit <FILL> on local `dev` (not pushed;
+(147 + sh323) + fsmap + others. `cargo build` EXIT 0. Commit c5ae013 on local `dev` (not pushed;
 operator pushes). elfjit.rs 48 B under the 1MB hook.
 
 ## This session (SH323)
