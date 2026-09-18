@@ -36,10 +36,13 @@ SendAppEventOnAppReady path (baseline A: 0 hits everywhere).
   false, post-do-init continuation 0x1023eff4c / ScriptContext loader 0x101f1d8ac
   / CoreScript cells remain 0 hits. The app-shell ctor runs but the session half
   of the pipe (governor, ScriptContext, Lua) is still gated on a live DM.
-- `w19-event=0x0` after the rung (the 'Home' discriminator needs w19=4). Across
-  every run logged (46) w19 is only ever 0x0 or 0x1, never 0x4 — the fabricated
-  "Home" jstring still does not resolve to a recognized event (the Step-2
-  real-jstring ABI gap remains open; noted, not solved here).
+- `w19-event=0x0` after the rung is NOT a reliable signal: the driver reads `se.x[19]`
+  AFTER `jit_run` returns, but x19 is callee-saved and SendAppEventOnAppReady restores it
+  (`ldp x20,x19,[sp,#304]` on return), so the read reflects the restored value, not the
+  discriminator's w19. The reliable evidence that the 'Home' event routes is the do-init
+  pipe executing (region hits prove the pipe's bl 0x2baeeec -> do-init 0x2206c40 runs).
+  The Step-2 real-jstring ABI question (whether the fabricated "Home" jstring resolves to
+  w19=4) is NOT settled by this read; treat it as open, not solved.
 - SH307 is the executor of this reach; SH308 pins it as a regression anchor.
   Route-B live-DM structural gate UNCHANGED; SH174 capture-latch stays the
   single forward hook.
