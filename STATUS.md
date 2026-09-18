@@ -1,32 +1,31 @@
 # Open-Sober run state (hermes-worker)
 
-## HEAD: `dev` branch, SH323 (advance the SH320/321 MAIN-path engine-settings-init line two more
-## fenceposts + cross a SECOND lifecycle-notify copy; five consecutive crossings since SH321:
-## 0x1021f3748 -> 0x1021f5078 -> 0x1025f370c -> 0x102256510). STATUS candidate (a), continued.
+## HEAD: `dev` branch, SH327 (force AppStarted factory construction DETERMINISTIC; app-start
+## fencepost 0x1025f5300 advances one level deeper to the V2StartAppWithParams params-obj +0x140
+## member). SEP-17 "force the construction branch" forward (SH326c premise reversal -> fix).
 
-**State**: `cargo test --workspace` green (0 fail): arm64jit lib 408/0 + elfjit examples 148/0
-(147 + sh323) + fsmap + others. `cargo build` EXIT 0. Commit c5ae013 on local `dev` (not pushed;
-operator pushes). elfjit.rs 48 B under the 1MB hook.
+**State**: `cargo test --workspace` green (0 fail): arm64jit lib 408/0 + elfjit examples 151/0
+(150 + sh327) + fsmap + others. `cargo build` EXIT 0. Commit on local `dev` (not pushed; operator
+pushes). elfjit.rs 31 B under the 1MB hook (condensed SH-prose to fit).
 
-## This session (SH323)
+## This session (SH327)
 
-1. Recon-v3 render plane intact (headless render plane, not touched this cycle).
-2. **SH323** — extended the SH320/321 MAIN-path engine-settings-init advance. New default-inert
-   guard JIT_ROUTEB_SETTINGS_SSO_SEED seeds two NULL cookie/string globals with an empty SSO
-   string: CELL_A [0x106ed7a18] (fn 0x21f5078 whitespace-check, clears the 0x1021f5078 wall) and
-   CELL_B [0x106ed7a28] (StartAppWithParams `bl 0x221364c` -> ldrb [x0] @0x1025f370c, seeded at the
-   confirmed block entry 0x1025f36ac). SH322's early-ret guard now also covers the second
-   lifecycle-notify copy 0x1021f4538. A/B (real so): BASELINE first SIGSEGV 0x1021f5078; FORWARD
-   seed=2, wall gone, terminal advances to 0x102256510 (fault=0x0). Five consecutive crossings on
-   the settings-init line.
-3. arm64jit lib 407 -> 408/0; elfjit examples 147 -> 148/0; workspace green; elfjit.rs 48 B under 1MB.
+1. Recon-v3 render plane intact (untouched this cycle).
+2. **SH327** — deterministic AppStarted construction. `routeb_patch_appstart_construct_force` patches
+   0x2e890f4 `b.ne 0x2e89118` (0x54000121) -> unconditional `b 0x2e89118` (0x14000009), removing the
+   factory 0x2e890c4's sole non-construction exit (producer-counter tag==2 -> unconstructed ret). Idempotent
+   (short-circuits [x19,#24] @0x2e89130). Gated on JIT_ROUTEB_DM_SEED/DMFORCE (inert by default).
+3. MEASURED (3/3 dual-PC dump): construction write fires + lands (`[appstart0x106a6f480]=0x55cb343ab000`,
+   real heap obj, now DETERMINISTIC); field-copy helper 0x25f54e8 completes + returns; fault ADVANCES to
+   `ldr w3,[x20,#320]` @0x25f5328 (fault=0x140), x20 = V2StartAppWithParams params obj = 0.
+4. arm64jit lib 408/0; elfjit examples 150 -> 151/0; +sh327 guard (9 pins); +probe_sh327_construct_force.sh.
 
 ## Standing (honest, unchanged)
 
 - **Route-B live-DM structural gate UNCHANGED**: no make_shared<DataModel> fires headlessly; DM-root
-  [0x106a68818] stays 0; MH_APP_READY stays false. The MAIN-path engine-settings-init line now
-  advances five fenceposts past SH321's SH273 wall but still terminates at the live-object class
-  (0x102256510, a JNI-receive entered with NULL this) — a SESSION-CTOR cave, not a DM.
+  [0x106a68818] stays 0; MH_APP_READY stays false.
+- NEW: app-start fencepost is deterministic-constructed; standing wall = V2StartAppWithParams
+  params-obj +0x140 member (x0/x20 param of fn 0x25f5270 = 0).
 - Everything achievable headlessly (llvmpipe); GPU host for performance later.
 
 ## Next-forward candidates

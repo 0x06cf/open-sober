@@ -1361,7 +1361,7 @@ fn routeb_patch_startapp_init3_gates() {
             let before = *(addr as *const u32);
             if before == orig {
                 *(addr as *mut u32) = 0xa900_7d1f; // stp xzr,xzr,[x8]
-                eprintln!("[elfjit:routeB] SH160 patched init3 dispatch-gate call @0x{addr:x} ({before:08x}) -> stp xzr,xzr,[x8] (zero out-buffer; gate never runs, benign no-op)");
+                eprintln!("[elfjit:routeB] SH160 patched init3 dispatch-gate call @0x{addr:x} ({before:08x}) -> stp xzr,xzr,[x8] (gate never runs; benign no-op)");
             } else if before == 0xa900_7d1f {
                 eprintln!("[elfjit:routeB] SH160 init3 gate @0x{addr:x} already patched");
             } else {
@@ -1371,6 +1371,30 @@ fn routeb_patch_startapp_init3_gates() {
         }
     }
     arm64jit::jit::block_cache_drop_region(0x102e9fcb0, 0x102ea3b40); // widen: whole governor tail + validator (SH160+ 0x102e9fcc4 block-cache race)
+}
+
+/// SH327: force AppStarted factory 0x2e890c4 construction DETERMINISTICALLY (0x1025f5300 gate
+/// needs [appstart+24]!=0; 0x2e890f4 b.ne->ret when tag==2 returned unconstructed).
+fn routeb_patch_appstart_construct_force() {
+    let (a, want) = (0x102e890f4u64, 0x1400_0009u32); // b 0x2e89118 (was b.ne 0x54000121)
+    let page = a & !0xfff;
+    unsafe {
+        if libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_WRITE) != 0 {
+            eprintln!("[elfjit:routeB] WARN SH327 mprotect RW failed @0x{a:x} errno={}", std::io::Error::last_os_error());
+            return;
+        }
+        let before = *(a as *const u32);
+        if before == 0x5400_0121u32 {
+            *(a as *mut u32) = want;
+            eprintln!("[elfjit:routeB] SH327 force AppStarted construct @0x{a:x} {before:08x}->{want:08x}");
+        } else if before == want {
+            eprintln!("[elfjit:routeB] SH327 construct branch @0x{a:x} already forced");
+        } else {
+            eprintln!("[elfjit:routeB] WARN SH327 construct @0x{a:x} unexpected {before:08x}, not patched");
+        }
+        let _ = libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_EXEC);
+    }
+    arm64jit::jit::block_cache_drop_region(0x102e890c4, 0x102e89174);
 }
 
 /// SH161: governor TAIL continuation (0x2e9fdf4) `ldr x0,[x19,#1088]`(impl[+0x440]); bl 24c3768
@@ -1437,7 +1461,7 @@ fn routeb_patch_gov_tail_cont() {
             for i in 0..3 {
                 *((addr + (i as u64) * 4) as *mut u32) = 0xd503_201f; // nop
             }
-            eprintln!("[elfjit:routeB] SH161 patched governor-tail refcount call window @0x{addr:x} (ldr/mov/bl 24c3768) -> 3x nop (impl[+0x440] structural NULL; result discarded)");
+            eprintln!("[elfjit:routeB] SH161 patched governor-tail refcount call @0x{addr:x} (ldr/mov/bl 24c3768) -> 3x nop (impl[+0x440] NULL; result discarded)");
         } else if before == [0xd503_201f; 3] {
             eprintln!("[elfjit:routeB] SH161 governor-tail refcount window @0x{addr:x} already patched");
         } else {
@@ -1624,9 +1648,9 @@ static ROUTEB_ADAPTER_REC_ADDR: std::sync::OnceLock<u64> = std::sync::OnceLock::
 /// Route-B SH81: seed the two engine dispatch-singleton `.data` records so accessor `2b9dee0`'s
 /// lazy-create returns a coherent polymorphic obj with benign-leaf virtuals (gate `2b9e030` memcpys
 /// [addr+24](src)[addr+0](size); src==NULL -> all-zero vtable -> SIGSEGV @0x10624f500).
-/// Records {+0 size,+8 pow2,+16 ticket,+24 src}. SH114: V2Init/V2Start/V1/AppReady soft-returns =
-/// lazy-singleton virtual dispatches (A 0x62517c4[+0xf8], A2 0x6251aa8[+0x108], B 0x6260948[+0x548]).
-/// SH111: leaf must return STABLE zeroed guest obj, not 0 (caller derefs [out]+0x28).
+/// Records {+0 size,+8 pow2,+16 ticket,+24 src}. SH114: V2Init/V2Start/V1/AppReady soft-return =
+/// lazy-singleton virtual dispatch (A 0x62517c4, A2 0x6251aa8, B 0x6260948); SH111: leaf returns a
+/// STABLE zeroed guest obj, not 0 (caller derefs [out]+0x28).
 fn routeb_seed_task_singletons() {
     if ROUTEB_SINGLETON_SEEDED.load(core::sync::atomic::Ordering::Relaxed) {
         return;
@@ -1694,7 +1718,7 @@ fn routeb_seed_dispatcher_node() {
         *(0x10683a460u64 as *mut u64) = 0x10683a000u64; // node[+0] -> 0-clean .bss (self-link base==node)
         *(0x10683a480u64 as *mut u64) = 1u64; // node[+0x20] = base[+32] active bit -> leaf returns 0
     }
-    eprintln!("[elfjit:routeB] SH120 seeded dispatcher-node global 0x10683a460 (+0=self-link 0x10683a000, +0x20=1) — app-bridge event dispatch resolves to benign 'nothing registered' instead of [*x1-24]=[0-24] fault");
+    eprintln!("[elfjit:routeB] SH120 seeded dispatcher-node global 0x10683a460 (+0=self-link 0x10683a000, +0x20=1); dispatch -> benign");
     ROUTEB_DISPATCHER_NODE_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
@@ -1952,7 +1976,7 @@ fn routeb_patch_nativeinit_lock_owner() {
         }
         libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
         arm64jit::jit::block_cache_drop_region(start, start + 12);
-        eprintln!("[elfjit:routeB] SH116 patched nativeInit lock-owner helper @0x{start:x} 12B -> materialize stable zeroed 0x{s:x} (mutex@+0x28 = valid PTHREAD_MUTEX_INITIALIZER)");
+        eprintln!("[elfjit:routeB] SH116 patched nativeInit lock-owner helper @0x{start:x} -> materialize stable zeroed 0x{s:x} (mutex@+0x28 valid)");
     }
     ROUTEB_LOCK_OWNER_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
@@ -1983,7 +2007,7 @@ fn routeb_patch_nativeinit_flagmap_helper() {
         *((start + 4) as *mut u32) = 0xd503_201fu32; // nop (was mov x29,sp)
         libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
         arm64jit::jit::block_cache_drop_region(start, start + 8);
-        eprintln!("[elfjit:routeB] SH117 patched nativeInit flag-map probe helper @0x{start:x} 8B -> leaf ret (returns x0=flag-map obj) — caller takes 'found' path, skips garbage insert");
+        eprintln!("[elfjit:routeB] SH117 patched nativeInit flag-map probe helper @0x{start:x} 8B -> leaf ret (x0=flag-map obj)");
     }
     ROUTEB_FLAGMAP_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
@@ -2083,7 +2107,7 @@ fn routeb_patch_nativeinit_flagmanager() {
         }
         libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
         arm64jit::jit::block_cache_drop_region(start, start + 0x10);
-        eprintln!("[elfjit:routeB] SH116b patched nativeInit flag-manager site @0x{start:x} 8B(adrp+ldr) -> x8=low zeroed 0x{obj:x} (mutex@+0x28 = PTHREAD_MUTEX_INITIALIZER)");
+        eprintln!("[elfjit:routeB] SH116b patched nativeInit flag-manager site @0x{start:x} 8B(adrp+ldr) -> x8=low zeroed 0x{obj:x} (mutex@+0x28 init)");
     }
     ROUTEB_FLAGMANAGER_PATCHED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
@@ -2171,7 +2195,7 @@ fn routeb_patch_preload_valuecell() {
         if arm64jit::jit::routeb_ensure_writable(VCELL) {
             *(VCELL as *mut u64) = obj;
         }
-        eprintln!("[elfjit:routeB] SH307 preload value-branch@0x{TBZ:x} tbz->nop + value-cell [0x{VCELL:x}]={obj:#x}: getter returns obj -> advances past terminal 0x102bb803c");
+        eprintln!("[elfjit:routeB] SH307 preload value-branch@0x{TBZ:x} tbz->nop + value-cell [0x{VCELL:x}]={obj:#x}; getter returns obj");
     }
     ROUTEB_PRELOAD_VALUE_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
@@ -6562,6 +6586,7 @@ fn main() {
                 || std::env::var_os("JIT_ROUTEB_DMFORCE").is_some()
             {
                 routeb_patch_startapp_init3_gates();
+                routeb_patch_appstart_construct_force(); // SH327: deterministic [appstart+24]
             }
             // SH93: gameGlobalInit's do-init parks forever on a CEvent completion set by a
             // TaskScheduler worker thread that never runs headlessly -> NOP the barrier so
@@ -6742,7 +6767,7 @@ fn main() {
                         // with the current thread's own pthread_self.
                         let me = unsafe { libc::pthread_self() };
                         unsafe { *(main_id_cell as *mut u64) = me as u64 };
-                        eprintln!("[elfjit:v2boot] seeded main-thread-id [0x106863a68]=0x{me:x} for GlobalInit thread-dispatch (this thread == stored == self -> takes the vt[+48] match path, no park)");
+                        eprintln!("[elfjit:v2boot] seeded main-thread-id [0x106863a68]=0x{me:x} for GlobalInit thread-dispatch (self -> vt[+48] match path, no park)");
                     }
                     // SH122: StartLuaAppDM fans the SAME GlobalInit do-init (0x2baeeec->0x2206c40),
                     // once-latched on [0x6a68410].bit0 + thread-gated on [0x106863a68] (deleg_65301a28).
@@ -6796,7 +6821,7 @@ fn main() {
                                     // keep the GlobalInit dispatch vtable pin so app-shell/global
                                     // init ctor remains reachable via the other path.
                                     *(0x10635cd10u64 as *mut u64) = 0x102207b50;
-                                    eprintln!("[elfjit:v2boot] SH239 GENUINE DM-root: [0x106a68818]+0x20 = manufactured DM {dm:#x} (vt 0x1067162e8, vt[+0x30]=0x1057d6ef4); holder [0x106a68818]=0x{holder:x}");
+                                    eprintln!("[elfjit:v2boot] SH239 GENUINE DM-root: [0x106a68818]+0x20 = manufactured DM {dm:#x} (vt[+0x30]=0x1057d6ef4); holder=0x{holder:x}");
                                 } else {
                                 // 0x10-byte object: only [0x00]=vtable is live (the
                                 // ctor 0x102207b50 never derefs `this`).
@@ -6871,7 +6896,7 @@ fn main() {
                                         *(impl_buf.wrapping_add(0x408) as *mut u64) = disptch_buf; // impl[+0x408] = DISPATCH
                                         *(0x106a70608u64 as *mut u64) = impl_buf; // wrapper[+0x20] = impl (governor x19)
                                     }
-                                    eprintln!("[elfjit:v2boot] SH159b seeded gov impl@[0x106a70608]=0x{impl_buf:x} impl[+0x408]=DISPATCH@0x{disptch_buf:x} DISPATCH.vt[+0x18]=benign leaf 0x{gov_leaf:x}");
+                                    eprintln!("[elfjit:v2boot] SH159b seeded gov impl@[0x106a70608]=0x{impl_buf:x} [+0x408]=DISPATCH 0x{disptch_buf:x} vt[0x18]=leaf");
                                 }
                                 // SH156 NEXT GATE: ctor 0x102207b50 reads globals whose pages boot left unmapped
                                 // (flags [0x7285fb0], once-guard2 [0x6c347c0], telemetry
@@ -6910,7 +6935,7 @@ fn main() {
                                         if cur == 0 {
                                             let buf = Box::leak(vec![0u8; 0x20usize].into_boxed_slice()).as_mut_ptr() as u64;
                                             unsafe { std::ptr::write_unaligned(TI as *mut u64, buf) };
-                                            eprintln!("[elfjit:v2boot] ROUTE-B NEXT3 seeded thread-init singleton [0x{TI:x}] = leaked 0x20 buffer {buf:#x} (clears SEGV 0x102207ef0)");
+                                            eprintln!("[elfjit:v2boot] ROUTE-B NEXT3 seeded thread-init singleton [0x{TI:x}] = leaked 0x20 buffer (clears SEGV 0x102207ef0)");
                                         }
                                     }
                                     if arm64jit::jit::routeb_ensure_writable(TEL) {
@@ -6928,8 +6953,8 @@ fn main() {
                                         }
                                     }
                                 }
-                                eprintln!("[elfjit:v2boot] SH156 seeded DM-root [0x106a68818]=0x{dmobj:x} (obj[0]=vtable 0x10635cce0, vt[+0x30]=0x102207b50 ctor) -> do-init match brs into REAL construction");
-                                eprintln!("[elfjit:v2boot] SH157 seeded governor router flag [0x106a70880]=1 -> AppBridgeV2 governor takes MODERN path to nativeAppBridgeStartAppWithParams (0x258c6e4)");
+                                eprintln!("[elfjit:v2boot] SH156 seeded DM-root [0x106a68818]=0x{dmobj:x} (vt 0x10635cce0, ctor 0x102207b50)");
+                                eprintln!("[elfjit:v2boot] SH157 seeded governor router flag [0x106a70880]=1 -> MODERN path to nativeAppBridgeStartAppWithParams");
                                 unsafe {
                                     eprintln!(
                                         "[elfjit:v2boot] SH157 governor router flag readback = {:#x}",
@@ -6939,7 +6964,7 @@ fn main() {
                                 } // close the SH239 `else` (JIT_ROUTEB_DM_ROOT_GENUINE off -> original fake-box branch)
                             }
                         }
-                        eprintln!("[elfjit:v2boot] GATE-FIX seeded main-id cell 0x{me:x} + flags-latch for StartLuaAppDM -> GlobalInit once-guard LEFT CLEAR so __call_once runs and populates DM-root [0x106a68818]");
+                        eprintln!("[elfjit:v2boot] GATE-FIX seeded main-id 0x{me:x}+flags-latch -> once-guard LEFT CLEAR so __call_once pops DM-root [0x106a68818]");
                     }
                     let mut s = arm64jit::jit::CpuState::new();
                     s.tpidr = tpidr;
@@ -7114,7 +7139,7 @@ fn main() {
                                 let cur = unsafe { std::ptr::read_unaligned(GOVFLAG as *const u8) };
                                 if cur & 1 == 0 {
                                     unsafe { std::ptr::write_unaligned(GOVFLAG as *mut u8, cur | 1) };
-                                    eprintln!("[elfjit:v2boot] SH269 seeded governor-predicate flag [0x{GOVFLAG:x}] bit0=1 before SendAppEventOnAppReady (routes live governor obj, not NULL app-DM controller @ 0x102ea0b9c)");
+                                    eprintln!("[elfjit:v2boot] SH269 seeded governor-predicate [0x{GOVFLAG:x}].bit0=1 (routes live gov, not NULL app-DM @0x102ea0b9c)");
                                 }
                             } else {
                                 eprintln!("[elfjit:v2boot] SH269 WARN: could not make governor flag [0x{GOVFLAG:x}] writable");
@@ -7172,7 +7197,7 @@ fn main() {
                 // path for initEngine_'s "Engine settings is null" (SH184). Opt-in --v2boot-session-signed.
                 if std::env::args().any(|a| a == "--v2boot-session-signed") {
                     unsafe { *(0x10683cff8u64 as *mut u64) = 0x0306u64; } // real version: low byte 6, byte1 3
-                    eprintln!("[elfjit:v2boot] SH275 set client-settings version [0x10683cff8]=0x0306 -> Signed receive takes the readLocalFlags parse path (not the empty-early branch)");
+                    eprintln!("[elfjit:v2boot] SH275 set client-settings version [0x10683cff8]=0x0306 -> readLocalFlags parse path");
                     let c1 = arm64jit::jni::new_string_utf_handle(b"");
                     let c2 = arm64jit::jni::new_string_utf_handle(b"");
                     let c3 = arm64jit::jni::new_string_utf_handle(b"");
@@ -7281,7 +7306,7 @@ fn main() {
                     // (w2=1) -> b 275a0c4 (GlobalInit-reentry, gated on once-guard [0x6a68410]).
                     if std::env::args().any(|a| a == "--v2boot-session-engine5") {
                         unsafe { *( (mgr3 + 16u64) as *mut u32) = 5u32; }
-                        eprintln!("[elfjit:v2boot] SH280 driving initEngine_ state=5 body DIRECT @ guest 0x102bd24b4 (app-name 'Home' + [this+0x40] config pre-seeded, once-guard latched)");
+                        eprintln!("[elfjit:v2boot] SH280 driving initEngine_ state=5 DIRECT @0x102bd24b4 (app-name 'Home' + config pre-seeded)");
                         let mut e5 = arm64jit::jit::CpuState::new();
                         e5.tpidr = tpidr;
                         e5.x[31] = boot_sp;
@@ -7300,7 +7325,7 @@ fn main() {
                     // reentry, SH283's ENG5_QMUTEX_FREE steal). Reuses SH279 seeds. Opt-in.
                     if std::env::args().any(|a| a == "--v2boot-session-engine9") {
                         unsafe { *( (mgr3 + 16u64) as *mut u32) = 9u32; }
-                        eprintln!("[elfjit:v2boot] SH284 driving initEngine_ state=9 body DIRECT @ 0x102bd2668 (app-name 'Home' + config pre-seeded; state->10, gated by JIT_ROUTEB_ENG5_QMUTEX_FREE/0x106863aa0 steal)");
+                        eprintln!("[elfjit:v2boot] SH284 driving initEngine_ state=9 DIRECT @0x102bd2668 (app-name 'Home' + config; state->10)");
                         let mut e9 = arm64jit::jit::CpuState::new();
                         e9.tpidr = tpidr;
                         e9.x[31] = boot_sp;
@@ -7513,7 +7538,7 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                         Err(e) => eprintln!("[elfjit:v2boot] SH296 dmfn stopped:{e}"),
                         Ok(r) => eprintln!("[elfjit:v2boot] SH296 dmfn returned Ok({r:#x})"),
                     }
-                    eprintln!("[elfjit:v2boot] SH296 post: MH_FLAGS_LOADED={} MH_APP_READY={} DM-root=0x{:x}", arm64jit::jni::nativehelper_flags_loaded(), arm64jit::jni::nativehelper_app_ready(), unsafe { *(0x106a68818u64 as *const u64) });
+                    eprintln!("[elfjit:v2boot] SH296 post: MH_FLAGS={} MH_APP_READY={} DM-root=0x{:x}", arm64jit::jni::nativehelper_flags_loaded(), arm64jit::jni::nativehelper_app_ready(), unsafe { *(0x106a68818u64 as *const u64) });
                     if std::env::var("JIT_DUMP_PC").is_ok() { dump("SH296-dmfn"); }
                     let _ = ret0;
                 }
@@ -7561,7 +7586,7 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                 if std::env::args().any(|a| a == "--v2boot-send-game-loaded") {
                     if std::env::var("JIT_SH115_SINGLETON_PATCH").ok().as_deref() == Some("1") {
                         unsafe { *(0x10683d010u64 as *mut u64) = u64::MAX; }
-                        eprintln!("[elfjit:v2boot] SH265 seeded pipe sync-gate [0x10683d010]=-1 -> OnGameLoaded pipe takes the synchronous do-init path (bl 0x2206c40)");
+                        eprintln!("[elfjit:v2boot] SH265 seeded pipe sync-gate [0x10683d010]=-1 -> OnGameLoaded takes sync do-init path (bl 0x2206c40)");
                     }
                     let g1 = arm64jit::jni::new_string_utf_handle(b"");
                     let g2 = arm64jit::jni::new_string_utf_handle(b"");
@@ -7604,7 +7629,7 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                     if std::env::args().any(|a| a == "--v2boot-bus-mainid") {
                         let me = unsafe { libc::pthread_self() };
                         unsafe { *(0x106863a68u64 as *mut u64) = me as u64; }
-                        eprintln!("[elfjit:v2boot] SH320 --v2boot-bus-mainid: main-id [0x106863a68]=0x{me:x} (ladder) before bus -> done-path dispatcher takes MAIN branch (binder-dispatch 0x206df4, DM ctor entry)");
+                        eprintln!("[elfjit:v2boot] SH320 --v2boot-bus-mainid: main-id [0x106863a68]=0x{me:x} -> done-path dispatcher MAIN branch (DM-ctor entry)");
                     }
                     eprintln!(
                         "[elfjit:v2boot] driving MessageBus.subscribe @ guest 0x102ba5bb8 (jh={b1:#x} b2={b2:#x} b3={b3:#x} b4={b4:#x})"
@@ -13359,7 +13384,7 @@ mod sh115_tests {
     #[test]
     fn sh201_v2_family_scan_real_image_nonempty() {
         // Guard against a silent regression where the family scan returns 0 on
-        // the real binary (it found 384 on libroblox.so during SH201 dev). The
+        // the real binary (it found 384 during SH201 dev). The
         // real image path is present only on this VPS; skip elsewhere.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
@@ -13411,7 +13436,7 @@ mod sh115_tests {
             // len==4 'Home' path -> movz w19,#4; ALT -> movz w19,#1.
             assert_eq!(w(0x2bb47c4), 0x5280_0093, "'Home' path discriminator = movz w19,#4");
             assert_eq!(w(0x2bb47cc), 0x5280_0033, "ALT discriminator = movz w19,#1");
-            eprintln!("sh211 real-image opcode anchors verified on libroblox.so");
+            eprintln!("sh211 real-image opcode anchors verified");
         } else {
             eprintln!("sh211 real-image guard: no real libroblox.so, skipping byte pins");
         }
@@ -13470,7 +13495,7 @@ mod sh115_tests {
             assert_eq!(w(0x6240bc4), 0xf940_0e61, "ldr x1,[x19,#24] (string len)");
             // function entry word (Java_* is reached via the JNI registry path)
             assert_eq!(w(0x6240900), 0x2a00_03e8, "FMOD JNI entry mov w0,w8");
-            eprintln!("sh213 FMOD/AAudio first-contact anchors verified on libroblox.so");
+            eprintln!("sh213 FMOD/AAudio first-contact anchors verified");
         } else {
             eprintln!("sh213 real-image guard: no real libroblox.so, skipping byte pins");
         }
@@ -13527,7 +13552,7 @@ mod sh115_tests {
             assert_eq!(w(0x2b53a64), 0x9401_40e4, "post-family bl receiveCall+0x558");
             assert_eq!(w(0x2b53a6c), 0xa9bf_7bfd, "post-family stp x29,x30,[sp,#-16]!");
             assert_eq!(w(0x2b53a74), 0x94de_0a4f, "post-family bl pthread_mutex_lock@plt");
-            eprintln!("sh219 flag-manager + post-family fragment words verified on libroblox.so");
+            eprintln!("sh219 flag-manager + post-family fragment words verified");
         } else {
             eprintln!("sh219 real-image guard: no real libroblox.so, skipping byte pins");
         }
@@ -13663,7 +13688,7 @@ mod sh115_tests {
             let throw_site: (u64, u64) = (0x25fb6bc, 0x1025fb6bc);
             assert_eq!(throw_site.0.wrapping_add(0x1_0000_0000), throw_site.1, "guest = file + 0x100000000");
             assert!(throw_site.1 & 3 == 0, "throw site 4-aligned");
-            eprintln!("sh222 json append-check site + cap cell + throw helper verified on libroblox.so");
+            eprintln!("sh222 json append-check site + cap cell + throw helper verified");
         } else {
             eprintln!("sh222 real-image guard: no real libroblox.so, skipping byte pins");
         }
@@ -13698,7 +13723,7 @@ mod sh115_tests {
                 assert!(guest & 3 == 0, "sh223 {name} 4-aligned");
                 assert!(guest < 0x120_0000_00, "sh223 {name} in canonical window");
             }
-            eprintln!("sh223 DM-creator region entries + govtail control verified on libroblox.so");
+            eprintln!("sh223 DM-creator region entries + govtail control verified");
         } else {
             eprintln!("sh223 real-image guard: no real libroblox.so, skipping byte pins");
         }
@@ -13735,7 +13760,7 @@ mod sh115_tests {
                 assert!(base >= 0x1_0000_0000 && base < 0x120_0000_00, "sh224 row 0x{base:x} in window");
                 assert!(base & 7 == 0, "sh224 row 0x{base:x} 8-aligned");
             }
-            eprintln!("sh224 corrected-base DM vtable slots verified on libroblox.so");
+            eprintln!("sh224 corrected-base DM vtable slots verified");
         } else {
             eprintln!("sh224 real-image guard: no real libroblox.so, skipping vtable-slot pins");
         }
@@ -13784,7 +13809,7 @@ mod sh115_tests {
             }
             // fork 0x10221942c real function (stp x29,x30,[sp,#-16]! prologue).
             assert_eq!(word(0x102_21942c), 0xa9bf7bfd, "fork 0x10221942c prologue");
-            eprintln!("sh225 do-init DM-construction dispatch fork verified on libroblox.so");
+            eprintln!("sh225 do-init DM-construction dispatch fork verified");
         } else {
             eprintln!("sh225 real-image guard: no real libroblox.so, skipping do-init fork pins");
         }
@@ -13850,7 +13875,7 @@ mod sh115_tests {
             // [5] Hard anchor for the vt+0x1f0 target the DMCONT-routed manager points at.
             assert_eq!(0x102bd1d68u64 & 3, 0, "continueAfterFlagsLoaded_ entry 4-aligned");
             assert_eq!(0x102bd1d68u64 & 7, 0, "continueAfterFlagsLoaded_ entry 8-aligned (stp pair)");
-            eprintln!("sh226 do-init binder-dispatch chain + DMCONT continuation anchors verified on libroblox.so");
+            eprintln!("sh226 do-init binder-dispatch chain + DMCONT continuation anchors verified");
         } else {
             eprintln!("sh226 real-image guard: no real libroblox.so, skipping reconciliation pins");
         }
@@ -13890,7 +13915,7 @@ mod sh115_tests {
             // goes the (never-fired) binder br.
             assert_eq!(word(0x102_206e28), 0x910003e0, "closure-build b.ne target mov x0,sp (non-match path)");
             assert_eq!(word(0x102_206e24), 0xd61f0020, "closure-build br x1 (dispatch — present in bytes but never executed on ladder)");
-            eprintln!("sh227 binder-dispatch decode corrected (#32) + b.ne bypass pinned on libroblox.so");
+            eprintln!("sh227 binder-dispatch decode corrected (#32) + b.ne bypass");
         } else {
             eprintln!("sh227 real-image guard: no real libroblox.so, skipping corrected-decode pins");
         }
@@ -13942,7 +13967,7 @@ mod sh115_tests {
                 assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh228 {name} {guest:#x} in window");
                 assert!(guest & 3 == 0, "sh228 {name} {guest:#x} 4-aligned");
             }
-            eprintln!("sh228 engine-init dispatcher sub/continueAfterFlagsLoaded_ anchors pinned on libroblox.so");
+            eprintln!("sh228 engine-init dispatcher sub/continueAfterFlagsLoaded_ anchors");
         } else {
             eprintln!("sh228 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -13990,7 +14015,7 @@ mod sh115_tests {
                 }
                 assert!(band_refs >= 4, "sh231 vtable band must contain >=4 RELATIVE relocs whose addend lands in the createDataModelForTeleport RTTI rodata band [0x6dc000,0x6e2000) (found {band_refs})");
             }
-            eprintln!("sh231 ExperienceController DM-creation world (bodies 0x102e1c650..0x102e25200, vtable band 0x63981d8..0x6399c00) pinned + RTTI-band reloc links verified on libroblox.so");
+            eprintln!("sh231 ExperienceController DM-creation world (bodies 0x102e1c650..0x102e25200, vtable band 0x63981d8..0x6399c00) pinned + RTTI relocs verified");
         } else {
             eprintln!("sh231 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -14037,7 +14062,7 @@ mod sh115_tests {
                 assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh232 {name} {guest:#x} in window");
                 assert!(guest & 3 == 0, "sh232 {name} {guest:#x} 4-aligned");
             }
-            eprintln!("sh232 EC callers pinned inside ladder rungs StartLuaAppDM + V2InitWithParams (bl targets 0x102e24598/0x102e24468) on libroblox.so");
+            eprintln!("sh232 EC callers pinned inside ladder rungs StartLuaAppDM + V2InitWithParams (bl targets 0x102e24598/0x102e24468)");
         } else {
             eprintln!("sh232 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -14109,7 +14134,7 @@ mod sh115_tests {
                 "sh235 marshaler 0x1023f1210 has EXACTLY these 3 direct callers");
             assert_eq!(ecworld_callers, vec![0x102_3f1294u64, 0x102_e18408u64],
                 "sh235 EC world 0x102e24598 has EXACTLY these 2 direct callers");
-            eprintln!("sh235 EC world 0x102e24598 direct entries = marshaler 0x1023f1210 (callers {:x?}) + EC self-call 0x102e18408 on libroblox.so", marshaler_callers);
+            eprintln!("sh235 EC world 0x102e24598 direct entries = marshaler 0x1023f1210 (callers {:x?}) + EC self-call 0x102e18408", marshaler_callers);
         } else {
             eprintln!("sh235 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -14308,7 +14333,7 @@ mod sh115_tests {
                 assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh264 {name} {guest:#x} in window");
                 assert!(guest & 3 == 0, "sh264 {name} {guest:#x} 4-aligned");
             }
-            eprintln!("sh264 Activity-lifecycle natives (nativeOnResumed/initAppShellReporter/setActive/SetInitParams + setActive core adapter-triplet read) pinned on libroblox.so");
+            eprintln!("sh264 Activity-lifecycle natives (nativeOnResumed/initAppShellReporter/setActive/SetInitParams + setActive core adapter-triplet read)");
         } else {
             eprintln!("sh264 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -14337,7 +14362,7 @@ mod sh115_tests {
             for (g, n) in [(0x102bb070cu64,"Signed"),(0x102bb0a34u64,"Cached"),(0x102bb0c5cu64,"CachedCompressed")] {
                 assert!(in_win(g), "sh275 {n} {g:#x} in-window+aligned");
             }
-            eprintln!("sh275 client-settings Signed/Cached/CachedCompressed entries + Signed version-gate decode (readLocalFlags path) pinned on libroblox.so");
+            eprintln!("sh275 client-settings Signed/Cached/CachedCompressed entries + Signed version-gate decode (readLocalFlags path)");
         } else {
             eprintln!("sh275 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -14373,7 +14398,7 @@ mod sh115_tests {
             for g in [0x102bd1c38u64, 0x102bd1c7cu64, 0x102bd1ca8u64, 0x102bd1cc0u64] {
                 assert!(in_win(g), "sh276 site {g:#x} in-window+aligned");
             }
-            eprintln!("sh276 nativeActivity_onEngineSettingsReceived prologue/version-gate/latch/mutex sites pinned on libroblox.so");
+            eprintln!("sh276 nativeActivity_onEngineSettingsReceived prologue/version-gate/latch/mutex sites");
         } else {
             eprintln!("sh276 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -14407,7 +14432,7 @@ mod sh115_tests {
             for g in [0x102bd1d08u64, 0x102bd1d44u64, 0x102bd1d68u64, 0x102bd2668u64] {
                 assert!(in_win(g), "sh277 site {g:#x} in-window+aligned");
             }
-            eprintln!("sh277 initEngine_ state-dispatch gate + benign tail + settings-serializer pinned on libroblox.so");
+            eprintln!("sh277 initEngine_ state-dispatch gate + benign tail + settings-serializer");
         } else {
             eprintln!("sh277 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -14446,7 +14471,7 @@ mod sh115_tests {
             for g in [0x102bd1cacu64, 0x102bd1cbcu64, 0x102bd1cf0u64, 0x102bd1d68u64] {
                 assert!(in_win(g), "sh278 site {g:#x} in-window+aligned");
             }
-            eprintln!("sh278 engine state->3 transition gate + initEngine_ ==3 serializer branch pinned on libroblox.so");
+            eprintln!("sh278 engine state->3 transition gate + initEngine_ ==3 serializer branch");
         } else {
             eprintln!("sh278 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -14485,7 +14510,7 @@ mod sh115_tests {
             for g in [0x102bd24b4u64, 0x102bd2528u64, 0x102bce0d4u64, 0x10275a0c4u64, 0x10275a154u64] {
                 assert!(in_win(g), "sh280 site {g:#x} in-window+aligned");
             }
-            eprintln!("sh280 engine-settings state=5 body + config-dispatch + GlobalInit-reentry anchors pinned on libroblox.so");
+            eprintln!("sh280 engine-settings state=5 body + config-dispatch + GlobalInit-reentry anchors");
         } else {
             eprintln!("sh280 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -14528,7 +14553,7 @@ mod sh115_tests {
             for g in [0x10275a154u64, 0x10275a23cu64, 0x10275a294u64, 0x102207118u64, 0x10220713cu64, 0x102207144u64] {
                 assert!(in_win(g), "sh281 site {g:#x} in-window+aligned");
             }
-            eprintln!("sh281 config+56 seed-crossed GlobalInit-reentry continuation anchors pinned on libroblox.so");
+            eprintln!("sh281 config+56 seed-crossed GlobalInit-reentry continuation anchors");
         } else {
             eprintln!("sh281 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -14599,7 +14624,7 @@ mod sh115_tests {
             for g in [0x102bd2668u64, 0x102bd26e8u64, 0x102bd2720u64, 0x102bce0d4u64, 0x10275a0c4u64] {
                 assert!(in_win(g), "sh284 site {g:#x} in-window+aligned");
             }
-            eprintln!("sh284 initEngine_ state=9 body (last never-driven state) pins + shared config-dispatch/reentry anchors verified on libroblox.so");
+            eprintln!("sh284 initEngine_ state=9 body (last never-driven state) pins + shared config-dispatch/reentry anchors verified");
         } else {
             eprintln!("sh284 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -14638,7 +14663,7 @@ mod sh115_tests {
             for g in [0x102bd1de8u64, 0x102bcdfd4u64, 0x102bce010u64, 0x102bd1f64u64, 0x102bd1fd4u64] {
                 assert!(in_win(g), "sh279 site {g:#x} in-window+aligned");
             }
-            eprintln!("sh279 settings-serializer world-build gates (config-lock + app-name) pinned on libroblox.so");
+            eprintln!("sh279 settings-serializer world-build gates (config-lock + app-name)");
         } else {
             eprintln!("sh279 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -14688,7 +14713,7 @@ mod sh115_tests {
             // The SH264-measured live-object fault prologue (reached from the
             // shared dispatcher's state dispatch): guestpc=0x1021f3748 = `sub sp,#0x90`.
             assert_eq!(word(0x102_1f3748), 0xd10243ff, "sh273 lifecycle-registry fault-site prologue (SH264 guestpc fault=0x50)");
-            eprintln!("sh273 ALL 12 JNIActivityLifecycleCallbacks nativeOn* entries converge on the single shared dispatcher 0x102_1f15a4 (one SH184 live-object wall; NOT independent levers) — pinned on libroblox.so");
+            eprintln!("sh273 ALL 12 JNIActivityLifecycleCallbacks nativeOn* converge on dispatcher 0x102_1f15a4 (one SH184 live-object wall; NOT independent levers)");
         } else {
             eprintln!("sh273 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -14759,7 +14784,7 @@ mod sh115_tests {
             // The GOVFLAG cell must be in the RW image window (u64-typed).
             let gov: u64 = 0x106a64da0;
             assert!((0x1_0000_0000u64..0x120_0000_00u64).contains(&gov), "sh306 GOVFLAG in window");
-            eprintln!("sh306 governor NULL-DM-controller terminal (0x102ea0b9c) + GOVFLAG [0x106a64da0] pinned on libroblox.so — standing SendAppEventOnAppReady no-regression anchor");
+            eprintln!("sh306 governor NULL-DM-controller terminal (0x102ea0b9c) + GOVFLAG [0x106a64da0] — standing SendAppEventOnAppReady no-regression anchor");
         } else {
             eprintln!("sh306 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -14786,7 +14811,7 @@ mod sh115_tests {
             // Value cell must be in the RW .bss window (host-writable).
             let vcell: u64 = 0x106a64d78;
             assert!((0x1_0000_0000u64..0x120_0000_00u64).contains(&vcell), "sh307 value-cell in window");
-            eprintln!("sh307 preload-getter value-branch (tbz->nop + [0x106a64d78]=obj) pinned on libroblox.so — forward lever on terminal 0x102bb803c");
+            eprintln!("sh307 preload-getter value-branch (tbz->nop + [0x106a64d78]=obj) — forward lever on terminal 0x102bb803c");
         } else {
             eprintln!("sh307 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -15188,6 +15213,27 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh327_appstart_construct_force_branch_pinned() {
+        // SH327: pin the factory 0x2e890c4 construction gate (b.ne->b at 0x2e890f4, the sole
+        // non-construct exit) + the construction body the force relies on.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            assert_eq!(word(0x102e_890dc), 0x97f4_8679, "sh327 bl 2baaac0");
+            assert_eq!(word(0x102e_890f4), 0x5400_0121, "sh327 b.ne 2e89118 (force target)");
+            assert_eq!(word(0x102e_89104), 0xd65f_03c0, "sh327 ret (unconstructed exit)");
+            assert_eq!(word(0x102e_89150), 0xf900_0e60, "sh327 str x0,[x19,#24]");
+            eprintln!("sh327 AppStarted construct-force branch pinned (b.ne->b).");
+        } else {
+            eprintln!("sh327 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh314_appstart_map_header_is_liveobj_not_fixed_cell() {
         // SH314 (do-not-re-tread closure): app-start map wall 0x1021dde34 (`ldr x23,[x21,#8]`,
         // x21 container=0x100548ca9) is fed by the ADDRESS OF A RODATA STRING
@@ -15302,7 +15348,7 @@ mod sh115_tests {
                 assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh272 {name} {guest:#x} in window");
                 assert!(guest & 3 == 0, "sh272 {name} {guest:#x} 4-aligned");
             }
-            eprintln!("sh272 preload getter BOTH branches structurally dead (value-cell=vtable-dispatch; construct zeroes [obj+80]) — live-object wall. Route-B gate UNCHANGED.");
+            eprintln!("sh272 preload getter BOTH branches structurally dead (value-cell=vtable-dispatch; construct zeroes [obj+80]) — live-object wall. Route-B UNCHANGED.");
         } else {
             eprintln!("sh272 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -15358,7 +15404,7 @@ mod sh115_tests {
                 assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh265 {name} {guest:#x} in window");
                 assert!(guest & 3 == 0, "sh265 {name} {guest:#x} 4-aligned");
             }
-            eprintln!("sh265 dataModel-bindings live-binder receive (nativeAppBridgeV2SendAppEventOnGameLoaded + 0x10635dfe8 vtable real-teardown) pinned on libroblox.so");
+            eprintln!("sh265 dataModel-bindings live-binder receive (nativeAppBridgeV2SendAppEventOnGameLoaded + 0x10635dfe8 vtable real-teardown)");
         } else {
             eprintln!("sh265 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -15397,7 +15443,7 @@ mod sh115_tests {
                 assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh266 {name} {guest:#x} in window");
                 assert!(guest & 3 == 0, "sh266 {name} {guest:#x} 4-aligned");
             }
-            eprintln!("sh266 messageBus MessageBus.subscribe (entry/JNI-slot dispatch/jstring marshal/op_new + real app-start bl 0x2343c10) pinned on libroblox.so");
+            eprintln!("sh266 messageBus MessageBus.subscribe (entry/JNI-slot dispatch/jstring marshal/op_new + real app-start bl 0x2343c10)");
         } else {
             eprintln!("sh266 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -15442,7 +15488,7 @@ mod sh115_tests {
                 assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh267 {name} {guest:#x} in window");
                 assert!(guest & 3 == 0, "sh267 {name} {guest:#x} 4-aligned");
             }
-            eprintln!("sh267 LSM insert-leaf atomic-OR mechanism (sub[idx]->*x1) pinned on libroblox.so");
+            eprintln!("sh267 LSM insert-leaf atomic-OR mechanism (sub[idx]->*x1)");
         } else {
             eprintln!("sh267 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -15479,7 +15525,7 @@ mod sh115_tests {
                 assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh285 {name} {guest:#x} in window");
                 assert!(guest & 3 == 0, "sh285 {name} {guest:#x} 4-aligned");
             }
-            eprintln!("sh285 LSM reader/pop terminal (settings-state cross, past insert-leaf) pinned on libroblox.so");
+            eprintln!("sh285 LSM reader/pop terminal (settings-state cross, past insert-leaf)");
         } else {
             eprintln!("sh285 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -15690,7 +15736,7 @@ mod sh115_tests {
                 assert!(off < 0x62d8190, "sh293 {name} {g:#x} file {off:#x} in exec seg");
             }
             assert_eq!(0x6a63b00u64 + 0x1_0000_0000, 0x106a63b00u64, "sh293 once-built cell guest");
-            eprintln!("sh293 item-proc [item+48]->0x22193a0 continuation (SH273-class) pinned on libroblox.so");
+            eprintln!("sh293 item-proc [item+48]->0x22193a0 continuation (SH273-class)");
         } else {
             eprintln!("sh293 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -15737,7 +15783,7 @@ mod sh115_tests {
             // i.e. SH293's labeled 0x1068266e8 was +0x400 (a whole adrp-page) off the real cell
             assert_eq!(0x6826000u64 + 744, 0x68262e8u64, "sh294 adrp page + ldr-imm #744 = 0x68262e8");
             assert_ne!(0x68262e8u64, 0x68266e8u64, "sh294 SH293's 0x68266e8 label is NOT the code-addressed cell");
-            eprintln!("sh294 corrected [item+48] registry cell 0x1068262e8 (writable .data, blr-fireable) + trampoline attribution pinned on libroblox.so");
+            eprintln!("sh294 corrected [item+48] registry cell 0x1068262e8 (writable .data, blr-fireable) + trampoline attribution");
         } else {
             eprintln!("sh294 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -15781,7 +15827,7 @@ mod sh115_tests {
                 let off = (g - 0x1_0000_0000) & 0xffff_ffff;
                 assert!(off < 0x62d8190, "sh295 {name} {g:#x} file {off:#x} in exec seg");
             }
-            eprintln!("sh295 [item+48] edge dispatch chain (w2==0 -> 0x28511c4 live-object wall) pinned on libroblox.so");
+            eprintln!("sh295 [item+48] edge dispatch chain (w2==0 -> 0x28511c4 live-object wall)");
         } else {
             eprintln!("sh295 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -15812,7 +15858,7 @@ mod sh115_tests {
             if th != 0 {
                 assert_eq!(unsafe { (th as *const u64).read_unaligned() }, 0x23f03b4, "sh296 table entry[4]=dmfn");
             }
-            eprintln!("sh296 DM-construction handler + dispatch table pinned on libroblox.so");
+            eprintln!("sh296 DM-construction handler + dispatch table");
         } else {
             eprintln!("sh296 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -15845,7 +15891,7 @@ mod sh115_tests {
             assert_eq!(word(0x102_3f0_5f8), 0x97fdca28, "sh297 bl nativeAppBridgeAppStart 0x2362e98");
             // the post-gate fault site (0x21e45c8 registration, one BL before app-start)
             assert_eq!(word(0x102_1e4_60c), 0xf94006a0, "sh297 fault site ldr x0,[x21,#8] in 0x21e45c8");
-            eprintln!("sh297 dmfn construction-body arg1-clobber path pinned on libroblox.so");
+            eprintln!("sh297 dmfn construction-body arg1-clobber path");
         } else {
             eprintln!("sh297 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -15879,7 +15925,7 @@ mod sh115_tests {
             assert_eq!(word(0x102_3f1_354), 0xa9bd7bfd, "sh298 EC callee 0x1023f1354 entry");
             // the EC callee's first op_new bl (builds the box whose NULL+0x48 deref is terminal)
             assert_eq!(word(0x102_3f1_384), 0x97e6af3c, "sh298 EC callee op_new-family bl");
-            eprintln!("sh298 registration-coherent + EC-world reach pinned on libroblox.so");
+            eprintln!("sh298 registration-coherent + EC-world reach");
         } else {
             eprintln!("sh298 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -15935,7 +15981,7 @@ mod sh115_tests {
                 assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh268 {name} {guest:#x} in window");
                 assert!(guest & 3 == 0, "sh268 {name} {guest:#x} 4-aligned");
             }
-            eprintln!("sh268 LSM free-list/pop terminal mechanism (link-store into R-E key) pinned on libroblox.so");
+            eprintln!("sh268 LSM free-list/pop terminal mechanism (link-store into R-E key)");
         } else {
             eprintln!("sh268 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -16019,7 +16065,7 @@ mod sh115_tests {
                 assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh261 {name} {guest:#x} in window");
                 assert!(guest & 3 == 0, "sh261 {name} {guest:#x} 4-aligned");
             }
-            eprintln!("sh261 app-start drain surface pinned (drain 0x233bc88..0x233bcf0 + registry builder 0x21daef8), terminal = run-variable live-object (bad_function_call / LSM SIGSEGV / 0x1748a4) on libroblox.so");
+            eprintln!("sh261 app-start drain surface pinned (drain 0x233bc88..0x233bcf0 + registry 0x21daef8); terminal = run-variable live-object");
         } else {
             eprintln!("sh261 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -16060,7 +16106,7 @@ mod sh115_tests {
                 assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh236 {name} {guest:#x} in window");
                 assert!(guest & 3 == 0, "sh236 {name} {guest:#x} 4-aligned");
             }
-            eprintln!("sh236 StartLuaAppDM receiveCall-dispatch soft-return location pinned (last block 0x1023f01e4 inside helper 0x1023f00f8; marshaler-call 0x1023f075c unreached headlessly) on libroblox.so");
+            eprintln!("sh236 StartLuaAppDM receiveCall-dispatch soft-return pinned (last block 0x1023f01e4 in helper 0x1023f00f8)");
         } else {
             eprintln!("sh236 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -16123,10 +16169,10 @@ mod sh115_tests {
                 let g = off + 0x100_0000_00;
                 match el.host_addr_of(g) { Some(h) => unsafe{ (h as *const u64).read_unaligned() }, None => 0 }
             };
-            eprintln!("sh237 select slots: +0x20 addend={:#x} -> loaded guest {:#x} (__clone stub 0x1db2cf0); +0x28 addend={:#x} -> loaded guest {:#x} (invoke 0x21e96f8) — std::function lambda-world pair (SH231 EC-world machinery), loader-synthesized RELATIVE, NOT session-written",
+            eprintln!("sh237 select slots: +0x20 addend={:#x}->guest {:#x}; +0x28 addend={:#x}->guest {:#x} (clone 0x1db2cf0/invoke 0x21e96f8)",
                 addend_of(0x635dd88), loaded_val(0x635dd88),
                 addend_of(0x635dd90), loaded_val(0x635dd90));
-            eprintln!("sh237 StartLuaAppDM receiveCall dispatch-select [0x10635dd68+0x20/+0x28] = LOADER-SYNTHESIZED .data.rel.ro (__clone 0x1db2cf0/invoke 0x21e96f8), not session-gated; route to marshaler 0x1023f075c gated downstream (0x1023f00f8 V2Init copy + FMOD tail)");
+            eprintln!("sh237 StartLuaAppDM dispatch-select [0x10635dd68+0x20/0x28] = LOADER relro (clone 0x1db2cf0/invoke 0x21e96f8)");
         } else {
             eprintln!("sh237 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -16173,7 +16219,7 @@ mod sh115_tests {
                 assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh239 {name} {guest:#x} in window");
                 assert!(guest & 3 == 0, "sh239 {name} {guest:#x} 4-aligned");
             }
-            eprintln!("sh239 qualified do-init facts: once-lambda store 0x102206d74 writes intern 0x400000b (not in-image DM) to [0x106a68408]; app-shell ctor 0x102207b50 runs deep (61+ blocks, tail FMOD 0x5fb30b4); no make_shared<DataModel> — Route-B live-DM gate UNCHANGED");
+            eprintln!("sh239 do-init: once-lambda 0x102206d74 writes intern 0x400000b to [0x106a68408]; no make_shared<DataModel>");
         } else {
             eprintln!("sh239 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -16231,7 +16277,7 @@ mod sh115_tests {
                 assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh240 {name} {guest:#x} in window");
                 assert!(guest & 3 == 0, "sh240 {name} {guest:#x} 4-aligned");
             }
-            eprintln!("sh240 DMCONT chain pinned fresh-at-HEAD (fnB 0x102bd1b98 -> dispatcher 0x2bd8ce8 -> getter+leaf blrs -> sub_2bd8dac/vt+0x1f0 -> continueAfterFlagsLoaded_ 0x102bd1d68); 3/3 EXIT 124: dispatcher enters at 0x102bd8ce8 but guest never resumes past first call-boundary (interior+sub+continueAfterFlagsLoaded_ 0 hits) — DMCONT continuation LATENT (SH228 negative re-confirmed)");
+            eprintln!("sh240 DMCONT chain pinned (fnB 0x102bd1b98->dispatcher 0x2bd8ce8->0x102bd1d68); never resumes past first call — DMCONT LATENT");
         } else {
             eprintln!("sh240 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -16501,7 +16547,7 @@ mod sh115_tests {
                 assert!(mc >= 1, "sh234 ctx vtable band must store make-current addend 0x5b3b358 (found {mc})");
                 assert!(sw >= 1, "sh234 ctx vtable band must store swap addend 0x5b3b408 (found {sw})");
             }
-            eprintln!("sh234 recon-v3 render-side engine contract (make-current 0x105b3b358 / frame-fn 0x105b32c00 / swap 0x105b3b408 / RENDERCTX vt 0x106731ae0 / renderinit 0x105b3a280) pinned on libroblox.so");
+            eprintln!("sh234 recon-v3 render-side engine contract (make-current 0x105b3b358 / frame-fn 0x105b32c00 / swap 0x105b3b408 / RENDERCTX vt 0x106731ae0)");
         } else {
             eprintln!("sh234 real-image guard: no real libroblox.so, skipping anchors");
         }

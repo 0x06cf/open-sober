@@ -5786,17 +5786,28 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
             }
         }
         if let Some(dump_pc) = dump_pc {
-            if let Ok(target) = u64::from_str_radix(dump_pc.trim_start_matches("0x"), 16) {
-                if pc == target {
-                    let s = unsafe { &*state };
-                    let mut line = format!("DUMPPC pc={pc:#x}");
-                    for (i, x) in s.x.iter().enumerate() {
-                        line.push_str(&format!(" x{i}={x:#x}"));
-                    }
-                    // Also read the guest canary slot [x29-16] and its neighbors
-                    // (the guest stack is guest==host identity-mapped, so reading
-                    // the host address works). This lets a single probe confirm
-                    // WHEN a frame's saved canary is clobbered.
+            // SH327: allow comma-separated PCs to watch a write+read pair in ONE run,
+            // and append the live AppStarted cell [0x106a6f480] (= [appstart+24]) to
+            // every dump so ordering vs the construction write is unambiguous.
+            let targets: Vec<u64> = dump_pc
+                .split(',')
+                .filter_map(|t| u64::from_str_radix(t.trim_start_matches("0x"), 16).ok())
+                .collect();
+            if targets.contains(&pc) {
+                let s = unsafe { &*state };
+                let mut line = format!("DUMPPC pc={pc:#x}");
+                for (i, x) in s.x.iter().enumerate() {
+                    line.push_str(&format!(" x{i}={x:#x}"));
+                }
+                unsafe {
+                    let cell = std::ptr::read_unaligned(0x106a6f480u64 as *const u64);
+                    let obj = std::ptr::read_unaligned(0x106a6f468u64 as *const u64);
+                    line.push_str(&format!(" [appstart0x106a6f480]={cell:#x} [0x106a6f468]={obj:#x}"));
+                }
+                // Also read the guest canary slot [x29-16] and its neighbors
+                // (the guest stack is guest==host identity-mapped, so reading
+                // the host address works). This lets a single probe confirm
+                // WHEN a frame's saved canary is clobbered.
                     let x29 = s.x[29];
                     if x29 != 0 {
                         let base = x29.wrapping_sub(0x40);
@@ -5821,7 +5832,6 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
                     }
                     println!("{line}");
                 }
-            }
         }
         #[cfg(debug_assertions)]
         if std::env::var_os("JIT_DUMP").is_some() {
