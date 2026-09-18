@@ -1,24 +1,21 @@
 # Open Sober — Agent Handoff
-## SH337 (Sep 19, 2026, hermes-worker): measured negative — V1 nativeAppBridgeAppStart__ driven
-## against a POPULATED registry (count=12) still does NOT register "App"; the "App"-registration
-## SESSION-CTOR lever stays the standing Route-B wall.
+## SH339 (Sep 19, 2026, hermes-worker): measured negative answering SH308's open Step-2 ABI question — the fabricated "Home" jstring does NOT route to event-code 4 (falls to 0).
 
-Single-agent (cone suppressed). New default-inert rung `--v2boot-postbus-v1appstart` (elfjit.rs)
-drives SH336's pinned V1 AppStart__ ABI AFTER `MessageBus.subscribe` populates the service registry
-0->12 — the genuinely-untested combination (every prior V1 drive ran from count=0 and died at the
-empty lookup). MEASURED (real libroblox.so, clean, EXIT 124, 0 crash):
-- SH337 bus Ok(0x3e8); SH337 V1 AppStart__ Ok(0x3e8) — V1 AppStart runs clean on 12 entries.
-- post-V1: registry STAYS 12 (task-scheduler family byte-identical), "App" NEVER among the entries,
-  DM-root [0x106a68818]=0x0, once-guard=0x1 (already latched from the bus).
-- => driving V1 AppStart__ on a populated registry does NOT make the "App" service register.
-  Consistent with SH313/315/316/317/318/335: "App" + its tier-2 controller-name cell (Runtime0)
-  are built only by a deeper live session ctor, not a bare app-start entry.
-
-Re-verified at HEAD (no regression): recon-v3 self-driven frames (24 frames swap Ok(0x1), 0 json
-abort, EXIT 124); SH335 reglive closure (registry 0..12 task-scheduler-only, "App" never an entry).
-Workspace green (elfjit examples 155/0, arm64jit lib 410/0, ws 0 failed). elfjit.rs 1048470 B under
-1MB hook (new rung + entries dump funded by condensing SH-prose comments; no test weakened).
-HONEST: no DM (DM-root 0, MH_* false); Route-B live-DM structural gate UNCHANGED; SH337 is a
-measured-negative closure on the SESSION-CTOR line, NOT a session advance. NEXT (unchanged): the
-real Activity/AppBridge session drive that registers the "App" service — now with V1-AppStart-on-
-populated-registry explicitly excluded. +frontier doc +probe runs/probe_sh337_v1appstart_postbus.sh.
+Single-agent (cone suppressed). New default-inert read-only guard `routeb_appevent_w19_guard`
+(jit.rs, opt-in JIT_ROUTEB_APPEVENT_W19) captures SendAppEventOnAppReady's event discriminator
+INPUT MID-EXECUTION at its real block boundary 0x102bb46b8 (region-watch-verified), which the
+post-return `se.x[19]` read (SH308) could not do (x19 callee-saved/restored → always 0).
+MEASURED 4/4 real-libroblox.so runs: [sp].b0=0x0c → libc++ SSO size 6 → discriminator's
+`cmp #0xc/#5/#4` falls through to event-code **0**, NOT 4. The fabricated handle bytes at
+x19/x5 ARE `486f6d65` ("Home") — source correct — but the RBX string the router reads at
+[sp] is not "Home", so the harness's 'Home' event does not reach the router as such.
+IMPORTANT refinement: the do-init pipe forward-reach (SH307/308 app-shell ctor, FMOD audio
+tail, StartAppWithParams, app-data-model count 0→1) STILL fires with event-code 0 in every run
+— it is driven by the SH126 sync-gate, NOT by correct 'Home' routing, so the session-advance
+is robust to the discriminator result. Does NOT manufacture a DM (DM-root 0, MH_* false);
+Route-B live-DM structural gate UNCHANGED; SH174 capture-latch stays the single forward hook.
+Source = +guard only (jit.rs, 76 lines), default-inert. Workspace green (build EXIT 0, tests
+590/0). +frontier doc +runs/capture_sh339_appevent_w19.sh +captures sh339-w19{b,g,h,i}.txt.
+HONEST: a measurement (opens no new gate), not a session advance; it closes the last open
+ABI sub-question SH308 carried on the do-init pipe's event side and proves the pipe does not
+depend on the fragile fabricated-jstring round-trip.

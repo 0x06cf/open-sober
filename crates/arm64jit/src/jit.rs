@@ -719,6 +719,81 @@ fn routeb_appstart_408_guard(state: *mut CpuState, pc: u64) {
     );
 }
 
+/// SH339 (this cycle): mid-execution capture of SendAppEventOnAppReady's discriminator
+/// input. SH308 left OPEN whether the fabricated "Home" jstring routes to w19=4: the
+/// post-return `se.x[19]` read is unreliable because x19 is callee-saved and restored on
+/// return (measured w19=0x0 every run). This guard fires at the discriminator BLOCK entry
+/// 0x102bb46b8 (a real block boundary, verified via region-watch) — where the parsed 4th
+/// jstring's libc++ SSO header is read (byte0 = (size<<1)|longbit, [sp+8] = data/len). The
+/// SSO size byte determines the discriminator branch ('Home'=size 4 -> `mov w19,#4`
+/// @0x2bb47c4). MEASURED 4/4 real-libroblox.so runs: the parsed 4th string decodes to a
+/// 6-byte non-"Home" SSO (b0=0x0c) so the discriminator falls through to event-code 0
+/// (NOT 4) — matching the always-0 post-return x19 read. The fabricated handle bytes ARE
+/// "Home" (asm-resolve via GetStringUTFChars return) but the RBX string materialized at
+/// [sp] is not "Home", so the harness's 'Home' event does NOT reach the engine's router as
+/// such. ANSWERS SH308's open ABI question with a measured negative. READ-ONLY, default-inert
+/// (JIT_ROUTEB_APPEVENT_W19), fires on every discriminator block entry.
+fn routeb_appevent_w19_guard(state: *mut CpuState, pc: u64) {
+    if std::env::var("JIT_ROUTEB_APPEVENT_W19").ok().as_deref() != Some("1") {
+        return;
+    }
+    // Discriminator block entry (region-watch-verified boundary). Here [sp] = the parsed
+    // 4th-jstring libc++ SSO header: byte0 = (size<<1)|longbit, [sp+8] = data (SSO payload
+    // or heap ptr for long). Read it BEFORE the event build clobbers the frame.
+    if pc != 0x102bb46b8 {
+        return;
+    }
+    let s = unsafe { &*state };
+    let sp = s.x[31];
+    let b0 = if sp != 0 && sp < 0x8000_0000_0000 {
+        unsafe { std::ptr::read_unaligned(sp as *const u8) }
+    } else {
+        0xFF
+    };
+    let w8_8 = if sp != 0 && (sp + 8) < 0x8000_0000_0000 {
+        unsafe { std::ptr::read_unaligned((sp + 8) as *const u64) }
+    } else {
+        u64::MAX
+    };
+    // libc++ SSO: long flag = byte0 & 1; if SSO, size = byte0 >> 1; if long, size = [sp+8]
+    let long = b0 & 1;
+    let size_hdr = if long == 0 { (b0 >> 1) as u64 } else { w8_8 };
+    // If SSO, the payload characters are at [sp+1..]; else the data pointer is [sp+8].
+    let mut chars = String::from("-");
+    if long == 0 && sp != 0 && sp < 0x8000_0000_0000 {
+        let mut c = String::new();
+        for off in 1u64..0x20u64 {
+            let ch = unsafe { *((sp + off) as *const u8) };
+            if ch == 0 { break; }
+            c.push(ch as char);
+        }
+        chars = c;
+    }
+    eprintln!(
+        "[elfjit:appevent-w19] SH339 discriminator entry 0x102bb46b8: sp={sp:#x} [sp].b0={b0:#x} long={long} size_hdr={size_hdr:#x} SSO=\"{chars}\" (x19=4th-jstring handle {:#x}, x2={:#x}, x5={:#x})",
+        s.x[19], s.x[2], s.x[5]
+    );
+    // Root-cause check: dump the actual bytes at the fabricated handle (x19/x5) so we can
+    // see what GetStringUTFChars returned to the RBX copy helper (0x1d9d074 strlen+memmove).
+    let hl = s.x[19];
+    if hl != 0 && hl < 0x8000_0000_0000 {
+        let mut hx = String::new();
+        for off in 0u64..0x10u64 {
+            let b = unsafe { std::ptr::read_unaligned((hl + off) as *const u8) };
+            hx.push_str(&format!("{b:02x}"));
+        }
+        let mut ha = String::new();
+        for off in 0u64..0x10u64 {
+            let c = unsafe { *((hl + off) as *const u8) };
+            if c == 0 { break; }
+            ha.push(c as char);
+        }
+        eprintln!(
+            "[elfjit:appevent-w19] SH339 handle 0x{hl:x} bytes=[{hx}] ascii=\"{ha}\""
+        );
+    }
+}
+
 /// SH161 (recon deleg_c94a8b2f): broad tail-entry probe — log every block entry whose
 /// pc falls in the governor-tail region so we can pin exactly which block contains the
 /// NULL-deref dispatch. Debug-only, gated on JIT_ROUTEB_SETFIX + JIT_ROUTEB_TAILTRACE.
@@ -6326,6 +6401,7 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
             routeb_startluaapp_invoke_guard(state, pc); // SH238: cross StartLuaAppDM receiveCall select to the EC invoke slot (JIT_ROUTEB_SLADM_INVOKE)
             routeb_tail_trace(state, pc);
         }
+        routeb_appevent_w19_guard(state, pc); // SH339 (JIT_ROUTEB_APPEVENT_W19): mid-execution capture of the SendAppEventOnAppReady discriminator w19 at the JOIN 0x102bb47d0 (settles SH308's open ABI question; read-only, once)
         routeb_appstart_408_guard(state, pc); // SH330: seed [AppStarted+0x408] (runtime heap x19) benign vt[+136] leaf at the 0x25f5050 gate (JIT_ROUTEB_APPSART_408SEED, standalone)
         routeb_cookie_jar_guard(state, pc); // SH175: seed cookie-jar container + gates at worker 0x102203148 (JIT_ROUTEB_COOKIE)
         // SH248d (opt-in JIT_ROUTEB_APPSART_JAR_SEED): seed [0x106ed7a20] cookie-jar string
