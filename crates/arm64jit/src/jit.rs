@@ -7769,6 +7769,52 @@ mod tests {
     }
 
     #[test]
+    fn sh301_ec_body_block_entry_doctrine_pinned() {
+        // SH301 (single-agent, real-image guard as sh300/sh299 family): byte-pin the
+        // EC-world body 0x102e24598's realsession-reader frontier so a future cycle
+        // does NOT re-attempt SH300 on the "region-probe was single-block-blind"
+        // objection. The measured doctrine (block-entry level, ~10 probe configs on
+        // real libroblox.so): (1) EC entry 0x102e24598 + resume 0x102e245f4 fire as
+        // block entries; (2) the interior string-assign `bl 0x2b504e4` @0x2e24610/0x2e24618
+        // ALSO fires as a block entry — PROVING interior guest `bl` targets do open
+        // block entries in this JIT (not inlined mid-block); (3) yet the two realsession
+        // reader `bl` targets — real V2Init 0x23c5538 (guest 0x1023c5538) and benign
+        // singleton 0x23c1b0c (guest 0x1023c1b0c) — NEVER fire as block entries across
+        // every config. Therefore the EC body provably soft-returns BEFORE the reader
+        // at 0x2e246f4 (`cbz w8` on [0x106d31e28]): SH300's flag seed is CORRECT and
+        // latched but its reader is unreached headlessly = genuinely dormant-by-measurement,
+        // NOT probe-blindness. Do-not-re-tread SH300 (do not re-seed the flag; the gate is
+        // the body's pre-reader continuation, SH299-NEXT-GATE class).
+        let p = std::path::Path::new(
+            "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
+        );
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let word_at = |vaddr: u64| -> u32 {
+                let off = vaddr as usize;
+                let b = &img[off..off + 4];
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            };
+            // EC entry + resume + the interior string-assign bl (PROVES interior bls
+            // open block entries — the sibling evidence that the realsession bl-targets
+            // would fire IF the reader were reached).
+            assert_eq!(word_at(0x2e24598), 0xa9ba7bfd, "sh301 EC entry (stp x29,x30,[sp,#-96]!)");
+            assert_eq!(word_at(0x2e245f0), 0x97d73359, "sh301 EC entry bl -> 0x1023f1354");
+            assert_eq!(word_at(0x2e24610), 0x91002280, "sh301 prefix string-add (x0=x20+8)");
+            assert_eq!(word_at(0x2e24618), 0x97f4afb3, "sh301 prefix bl 0x2b504e4 (fires as block entry)");
+            // the realsession reader + ITS two bl-targets (NEVER fire as block entries):
+            assert_eq!(word_at(0x2e246f4), 0xb001f868, "sh301 reader adrp x8,6d31000");
+            assert_eq!(word_at(0x2e246f8), 0x3978a108, "sh301 reader ldrb w8,[x8,#3624] (= [0x106d31e28])");
+            assert_eq!(word_at(0x2e246fc), 0x34000188, "sh301 reader cbz w8,0x2e2472c (flag branch)");
+            assert_eq!(word_at(0x2e24704), 0x97d6838d, "sh301 REAL V2Init bl 0x23c5538 (flag=1 path)");
+            assert_eq!(word_at(0x2e24730), 0x97d674f7, "sh301 BENIGN singleton bl 0x23c1b0c (flag=0 path)");
+            eprintln!("sh301 EC realsession-reader frontier + both bl-targets pinned on libroblox.so (reader unreached by block-entry doctrine)");
+        } else {
+            eprintln!("sh301 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh253_source_vector_guard_is_env_pc_gated_and_seeds_registrar_source() {
         // SH253: routeb_source_vector_seed_guard must (a) be inert without
         // JIT_ROUTEB_SOURCE_SEED, (b) fire ONLY within nativeGameGlobalInit
