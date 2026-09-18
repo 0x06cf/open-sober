@@ -1,40 +1,34 @@
 # Open Sober — Agent Handoff
-## SH343 (Sep 19, 2026, hermes-worker): CROSSED the SH341 LSM poison fencepost — the persistence-lane terminal wall (guestpc 0x101d9a528, the LSM free-list pop that SIGABRT'd every full-ladder Route-B run) now completes via routeb_lsm_keyfix_guard (JIT_ROUTEB_LSM_KEYFIX=1): the single poisoned .text KEY (0x101d968e4, from the 0x626b6d0 pool-pop wrapper) at the pop write-site is redirected to a valid host-heap write target, so `str x8,[x1]` lands in real memory. Measured real libroblox.so: keyfix fired once on the crashing iteration; the ladder advances ONE fencepost to guestpc 0x101db1b08 (SH285's LSM reader/pop terminal, fault=0xffffffffffffffff). Workspace green (arm64jit 414/0, +3 hermetic tests); recon-v3 deliverables re-verified present.
+## SH344 (Sep 19, 2026, hermes-worker): Route-B re-attack on the SH343-deepened FULL ladder — the NativeDataModelManager session-ctor line now FIRES (DM-creator band 0 hits -> 1 hit @0x102bd1b98), yet the engine's make_shared<DataModel> still never allocs (0 validated), terminal = the SH285 LSM reader/pop live-object wall 0x101db1b08. re-armed + ran the SH174 DM-capture latch on the ladder (latent hook proven live: caught real allocs, 0 validated).
 
-Single-agent (cone suppressed). One new default-inert env-gated guard + 3 hermetic unit
-tests + frontier doc + repro capture script. No production path edited outside the new
-guard (which is opt-in and off by default). Workspace green.
+Single-agent (cone suppressed). Persistence landed (SH343) -> returned to Route B per
+the operator's hard directive. Measurement-only (no production editor). Workspace green.
 
-SH343 (committed): with JIT_ROUTEB_LSM_KEYFIX=1 the full-ladder send-appevent + session
-route no longer ABRTs at the SH341 terminal 0x101d9a528 (persistence-lane pop); instead it
-advances to the SH285 reader/pop terminal 0x101db1b08 (fault=0xffffffffffffffff, RBX-poisoned
-live-object pointer) — a concrete measured CROSS on STATUS candidate #2. Pre/post identical
-env except KEYFIX. This is a persistence-lane advance, NOT a session crossing: DM-root 0,
-MH_* all false, Route-B live-DM gate UNCHANGED; SH174 capture-latch stays the forward hook.
+## SH344 (committed): two probes + frontier doc.
+- Run 1 (JIT_DM_ALLOC_CAPTURE+DELEGATE): latch ARM confirmed (`CRT operator-new ACTIVE
+  hook 0x1067daaf0 -> capture trail`) catching real allocs (0x18, 0x20040) but **0
+  [validated]** -> no live DataModel. EXIT 139 bad_function_call = the known
+  delegate-path disruption on the deep ladder (SH170/runbook caveat), not a session fault.
+- Run 2 (region-watch): governor 22 pcs end-to-end (0x102e9fa84..0x102ea30dc) then
+  routeb-dmforce SH164 fabricated manager -> fnB real engine-init guest 0x102bd1b98 ->
+  bl 0x102bd8ce8 -> REAL continueAfterFlagsLoaded_ (0x102bd1d68) -> nativeAppBridgeAppStart
+  (SH165 manager re-seed + SH243 getter cell + SH245 app-name guard all fired).
+  Terminal: guestpc=0x101db1b08 fault=0xffffffffffffffff (SH285 LSM reader/pop live-object
+  wall). ScriptContext + setDataModelToCurrent registry 0 hits. EXIT 134.
+- CONFIRMS: SH343's LSM keyfix does NOT unlock the DM ctor. The full ladder now
+  measureably enters the NativeDataModelManager session-ctor line (distinct from SH340's
+  skip-appstart governor-silent path) but the live-DM gate is UNCHANGED — no DM-root,
+  MH_* false. SH285 verdict stands: 0x101db1b08 is the live-object class,
+  cause-not-symptom only, do NOT repair-seed it.
 
-## SH342 (Sep 19, 2026, hermes-worker): measured the SETWORLDBUILD world-build continuation (do-init -> fn 0x102ea3b14 -> nativeAppBridgeAppStart__) is UNREACHABLE from every driven rung — V2InitWithParams benign-soft-returns Ok(0x3e8) before its world-build gate block 0x102368100 executes so the seed never fires (0 world-build/appstart region hits w/ and w/o V2_ONDEMAND); full ladder dies at new live-object site 0x1026d63c0 (SH324-class). Refines STATUS candidate #2: world-build gate premise broken, continuation gated behind the live-DM/session-ctor wall (SH324/SH340). recon-v3 frame plane re-verified green (real mesh, 0 crashes, EXIT 124).
+recon-v3 deliverables (type4_frame_thunk self-drive + JIT_JSON_ZERO_FIX) re-verified
+present at HEAD. Route-B live-DM structural gate UNCHANGED. SH174 capture-latch (proven
+armed here) stays the single forward hook.
 
-Single-agent (cone suppressed). One default-inert READ-ONLY instrumentation guard + one
-hermetic lib pin + frontier doc + repro probe. No production path edited. Workspace green.
-
-SH341 (committed): `routeb_lsm_keytrace_guard` (jit.rs, JIT_ROUTEB_LSM_KEYTRACE=1, inert)
-fires at the LSM pool-pop fn entry 0x101d9a5a0 + pop write-site 0x101d9a528, logging
-x0=KEY + x30=LR (caller), classifying each key (EXEC/.text vs guest-data vs host-leak).
-MEASURED on the real libroblox.so (SH267 ON arm, EXIT 134 at 0x101d9a528): **exactly ONE
-poisoned key** — 0x101d968e4, caller LR=0x10626b6dc — is the crash; all other 390 pops
-carry valid host-heap keys and complete. Disasm confirmed file 0x626b6d0 is a thin
-trampoline that forwards x0 unchanged into the pool-pop (`bl 0x1d9a5a0`) — this is the
-"FMOD AAudio 626b6d0" site cited since SH212; it is the LSM pool-pop wrapper, not FMOD
-audio output. => SH268's "proven-unwritable R-E live-object" is a SYMPTOM: the persistence
-lane never writes code memory; a single stale .text pointer is fed as the pool key once,
-by the FMOD/0x626b6d0 caller. Fix target = that upstream caller, NOT the LSM pop (which is
-well-behaved for all valid keys). No crossing: DM-root 0, MH_* false, Route-B live-DM gate
-UNCHANGED; SH174 capture-latch stays the single forward hook. `sh341` hermetic pin lives in
-the arm64jit LIB suite (held the elfjit example under its 1MiB hook; the pop mechanism
-bytes were already pinned by sh267/sh268).
-
-HONEST: measurement/attribution, not a session advance — but it converts a long-standing
-static verdict (SH268 "no lever can reach it") into a measured single-source pointer leak,
-correcting the "FMOD AAudio" label and narrowing the fix to the 0x626b6d0 caller.
-NEXT (unchanged): the real Activity/AppBridge session drive (SEP-17 SESSION-CTOR lever);
-V1-AppStart-on-populated-registry measured-negative (SH337).
+## Next (unchanged, authoritative)
+The SEP-17 SESSION-CTOR lever (drive the real Android Activity/AppBridge session init
+state machine) remains the primary forward — now with the NativeDataModelManager line
+reachable. The next implementable artifact is the scoped re-router of the manager's
+flag-completion slot (+0x1f0) toward a real engine-constructed app-shell
+(SH165-fwd "Next"), gated by the fact that seeds cannot produce a live DataModel
+(SH165-fwd task-1/e2, SH174 runbook).
