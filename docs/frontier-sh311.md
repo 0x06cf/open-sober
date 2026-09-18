@@ -68,6 +68,25 @@ path.
 - 0x61e30bc itself was not driven in this cycle (it is the leaf that returns into the store);
   its NULL-return cause is the named next gate, not yet resolved.
 
+## Addendum — the DM-controller ctor chain 0x61e30bc anatomy (why it returns 0)
+
+Fresh disasm 0x61e30bc (the tail of `bl 0x2173b3c`): prologue -> `bl 0x216848c` + `bl 0x21686cc`
+(inits) -> `adrp x0,6eda000; add x0,#0xe60` (global 0x106eda0e0) + `bl 0x2b53ba0` (get-singleton)
+-> `mov x0,x23(name); mov x1,x20(param)` then **`bl 0x2168798` (name->service lookup) ->
+`mov x25,x0; cbnz x0,0x61e32cc`** — a non-zero lookup is returned directly. Headlessly the
+lookup returns 0, so control falls to the alternative: reads version counter [0x106fe24f8]
+(`ldr w8,[x27,#3848]`, x27=6fe2000), `cmp w8,#0xa7e` branch — if version==0xa7e AND
+[0x106fe2f90]==0, it builds a real object via 2x `bl 0x61e3aa4` (construct) storing into the
+persistent obj [0x106fe2f08+120/128] and returns it; else returns 0 (or a table-slot value
+[0x106fe2f00 + w24*8 + 128] in the version-range case). With the once-lambda's w3=0xff
+(w24=255) and no populated service registry headlessly, both paths yield 0.
+Concrete consequence: the DM-controller ctor returns 0 because `bl 0x2168798` (name->service
+lookup with the do-init's rodata name strings) finds nothing populated headlessly, and the
+fallback 0xa7e-build is version-gated ([0x106fe24f8] != 0xa7e). A live DM-root therefore needs
+driving 0x2168798 to return a valid service object or populating the registry it reads — the
+real-session construction path (SEP-17 SESSION-CTOR), not a `.bss` seed. Not re-tread beyond
+this map.
+
 ## Verify / files
 
 - New hermetic sh311 (elfjit.rs real-image guard, 5 byte-pins): ldarb 0x2206c7c=0x08dffd09,
