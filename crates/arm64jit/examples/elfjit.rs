@@ -6733,12 +6733,10 @@ fn main() {
                             // compares pthread_self vs stored main-id; seed [0x6863a68]=this rung's tid.
                 let main_id_cell: u64 = 0x106863a68;
                 let orig_main_id = unsafe { *(main_id_cell as *const u64) };
-                // SH86: OTel/pb_defaults registration (deep in nativeGameGlobalInit's do-init)
-                // allocates via CRT `operator new` (file 0x2a0d9b8) whose hook dispatch compares
-                // ACTIVE hook [0x1067daaf0] vs DEFAULT [0x1067d0840]. Both 0 in file -> correct
-                // fast TLS path (no blr); under JIT the RW seg leaves ACTIVE as host-heap garbage
-                // -> cmp differs -> `blr x8` jumps to heap -> SIGSEGV. Seed BOTH 0 (canonical
-                // default) before rung 1; idempotent (real boot installs an override, never here).
+                // SH86: OTel/pb_defaults registration allocates via CRT `operator new` (0x2a0d9b8) whose hook
+                // dispatch compares ACTIVE hook [0x1067daaf0] vs DEFAULT [0x1067d0840]. Both 0 in
+                // file -> fast TLS path; JIT leaves ACTIVE as host-heap garbage -> blr jumps to heap
+                // SIGSEGV. Seed BOTH 0 before rung 1 (idempotent; real boot installs an override).
                 unsafe {
                     *(0x1067daaf0u64 as *mut u64) = 0; // active allocator-hook global
                     *(0x1067d0840u64 as *mut u64) = 0; // default allocator-hook global
@@ -6746,22 +6744,19 @@ fn main() {
                 eprintln!(
                     "[elfjit:v2boot] SH86 seeded CRT allocator-hook globals [0x1067daaf0]=[0x1067d0840]=0 so operator-new takes the fast path (no blr through host garbage)"
                 );
-                // SH88: the OTel/pb_defaults descriptor registration passes a static
-                // `.data.rel.ro` protobuf FIELD-TAG constant (0x1800064 16-byte
-                // strided table at file 0x62f5110) as the map/this arg to the hash-map FIND
-                // op (file 0x29f424c), because the upstream registry map it should have been
-                // constructed from (BSS 0x106838368/378/380) is never built under the JIT.
-                // Seed a coherent empty span-hash map into those slots and register it with
-                // the dispatch hook as the substitute for sub-image map/this candidates.
+                // SH88: OTel/pb_defaults descriptor registration passes a static .data.rel.ro
+                // protobuf FIELD-TAG (0x1800064 table @ file 0x62f5110) as map/this arg to the FIND
+                // op (0x29f424c), because the upstream registry map (BSS 0x106838368/378/380) is
+                // never built under the JIT. Seed a coherent empty span-hash map into those slots
+                // and register it with the dispatch hook as substitute for sub-image map/this.
                 let pb_map = routeb_seed_pb_registry_map(iimg, ib);
                 arm64jit::jit::routeb_register_substitute_map(pb_map);
-                // SH99: seed the global 0x10-stride vector the deep globalinit do-init
-                // probes (guest 0x106dcae08, begin deref'd unconditionally -> NULL SEGV).
+                // SH99: seed the 0x10-stride vector the deep globalinit do-init probes
+                // (0x106dcae08, begin deref'd unconditionally -> NULL SEGV).
                 let _ = routeb_seed_game_global_vector();
                 // SH107: nativeUpdateAdapterInit (rung 2) reads a global adapter-config RECORD
-                // via [guest 0x106ed7a18] (adrp 6ed7000; ldr #2584 = 0xa18; then `ldrb w10,
-                // [x9]; tbnz w10,#0`). BSS leaves it 0 -> SIGSEGV 0x10221d7a8. Seed a
-                // zeroed 0x20 record: bit0==0 takes the clean copy path, no change.
+                // via [0x106ed7a18] (ldrb w10,[x9]; tbnz w10,#0). BSS 0 -> SIGSEGV 0x10221d7a8.
+                // Seed a zeroed 0x20 record: bit0==0 takes the clean copy path.
                 let adapter_rec =
                     *ROUTEB_ADAPTER_REC_ADDR.get_or_init(|| {
                         let r = Box::leak(vec![0u8; 0x20usize].into_boxed_slice()).as_mut_ptr() as u64;
@@ -6770,25 +6765,20 @@ fn main() {
                         r
                     });
                 let _ = adapter_rec;
-                // SH109: V2InitWithParams/V2StartAppWithParams and setTaskSchedulerBM gate on a
-                // version-global [adrp 0x683d000 + 848] = guest 0x10683d350 (`ldr x8,[x8,#848]`;
-                // `and w9,w8,#0xff; and x10,x8,#0xfc00; cmp w9,#6; b.eq <main>`). BSS leaves 0 ->
-                // they take the "not version 6" detour SH103 host-ptr-leak blr
-                // (soft-return pc outside image). Seed low byte=6 (0xfc00 clear) to stay on the
-                // clean main path. Re-asserted from this thread (idempotent RW store).
+                // SH109: V2Init/V2StartApp/setTaskSchedulerBM gate on version-global [0x10683d350]
+                // (and w9,w8,#0xff; cmp w9,#6; b.eq main). BSS 0 -> "not v6" detour
+                // SH103 host-ptr-leak blr. Seed low byte=6 to stay on the main path.
                 unsafe {
                     *(0x10683d350u64 as *mut u64) = 6; // low byte==6, bits clear
                     *(0x10683d358u64 as *mut u64) = 0; // version-string ptr slot
                 }
                 eprintln!("[elfjit:v2boot] SH109 seeded version-gate [0x10683d350]=6 so V2Init/V2Start keep the clean main path");
                 let _ = (iimg, ib);
-                // SEP-17 SESSION DRIVE (--v2boot-session, opt-in): drives the REAL Android
-                // Activity/AppBridge lifecycle natives the engine asserts on (SH184). All are
-                // JNI-RECEIVE entries (ZERO in-image bl callers — only a real Activity invokes
-                // them), harness MUST drive them; nothing did. Fresh guest jit_runs on
-                // ONE ladder thread (SH55/64 serialized), reusing boot_sp/tpidr + fabricated thiz
-                // + init-params jobject, in the real Activity's order. setActive reads the
-                // SH248f-fabricated adapter triplet [0x106b0bde0] (benign path). Ref: recon-routeB.
+                // SEP-17 SESSION DRIVE (--v2boot-session): drives the REAL Android Activity/AppBridge
+                // lifecycle natives the engine asserts on (SH184). All JNI-RECEIVE (zero in-image bl
+                // callers) — harness MUST drive them. Fresh guest jit_runs on ONE ladder thread
+                // (SH55/64), reusing boot_sp/tpidr + fabricated thiz. setActive reads the SH248f
+                // adapter triplet [0x106b0bde0]. Ref: recon-routeB.
                 if std::env::args().any(|a| a == "--v2boot-session") {
                     let mut lifecycle: Vec<(&str, u64, [u64; 8])> = vec![
                         ("initAppShellReporter", 0x1021f53b8, [env_ptr, thiz, 0, 0, 0, 0, 0, 0]),
@@ -6796,12 +6786,11 @@ fn main() {
                         ("SetInitParams",        0x102bcc814, [env_ptr, thiz, init_params, 0, 0, 0, 0, 0]),
                     ];
                     // nativeInitClientSettings (0x1022265fc) feeds initEngine_'s "Engine settings
-                    // is null" hard-assert (SH184). Its string args (x2/x3/x4 CLEAR XML/settings
-                    // jstrings) resolve via 0x21e1fec (jstring->RBX-string, JNIEnv GetStringUTFChars;
-                    // SH186 slot-169 identity shim => fabricated empty jstrings DO resolve). Gates on
-                    // version word [0x10683cff8] (low==6 && byte1==3 -> readLocalFlags / empty-early
-                    // else). Opt-in --v2boot-session-set; measures whether real client-settings feeds
-                    // advance the initEngine_ gate (nil-milestone either way — a consumer).
+                    // is null" hard-assert (SH184). String args (x2/x3/x4 jstrings) resolve via
+                    // 0x21e1fec (jstring->RBX-string, JNIEnv GetStringUTFChars; SH186 slot-169 identity
+                    // shim => empty jstrings resolve). Gates on version [0x10683cff8]. Opt-in
+                    // --v2boot-session-set; measures if real client-settings feed advances initEngine_
+                    // (consumer, nil-milestone either way).
                     if std::env::args().any(|a| a == "--v2boot-session-set") {
                         // version gate for the readLocalFlags path (SH109/121-style; clear bits)
                         unsafe { *(0x10683cff8u64 as *mut u64) = 0; }
@@ -6810,12 +6799,11 @@ fn main() {
                         let s3 = arm64jit::jni::new_string_utf_handle(b"");
                         lifecycle.push(("InitClientSettings", 0x1022265fc, [env_ptr, thiz, s1, s2, s3, 0, 0, 0]));
                     }
-                    // nativeOnResumed (0x1021f5db8) tail-branches SHARED Activity
-                    // lifecycle-notifier 0x21f15a4 whose body derefs a real callback-registry
-                    // obj at +0x50 (fault=0x50 @ 0x1021f3748) — SH184 live-object class, not a
-                    // seedable cell. It hard-aborts the process, so AMBULATORY: driven ONLY
-                    // under --v2boot-session-resumed (a diagnostic), never in the default
-                    // clean session drive (must leave the app-start ladder reachable).
+                    // nativeOnResumed (0x1021f5db8) tail-branches SHARED Activity lifecycle-notifier
+                    // 0x21f15a4 whose body derefs a real callback-registry obj at +0x50
+                    // (fault=0x50 @ 0x1021f3748) — SH184 live-object class, never seedable. It hard-
+                    // aborts, so AMBULATORY: driven ONLY under --v2boot-session-resumed (diagnostic),
+                    // never in the default clean drive (must leave app-start ladder reachable).
                     if std::env::args().any(|a| a == "--v2boot-session-resumed") {
                         lifecycle.push(("nativeOnResumed", 0x1021f5db8, [env_ptr, thiz, 0, 0, 0, 0, 0, 0]));
                     }
@@ -6944,18 +6932,15 @@ fn main() {
                                         // (docs/recon-sh156-startluaappdm-postdoinit.md).
                                         *(0x106a70880u64 as *mut u8) = 1;
                                     // SH159: AppBridgeV2 union-init 0x2366694 sub-ctor 0x2366848 guards on
-                                    // globals G=[0x6a63da0] W=[0x6a63d70]; headlessly both are non-NULL host-heap
-                                    // pointers (not live objs) so it treats one as `this`, garbage-dispatches,
-                                    // never returns. Zero both -> all sub-ctors collapse at their cbz guard ->
-                                    // 0x2366694 returns -> body blr @0x23effbc reaches the governor.
+                                    // G=[0x6a63da0] W=[0x6a63d70]; headlessly both are host-heap garbage. Zero both
+                                    // -> sub-ctors collapse at cbz guard -> 0x2366694 returns -> blr @0x23effbc
+                                    // reaches the governor.
                                     *(0x106a63da0u64 as *mut u64) = 0;
                                     *(0x106a63d70u64 as *mut u64) = 0;
-                                    // SH159c: the governor 0x102e9fa84 gates version word
-                                    // [0x6a70700] at 0x2e9fac4-0x2e9fb20 (low byte >=6 &&
-                                    // byte1 >=3 -> MODERN APPENDIX, an V2Init param re-read
-                                    // that faults on an uninitialized x5 stack union).
-                                    // Force version=0 so `b.cc 0x2e9fb20` skips the appendix
-                                    // to the ROUTER path (router flag [0x6a70880]=1 -> MODERN -> bl 0x258c6e4).
+                                    // SH159c: governor 0x102e9fa84 gates version [0x6a70700] (low>=6 && byte1>=3
+                                    // -> MODERN APPENDIX, V2Init re-read that faults on uninitialized x5 stack
+                                    // union). Force version=0 so `b.cc 0x2e9fb20` skips appendix to ROUTER path
+                                    // (flag [0x6a70880]=1 -> MODERN -> bl 0x258c6e4).
                                     *(0x106a70700u64 as *mut u64) = 0;
                                     // SH159c .text patch: force the governor's
                                     // version-gate to always take the ROUTER path
@@ -6980,11 +6965,11 @@ fn main() {
                                     // == NULL under partial do-init (fault [x0,#320]). Its
                                     // return is discarded; NOP the 3-instruction window.
                                     routeb_patch_gov_tail_cont();
-                                    // SH159b (recon deleg_0eff24ca): the governor (0x102e9fa84) reads x19=[x0+0x20]
-                                    // at 0x2e9fac0 (x0=wrapper @ [0x106a705e8]; x19=impl=[0x106a70608]).
-                                    // Runtime dump fault showed x19=host-garbage -> the MODERN
-                                    // appendix derefs it -> SIGSEGV. Seed a real guest impl buffer at
-                                    // [0x106a70608] + its +0x408 DISPATCH obj + DISPATCH vt[+0x18]=benign.
+                                    // SH159b (recon deleg_0eff24ca): governor 0x102e9fa84 reads x19=[x0+0x20]
+                                    // at 0x2e9fac0 (x0=wrapper @[0x106a705e8]; x19=impl=[0x106a70608]).
+                                    // Runtime dump fault showed x19=host-garbage -> MODERN appendix derefs it
+                                    // -> SIGSEGV. Seed a real guest impl buffer at [0x106a70608] + its
+                                    // +0x408 DISPATCH obj + DISPATCH vt[+0x18]=benign.
                                     let gov_leaf = *ROUTEB_LEAF_ADDR.get_or_init(|| {
                                         let a = arm64jit::jit::register_host_call_auto(routeb_singleton_leaf);
                                         eprintln!("[elfjit:v2boot] SH159 gov dispatch leaf registered at {a:#x}");
@@ -7470,10 +7455,9 @@ fn main() {
                         dump("SH284-engine9");
                     }
                                         // SH288 (--v2boot-session-consumer) + SH290 (--v2boot-session-itemproc): drive the
-                    // never-run WORKER's consume loop 0x10220778c / per-item PROCESSOR 0x102207950
-                    // (once-guard [0x106a63b08], once-body [0x106a63b00] via 0x2173b3c string-map
-                    // insert + clock 0x221942c). SH290: item-proc ALONE with a zeroed item (both
-                    // indir blr cbz-skip) so only __call_once + clock run.
+                    // never-run WORKER consume loop 0x10220778c / per-item PROCESSOR 0x102207950
+                    // (once-guard [0x106a63b08], once-body [0x106a63b00] via 0x2173b3c + clock
+                    // 0x221942c). SH290: item-proc alone with a zeroed item (indir blrs cbz-skip).
 if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                         let wf = unsafe { *(0x106a63b08u64 as *const u64) };
                         eprintln!("[elfjit:v2boot] SH288 consumer-drive: once-guard={wf:#x} driving worker consume loop @ 0x10220778c");
@@ -7494,9 +7478,8 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                 // SH290 (--v2boot-session-itemproc): drive item-PROCESSOR 0x102207950 alone.
                 // Zeroed item cbz-skips both indir blr ([item+32]->vt[+48], [item+48]->0x22193a0)
                 // leaving only once path: guard [0x106a63b08] -> __call_once 0x284ce54 ->
-                // once-body (string-map insert 0x2173b3c -> [0x106a63b00]) -> guard-release
-                // 0x284cf5c -> clock 0x221942c -> canary+ret. SH288's consumer SIGSEGV'd at SH273
-                // before the readback; this isolates the once-build so it completes + reads back.
+                // once-body (string-map insert 0x2173b3c -> [0x106a63b00]) -> release 0x284cf5c ->
+                // clock 0x221942c -> ret. Isolates the once-build so it completes + reads back.
                 if std::env::args().any(|a| a == "--v2boot-session-itemproc") {
                     let item = Box::leak(vec![0x0u8; 0x120usize].into_boxed_slice()).as_mut_ptr() as u64;
                     unsafe { *(0x106a63b08u64 as *mut u64) = 0; } // force once-guard clear so the once-body runs
@@ -7713,11 +7696,10 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                     dump("SH278");
                 }
                 // SEP-17 session-drive (dataModel-bindings live binder): drive the REAL
-                // nativeAppBridgeV2SendAppEventOnGameLoaded receive (0x102bb429c) as a
-                // post-ladder rung (single thread). Marshals 3 jstrings into a 0x50 AppEvent,
-                // then bl 0x2baeeec -> the do-init pipe. SH186 identity shim resolves the
-                // jstrings; event vtable 0x10635dfe8 is LOADER-populated (SH265). Seed only
-                // the pipe sync-gate [0x10683d010]=-1 so do-init takes the sync path.
+                // nativeAppBridgeV2SendAppEventOnGameLoaded receive (0x102bb429c) as a post-ladder
+                // rung. Marshals 3 jstrings into a 0x50 AppEvent, then bl 0x2baeeec -> the do-init
+                // pipe. SH186 identity shim resolves jstrings; event vt 0x10635dfe8 is LOADER-
+                // populated (SH265). Seed pipe sync-gate [0x10683d010]=-1 for the sync path.
                 if std::env::args().any(|a| a == "--v2boot-send-game-loaded") {
                     if std::env::var("JIT_SH115_SINGLETON_PATCH").ok().as_deref() == Some("1") {
                         unsafe { *(0x10683d010u64 as *mut u64) = u64::MAX; }
@@ -7748,11 +7730,10 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                     );
                     dump("SendAppEventOnGameLoaded");
                 }
-                // SEP-17 messageBus receive (0x2ba5bb8): the only never-driven Route-B candidate SH185
-                // closed by STATIC judgment. JNI-RECEIVE export; body dispatches a JNI table
-                // slot, allocates subscription boxes (op_new 0x1d96768 0x28/0x20), and directly
-                // bl's nativeAppBridgeAppStart (0x2343c10) — a REAL app-start route. Opt-in
-                // --v2boot-session-bus; single ladder thread. ABI: x0=env x1=thiz x2/x3/x4/x5.
+                // SEP-17 messageBus receive (0x2ba5bb8): SH185 closed by STATIC judgment only.
+                // JNI-RECEIVE; body dispatches a JNI slot, allocates subscription boxes
+                // (op_new 0x1d96768 0x28/0x20), and bl's nativeAppBridgeAppStart (0x2343c10) — a real
+                // app-start route. Opt-in --v2boot-session-bus; single ladder thread. ABI env/thiz/x2..x5.
                 if std::env::args().any(|a| a == "--v2boot-session-bus") {
                     let b1 = arm64jit::jni::new_string_utf_handle(b"experience-launch");
                     let b2 = arm64jit::jni::new_string_utf_handle(b"");
@@ -7924,6 +7905,12 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                         (false, 0)
                     };
                     let adc = unsafe { *(0x106dca000u64 as *const u64).add(0xe88 / 8) };
+                    // SH316: ONCE-SLOT [0x106a68408] (str x0,[x23,#1032] @0x2206d74, x23=adrp 6a68000)
+                    // is a DISTINCT cell from DM-root [0x106a68818] (+0x410; no static/once writer,
+                    // SH155). On a populated registry the once-lambda's ctor fast-path stores the
+                    // matched "Execute" service handle (0x400000b) here — do-init's once now completes
+                    // with a real non-NULL result, while the live-DM cell stays 0.
+                    let once_slot = unsafe { *(0x106a68408u64 as *const u64) };
                     // SH315: read back the service-registry COUNT [0x106fe2f08] (w22) — the DM-controller
                     let srv_reg_count = unsafe { *(0x106fe2f08u64 as *const u32) };
                     // SH315: dump the first ~16 registered service NAMES (lookup walks
@@ -7947,7 +7934,7 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                         srv_names.push(format!("{s}@{srvp:#x}"));
                     }
                     eprintln!(
-                        "[elfjit:v2boot] SH155 DM-root probe: once-guard={og:#x} DM-root[0x106a68818]=0x{dm_root:x} vt+0x30={vt30:#x} mark_b(liveDM)={mark_b} service-registry-count[0x106fe2f08]={srv_reg_count} app-data-model-count[0x106dca000+0xe88]={:#x}",
+                        "[elfjit:v2boot] SH155 DM-root probe: once-guard={og:#x} once-slot[0x106a68408]=0x{once_slot:x} DM-root[0x106a68818]=0x{dm_root:x} vt+0x30={vt30:#x} mark_b(liveDM)={mark_b} service-registry-count[0x106fe2f08]={srv_reg_count} app-data-model-count[0x106dca000+0xe88]={:#x}",
                         adc
                     );
                     eprintln!(
@@ -10408,7 +10395,7 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                                                                                                                                         sm.tpidr = tpidr; sm.x[31] = isp;
                                                                                                                                                         sm.x[0] = mvp_loc; sm.x[1] = 1; sm.x[2] = 0; sm.x[3] = mvp_ptr;
                                                                                                                                                         let _ = arm64jit::jit::jit_run(iimg, ibase, mat4fv, &mut sm as *mut CpuState);
-									// SH145: upload identity model-rotation to uModelRot so VS's mat3*uNormal -> world-space normals for diffuse light.
+									// SH145: upload identity model-rotation to uModelRot so VS mat3*uNormal -> world-space normals.
                                                                                                                                                         let mrot_uname = objs.as_ptr() as u64 + 0x1000;
                                                                                                                                                         std::ptr::copy_nonoverlapping(b"uModelRot\0".as_ptr(), mrot_uname as *mut u8, 10);
                                                                                                                                                         let mrot_loc = gcall(plt_get_uniform_location, program, mrot_uname, 0, 0, 0, 0).unwrap_or(0) & 0xffff_ffff;
@@ -10926,7 +10913,7 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                             std::thread::sleep(std::time::Duration::from_millis(350));
                                         }
                                     }
-                                    // --renderframe-mesh-uv-orbit <N>: SH144 — render the REAL studs-textured mesh N
+                                    // --renderframe-mesh-uv-orbit <N>: SH144 — render REAL studs-textured mesh N
                                     // times from a camera ORBITING the model's +Y axis. Each frame re-uploads a
                                     // yawed MVP to mesh-uv program, re-drives the engine's own geometry
                                     // wrapper 0x105b35288 over stride-24 VBO/EBO, and swaps — a real
@@ -11311,7 +11298,7 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                 let _ = gcall(0x1062d75a0, prog, 0,0,0,0,0);          // glUseProgram
                                 // Texture: default = 2x2 RGBA checkerboard RED/GREEN/BLUE/WHITE;
                                 // --renderframe-etc2a = a REAL 8x8 ETC2-RGBA8/EAC texture (0x9278)
-                                                                                 // via glCompressedTexImage2D (the last compressed format with an
+                                                                                 // via glCompressedTexImage2D (last compressed format with an
                                 // unimplemented live-path prove). The bridge decodes ETC2-RGBA8 and
                                 // re-uploads, EAC alpha + RGB both reach the quad.
                                 let tex_data = base + 0x6000;
@@ -13420,7 +13407,7 @@ mod sh115_tests {
                                         while s < se {
                                             let ws =
                                                 u32::from_le_bytes([img[s], img[s + 1], img[s + 2], img[s + 3]]);
-                                            // STR X (unsigned imm, 64-bit): 0xf9000000 head only (0xf9400000 is LDR, NOT a store)
+                                            // STR X (unsigned imm, 64-bit): 0xf9000000 head only (0xf9400000 is LDR else)
                                             let str_x = (0xffc00000 & ws) == 0xf9000000;
                                             // STP X: 0xa9000000-family (unsigned imm)
                                             let stp_x = (0xffc00000 & ws) == 0xa9000000;
@@ -15053,7 +15040,7 @@ mod sh115_tests {
                 assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh308 {name} {guest:#x} in window");
                 assert!(guest & 3 == 0, "sh308 {name} {guest:#x} 4-aligned");
             }
-            // SH308 (SH307-on) pipe reaches app-shell ctor through FMOD tail + StartAppWithParams; DM-root 0; Route-B gate UNCHANGED.
+            // SH308 (SH307-on) pipe reaches app-shell ctor through FMOD tail + StartAppWithParams; DM-root 0.
         } else {
             eprintln!("sh308 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -15111,8 +15098,10 @@ mod sh115_tests {
     #[test]
     fn sh311_doinit_once_lambda_fires_dmroot_ctornull() {
         // SH311 (3/3): do-init ONCE-lambda 0x2206d10 FIRES + `str x0,[x23,#1032]`
-        // @0x2206d74 stores DM-root [0x106a68818], yet DM-root reads 0 -> bl 0x2173b3c
-        // (-> tail 0x61e30bc DM ctor chain) returns 0: the once-lambda DOES run, ctor fails.
+        // @0x2206d74 stores into once-slot [0x106a68408], and DM-root [0x106a68818]
+        // (+0x410, distinct cell) reads 0. SH316: on the populated-registry plain run the
+        // ctor fast-path now puts the matched "Execute" handle there instead of the NULL the
+        // empty-registry SH311 saw.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15156,13 +15145,12 @@ mod sh115_tests {
 
     #[test]
     fn sh313_registry_no_static_writer_fastpath_needs_one_app() {
-        // SH313: service-registry is 100% SESSION-constructed; ctor FAST path needs ONE "App"
+        // SH313: service-registry 100% SESSION-constructed; ctor FAST path needs ONE "App"
         // entry (not 0xa7e). ctor 0x61e30bc entered with "App"(0x2d34ab)/"Execute"(0x3d1ba8);
         // lookup bl 0x2168798 reads COUNT [0x106fe2f08] cbz->ret0 when empty; FAST `cbnz x0`
         // @0x61e3124 returns the matched service LIVE DM-controller -> non-NULL DM-root.
         // WHOLE-IMAGE: count written ONLY 0xa7e-gated ctor increment; array [0x106fe6180]
         // ZERO static writers => populated ONLY by app-start's own session run (dies at 0x1021dde34).
-        // bar = 1 "App" reg.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15183,12 +15171,12 @@ mod sh115_tests {
     #[test]
     fn sh314_appstart_map_header_is_liveobj_not_fixed_cell() {
         // SH314 (do-not-re-tread closure): app-start map wall 0x1021dde34 (`ldr x23,[x21,#8]`,
-        // x21 container=0x100548ca9) is fed by a pointer the ADDRESS OF A RODATA STRING
-        // (file 0x548ca9 = "Id\0assetTypeId\0avatar_load_start\0..."), NOT heap-garbage nor an
-        // unapplied reloc — a map slot type-punned with a string ptr by an upstream init that never
-        // runs headlessly. The 5 STATIC walkers (of 0x21ddbc8) build STACK containers
-        // (x0=sp+0xc48, x1=sp+0xa70, w2=1) from table 0x66e7000 → benign, NOT the crash
-        // (x22=0x11 != 1). => no count-clamp/fixed-cell/repair crosses it; real session ctor needed.
+        // x21 container=0x100548ca9) is fed by the ADDRESS OF A RODATA STRING
+        // (file 0x548ca9 = "Id\0assetTypeId\0avatar_load_start\0..."), not heap-garbage nor an
+        // unapplied reloc — a map slot type-punned with a string ptr. The 5 STATIC walkers
+        // (of 0x21ddbc8) build STACK containers (x0=sp+0xc48, x1=sp+0xa70, w2=1) from table
+        // 0x66e7000 → benign, NOT the crash (x22=0x11 != 1). No count-clamp/fixed-cell/repair
+        // crosses it; real session ctor needed.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15214,10 +15202,8 @@ mod sh115_tests {
         // SH315 (5/5, real so, skip-appstart + session-bus): registry count [0x106fe2f08]=12
         // after MessageBus.subscribe drives app-start's session registration — FIRST headless
         // non-zero (was 0). Array [0x106fe6180] (0x60 stride) holds DM-task services
-        // ('Thread(BG/FG)','Spawn','Yield','Close','Sleep','Sched','Execute') but NOT the ctor's
-        // 'App' pair, so lookup misses, DM-root stays 0. No DM (probe B: ctor 0x61e30bc region
-        // fires on cleared once-guard, but once-lambda never self-latches). SESSION-CTOR advance,
-        // not a DM. DM-root 0, MH_* false.
+        // ('Thread','Spawn','Yield','Close','Sleep','Sched','Execute') but NOT the ctor's
+        // 'App' pair, so the fast-path misses and DM-root stays 0. SESSION-CTOR advance, not a DM.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15235,6 +15221,31 @@ mod sh115_tests {
             assert_eq!(word(0x102_ba5bb8), 0xd10643ff, "sh315 bus sub sp,#0x190 prologue");
         } else {
             eprintln!("sh315 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
+    fn sh316_doinit_once_latches_and_ctorstores_execute_service_handle() {
+        // SH316 (measured, real so, plain session-bus run): do-init once-guard [0x106a68410]
+        // SELF-LATCHES (0x1) — __call_once COMPLETES on the populated registry (SH315's
+        // "never self-latches" held only for the postbus guard-cleared re-drive). The ctor's
+        // fast-path returns the matched "Execute" handle 0x400000b into once-slot [0x106a68408]
+        // (str x0,[x23,#1032] @0x2206d74, x23=adrp 6a68000) — a real non-NULL do-init result —
+        // while DM-root [0x106a68818] (+0x410, no writer per SH155) stays 0. Done-path 0x2206c8c
+        // `ldr x1,[x8,#1032]` reads once-slot, not DM-root.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            assert_eq!(word(0x102_206c74), 0xd0024308, "sh316 adrp x8,6a68000 (once cell base)");
+            assert_eq!(word(0x102_206c78), 0x91104108, "sh316 add x8,#0x410 guard");
+            assert_eq!(word(0x102_206c8c), 0xf9420501, "sh316 done-path ldr x1,[x8,#1032] (once-slot)");
+            assert_eq!(word(0x102_206d74), 0xf90206e0, "sh316 once-lambda str x0,[x23,#1032]");
+        } else {
+            eprintln!("sh316 real-image guard: no real libroblox.so, skipping anchors");
         }
     }
 
