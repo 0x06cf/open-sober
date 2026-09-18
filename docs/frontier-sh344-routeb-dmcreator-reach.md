@@ -78,11 +78,26 @@ drive (real Activity/AppBridge session, the SEP-17 primary lever) or real input 
 display (migration runbook), not another static seed. SH174 capture-latch (now
 proven armed here) stays the single forward hook.
 
+## SH344b (same cycle, app-shell-ctor band probe)
+- Region-watch [app-shell ctor 0x102207b50..0x102209000][post-do-init
+  0x1023eff4c..0x1023f0100][ScriptContext 0x101f1d8ac] on the SAME SH343 full ladder:
+  **app-shell ctor band 0 hits** — the manager->nativeAppBridgeAppStart continuation
+  does NOT proceed into the app-shell ctor under the current seeds (stable negative;
+  same conclusion as SH164 for this band). Terminal differs by band config:
+  `guestpc=0x10284cfa0 fault=0x0` (EXIT 134) — this is the
+  JNIActivityLifecycleCallbacks nativeOnDestroyed family (`ldr x1,[x8]` x8=0 at
+  file 0x284cfa4), i.e. the run routes into an activity-lifecycle callback path when
+  the app-shell band is watched (seed/timing divergence). Informative for the
+  SESSION-CTOR lever: the activity-lifecycle surface is where control goes, not the
+  app-shell ctor.
+
 ## Files
 - Probe: runs/capture_sh344_dmcap.sh (DM-capture arm on SH343 ladder; shows latch
   armed + 0 [validated] + bad_function_call EXIT 139).
 - Probe: runs/capture_sh344_routeb_reach.sh (region-watch; governor 22 hits, DM-creator
   1 hit @0x102bd1b98, ScriptContext/setDataModelToCurrent 0, terminal 0x101db1b08).
+- Probe: runs/capture_sh344b_appshell.sh (app-shell ctor band 0 hits; terminal
+  0x10284cfa0 nativeOnDestroyed family).
 - Live captures gitignored (runs/sh344-*.txt).
 - No production code changed this cycle; workspace green.
 
