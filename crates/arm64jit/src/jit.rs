@@ -1050,6 +1050,51 @@ fn routeb_govflag_seed_guard(_state: *mut CpuState, pc: u64) {
     }
 }
 
+/// SH298 (opt-in JIT_ROUTEB_EC_ARG1=1): the DM-construction drive now reaches the
+/// EC world entry 0x102e24598 (SH235's genuine DM-creation world, first headless
+/// penetration). The EC marshaller reads [arg1+0x48] immediately (`mov x21,x1` @0x2e245e4
+/// then `ldrsb x8,[x25,#72]` @0x102e245f8) and our construction body forwards arg1=0
+/// -> SIGSEGV fault=0x48. SH297/298 proved a coherent OBJECT seed advances the line
+/// (marginally, one fencepost at a time). This guard seeds state.x[1] (=arg1) with a
+/// stable zeroed 0x80 object at the EC-world entry block when x1==0, so [x1+0x48]
+/// reads in-bounds 0 (neutral byte) instead of NULL+0x48 faulting. Default-inert.
+fn routeb_ec_world_arg1_guard(state: *mut CpuState, pc: u64) {
+    if std::env::var("JIT_ROUTEB_EC_ARG1").ok().as_deref() != Some("1") {
+        return;
+    }
+    // Fire at the EC-world entry block (0x102e24598) before it reads [arg1+0x48].
+    if pc != 0x102e24598 {
+        return;
+    }
+    if unsafe { (*state).x[1] } != 0 {
+        return;
+    }
+    let obj = routeb_singleton_obj_addr_crate();
+    unsafe { (*state).x[1] = obj; }
+    eprintln!("[routeb-sh298] seeded EC-world arg1 (x[1]) = stable object 0x{obj:x} at pc=0x{pc:x} (was 0 -> would SIGSEGV [x1+0x48])");
+}
+
+/// Crate-side stable object mirror of elfjit routeb_singleton_obj_addr: zeroed 0x80
+/// object with [0]=all-leaf vtable (any virtual returns OBJ), so [obj+0x48] reads 0.
+fn routeb_singleton_obj_addr_crate() -> u64 {
+    use std::sync::OnceLock;
+    static OBJ: OnceLock<u64> = OnceLock::new();
+    *OBJ.get_or_init(|| {
+        extern "C" fn leaf(_a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64) -> u64 {
+            routeb_singleton_obj_addr_crate()
+        }
+        let leaf_a = register_host_call_auto(leaf);
+        let v: Vec<u8> = vec![0u8; 0x60];
+        let v = v.leak();
+        for slot in 0..(0x60 / 8) {
+            unsafe { *(v.as_mut_ptr().wrapping_add(slot * 8) as *mut u64) = leaf_a; }
+        }
+        let o = vec![0u8; 0x80usize].leak();
+        unsafe { *(o.as_mut_ptr() as *mut u64) = v.as_ptr() as u64; } // [0]=leaf-vt
+        o.as_ptr() as u64
+    })
+}
+
 /// ROUTE-B RECON V3 NEXT-3 do-init seeds (authoritative deleg_8d5648cf). The do-init
 /// / app-shell world-build ctor (GlobalInit 0x102207b50 body) faults at THREE concrete
 /// sites that a value-seed clears. SH156 already MAPS the containing pages; these
@@ -5878,6 +5923,9 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // adapter at [0x106b0bde0] so the continuation's app-start closure dispatch (vt[0]
         // blr @0x233904c) resolves benignly instead of SIGSEGV'ing at 0x102339020.
         routeb_appstart_adapter_seed_guard(state, pc);
+        // SH298 (opt-in JIT_ROUTEB_EC_ARG1): seed the EC-world entry arg1 (x[1]) with a
+        // stable zeroed object when NULL so the EC marshaller's [x1+0x48] read is in-bounds.
+        routeb_ec_world_arg1_guard(state, pc);
         // SH259 (opt-in JIT_ROUTEB_APPSART_SETTINGS_ONCE): seed the once-guard
         // [0x106a6f430] of the settings/registry factory 0x21dac2c (deepest reach,
         // bl @0x102339d44) so it early-returns the registry object without running the
@@ -7493,6 +7541,41 @@ mod tests {
             );
             std::env::remove_var("JIT_ROUTEB_APPSART_ADAPTER_SEED");
             std::ptr::write_unaligned(ADAPTER_GLOBAL as *mut u64, 0);
+        }
+    }
+
+    #[test]
+    fn sh298_ec_world_arg1_guard_is_env_pc_gated_and_seeds_object() {
+        // SH298b: the EC-world arg1 guard must (a) be inert without JIT_ROUTEB_EC_ARG1,
+        // (b) fire only at EC-world entry 0x102e24598, (c) seed a non-NULL zeroed object
+        // with a leaf vtable into state.x[1] only when x[1]==0, (d) be idempotent.
+        unsafe {
+            let mut state = CpuState::new();
+            state.x[1] = 0;
+            // (a) env unset -> inert (x[1] stays 0).
+            std::env::remove_var("JIT_ROUTEB_EC_ARG1");
+            routeb_ec_world_arg1_guard(&mut state as *mut CpuState, 0x102e24598);
+            assert_eq!(state.x[1], 0, "env-gated: inert without JIT_ROUTEB_EC_ARG1");
+            // (b) env set, wrong pc -> inert.
+            std::env::set_var("JIT_ROUTEB_EC_ARG1", "1");
+            state.x[1] = 0;
+            routeb_ec_world_arg1_guard(&mut state as *mut CpuState, 0x102e24590);
+            assert_eq!(state.x[1], 0, "pc-gated: must fire only at EC-world entry 0x102e24598");
+            // (c) env set + entry pc + x[1]==0 -> seed a stable object with [0]=leaf-vt.
+            routeb_ec_world_arg1_guard(&mut state as *mut CpuState, 0x102e24598);
+            let obj = state.x[1];
+            assert_ne!(obj, 0, "x[1] must be seeded non-NULL at EC-world entry");
+            let vt = std::ptr::read_unaligned(obj as *const u64);
+            assert_ne!(vt, 0, "seeded object [0] must be a non-NULL vtable");
+            let leaf = std::ptr::read_unaligned(vt as *const u64);
+            assert_ne!(leaf, 0, "vt[0] must be a non-NULL benign leaf");
+            // [obj+0x48] must read in-bounds (0) so the EC marshaller doesn't fault.
+            assert_eq!(std::ptr::read_unaligned((obj + 0x48) as *const u8), 0, "[obj+0x48] must read 0");
+            // (d) idempotent: non-NULL x[1] left untouched.
+            state.x[1] = 0x1234;
+            routeb_ec_world_arg1_guard(&mut state as *mut CpuState, 0x102e24598);
+            assert_eq!(state.x[1], 0x1234, "idempotent: non-NULL x[1] left untouched");
+            std::env::remove_var("JIT_ROUTEB_EC_ARG1");
         }
     }
 

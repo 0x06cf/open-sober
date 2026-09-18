@@ -76,20 +76,34 @@ further, reaches the EC world.
 - `cargo build -p arm64jit --example elfjit` EXIT 0 (117/118 warnings, pre-existing).
 - elfjit.rs 1,048,408 + HANDOFF under the 1MB pre-commit hook (prose trimmed).
 
+## SH298b (same session, measured follow-up): EC-world ARG1 guard CROSSES the
+## documented next-gate one fencepost. New default-inert block-entry guard
+## `routeb_ec_world_arg1_guard` (jit.rs, JIT_ROUTEB_EC_ARG1=1) fires at the EC-world
+## entry block 0x102e24598 and seeds state.x[1] (=arg1) with a stable zeroed 0x80
+## object when NULL, so the EC marshaller's `ldrsb x8,[x25,#72]` @0x102e245f8 reads
+## in-bounds 0 instead of NULL+0x48. MEASURED 3/3 (real so, full SH298 env): guard
+## fires every run + the +0x48 fault is GONE -> new terminal SIGSEGV fault=0x10
+## (guestpc still reports 0x102e245f4 block-entry; x8=x9=x10=x20=0) inside the EC
+## marshaller's app-request build sub-path — the SH174/SH204 live-object class one
+## fencepost deeper, exactly as the SH298 NEXT-GATE note predicted. Guard is
+## default-inert (baseline SH298 without JIT_ROUTEB_EC_ARG1 unchanged at 0x48).
+## Honest: does not manufacture a DM; Route-B live-DM gate UNCHANGED; SH174 latch
+## stays forward hook. Kept (unlike SH248h/256 revert) because it measurably
+## advances the EC-world terminal rather than being unable to fire.
+
 ## NEXT GATE (for the next frontier session)
 
-The new terminal is `SIGSEGV [x25,#72] @0x102e245f8` (fault=0x48) where
-`x25 = x21 = x1(EC arg1) = 0` (EC entry `mov x21,x1` @0x102e245e4, after the
-`bl 0x1023f1354` helper completes). The EC marshaller reads `[arg1+0x48]` as a
-live byte/valid-object flag immediately — exactly SH235's "immediately derefs
-live objects, NOT a static seed". This is the SH174/SH204 live-object class,
-now REACHED INSIDE the genuine DM world (was: only located/measured-unreached).
-A static arg1 seed would likely advance one fencepost then hit the next live-object
-deref; the cause-not-symptom path is a REAL session producing a coherent
-ExperienceController/app-request object (SESSION-CTOR). Do-not-re-tread broad
-static seeds per SH174/204/248h/256 doctrine; per the operator's MIGRATION-IS-NOT-
-A-STOPPING-POINT, keep grinding the DM-construction/DMCONT/PATH-B line inside
-this JIT rather than folding to a host-migration verdict.
+With JIT_ROUTEB_EC_ARG1=1 (the SH298b guard) the EC arg1+0x48 gate is crossed;
+the standing terminal is now `SIGSEGV fault=0x10` inside the EC marshaller's
+app-request build sub-path (guestpc reports 0x102e245f4; x8=x9=x10=x20=0),
+one live-object fencepost deeper (SH174/SH204 class). The EC world builds a real
+app-request object and dies deref-ing a NULL-derived [+0x10]. Cause-not-symptom
+path remains SESSION-CTOR producing a coherent ExperienceController/app-request
+object; a static seed would likely advance one more fencepost then hit the next
+live-object deref. Do-not-re-tread broad static seeds per SH174/204/248h/256
+doctrine; per the operator's MIGRATION-IS-NOT-A-STOPPING-POINT, keep grinding the
+DM-construction/DMCONT/PATH-B line inside this JIT rather than folding to a
+host-migration verdict.
 
 - `crates/arm64jit/examples/elfjit.rs` (SH298 stage3: CELL->R coherent registration
   obj `[R+8]=singleton` under `JIT_ROUTEB_DMFN_REGISTER`; +hermetic sh298).
