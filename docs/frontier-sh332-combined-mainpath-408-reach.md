@@ -78,3 +78,22 @@ tier-2 controller-name table.
 
 Single-agent, default-inert (all guards opt-in env, unchanged). elfjit.rs byte-identical, under the
 1MB pre-commit hook.
+
+## SH333 addendum — A/B attribution of the +0x408 (and registration-walk) reach (same cycle)
+
+Added runs/probe_sh333_bus_mainpath.sh, which stacks the SH315 bus route (`--v2boot-session-bus`)
+with the MAIN-path stack + 408 cross on ONE non-skip run, and A/B's the guards:
+
+- **Arm A (SH330+SH320 guards ON)**: `guard408=2`, `fork501c=1`, `fork5060=1` — the +0x408 app-start
+  cross fires (SH332 parity), registration-walk `regwalk=2` + lookup `lookup=4` both execute. Run dies
+  SIGSEGV `guestpc=0x101dcab68` -> SIGABRT leaked host-pc (SH320-class run-variable), BEFORE the
+  post-ladder dump so no registry/DM-root readout is reached.
+- **Arm B (SH330+SH320 guards OFF)**: `guard408=0`, `fork501c=0`, `fork5060=0` — the +0x408 cross does
+  NOT fire; registration-walk + lookup still execute; run dies `guestpc=0x101db1d04` (the standing
+  SH260/285 LSM insert-leaf reader wall, NOT the +0x408 path).
+
+Conclusion: the +0x408 reach seen in SH332/SH333-arm-A is attributable to the SH330 guard (A/B clean)
+and the registration-walk driving is independent (fires on both arms). Neither arm reaches the
+post-ladder `dump()` (registry count "App", DM-root, tier-2 cell) because the continuation faults at the
+run-variable FMOD/AAudio / LSM reader wall first — so the "App"-registration question stays open but
+UNCHANGED: no new stable gate, no DM. Consistent with SH332 + SH330/331.
