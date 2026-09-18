@@ -4937,10 +4937,9 @@ fn real_ui_textures() -> Vec<RealSprite> {
 /// backdrop + one aspect-correct box per REAL Roblox UI sprite (spinner, robux
 /// icon, jump button), sampled from a single shared vertical atlas (row 0 =
 /// solid backdrop strip, then each sprite in its own memory-row block),
-/// composited with GL_BLEND. Verified by per-sprite glReadPixels: each
-/// probe's expected color read from the DECODED sprite rgba (not hard-coded),
-/// mapped via imgpix_rect (the vUV-linear math the shader's aTex yields), so a
-/// present sprite proves its real pixels landed in place.
+/// composited with GL_BLEND. Verified per-sprite: expected color read from the
+/// DECODED sprite rgba (not hard-coded) via imgpix_rect (vUV-linear shader
+/// mapping) — a present sprite proves its real pixels landed.
 pub fn render_engine_emitter_multi(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) -> u64 {
     if !(ctx >= 0x100000000 && ctx >> 56 == 0) {
         return 0;
@@ -4968,22 +4967,14 @@ pub fn render_engine_emitter_multi(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) 
     const VW: f32 = 1280.0;
     const VH: f32 = 720.0;
     let login = std::env::var_os("RENDEREMITTER_LOGIN").is_some();
-    // SH150 — RENDEREMITTER_HOME=1: render the 'home' half of the auth surface —
-    // the real FPSBackground.png (opaque 1024x1024 launcher backdrop) as the
-    // full-viewport backing instead of the login's dark reversevignette, with the
-    // real RO-BLOX wordmark + a spotlight strip. Same emitter machinery, real-APK
-    // pixels. (login stays the dark login form; either may run with MULTI.)
-    // (name, cx_ndc, cy_ndc, hh, probe_ix, probe_iy, tol). Login mode (SH73):
-    // the real auth backdrop (reversevignette, nearly-clear where the logo
-    // sits) + the Roblox wordmark. Vignette probe over the solid dark row-0;
-    // logo glyph is alpha=255 white so its probe is byte-exact over ANY dst.
+    // SH150 — RENDEREMITTER_HOME=1 render the 'home' half of the auth surface
+    // (real FPSBackground.png launcher backdrop + RO-BLOX wordmark; login stays
+    // the dark form). Sprite index is positional (matches the sprite vec).
     let placements: &[(&str, f32, f32, f32, u32, u32, u32)] = if std::env::var_os("RENDEREMITTER_HOME").is_some() {
         // SH150 — Home/launcher surface: the REAL FPSBackground.png (index 0,
         // drawn first) fills the viewport as the opaque launcher backdrop, with
-        // the RO-BLOX wordmark (index 1) centered above — the operator's 'home'
-        // half of 'login/home'. All remaining sprites (reversevignette, the
-        // login form prims, and the text labels) get a ZERO-SIZE box so they
-        // draw nothing; placement INDEX is positional (matches the sprite vec).
+        // the RO-BLOX wordmark (index 1) above — the operator's 'home' half of
+        // 'login/home'. All remaining sprites get ZERO-SIZE boxes (draw nothing).
         &[
             ("FPSBackground.png", 0.0, 0.0, 1.78, 512, 512, 8),
             ("logo_white_1x.png", 0.0, 0.42, 0.22, 193, 44, 2),
@@ -5718,11 +5709,10 @@ fn present_one_task_frame(ctx: u64, n: u64, iimg: &[u8], ibase: u64, isp: u64) -
     // swap via the SAME real ctx-vt[+24] — a genuine present. Both emitters run
     // as their OWN top-level jit_run (desync-safe) using the CACHED textured
     // program + pre-uploaded texture (no nested guest-bridge GLSL compile, the
-    // exact SH151 SIGABRT class). Selector is the ENV, not the emitter's return
-    // value (these engine callbacks return Ok(ret)=0 on success — an early
-    // `return 0` also reads 0, so return value cannot distinguish; we pick the
+    // SH151 SIGABRT class). Selector is the ENV (engine callbacks return
+    // Ok(ret)=0 on success) — we pick
     // real-artwork multi-emitter when RENDEREMITTER_HOME=1, else the palette
-    // home emitter). Returns 1 (present succeeded, crash-free).
+    // home emitter). Returns 1 = present succeeded, crash-free.
     if std::env::var_os("RENDER_TASKFRAME_HOME").is_some() {
         let real_home = std::env::var_os("RENDEREMITTER_HOME").is_some();
         let r = if real_home {
@@ -6829,13 +6819,11 @@ fn main() {
                         lifecycle.push(("InitClientSettings", 0x1022265fc, [env_ptr, thiz, s1, s2, s3, 0, 0, 0]));
                     }
                     // nativeOnResumed (0x1021f5db8) tail-branches into the SHARED Activity
-                    // lifecycle-notifier dispatcher 0x21f15a4 whose body derefs a real
-                    // lifecycle-callback registry object at +0x50 (fault=0x50 @ 0x1021f3748)
-                    // — the SH184 live-object class, NOT a seedable cell. It hard-aborts the
-                    // whole process (SIGABRT after the SIGSEGV), so it is AMBULATORY: driven
-                    // ONLY under the explicit --v2boot-session-resumed flag (a diagnostic),
-                    // never in the default clean session drive, which must leave the app-start
-                    // ladder reachable. Same honest classification as SH248h/256 reverted levers.
+                    // lifecycle-notifier 0x21f15a4 whose body derefs a real callback-registry
+                    // obj at +0x50 (fault=0x50 @ 0x1021f3748) — SH184 live-object class, not a
+                    // seedable cell. It hard-aborts the process, so AMBULATORY: driven ONLY
+                    // under --v2boot-session-resumed (a diagnostic), never in the default
+                    // clean session drive (must leave the app-start ladder reachable).
                     if std::env::args().any(|a| a == "--v2boot-session-resumed") {
                         lifecycle.push(("nativeOnResumed", 0x1021f5db8, [env_ptr, thiz, 0, 0, 0, 0, 0, 0]));
                     }
@@ -7054,14 +7042,12 @@ fn main() {
                                         eprintln!("[elfjit:v2boot] SH156 WARN failed to map page for 0x{g:x}");
                                     }
                                 }
-                                // ROUTE-B RECON V3 NEXT-3 do-init seeds (opt-in
-                                // JIT_ROUTEB_DOINIT_NEXT3): the three app-shell/do-init ctor SEGVs
-                                // (thread-init 0x102207ef0, telemetry 2b4cd1c park, map-page
-                                // 0x102212838) need VALUE seeds. SH156 maps the pages but never
-                                // writes these values; the en-crate block-entry guard is INERT
-                                // here (ctor blocks already JIT-cached by the prior StartLuaAppDM
-                                // rung), so seed the VALUES at the SAME synthesis point that maps
-                                // them — the SH269 GOVFLAG direct-seed pattern.
+                                // ROUTE-B V3 NEXT-3 do-init seeds (opt-in JIT_ROUTEB_DOINIT_NEXT3): the three
+                                // app-shell/do-init ctor SEGVs (thread-init 0x102207ef0, telemetry
+                                // 2b4cd1c park, map-page 0x102212838) need VALUE seeds. SH156 maps
+                                // the pages but never writes them; the block-entry guard is INERT
+                                // here (ctor blocks already JIT-cached), so seed the VALUES at the
+                                // synthesis point that maps them — the SH269 GOVFLAG seed pattern.
                                 if std::env::var_os("JIT_ROUTEB_DOINIT_NEXT3").is_some() {
                                     const TI: u64 = 0x1067333aa0; // thread-init singleton (clears 0x102207ef0)
                                     const TEL: u64 = 0x106dcd380; // telemetry once-cell (clears 2b4cd1c park)
@@ -9893,12 +9879,10 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                             }
                         }
                         // --renderframe-drawprobe: drive the engine's REAL geometry draw wrapper
-                                    // 0x5b35288 (fn that calls primitive-setup 0x5b353d0 then dispatches the
-                                    // indexed/array draw through GLES dispatch-table slots 9/10). Fabricate a
-                                    // minimal coherent renderer: empty primitive list ([container+72]==
-                                    // [container+80]==0 -> 0x5b353d0 returns mask 0 fast), but a NONZERO
-                                    // [renderer+120] index-buffer object + nonzero count arg (w5) so the wrapper
-                                    // takes the INDEXED path and dispatches slot 9 (glDrawElements).
+                                    // 0x5b35288 (primitive-setup 0x5b353d0 -> draw via GLES slots 9/10). Minimal
+                                    // coherent renderer: empty primitive list ([container+72]==[container+80]==0
+                                    // -> mask 0 fast), NONZERO [renderer+120] index-buffer + w5 count -> INDEXED
+                                    // path dispatches slot 9 (glDrawElements).
                         if renderframe_args.iter().any(|a| a == "--renderframe-drawprobe") {
                             let objs = Box::leak(vec![0u8; 8192].into_boxed_slice());
                             let base = objs.as_ptr() as u64;
@@ -11190,14 +11174,11 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                 .or_else(|| {
                                     renderframe_args.iter().any(|a| a == "--renderframe-quad-loop").then_some(6)
                                 });
-                            // --renderframe-grid <N>: scale the coherent renderer onto a REAL
-                            // larger mesh — an NxN grid of textured quads (N>1 => (N+1)^2
-                            // verts, 6*N^2 indices, one distinct texel color per cell drawn
-                            // at the real interpolated UV). Proves the engine's OWN geometry
-                            // wrapper + primitive-setup loop render a mesh of real topology
-                            // (many verts/indices), not just a single 4-vert quad (SH25-33).
-                            // Readback probes each cell center, which must read that cell's
-                            // distinct texel — per-cell UV->texel mapping across the mesh.
+                            // --renderframe-grid <N>: NxN grid of textured quads (N>1 => (N+1)^2
+                            // verts, 6*N^2 indices, one distinct texel color per cell).
+                            // Proves the engine renders a real-topology mesh, not a single
+                            // 4-vert quad (SH25-33). Probe each cell center -> that cell's
+                            // distinct texel (per-cell UV->texel map).
                             let grid_n: Option<u32> = renderframe_args
                                 .iter()
                                 .position(|a| a == "--renderframe-grid")
@@ -11858,12 +11839,11 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
 
     // SH177 (objective 2b, deleg_48e16777): cookie READ-BACK — after --cookie-ingress
     // self-constructs the jar, write a classified value and drive nativeGetCookiesInNetscapeFormat
-    // (0x1021ff6b0) so the ENGINE re-emits it as an RFC6265 line via its jar-driven Route B —
-    // the deterministic engine-side read of the persisted login cookie, headlessly. Preconditions
-    // pinned from disasm: accessor 0x21e1668 (config singleton [0x10683d7e8] + gate [0x10683d810]),
-    // features obj [S+24] byte +73 bit0=0 (Route B jar-driven; bit0=1 reads WebLogin store instead),
-    // w2=0, probe 0x21ff828 permitting. Out string -> x8. A further unexercised singleton faulting
-    // at a pc is the honest NEXT gate (documented, not a claim).
+    // (0x1021ff6b0) so the ENGINE re-emits it as an RFC6265 line — the deterministic engine-side
+    // read of the persisted login cookie, headlessly. Pins: accessor 0x21e1668 (config singleton
+    // [0x10683d7e8] + gate [0x10683d810]), features obj [S+24] byte +73 bit0=0 (Route B jar-driven;
+    // bit0=1 reads WebLogin store instead), w2=0, probe 0x21ff828 permitting. Out string -> x8.
+    // A further unexercised singleton faulting at a pc is the honest NEXT gate (documented, not claimed).
     if std::env::args().any(|a| a == "--cookie-readback") {
         const GETTER: u64 = 0x1021ff6b0;
         const CFG: u64 = 0x10683d7e8; // config singleton
@@ -12985,12 +12965,12 @@ mod sh115_tests {
         // SH245-candidate-1: the active continuation reaches `bl operator_new(0x28)`
         // at file 0x2bd2128. Headlessly operator-new's fast path returns NULL for
         // size>0xa when the allocator-activation byte [0x10727570c].bit0 is clear ->
-        // the closure boxes NULL -> bad_alloc. The fix materializes a leaked 0x40 box
-        // into x0 over the 3-slot window (movz/movk = 48-bit host heap ptr) and drops
-        // the bl. This hermetic pins: (a) the 3 real-image call-site words, (b) the
-        // movz/movk round-trips a 48-bit box ptr back to itself, (c) the word guard
-        // would FAIL on a drifted window. Site words (0x2bd2120..28): mov w0,#0x28
-        // (0x52800500) ; mov w1,#0x8 (0x52800101) ; bl 0x1db1a38.
+        // the closure boxes NULL -> bad_alloc. Fix: leak a 0x40 box into x0 over the
+        // 3-slot window (movz/movk = 48-bit host ptr) and drop the bl. This hermetic
+        // pins: (a) the 3 real-image call-site words, (b) the movz/movk round-trip a
+        // 48-bit box ptr back to itself, (c) the word guard fails on a drifted window.
+        // Site words (0x2bd2120..28): mov w0,#0x28 (0x52800500) ; mov w1,#0x8
+        // (0x52800101) ; bl 0x1db1a38.
         let window_file_start = 0x2bd2120usize;
         let expected = [0x5280_0500u32, 0x5280_0101u32, 0x97c7_7e44u32];
         let make_word = |hw: u32, imm: u16| -> u32 {
@@ -14556,7 +14536,7 @@ mod sh115_tests {
         // (0x2bd1c38) — the SEP-17 directive's OTHER named primitive — never driven
         // (SH264-275 drove lifecycle + client-settings, not this). --v2boot-session-engine
         // drives it on a fabricated zeroed manager. Pins its shape so the drive (and
-        // downstream session-state reads of [this+648]/[this+16]) can't drift silently:
+        // downstream reads of [this+648]/[this+16]) can't drift silently:
         // prologue sub sp,#0x40, version-word [0x10683d8f8]; gate cmp w9,#0x6/ccmp/b.eq;
         // FLog-0x4997a7 adrp (0x2bd1c7c); mutex lock bl 2b53a68 @0x2bd1ca8 / unlock
         // 2b53abc @0x2bd1cc8 (x0=this+0x14); LATCH strb w1,[this+0x288] (0x2bd1cb4);
@@ -15120,6 +15100,37 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh312_dmctor_null_is_service_registry_empty_pinned() {
+        // SH312 (3/3, SH311-forward): WHY the DM-controller ctor (0x61e30bc, tail of
+        // bl 0x2173b3c) returns 0 -> do-init stores NULL DM-root [0x106a68818]. First
+        // action `bl 0x2168798` (0x61e311c) = name->service lookup that reads the
+        // registry COUNT GUEST [0x106fe2f08] (`ldr w22,[x8,#3848]` @0x21687d0) and
+        // `cbz w22 -> 0x2168834` (0x21687d4) returns 0 when empty. Headlessly no
+        // service is registered -> lookup=0; fallback is version-gated `cmp w8,#0xa7e`
+        // (0x61e3150, same cell) builds only at count==0xa7e (~2694 real registrations
+        // = a real session ctor, SH174/204 class, never a .bss seed). A live DM-root
+        // needs the registry populated by app-start's OWN session run (caller
+        // 0x235678c `bl 0x21e2a90` is inside nativeAppBridgeAppStart), which dies at
+        // the standing 0x1021dde34 map wall. SESSION-CTOR gate, not a seed. Pins:
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            assert_eq!(word(0x102_1687d0), 0xb94f0916, "sh312 lookup registry-count ldr w22,[x8,#3848]");
+            assert_eq!(word(0x102_1687d4), 0x34000316, "sh312 cbz w22 -> return 0 (empty registry)");
+            assert_eq!(word(0x106_1e311c), 0x96fe159f, "sh312 ctor bl 0x2168798 lookup");
+            assert_eq!(word(0x106_1e3124), 0xb5000d40, "sh312 cbnz x0 -> ret lookup result, else fallthrough");
+            assert_eq!(word(0x106_1e3150), 0x7129f91f, "sh312 fallback cmp w8,#0xa7e (registry version gate)");
+            assert_eq!(word(0x106_1e3154), 0x54000421, "sh312 b.ne -> skip 0xa7e build (count!=0xa7e)");
+        } else {
+            eprintln!("sh312 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh272_preload_getter_both_branches_structurally_dead_pinned() {
         // SH272: preload getter returns 0 on BOTH branches (vtable dispatch / ctor zeroes
         // [obj+80]). verdict: live-object wall, do-not-re-tread. pin below.
@@ -15163,7 +15174,7 @@ mod sh115_tests {
 
     #[test]
     fn sh265_gameloaded_binder_receive_pinned() {
-        // SH265 (single-agent): pin the dataModel-bindings live-binder receive
+        // SH265: pin the dataModel-bindings live-binder receive
         // nativeAppBridgeV2SendAppEventOnGameLoaded (guest 0x102bb429c) — OnAppReady's sibling.
         // --v2boot-send-game-loaded drives it as a real guest entry. Pin (docs detail):
         //   entry 0x102bb429c = sub sp,#0x110 (0xd10443ff)
@@ -15260,7 +15271,7 @@ mod sh115_tests {
 
     #[test]
     fn sh267_lsm_insert_leaf_mechanism_pinned() {
-        // SH267 (single-agent): pin the LSM INSERT-leaf gating the SEP-17 session-drive.
+        // SH267: pin the LSM INSERT-leaf gating the SEP-17 session-drive.
         // Insert 0x1db1cc8 reads x1=sub[idx] ((key>>16)&0x1fff) then bl 0x2b9ea40 does
         // atomic-OR bit1 into *x1 (0x2b9ea40 bti 0xd503245f / 0x2b9ea44 adrp 0xb001e4f0 /
         // 0x2b9ea48 ldrb [x16,#2648] 0x39696210 / 0x2b9ea4c cbz 0x34000070 / 0x2b9ea50
@@ -15308,15 +15319,12 @@ mod sh115_tests {
 
     #[test]
     fn sh285_lsm_reader_pop_settings_state_cross_terminal_pinned() {
-        // SH285 (single-agent): pin the NEW terminal the engine's OWN initEngine_
-                // settings-state self-drive (state=9->10 -> GlobalInit reentry -> app-start)
-                // reaches with the SH267 LSM_NODES seed. A/B (3x real so): A (LSM_NODES off,
-                // SH284 baseline) SIGSEGV guestpc=0x101db1d04 = LSM insert-leaf (SH260-parked,
-                // fault=0x0). B (+LSM_NODES) SIGSEGV guestpc=0x101db1b08 = the LSM READER/pop
-                // path, one fencepost deeper (the insert-leaf CROSSED), a DIFFERENT reader fn
-                // than SH268's free-list pop 0x101d9a528 —
-                // still the SH174/204 live-object class; REGRESSION pin, not a forward gate.
-                // Seed reused = SH267's. Skip-if-absent.
+            // SH285: engine's OWN initEngine_ settings self-drive (state=9->10, SH284) peaks
+            // at the SH267 LSM_NODES seed. A/B (3x real so): A (off) SIGSEGV guestpc=
+            // 0x101db1d04 = LSM insert-leaf (SH260, fault=0). B (+LSM_NODES) SIGSEGV
+            // 0x101db1b08 = LSM READER/pop, one fencepost deeper (insert-leaf CROSSED), a
+            // DIFFERENT reader than SH268's free-list pop 0x101d9a528; still SH174/204
+            // live-object class; REGRESSION pin, not forward. Seed = SH267's. Skip-if-absent.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15561,7 +15569,7 @@ mod sh115_tests {
 
     #[test]
     fn sh294_item48_corrected_cell_and_dispatch() {
-        // SH294 (single-agent): CORRECT two mis-attributions in SH293's [item+48] mechanism
+        // SH294: CORRECT two mis-attributions in SH293 [item+48] mechanism
         // pin — SH243-class wrong-address/label bug. (1) The lifecycle-registry fn-ptr cell
         // read by all subpaths is guest 0x1068262e8 (adrp 0x6826000 + #744), file-backed
         // WRITABLE .data, NOT 0x1068266e8 as SH293 labeled; deref'd via `cbz x8,skip; blr x8`
@@ -15611,7 +15619,7 @@ mod sh115_tests {
 
     #[test]
     fn sh295_item48_edge_driven_to_wall() {
-        // SH295 (single-agent, --v2boot-session-itemproc): DRIVE the last never-driven
+        // SH295 (--v2boot-session-itemproc): DRIVE the last never-driven
         // item-proc edge [item+48]. item[+48]=benign obj makes `bl 0x22193a0` EXECUTE;
         // 0x22193a0 sets w2=xzr -> trampoline 0x22076e8 -> dispatcher 0x2850ef0 -> cbz w8 ->
         // 0x2850fa8 -> bl 0x28511c4 = vt[+112] LIVE-OBJECT wall, reached BEFORE the benign-cell
@@ -15759,9 +15767,9 @@ mod sh115_tests {
 
     #[test]
     fn sh268_lsm_freelist_terminal_mechanism_pinned() {
-        // SH268 (single-agent): pin the NEW terminal after the SH267 insert-leaf crossing.
+        // SH268: pin the NEW terminal after the SH267 insert-leaf crossing.
         // With JIT_ROUTEB_APPSART_LSM_NODES=1 the lane crosses the insert-leaf (fault=0x0
-        // at 0x101db1d04) but advances one fencepost deeper into the LSM FREE-LIST/pop:
+        // at 0x101db1d04) but advances a fencepost deeper into the LSM FREE-LIST/pop:
         //   SIGSEGV fault=0x101d968e4 guestpc=0x101d9a528 (fn sub_1d9a4e0 tail 0x1d9a528)
         //   x19=host heap, x20=x1=0x101d968e4, lr=0x101d9a6b8, lsm_map_global=host
         // Mechanism: fn 0x1d9a528 pop tail `ldr x8,[x0,#24]; str x1,[x0,#24]; str x8,[x1] @0x1d9a568`
@@ -15856,7 +15864,7 @@ mod sh115_tests {
 
     #[test]
     fn sh261_appstart_drain_surface_advances_past_lsm_wall_pinned() {
-        // SH261 (single-agent): measure the NEW frontier after SH260 parked the LSM
+        // SH261: measure the NEW frontier after SH260 parked the LSM
         // insert-leaf. Re-running the SH259 repro the app-start body walks DEEP into
         // its own self-drive message-loop drain: region-watch fires 100+ pcs incl. drain
         // 0x233bc88..0x233bcf0 (once-check 0x21dae90 + registry 0x21daef8), reads
