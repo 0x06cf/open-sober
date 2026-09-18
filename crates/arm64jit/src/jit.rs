@@ -1074,6 +1074,63 @@ fn routeb_ec_world_arg1_guard(state: *mut CpuState, pc: u64) {
     eprintln!("[routeb-sh298] seeded EC-world arg1 (x[1]) = stable object 0x{obj:x} at pc=0x{pc:x} (was 0 -> would SIGSEGV [x1+0x48])");
 }
 
+/// SH299 (opt-in JIT_ROUTEB_EC_ARG0VT=1): the EC world 0x102e24598 (genuine DM-creation
+/// machine, reached headlessly in SH298/298b) continues past the arg1+0x48 gate into its
+/// app-request build and re-enters the EC marshaller virtual-dispatch at
+/// `0x2e2464c: ldr x8,[x19,#48]!` (x19 = EC arg0 = the DM-construction object received
+/// from fn 0x1023f03b4) -> `ldr x8,[x8,#16]` -> `blr x8` with x0=x19. That dispatch object
+/// at [arg0+0x30] is NULL on our fabricated zeroed arg0 -> x8=[0], `[x8,#16]=[0+0x10]`
+/// SIGSEGV fault=0x10 (host raw `mov rdx,[rbx+0x40]; lea rdx,[rdx+0x10]; mov rax,[rdx]`
+/// = guest x8 load, x8=0; reg dump x19=dmthis+0x30). SH297/298 proved a coherent OBJECT
+/// seed advances the EC line one fencepost, so this guard seeds [arg0+0x30] with a
+/// coherent dispatch object whose vt[+16] = a benign host leaf returning 1 — the `cbnz
+/// w0` @0x2e2465c is TAKEN -> control jumps to 0x2e24678 (continue building) instead of
+/// faulting at [0+0x10]. Default-inert. Fires at EC-world entry block 0x102e24598
+/// (state.x[0] = arg0) when [arg0+0x30]==0.
+fn routeb_ec_world_arg0_vt_guard(state: *mut CpuState, pc: u64) {
+    if std::env::var("JIT_ROUTEB_EC_ARG0VT").ok().as_deref() != Some("1") {
+        return;
+    }
+    if pc != 0x102e24598 {
+        return;
+    }
+    let arg0 = unsafe { (*state).x[0] };
+    if arg0 == 0 {
+        return;
+    }
+    let slot = arg0 + 0x30;
+    // Idempotent: only seed when the dispatch-object slot is empty.
+    let cur = unsafe { std::ptr::read_unaligned(slot as *const u64) };
+    if cur != 0 {
+        return;
+    }
+    let obj = routeb_ec_arg0_vt_dispatch_obj();
+    unsafe { std::ptr::write_unaligned(slot as *mut u64, obj) };
+    eprintln!("[routeb-sh299] seeded EC arg0 +0x30 = coherent dispatch obj 0x{obj:x} (vt[+16]=ret1 leaf; was 0 -> would SIGSEGV [x8,#16] fault=0x10) at pc={pc:#x} arg0={arg0:#x}");
+}
+
+/// Stable coherent dispatch object for SH299: [obj]=all-ret1 leaf vtable (a dedicated
+/// ret1 leaf, NOT the ret0 singleton vtable), so the EC marshaller's `ldr x8,[x8,#16]`
+/// -> `blr x8` returns 1 and the `cbnz w0` @0x2e2465c is taken (builds onward).
+fn routeb_ec_arg0_vt_dispatch_obj() -> u64 {
+    use std::sync::OnceLock;
+    static O: OnceLock<u64> = OnceLock::new();
+    *O.get_or_init(|| {
+        extern "C" fn ret1(_a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64) -> u64 {
+            1
+        }
+        let ret1 = register_host_call_auto(ret1);
+        let v: Vec<u8> = vec![0u8; 0x60];
+        let v = v.leak();
+        for slot in 0..(0x60 / 8) {
+            unsafe { *(v.as_mut_ptr().wrapping_add(slot * 8) as *mut u64) = ret1; }
+        }
+        let o = vec![0u8; 0x40usize].leak();
+        unsafe { *(o.as_mut_ptr() as *mut u64) = v.as_ptr() as u64; } // [0]=ret1-leaf vt
+        o.as_ptr() as u64
+    })
+}
+
 /// Crate-side stable object mirror of elfjit routeb_singleton_obj_addr: zeroed 0x80
 /// object with [0]=all-leaf vtable (any virtual returns OBJ), so [obj+0x48] reads 0.
 fn routeb_singleton_obj_addr_crate() -> u64 {
@@ -5926,6 +5983,11 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // SH298 (opt-in JIT_ROUTEB_EC_ARG1): seed the EC-world entry arg1 (x[1]) with a
         // stable zeroed object when NULL so the EC marshaller's [x1+0x48] read is in-bounds.
         routeb_ec_world_arg1_guard(state, pc);
+        // SH299 (opt-in JIT_ROUTEB_EC_ARG0VT): seed the EC arg0's +0x30 virtual-dispatch
+        // object slot (NULL on our fabricated zeroed arg0 -> [0+0x10] fault=0x10) with a
+        // coherent dispatch obj whose vt[+16]=ret1 leaf, so the EC marshaller's
+        // `ldr x8,[x8,#16]; blr x8` returns 1 and the cbnz advances the app-request build.
+        routeb_ec_world_arg0_vt_guard(state, pc);
         // SH259 (opt-in JIT_ROUTEB_APPSART_SETTINGS_ONCE): seed the once-guard
         // [0x106a6f430] of the settings/registry factory 0x21dac2c (deepest reach,
         // bl @0x102339d44) so it early-returns the registry object without running the
@@ -7576,6 +7638,51 @@ mod tests {
             routeb_ec_world_arg1_guard(&mut state as *mut CpuState, 0x102e24598);
             assert_eq!(state.x[1], 0x1234, "idempotent: non-NULL x[1] left untouched");
             std::env::remove_var("JIT_ROUTEB_EC_ARG1");
+        }
+    }
+
+    #[test]
+    fn sh299_ec_world_arg0_vt_guard_is_env_pc_gated_and_seeds_dispatch_obj() {
+        // SH299: routeb_ec_world_arg0_vt_guard must (a) be inert without
+        // JIT_ROUTEB_EC_ARG0VT, (b) fire only at EC-world entry 0x102e24598, (c) only
+        // seed [arg0+0x30] when arg0!=0 AND the slot is empty, (d) seed a coherent
+        // dispatch object whose vt[+16] is a non-NULL leaf, (e) be idempotent.
+        unsafe {
+            let mut state = CpuState::new();
+            // Use a real leaked writable buffer as arg0 so the slot-write is valid.
+            let buf = Box::leak(vec![0u8; 0x100usize].into_boxed_slice()).as_mut_ptr() as u64;
+            state.x[0] = buf;
+            // zero the target slot first
+            std::ptr::write_unaligned((state.x[0] + 0x30) as *mut u64, 0);
+            // (a) env unset -> inert (slot stays 0).
+            std::env::remove_var("JIT_ROUTEB_EC_ARG0VT");
+            routeb_ec_world_arg0_vt_guard(&mut state as *mut CpuState, 0x102e24598);
+            assert_eq!(std::ptr::read_unaligned((state.x[0] + 0x30) as *const u64), 0,
+                "env-gated: inert without JIT_ROUTEB_EC_ARG0VT");
+            // (b) env set, wrong pc -> inert.
+            std::env::set_var("JIT_ROUTEB_EC_ARG0VT", "1");
+            routeb_ec_world_arg0_vt_guard(&mut state as *mut CpuState, 0x102e24590);
+            assert_eq!(std::ptr::read_unaligned((state.x[0] + 0x30) as *const u64), 0,
+                "pc-gated: must fire only at EC-world entry 0x102e24598");
+            // (c) env set + entry pc + empty slot -> seed a coherent dispatch object.
+            std::ptr::write_unaligned((state.x[0] + 0x30) as *mut u64, 0);
+            routeb_ec_world_arg0_vt_guard(&mut state as *mut CpuState, 0x102e24598);
+            let obj = std::ptr::read_unaligned((state.x[0] + 0x30) as *const u64);
+            assert_ne!(obj, 0, "arg0+0x30 must be seeded non-NULL");
+            let vt = std::ptr::read_unaligned(obj as *const u64);
+            assert_ne!(vt, 0, "dispatch obj [0] must be a non-NULL vtable");
+            let leaf = std::ptr::read_unaligned((vt + 16) as *const u64);
+            assert_ne!(leaf, 0, "vt[+16] (the EC marshaller blr target) must be non-NULL");
+            // (d) arg0==0 -> no seed (nothing sensible to target).
+            state.x[0] = 0;
+            routeb_ec_world_arg0_vt_guard(&mut state as *mut CpuState, 0x102e24598);
+            // (e) idempotent: non-empty slot left untouched.
+            state.x[0] = buf;
+            std::ptr::write_unaligned((state.x[0] + 0x30) as *mut u64, 0x1234);
+            routeb_ec_world_arg0_vt_guard(&mut state as *mut CpuState, 0x102e24598);
+            assert_eq!(std::ptr::read_unaligned((state.x[0] + 0x30) as *const u64), 0x1234,
+                "idempotent: non-empty slot left untouched");
+            std::env::remove_var("JIT_ROUTEB_EC_ARG0VT");
         }
     }
 
