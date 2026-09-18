@@ -76,7 +76,20 @@ further, reaches the EC world.
 - `cargo build -p arm64jit --example elfjit` EXIT 0 (117/118 warnings, pre-existing).
 - elfjit.rs 1,048,408 + HANDOFF under the 1MB pre-commit hook (prose trimmed).
 
-## Files
+## NEXT GATE (for the next frontier session)
+
+The new terminal is `SIGSEGV [x25,#72] @0x102e245f8` (fault=0x48) where
+`x25 = x21 = x1(EC arg1) = 0` (EC entry `mov x21,x1` @0x102e245e4, after the
+`bl 0x1023f1354` helper completes). The EC marshaller reads `[arg1+0x48]` as a
+live byte/valid-object flag immediately — exactly SH235's "immediately derefs
+live objects, NOT a static seed". This is the SH174/SH204 live-object class,
+now REACHED INSIDE the genuine DM world (was: only located/measured-unreached).
+A static arg1 seed would likely advance one fencepost then hit the next live-object
+deref; the cause-not-symptom path is a REAL session producing a coherent
+ExperienceController/app-request object (SESSION-CTOR). Do-not-re-tread broad
+static seeds per SH174/204/248h/256 doctrine; per the operator's MIGRATION-IS-NOT-
+A-STOPPING-POINT, keep grinding the DM-construction/DMCONT/PATH-B line inside
+this JIT rather than folding to a host-migration verdict.
 
 - `crates/arm64jit/examples/elfjit.rs` (SH298 stage3: CELL->R coherent registration
   obj `[R+8]=singleton` under `JIT_ROUTEB_DMFN_REGISTER`; +hermetic sh298).
