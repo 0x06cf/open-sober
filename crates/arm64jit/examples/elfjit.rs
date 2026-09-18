@@ -15004,12 +15004,9 @@ mod sh115_tests {
 
     #[test]
     fn sh306_governor_null_controller_terminal_pinned() {
-        // SH306: anchor the CURRENT SendAppEventOnAppReady no-regression terminal.
-        // Baseline GOVFLAG-off dies at governor NULL app-DM-controller guestpc=0x102ea0b9c
-        // (`ldr x8,[x0]` where x0=[app-governor+1032]=0 when flag [0x106a64da0] clear).
-        // GOVFLAG=1 advances to the sh270-pinned preload-overrides wall 0x102bb803c.
-        // Pin the governor fn prologue + flag cell + dispatch chain so a future
-        // session-drive registers on the SAME terminal or fails loudly.
+        // SH306: SendAppEventOnAppReady baseline (GOVFLAG-off) dies at governor NULL
+        // app-DM-controller guestpc=0x102ea0b9c; GOVFLAG=1 advances to the sh270
+        // preload wall 0x102bb803c. Pin the governor prologue + flag cell + dispatch.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15038,9 +15035,8 @@ mod sh115_tests {
     #[test]
     fn sh307_preload_valuecell_branch_forced_pinned() {
         // SH307: SH270's preload-overrides value-cell wire was INERT because the guard
-        // helper (bl 0x57816f0, once [0x6d2df30]) routes getter 0x2dae5f0 to the CONSTRUCT
-        // branch (returns 0), so [0x106a64d78] was never read. Forced here: NOP the tbz
-        // @0x2dae5fc so the getter falls to the value-cell dispatch; seeded all-leaf obj ->
+        // helper routes getter 0x2dae5f0 to the CONSTRUCT branch (ret 0), so
+        // [0x106a64d78] was never read. NOP the tbz @0x2dae5fc + seed an all-leaf obj ->
         // getter returns non-NULL -> terminal 0x102bb803c dispatches a leaf -> ADVANCES.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
@@ -15057,7 +15053,7 @@ mod sh115_tests {
             // Value cell must be in the RW .bss window (host-writable).
             let vcell: u64 = 0x106a64d78;
             assert!((0x1_0000_0000u64..0x120_0000_00u64).contains(&vcell), "sh307 value-cell in window");
-            eprintln!("sh307 preload-getter value-branch forced (tbz->nop @0x102dae5fc + value-cell [0x106a64d78]=fabricated obj) pinned on libroblox.so — forward lever on SendAppEventOnAppReady terminal 0x102bb803c");
+            eprintln!("sh307 preload-getter value-branch (tbz->nop + [0x106a64d78]=obj) pinned on libroblox.so — forward lever on terminal 0x102bb803c");
         } else {
             eprintln!("sh307 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -15065,13 +15061,9 @@ mod sh115_tests {
 
     #[test]
     fn sh308_sendappevent_doinit_ctor_audio_tail_reach_pinned() {
-        // SH308 (measured on real libroblox.so, SH307-forward A/B): with
-        // JIT_ROUTEB_PRELOAD_VALUECELL the SendAppEventOnAppReady pipe drives the
-        // do-init app-shell ctor (0x102207b50, ~31 blocks) through its FMOD/AAudio
-        // audio-iterate tail (0x105fb30b4) AND reaches StartAppWithParams
-        // (0x10258b144) — firsts on this path (A baseline dies at 0x102bb803c).
-        // Pin the ctor entry + FMOD-tail jump + iterate entry/empty-check +
-        // audio-init body + StartAppWithParams entry (A/B-contrast anchors).
+        // SH308 (SH307-forward A/B): with JIT_ROUTEB_PRELOAD_VALUECELL the
+        // SendAppEventOnAppReady pipe drives the app-shell ctor 0x102207b50 through its
+        // FMOD/AAudio tail 0x105fb30b4 + reaches StartAppWithParams 0x10258b144.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15095,9 +15087,32 @@ mod sh115_tests {
                 assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh308 {name} {guest:#x} in window");
                 assert!(guest & 3 == 0, "sh308 {name} {guest:#x} 4-aligned");
             }
-            eprintln!("sh308 pin: SendAppEventOnAppReady pipe (SH307-on) drives do-init app-shell ctor 0x102207b50 through its FMOD tail 0x105fb30b4 + reaches StartAppWithParams 0x10258b144 (A dies at 0x102bb803c, no ctor). DM-root stays 0; Route-B live-DM gate UNCHANGED.");
+            // SH308 (SH307-on) pipe reaches app-shell ctor through FMOD tail + StartAppWithParams; DM-root 0; Route-B gate UNCHANGED.
         } else {
             eprintln!("sh308 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
+    fn sh309_startapp_spine_reach_unreached_gate_prologues_pinned() {
+        // SH309: the SendAppEvent pipe drives StartAppWithParams' spine (bl 2baeeec ->
+        // do-init, preload-dispatch vt[+296], clean ret) but post-do-init/governor/
+        // EC/ScriptContext stay 0 hits. Pin the spine + the unreached gate prologues.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            assert_eq!(word(0x102_58b2dc), 0x94188f04, "sh309 pipe bl 2baeeec (->do-init)");
+            assert_eq!(word(0x102_58b630), 0xf9409508, "sh309 ldr vt[+296]");
+            assert_eq!(word(0x102_58b698), 0xd65f03c0, "sh309 clean ret");
+            assert_eq!(word(0x102_3eff4c), 0xd10603ff, "sh309 post-do-init (0-hit)");
+            assert_eq!(word(0x102_e9fa84), 0xa9ba7bfd, "sh309 governor (0-hit)");
+            assert_eq!(word(0x101_f1d8ac), 0x90022ca8, "sh309 ScriptContext (0-hit)");
+        } else {
+            eprintln!("sh309 real-image guard: no real libroblox.so, skipping anchors");
         }
     }
 
@@ -15118,13 +15133,13 @@ mod sh115_tests {
             assert_eq!(word(0x102_dae60c), 0xf9400008, "sh272 value-cell ldr x8,[x0] (vtable-dispatch, NOT soft-return)");
             assert_eq!(word(0x102_dae610), 0xf9400902, "sh272 value-cell ldr x2,[x8,#16] (vt[+16])");
             assert_eq!(word(0x102_dae620), 0xd61f0040, "sh272 value-cell br x2 (dispatches vt[+16])");
-            // Construct branch: ctor zero-inits [obj+80].
+            // Construct branch zeroes [obj+80].
             assert_eq!(word(0x101_df9058), 0xa904fe60, "sh272 ctor stp x0,xzr,[x19,#72] zeroes [obj+80]");
             assert_eq!(word(0x102_dae624), 0x97c12a75, "sh272 construct bl ctor 0x101df8ff8 (already sh270)");
-            // Helper 0x2daf5c8 terminal: [obj+80] null -> ret 0.
+            // Helper 0x2daf5c8: [obj+80] null -> ret 0.
             assert_eq!(word(0x102_daf5ec), 0xf9402a60, "sh272 helper ldr x0,[x19,#80] (null-flag)");
             assert_eq!(word(0x102_daf5f0), 0xb40000c0, "sh272 helper cbz x0 -> ret 0 (headless construct yields [obj+80]=0)");
-            // Guard helper cell base (0x57816f0's own Meyers once byte).
+            // Guard helper 0x57816f0 Meyers once byte:
             assert_eq!(word(0x105_7816fc), 0x9000ad68, "sh272 guard helper adrp x8,0x6d2d000");
             assert_eq!(word(0x105_781700), 0x913cc108, "sh272 guard helper add #0xf30 => [0x6d2df30]");
             for (guest, name) in [
@@ -15137,7 +15152,7 @@ mod sh115_tests {
                 assert!(guest >= 0x1_0000_0000 && guest < 0x120_0000_00, "sh272 {name} {guest:#x} in window");
                 assert!(guest & 3 == 0, "sh272 {name} {guest:#x} 4-aligned");
             }
-            eprintln!("sh272 pin: nativePreloadFlagOverrides getter BOTH branches structurally dead (value-cell=vtable-dispatch needs live obj; construct ctor zeroes [obj+80]) — live-object wall, not a seed. Route-B gate UNCHANGED.");
+            eprintln!("sh272 preload getter BOTH branches structurally dead (value-cell=vtable-dispatch; construct zeroes [obj+80]) — live-object wall. Route-B gate UNCHANGED.");
         } else {
             eprintln!("sh272 real-image guard: no real libroblox.so, skipping anchors");
         }
@@ -16392,20 +16407,17 @@ mod sh115_tests {
 mod sh126_tests {
     use super::*;
     // SH126: SendAppEventOnAppReady (0x102bb463c) app-event vtable 0x635e068 is
-    // ALL-ZERO .data.rel.ro -> terminal virtual dispatch at 0x102bb4984
-    // (`ldr x9,[x0]; ldr x8,[x9,x8]; blr x8`, x8=0x28) is `blr 0` = benign
-    // soft-return. Materialize +0x20/+0x28 slots to the benign leaf + seed the
-    // pipe sync-gate so the body completes AND the pipe takes sync do-init.
+    // ALL-ZERO .data.rel.ro -> terminal virtual dispatch 0x102bb4984 `blr 0` benign
+    // soft-return. Materialize +0x20/+0x28 leaf slots + seed pipe sync-gate -> sync do-init.
     #[test]
     fn sh126_app_event_vtable_is_dead_and_patch_targets_are_valid() {
-        // vtable base 0x635e068 is inside LOAD(off 0x62d81c0 -> vaddr 0x62dc1c0),
-        // within=0x85ea8 -> vaddr 0x6362068 -> guest 0x106362068.
+        // vtable base 0x635e068 in 2nd LOAD -> REAL guest base 0x106362068.
         assert_eq!(0x62dc1c0u64 + 0x85ea8, 0x6362068u64, "app-event vtable REAL vaddr (within 2nd LOAD)");
         assert_eq!(0x6362068u64 + 0x1_0000_0000, 0x106362068u64, "app-event vtable REAL guest base");
-        // slots the terminal blr can target: +0x20 (x0==stack-temp) / +0x28 (non-NULL)
+        // slots the terminal blr can target: +0x20 / +0x28
         assert_eq!(0x106362068u64 + 0x20, 0x106362088u64, "vtable +0x20 guest");
         assert_eq!(0x106362068u64 + 0x28, 0x106362090u64, "vtable +0x28 guest");
-        // the terminal dispatch + the pipe sync-gate reader.
+        // terminal dispatch + pipe sync-gate reader:
         assert_eq!(0x2bb4984u64 + 0x1_0000_0000, 0x102bb4984u64, "terminal blr");
         assert_eq!(0x2baef24u64 + 0x1_0000_0000, 0x102baef24u64, "pipe `cmn x8,#-1` gate");
         assert_eq!(0x683d000u64 + 0x10, 0x683d010u64, "pipe sync-gate FILE vaddr");
@@ -16419,8 +16431,7 @@ mod sh126_tests {
     }
     #[test]
     fn sh126_app_event_vtable_guard_only_writes_when_dead() {
-        // The patcher only writes slots that are both currently zero (all-zero
-        // vtable), so it is idempotent and never stomps a real populated vtable.
+        // The patcher only writes all-zero slots -> idempotent, never stomps a real vtable.
         let gvt = 0x106362068u64;
         assert!(gvt & 7 == 0, "vtable base 8-aligned");
         assert_eq!((gvt + 0x20) & 7, 0, "slot20 aligned");
