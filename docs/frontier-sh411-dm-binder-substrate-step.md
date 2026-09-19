@@ -61,9 +61,32 @@ live-DM structural gate UNCHANGED (DM-root 0, MH_GAME_LOADED false).
 
 ## Files
 
-- `crates/arm64jit/src/session.rs`: +`drive_data_model_binder` + wiring + hermetic
-  (off-hook; jit.rs/elfjit.rs untouched).
-- Real-binary log: /tmp/sh411-verify.txt (outside repo).
+- `crates/arm64jit/src/session.rs`: +`drive_data_model_binder` +`drive_native_app_start`
+  + wiring + hermetic (off-hook; jit.rs/elfjit.rs untouched).
+- Real-binary log: /tmp/sh411-verify.txt, /tmp/sh411b-verify.txt (outside repo).
+
+## SH411b extension (same cycle)
+
+The SEP-17 SESSION-CTOR directive names TWO components that were only reachable
+via probe rungs, not the ordered runtime: the **dataModel-bindings live binder**
+(above) and **nativeAppBridgeAppStart** (V1, guest 0x102338510, SH336/SH337 ABI).
+SH411b promotes the latter as a first-class post-substrate step
+(`session::drive_native_app_start`), driven immediately after MessageBus.subscribe
+(the post-bus order SH337 proved gives the app-start walk a populated registry).
+Kept OUT of the substrate table (the sh399 `abi_slots<=5` hermetic is load-bearing;
+V1 needs x2..x7 = abi_slots 7), driven as a peer of the binder instead. The sh411
+hermetic now pins both drive signatures.
+
+MEASURED (real libroblox.so, SH400 env, EXIT 124 / 0 crash):
+```
+[session-drive] nativeAppBridgeAppStart (V1 0x102338510) with populated registry @ entry
+[session-drive] nativeAppBridgeAppStart returned Ok(0x3e8); registry=12 DM-root=0x0
+```
+The V1 app-start walk executes inside the ordered substrate with a populated
+registry (12), confirming the SH337 post-bus order composes in the runtime. Honest:
+app-start REGISTERS services (registry 0->12 observable), it does NOT construct a
+DataModel (DM-root 0). Route-B live-DM structural gate UNCHANGED. Workspace green
+(arm64jit lib 458/0, `cargo test --workspace` 638/0). session.rs only.
 
 Do-not-re-tread unchanged: no LSM skips, no map manufacture, no
 setDataModelToCurrent, no single-object DM seeds.

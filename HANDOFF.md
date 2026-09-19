@@ -1,6 +1,10 @@
 # Open Sober — Agent Handoff
 
 ## SH411 (Sep 19, 2026, hermes-worker): promote the SEP-17 dataModel-bindings LIVE BINDER into the ordered session substrate as a first-class driven runtime step — the messageBus publish-RECEIVE half (publishRaw 0x102334684 -> cb [DataModelBindings+16]) now runs on the ladder thread right after MessageBus.subscribe, not just as an opt-in SH347/364 probe rung
+(SH411b extends this: SEP-17 **nativeAppBridgeAppStart** V1 0x102338510 is also
+now a first-class post-substrate step — `session::drive_native_app_start` runs it
+right after MessageBus.subscribe, MEASURED Ok(0x3e8) registry=12 DM-root=0x0.
+Both SEP-17-named RECEIVE/app-start components are driven, not probed.)
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 re-verified green first (attempt 1: 24 real task frames `present swap Ok(0x1)`,
 195 pops, 0 json abort, 0 crash; JIT_JSON_ZERO_FIX present). Production code only
