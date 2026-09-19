@@ -1,56 +1,44 @@
 # Open-Sober run status (hermes-worker)
 
-n
-Updated this cycle: SH465 — make the session-substrate completion metric OUTCOME-AWARE:
-the runtime now reports true session-boot health (14/16 atoms completed jit_run), not
-a return-value filter (11/16). Workspace green (857/0; arm64jit lib 676/0 incl. 1 new
-sh465 hermetic; build --workspace + --example elfjit OK). recon-v3 self-driven-frame
-+ json-abort deliverables re-verified green on the real binary (24 real task frames,
-196 node pops, 0 json abort, 0 crash, EXIT 0). Route-B live-DM gate UNCHANGED (DM-root
-[0x106a68818]=0, structural at the write site per SH462/463). @top
+Updated this cycle (SH475): pinned the SendAppEventOnAppReady event-name discriminator DECODE
+as a tested contract (the operator's "confirm w19-event=0x4"), and staged the real APK assets
+so the engine's own content reads have something to serve when a live DM arrives.
 
 ## Current state
 
-- `dev` HEAD: (SH465). recon-v3 immediate-priority deliverables green at HEAD
-  (type4 self-driven frames + json-abort — re-verified this cycle).
-- SH465 new: the substrate's `N/16 completed` metric now distinguishes a real
-  `jit_run` completion (Completed(0) included — the void JNI natives are legitimate
-  returns) from a `Stopped` atom. The 11/16 baseline understated a healthy session
-  boot (14/16 genuinely complete on the real binary); the summary now reads
-  `completed/total completed jit_run (nonzero non-zero return); stopped/total stopped`.
-  Readout/observability only — no guest byte, no env, no ladder-path change.
-- Route-B live-DM wall re-confirmed at the readout (once-guard seeded, DM-root 0x0):
-  structural, built only by a real engine session ctor (SEP-17/18 session/runtime
-  surface lever unchanged as the aligned front).
+- `dev` HEAD: (SH475). recon-v3 immediate-priority deliverables re-verified GREEN at fresh HEAD
+  (capture_taskv4_frame.sh attempt 1: 24 real task-driven frames, 196 node pops, 0 json abort,
+  0 crash, EXIT 124).
+- Do-init/Route-B baseline re-probed (capture_sh415): substrate 14/16, once-guard bit0=1, DM-root
+  [0x106a68818]=0x0 (LIVE DM=false), MH_FLAGS_LOADED/ENGINE_INITIALIZED/APP_READY all true,
+  AppBridgeV2 vt resolved, 0 crash.
+- SH475: `jit::routeb_appevent_sso_size_to_event_code(b0,sp8)` — pure model of the SendAppEvent
+  'Home' discriminator (SSO size4->event 4, 5->1, 12->3, else 0), + hermetic truth table + sh211
+  real-image byte pins of the decode chain @0x102bb46b8. Closes the operator's explicit
+  "confirm w19-event=0x4" pin. Honest: SH339's measured size-6 fabrication -> 0 (not 4); the
+  discriminator genuinely routes "Home" only when a real 4-byte string reaches it.
+- Also staged the real APK assets/ (594 files, 81MB) at /tmp/sober_assets_real; measured ZERO
+  AAssetManager/rbxasset requests on the currently-reachable path (content stays latent until live DM).
 
 ## This cycle's advance
 
-- Re-verified all three axes green at HEAD (recon-v3 runtime deliverable as a REAL
-  capture: 24 task-driven frames, 0 json abort, 0 crash, EXIT 0; workspace 857/0).
-- Fixed the session-drive observability metric so the runtime reports the true number
-  of atoms that completed (14/16, incl. the three void JNI natives) and isolates the
-  only two real faults as the documented pre-existing nativeInit "outside image" lane.
-- Added the hermetic sh465 pin (Completed(0) counts; only Stopped does not).
+- One small pure helper + hermetic in jit.rs; sh211 real-image byte-pin extension in elfjit.rs.
+  Both under the 1MiB hook (jit.rs 1,048,119; elfjit.rs 1,048,491; SH-prose comments condensed).
 
 ## Honest status
 
-- No DM (DM-root [0x106a68818]=0, no store reaches it headlessly, MH_GAME_LOADED
-  false) — Route-B live-DM structural gate UNCHANGED, confirmed at the store level
-  (SH462). Session/runtime-surface work (session ctor drive, MH_* lifecycle, content
-  surface, input loop, audio drain) remains latent-but-correct, firing the instant a
-  live DM owns a session. This cycle was an observability-correctness pass, not a
-  Route-B seed.
+- No DM (DM-root [0x106a68818]=0, no store reaches it headlessly, LIVE DM=false) — Route-B live-DM
+  structural gate UNCHANGED (SH462/467). This is a BUILD-THE-RUNTIME test-contract + content-surface
+  advance, not a Route-B seed.
 
 ## Next-forward candidates
 
-1. (standing, TOP — Route B) do-init completeness / live-DM: measured at read + write
-   (SH462) sites as structural. Aligned lever is the session-ctor / runtime-surface
-   drive (SEP-17/18): build the Android/Java/session compat layer so the engine's OWN
-   session constructs the DM, not seeds.
-2. DMCONT 0x102bd1d68 = 0 from the MAIN arm (unchanged standing gate).
-3. Do-not-re-tread unchanged: LSM skips/rebuilds, setDataModelToCurrent, EC reader,
-   window-attach real, ALooper, governor gates, and the two nativeInit 'outside image'
-   substrate atoms (documented run-variable pre-existing lane).
-4. Do NOT run the SH174 latch without JIT_DM_ALLOC_CAPTURE_DELEGATE=1.
-5. No re-treads until Route B advances or a new family is identified from a real-run
-   decode gap (SH463 confirmed the family space is genuinely complete).
+1. (standing, TOP) do-init completeness / live-DM: aligned lever is the session-ctor/runtime-surface
+   drive (engine's OWN session constructs the DM). The real APK assets are now staged so a completed
+   do-init's First AAssetManager/rbxasset request has REAL content to serve.
+2. The SendAppEvent 'Home' fabricate path (SH339): a real 4-byte "Home" SSO reaching the discriminator
+   (currently the fabricated jstring materializes as size 6 -> event 0). Fixing the fabricate side is
+   an open question downstream of the live-DM wall.
+3. DMCONT 0x102bd1d68 = 0 from the MAIN arm (unchanged).
+4. DeviceParams viewport{Width,Height}Mm (338/190): reached via a Java static
+   DeviceUtils.getScreenPhysicalSizeInMillimeters→Point→x/y FIELD path — build when a live run touches it.

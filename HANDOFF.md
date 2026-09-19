@@ -1,5 +1,46 @@
 # Open Sober — Agent Handoff
 
+## SH475 (Sep 20, 2026, hermes-worker): pin the SendAppEventOnAppReady event-name discriminator DECODE as a tested contract (the operator's "confirm w19-event=0x4"), + stage the real APK assets for the engine's own content reads
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified
+GREEN at this fresh HEAD first (capture_taskv4_frame.sh attempt 1: 24 real task-driven
+frames `present swap Ok(0x1)`, 196 node pops, 0 json abort, 0 crash, EXIT 124 =
+stable idle). Do-init/Route-B baseline re-probed (capture_sh415: substrate 14/16,
+once-guard bit0=1, DM-root [0x106a68818]=0x0 -> LIVE DM=false, MH_FLAGS_LOADED/
+ENGINE_INITIALIZED/APP_READY all true, AppBridgeV2 vt resolved, 0 crash). Workspace
+green (arm64jit lib 680->681 incl. 1 new sh475 hermetic; cargo test --workspace EXIT 0;
+cargo build --workspace + --example elfjit OK). New production code is ONE small pure
+helper in jit.rs; on-disk sizes kept under the 1MiB hook (jit.rs 1,048,119; elfjit.rs
+1,048,491; condensing SH-prose comments as the pre-commit hook requires).
+- **SH475 (the gap closed):** the operator's step-2 ABI note explicitly says "PIN this:
+  confirm w19-event=0x4" for SendAppEventOnAppReady's 'Home' event discriminator.
+  SH206/sh211 pinned only the two OUTPUT movz opcodes (`movz w19,#4` @0x2bb47c4 'Home',
+  `movz w19,#1` @0x2bb47cc ALT); the DECODE that selects between them — the even-name
+  jstring's libc++ SSO header (byte0=(size<<1)|longbit) turned into the size that drives
+  the branch — was unpinned, so a silent decode drift could reroute "Home" and break the
+  G2 onAppReady gate. SH475 adds `jit::routeb_appevent_sso_size_to_event_code(b0, sp8)`,
+  a pure model of the discriminator decode at 0x102bb46b8 (SSO size4 =="Home"-> event 4,
+  5->1 ALT, 12->3, else 0 "other"), + a hermetic pinning the full truth table, and extends
+  sh211's real-image guard with exact-byte pins of the load/decode chain (ldrb w8,[sp]
+  0x394003e8, ldr x9,[sp+8] 0xf94007e9, lsr 0xd341fd0a, tst 0x7200011f, csel 0x9a890149,
+  cmp #12/#5/#4 0xf100313f/0xf100153f/0xf100113f).
+- Honest: NOT a live-DM step (Route-B live-DM gate UNCHANGED; DM-root 0 structural per
+  SH462/467), and NOT a fix of the fabricate path itself — SH339 measured the harness's
+  fabricated "Home" jstring as size 6 -> event-code 0, NOT 4, on the deeper send-appevent
+  route (the substrate SendAppEventOnAppReady soft-returns at Ok(0x3e8) before the
+  discriminator block). This closes the operator's explicit "confirm w19-event=0x4" as a
+  tested, byte-anchored contract: a real "Home" (size 4) MUST route to 4, and a regression
+  in EITHER the decode logic OR the discriminator bytes is now caught. No re-treads.
+- **Also staged:** the real APK `assets/` tree (594 files, 81MB) at /tmp/sober_assets_real
+  — the `aassetmanager_open` resolver (shims.rs) previously had no real content to serve,
+  so even a live-DM-driven AAssetManager request for e.g. `models/UniversalApp/
+  UniversalApp.rbxm` (R2) or the LuaPackages would MISS. MEASURED with JIT_ASSET_TRACE on
+  the 24-frame deliverable: ZERO AAssetManager/rbxasset requests fire on the currently-
+  reachable path — honest confirmation the content path stays latent until do-init owns a
+  live DM (the standing structural wall). Latent-but-correct, default-safe.
+- Files: docs/frontier-sh475-appevent-w19-decode-pin.md + crates/arm64jit/src/jit.rs
+  (pure helper + sh475 hermetic) + crates/arm64jit/examples/elfjit.rs (sh211 real-image
+  SSO-decode-chain byte pins) + runs/fresh_w19_substrate.sh (fresh-HEAD A/B repro).
+
 ## SH472 + SH473 + SH474 (Sep 19, 2026, hermes-worker): close the session-content fn-table DISPATCH coverage — the json-abort params, boolean/long getters, and display float-fields are now pinned through the REAL JNIEnv slots (were production arms with dead or absent pins)
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified
 GREEN at fresh HEAD first (capture_taskv4_frame.sh attempt 1: 24 real task-driven

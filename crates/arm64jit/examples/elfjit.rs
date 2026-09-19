@@ -1779,7 +1779,7 @@ fn routeb_seed_dispatcher_node() {
     ROUTEB_DISPATCHER_NODE_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
-// -- SH121: TaskScheduler ctor "flags-loaded" gate -> raise(SIGTRAP) ----
+// -- SH121: TaskScheduler ctor "flags-loaded" gate ----
 // setTaskSchedulerBackgroundMode lazily constructs the TaskScheduler via
 // once-guard [0x10726a488]. Its ctor (file 0x224f810) starts with flags gate
 // 0x10224fa20 `ldrb w8,[x8,#2516]` (flags-loaded byte [0x72739d4]; tbz w8,#0,
@@ -2405,9 +2405,9 @@ fn routeb_patch_rung0_flag_recorder() {
 }
 static ROUTEB_GUARD_UNIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 /// SH118: 0x1067d16f0 is BOTH `__stack_chk_guard` GOT slot AND the engine render-ctx/singleton
-/// global (SH14/106). SH106 seeded a canary VALUE, but StartApp/renderinit RE-PUBLISH the slot to
-/// the live ctx; mid-body republish -> fake stack-smash. Fix: seed a stable leak-ADDRESS u64
-/// (cached at prologue, stays constant despite re-publication). Run before rungs that republish.
+/// global (SH14/106). SH106 seeded a VALUE; StartApp/renderinit RE-PUBLISH the slot to the live
+/// ctx -> mid-body fake stack-smash. Fix: seed a stable leak-ADDRESS u64 (cached, constant despite
+/// re-publication). Run before rungs that republish.
 fn routeb_reassert_canary_guard() {
     let unit = *ROUTEB_GUARD_UNIT.get_or_init(|| {
         let b: &'static mut u64 = Box::leak(Box::new(0x2f_2a_1a_0a_0e_0f_10_11u64));
@@ -2857,12 +2857,10 @@ pub fn render_engine_emitter_quad(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) -
             gi(0x0C01 /*GL_DRAW_BUFFER*/, &mut rb);
             eprintln!("[elfjit:renderemitter] draw_fbo={dfbo} draw_buffer={rb:#x} (before emit)");
         }
-        // SH66b root cause + FIX: GL_DRAW_BUFFER==GL_NONE. The prior attempt used
-        // glDrawBuffer (singular) - a DESKTOP-only symbol Mesa's libGLESv2.so.2
-        // does NOT export (nm: only the plural glDrawBuffers, ES3.0+), so it
-        // silently no-op'd via mesa_fn->None. Use the real ES3 plural
-        // glDrawBuffers(1,{GL_BACK}) + glReadBuffer(GL_BACK) default-FBO emit
-        // lands presented back buffer.
+        // SH66b root cause + FIX: GL_DRAW_BUFFER==GL_NONE. glDrawBuffer (singular) is
+        // DESKTOP-only — Mesa libGLESv2.so.2 exports only the plural glDrawBuffers (ES3+),
+        // so it silently no-op'd. Use the real ES3 plural glDrawBuffers(1,{GL_BACK}) +
+        // glReadBuffer(GL_BACK) so the default-FBO emit lands the presented back buffer.
         if let Some(dbs) = mesa_fn::<extern "C" fn(i32, *const u32)>(h, b"glDrawBuffers\0") {
             let back = 0x0405u32; // GL_BACK
             dbs(1, &back);
@@ -2875,11 +2873,8 @@ pub fn render_engine_emitter_quad(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) -
         st.x[31] = stk_top;
         st.x[0] = g;
         st.x[1] = 3; // w1 mode_idx -> GL_TRIANGLE_STRIP
-        // SH67-disasm-proven emitter ABI (0x105b35288 decode): the emitter maps
-        // arg2 -> glDrawArrays FIRST and arg4 -> glDrawArrays COUNT (file decode:
-        // w22=w1 mode, w23=w2 first, w20=w4 count). The pre-SH67 drive put
-        // count@x2/first@x4 -> glDrawArrays(first=4, count=0), a legal no-op that
-        // silently drew nothing. Correct: first=0, count=4; verified pixels land.
+        // SH67 emitter ABI (0x105b35288): arg2->glDrawArrays FIRST, arg4->COUNT (w22=mode, w23=first,
+        // w20=count). Pre-SH67 put count@x2/first@x4 -> draw(4,0), a silent no-op. Correct: first=0, count=4.
         st.x[2] = 0; // w2 first
         st.x[3] = 0; // w3 geom_key
         st.x[4] = 4; // w4 count
@@ -6754,13 +6749,10 @@ fn main() {
                         "[elfjit:v2boot-input-poll] SH416 one-shot real-input poll delivered {delivered} events"
                     );
                 }
-                // SH417 (--v2boot-input-loop): persistent-tracker host-input LOOP
-                // (STATUS next-forward #3). SH416's one-shot poll rebuilt the tracker
-                // each call (cross-poll press DOWN then MOVE were mistracked); this
-                // keeps ONE tracker across INPUT_LOOP_ITERS (default 8) non-blocking
-                // drains of the registered window -> guest nativePassInput. Bounded,
-                // inert (0, no X connect) unless JIT_AINPUT_BRIDGE + window XID +
-                // live image. See session.rs drive_host_input_loop.
+                // SH417 (--v2boot-input-loop): persistent-tracker host-input LOOP (STATUS #3). SH416's
+                // one-shot poll rebuilt the tracker each call (DOWN->MOVE mistracked); this keeps
+                // ONE tracker across INPUT_LOOP_ITERS (default 8) drains -> guest nativePassInput.
+                // Bounded, inert (0, no X connect) unless JIT_AINPUT_BRIDGE + window XID + live image.
                 if std::env::args().any(|a| a == "--v2boot-input-loop") {
                     let iters: usize = std::env::var("INPUT_LOOP_ITERS")
                         .ok()
@@ -13405,7 +13397,17 @@ mod sh115_tests {
             // len==4 'Home' path -> movz w19,#4; ALT -> movz w19,#1.
             assert_eq!(w(0x2bb47c4), 0x5280_0093, "'Home' path discriminator = movz w19,#4");
             assert_eq!(w(0x2bb47cc), 0x5280_0033, "ALT discriminator = movz w19,#1");
-            eprintln!("sh211 real-image opcode anchors verified");
+            // SH475: SSO-size decode chain @ block entry 0x102bb46b8 — the jstring libc++ SSO header -> the
+            // size driving the movz #4/#1/#3 branch. Pins match pure routeb_appevent_sso_size_to_event_code.
+            assert_eq!(w(0x2bb46b8), 0x3940_03e8, "ldrb w8,[sp] (SSO header byte)");
+            assert_eq!(w(0x2bb46bc), 0xf940_07e9, "ldr x9,[sp+8] (long length)");
+            assert_eq!(w(0x2bb46c0), 0xd341_fd0a, "lsr x10,x8,#1 (SSO size)");
+            assert_eq!(w(0x2bb46c4), 0x7200_011f, "tst w8,#1 (long bit)");
+            assert_eq!(w(0x2bb46c8), 0x9a89_0149, "csel x9,x10,x9,eq");
+            assert_eq!(w(0x2bb46cc), 0xf100_313f, "cmp x9,#12");
+            assert_eq!(w(0x2bb46d4), 0xf100_153f, "cmp x9,#5");
+            assert_eq!(w(0x2bb46dc), 0xf100_113f, "cmp x9,#4");
+            eprintln!("sh211 real-image opcode anchors verified (+ SH475 SSO-decode chain)");
         } else {
             eprintln!("sh211 real-image guard: no real libroblox.so, skipping byte pins");
         }

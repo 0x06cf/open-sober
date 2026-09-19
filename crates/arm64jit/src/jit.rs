@@ -1262,6 +1262,21 @@ fn routeb_appevent_w19_guard(state: *mut CpuState, pc: u64) {
     }
 }
 
+/// SH475: SendAppEventOnAppReady event-name discriminator (guest 0x102bb46b8): libc++ SSO header
+/// b0=(size<<1)|longbit; size=b0>>1 or [sp+8]. size4=="Home"->4(@0x2bb47c4), 5->1(@0x2bb47cc),
+/// 12->3(@0x476c), else 0("other"). Operator's "confirm w19-event=0x4": Home(size4) MUST->4;
+/// SH339 measured the fabricated jstring as size 6->0 (honest negative). Pure/no env, parallel-safe.
+pub fn routeb_appevent_sso_size_to_event_code(b0: u8, sp8: u64) -> u32 {
+    let long = b0 & 1;
+    let size = if long == 0 { u64::from(b0 >> 1) } else { sp8 };
+    match size {
+        4 => 4,  // "Home" (app-shell home-screen event) — OPERATOR-PINNED w19-event=0x4
+        5 => 1,  // ALT 5-char path (movz w19,#1 @0x2bb47cc)
+        12 => 3, // 12-byte path (movz w8,#3 @0x476c + csel -> w19=3)
+        _ => 0,  // "other" (SH339 measured the fabricated jstring as size 6 -> this branch)
+    }
+}
+
 /// SH341: attribute WHICH of the LSM pool-pop call sites passes a poisoned free-list
 /// head-cell KEY (a .text/exec-segment address) that the pop's trailing `str x8,[x1]`
 /// @0x1d9a568 writes into (fault = the key, SH268 measured 0x101d968e4). SH268 pinned
@@ -2944,26 +2959,17 @@ pub fn routeb_manufactured_dm() -> u64 {
 
 // ---------------------------------------------------------------------------
 // SH182: host-drive the genuine-DM-vtable app-shell ctor on the manufactured DM.
-// App-shell ctor slot [V+0x30] of genuine DM primary vtable (0x1067162f0) = guest
-// 0x1057d6ef4 (real relocated engine code). Ctor reads only: (a) stack-canary
-// global 0x1067d16f0 (write a stable ptr -> any stable value auto-passes epilogue);
-// (b) DM +0x38c `ldrsw x3,[x19,#908]` (4 readable bytes, 0 fine); (c) ABI gate on x1
-// `ldr x8,[x1,#8]` (zeroed descriptor PATH A -> clean zero-touch no-op+ret = safe
-// survival proof). PATH B (SSO "ServerRestartScheduled") not locked (SSO/eql fn
-// 0x2152f30 byte model unverified) — do NOT lock it. Drive 0x1057d6ef4 with
-// x0=manufactured DM + x1=&zeroed descriptor via nested run_guest_callback (type4
-// pattern). default-inert; env JIT_ROUTEB_DM_CTOR_DRIVER=1. +1 hermetic.
+// App-shell ctor slot [V+0x30] of genuine DM primary vtable (0x1067162f0) = guest 0x1057d6ef4.
+// Ctor reads: (a) canary 0x1067d16f0 (stable ptr auto-passes epilogue); (b) DM +0x38c ldrsw
+// (4 readable bytes); (c) ABI gate x1 `ldr x8,[x1,#8]` (zeroed PATH A -> clean no-op+ret).
+// PATH B ("ServerRestartScheduled" SSO) not locked (fn 0x2152f30 unverified) — do NOT lock.
+// Drive 0x1057d6ef4 with nested run_guest_callback (type4 pattern). default-inert; JIT_ROUTEB_DM_CTOR_DRIVER=1.
 // ---------------------------------------------------------------------------
-/// Build the x1 descriptor for the app-shell ctor. `full` selects the PATH B
-/// descriptor: [descriptor+8] = pointer to a SHORT-form (SSO) libc++ std::string
-/// `"ServerRestartScheduled"` — byte0=0x2c (size 22<<1, bit0=0 short), bytes
-/// 1..22 inline data, byte23=0 (recon deleg_aac54e43: the ctor builds its own
-/// comparison literal the same way, and fn 0x2152f30 reads SHORT form: length
-/// = byte0>>1, data at base+1; bytes>0x17 ignored). PATH B runs the ctor's REAL
-/// init body (component ctor 0x2bc4f64, AppBridgeV2Init 0x238e0bc, placeVersion
-/// vector append). `false` selects PATH A: a zeroed descriptor whose +8..+0x20
-/// is a valid EMPTY libc++ std::string (SSO size 0) -> the ctor's `ldr x8,[x1,#8]`
-/// gate reads 0 -> clean zero-touch no-op + ret (the safe survival proof).
+/// Build the x1 descriptor for the app-shell ctor. `full` selects PATH B descriptor:
+/// [desc+8] = ptr to SHORT-form (SSO) std::string "ServerRestartScheduled" (byte0=0x2c size 22<<1,
+/// inline bytes 1..22, byte23=0; fn 0x2152f30 reads byte0>>1 + base+1). `false` selects PATH A:
+/// zeroed descriptor with +8..+0x20 a valid EMPTY SSO string -> `ldr x8,[x1,#8]` reads 0 ->
+/// clean zero-touch no-op + ret (safe survival proof).
 fn routeb_dm_ctor_arg(full: bool) -> u64 {
     use std::sync::OnceLock;
     static PATHB: OnceLock<u64> = OnceLock::new();
@@ -4583,22 +4589,14 @@ fn routeb_dm_alloc_capture_guard(_state: *mut CpuState, pc: u64) {
     );
 }
 
-/// SH248 (Route-B allocator-enabler line, opt-in JIT_ROUTEB_ALLOC_PROBE=1):
+/// SH248 (Route-B allocator probe, opt-in JIT_ROUTEB_ALLOC_PROBE=1):
 /// The DMCONT continuation / StartLuaAppDM construction / operator_new ALL funnel
 /// through the real allocator (operator_new 0x1db1a38/0x1d96768 -> 0x1db1c60 tail
-/// wrapper -> 0x623fe1c free-list allocator). Headlessly sizes <=0xa succeed but
-/// 0x28/0x20 fail (`std::bad_alloc`); SH247 proved the working descriptor path
-/// itself cannot serve >0xa. This probe MEASURES the mechanism instead of treating
-/// it as an ROI judgment (operator doctrine): it logs allocator base (x0 = TLS obj
-/// OR the global fallback [0x67bf4c0]), requested size (x1), the size-class
-/// free-list node (base + round8(size) + 232) and its free-list head [+8] + 16-bit
-/// count [+16], so a follow-up can see whether small classes have pre-populated
-/// free-lists (a real CRT bootstrap) vs the 0x28/0x20 classes empty ("size-class
-/// region not set up") — the direct evidence whether a free-list seed is feasible
-/// (the 0x70c "single enabler for all of Route B") or provably not. Because a
-/// direct `b` tail-jump makes the allocator mid-block (block entered at the caller,
-/// SH217-class), the probe fires on a WINDOW of block-entry pcs across the whole
-/// allocator path, logging the pc + which function entered. Zero guest-byte mutation.
+/// wrapper -> 0x623fe1c free-list allocator); sizes >0xa fail (`std::bad_alloc`).
+/// Logs allocator base (x0=TLS obj or fallback [0x67bf4c0]), size (x1), the size-class
+/// free-list node, +8 head, +16 count — whether small classes are pre-populated or
+/// 0x28/0x20 empty ("region not set up"): evidence whether a seed is feasible. Fires on a
+/// window of allocator block-entry pcs (tail-jump means mid-block, SH217-class); 0 mutation.
 fn routeb_alloc_probe_guard(state: *mut CpuState, pc: u64) {
     if std::env::var_os("JIT_ROUTEB_ALLOC_PROBE").is_none() {
         return;
@@ -6269,15 +6267,12 @@ fn cached_block(
 /// and when it returns on an indirect/return transfer, `state.pc` holds the next address, so the
 /// dispatcher compiles & re-enters there. Halts when `pc == 0`.
 // ---------------------------------------------------------------------------
-// SH202: on-demand single-site V2 singleton-dispatch family patcher. SH200 patched 4 located objB
-// vtable sites, but the ~365-site family stops V2Init/V2Start run-variably at OTHER sites (blr
-// 0x1062514e0/0x106259a50/0x106265f40); SH199 world-build gate 0x102ea3b14 never reliably reached.
-// Family-wide patch crash-loops (SH201 over-patch touches in-band N<0xf0 -> SIGABRT). SH202's
-// lever: patch ONLY the exact site the run ACTUALLY dispatches through, ON DEMAND, at the
-// outside-image stop (guest `blr x8` into host box-alloc set x30=blr+4 -> blr_site=x30-4). Safe:
-// verify family member, patch dispatch window (materialize stable singleton into x0 + nop blr),
-// drop block cache, rewind pc, continue run_loop. Blinded one site at a time. Default-INERT
-// (JIT_ROUTEB_V2_ONDEMAND=1).
+// SH202: on-demand single-site V2 singleton-dispatch family patcher. SH200 patched 4 sites;
+// the ~365-site family stops V2Init/V2Start run-variably at OTHER sites (blr 0x1062514e0/0x106259a50/
+// 0x106265f40); world-build 0x102ea3b14 never reliably reached. Family-wide patch crash-loops.
+// Lever: patch ONLY the exact site the run dispatches through, ON DEMAND, at the outside-image stop
+// (blr x8 into host box-alloc sets x30=blr+4 -> site=x30-4): verify member, patch window,
+// drop cache, rewind, continue. Default-INERT (JIT_ROUTEB_V2_ONDEMAND=1).
 // ---------------------------------------------------------------------------
 /// SH202 pure classifier: given a candidate `blr x8` guest address, decide whether it is a genuine
 /// objB-getter singleton-dispatch family site and, if so, return the guest address where its patch
@@ -6906,24 +6901,13 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         }
         stamp_cntvct(state);
         // SH61 (recon-selfdrive-seed-jsonfix.md §B): neutralize the bare-StartApp
-        // "RBX::json::Writer string length overflow" abort. The abort is a
-        // guest-internal uninitialised stack std::string read during StartApp's
-        // launch-params json serialization: the append bound-check at guest
-        // 0x102355d40 (file 0x2355d40) does `adrp x8,7275000; mov x19,x2; ldrsw
-        // x8,[x8,#1608]; cmp x8,x2; b.cc throw` — i.e. throws when the writer's
-        // capacity cell (guest 0x107275648, file 0x7275648) < the string LENGTH
-        // in x2. The offending length is a leaked HOST pointer / stack address
-        // (==sp, ==sp-0x30, run-variable, ASLR) — SH45/SH46/SH56 proved it is
-        // not the harness LSM seed and is params-independent (identical abort
-        // for a JSON jstring and a real AutoValue jobject; JIT_TRACE=1 emits
-        // ZERO getter lines). The minimal deterministic fix: force the length
-        // to 0 AT this check whenever it would throw, so the writer appends an
-        // SSO EMPTY string (size()==0) and never reaches the throw helper
-        // 0x1025fb6bc. The capacity cell is READ-ONLY (auto-heals nothing) —
-        // never raise it (raising makes the writer memcpy with len's low 32
-        // bits ~1.6GB -> SEGV). Env-gated opt-in (JIT_JSON_ZERO_FIX=1); the
-        // default path is untouched. Guest memory is identity-mapped, so the
-        // capacity cell reads directly.
+        // "RBX::json::Writer string length overflow" abort. Append bound-check guest
+        // 0x102355d40 (file 0x2355d40): `adrp x8,7275000; mov x19,x2; ldrsw x8,[x8,#1608];
+        // cmp x8,x2; b.cc throw` — throws when capacity cell (guest 0x107275648) < the
+        // string LENGTH in x2, which is a leaked host ptr/stack addr (==sp/sp-0x30, ASLR;
+        // params-independent per SH45/46/56). Fix: force length 0 AT this check when it would
+        // throw -> SSO EMPTY string (size()==0), never reaching throw 0x1025fb6bc. Never raise
+        // the read-only capacity cell (len low-32 ~1.6GB memcpy -> SEGV). Env-gated (JIT_JSON_ZERO_FIX=1).
         if json_zero_fix_enabled() {
             if pc == 0x102355d40 {
                 const JSON_CAP_CELL: *const i32 = 0x107275648 as *const i32;
@@ -9012,6 +8996,20 @@ mod tests {
             env_test_remove("JIT_ROUTEB_APPSART_ONCE_SEED");
             std::ptr::write_unaligned(ONCE_CELL as *mut u64, 0);
         }
+    }
+
+    /// SH475: event-name discriminator decode — operator's "confirm w19-event=0x4".
+    /// Home(SSO size4) MUST->4; SH339 sized the fabricated jstring as 6->0 (honest negative).
+    #[test]
+    fn sh475_appevent_w19_discriminator_sso_size_to_event_code() {
+        assert_eq!(routeb_appevent_sso_size_to_event_code(0x08, 0), 4, "Home -> event-code 4 (operator-pinned)");
+        assert_eq!(routeb_appevent_sso_size_to_event_code(0x08, 0xdead), 4, "size-4 b0 -> 4 regardless of sp8");
+        assert_eq!(routeb_appevent_sso_size_to_event_code(0x09, 4), 4, "long-form size 4 -> Home");
+        assert_eq!(routeb_appevent_sso_size_to_event_code(0x0a, 0), 1, "ALT 5-char -> 1");
+        assert_eq!(routeb_appevent_sso_size_to_event_code(0x18, 0), 3, "12-byte -> 3");
+        assert_eq!(routeb_appevent_sso_size_to_event_code(0x0c, 0), 0, "SH339 size-6 -> 0, NOT 4");
+        assert_eq!(routeb_appevent_sso_size_to_event_code(0x00, 0), 0, "empty -> 0");
+        assert_eq!(routeb_appevent_sso_size_to_event_code(0xff, 0), 0, "unrecognized -> 0");
     }
 
     #[test]
