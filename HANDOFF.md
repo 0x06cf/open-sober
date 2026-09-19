@@ -1,5 +1,35 @@
 # Open Sober — Agent Handoff
 
+## SH461-VERIFY (Sep 19, 2026, hermes-worker): recon-v3 §A type4_frame_thunk SELF-DRIVEN-FRAME deliverable VERIFIED GREEN ON THE REAL BINARY — 24 real task-driven frames (real capture artifact)
+Single-agent (cone suppressed). Ran `runs/capture_taskv4_frame.sh` against the
+real 104MB `libroblox.so` after the SH455-461 test-only codegen-pin lineage kept
+the runtime byte-identical to the SH445 baseline. MEASURED (attempt 1/6, EXIT
+124, 0 crash-signals):
+- `[elfjit:taskv4-frame] present #N swap Ok(0x1) color=[...]` x **24** — each a
+  REAL engine frame (engine make-current 0x105b3b358 -> frame-fn 0x105b32c00 ->
+  eglSwapBuffers 0x105b3b408 on the recovered RENDERCTX vtable 0x106731ae0),
+  task-driven not harness-driven.
+- `dispatch #2165000` w4=4 dispatches reaching the thunk; **196 real node pops**
+  through the real drain pop-loop (real task dispatch, none fabricated).
+- seed markers: `[elfjit:taskv4] type4_frame_thunk registered at
+  0x7f00000001d0` + `seeded dispatcher type-4 vector [0x106829ea8] =
+  0x7f00000001d0` + the two heartbeat `mov w4,#2/#3 -> #4` patches
+  (0x102856f24/0x102856f68) + `[elfjit:renderthunk] published RENDERCTX
+  0x7f9530111b20`.
+- **0 json abort** (JIT_JSON_ZERO_FIX path stays clean), 0 crash.
+- Concurrent on the same run: `[persist] live datastore roundtrip write=45B ...
+  read_back_byte_exact=true on_disk=true` = the objective-2b "remembers
+  sign-in" durable-persistence contract fires ON a real session (backs SH423's
+  hermetic).
+- This is the recon-v3 §A deliverable (doc recon-selfdrive-seed-jsonfix.md):
+  type-4 dispatch now emits REAL task-driven frames, task-driven rather than
+  harness-driven. Honest: NOT a live DM (DM-root [0x106a68818]=0x0; Route-B
+  live-DM structural gate UNCHANGED) — the frame-present path is proven, the
+  DM-world construction wall stands.
+- Files: docs/frontier-sh461v-type4frame-real-verify.md (evidence doc) + raw
+  capture log `/home/hermes-worker/runs/sh60-taskv4-frame.txt` (340K, kept on
+  disk). Commit 521a6d7.
+
 ## SH461 (Sep 19, 2026, hermes-worker): hermetic coverage of the SHA crypt HOST-CALL codegen family (translate.rs Sha — sha1/sha256 Vd.4S, Vn.4S, Vm.4S) — 1 pin
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 unchanged-green (the change is `#[cfg(test)]`-only, so the runtime deliverable
