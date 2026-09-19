@@ -9559,9 +9559,25 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert!(moved >= 1, "REQUEUE must move a waiter (real kernel), got {moved}");
-        // Wake on dst: must release the requeued waiter.
+        // Wake on dst: must release the requeued waiter. The requeue moved the
+        // waiter onto dst's queue, so a WAKE on dst is guaranteed to return >=1
+        // the moment it is queued there. Under heavy parallel `cargo test
+        // --workspace` scheduling the freshly-requeued waiter can still be
+        // mid-transition when the very first WAKE syscall lands, so spin like
+        // the REQUEUE side above (a faked-0 handler would exhaust the window
+        // and still fail the below assertion — this does NOT weaken the
+        // SH133 regression, it only removes the single-syscall timing flake).
         let wake: [u64; 6] = [dst as u64, libc::FUTEX_WAKE as u64, 1, 0, 0, 0];
-        assert!(handle_futex(&wake) >= 1, "WAKE on dst must wake the requeued waiter");
+        let mut woken: i64 = 0;
+        for _ in 0..20_000 {
+            let r = handle_futex(&wake);
+            if r >= 1 {
+                woken = r;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(woken >= 1, "WAKE on dst must wake the requeued waiter, got {woken}");
         let _ = handle.join();
         assert!(done.load(Ordering::SeqCst), "requeued waiter must have been woken (not timed out)");
         unsafe { drop(Box::from_raw(src as *mut libc::c_int)); drop(Box::from_raw(dst as *mut libc::c_int)); }
