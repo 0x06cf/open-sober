@@ -7368,6 +7368,100 @@ mod tests {
 
     // TEMPORARY-REMOVED probe (captured emission, then deleted).
 
+    #[test]
+    fn sh451_shrn_8to4_narrowing_width_full_buffer() {
+        // shrn V1.2s, V2.2d, #16 (esrc=8 shift=16 upper=false round=false): the
+        // NARROWING shift — 2 double-width source elements become 2 half-width
+        // dest elements. Each lane: mov_load64 (48 8b 83, the 64-bit source) +
+        // shr rax,16 (48 c1 e8 10) + mov_store32 (89 83, the 32-bit dest) —
+        // source 8B wide, dest 4B wide. The width pair is the semantic: a flub
+        // that stores the full 64-bit source into a 4B dest or truncates a 4B
+        // source corrupts every lane. rd=1 rn=2 -> Vn@0x130 Vd@0x120.
+        let b = tr_bytes(Inst::SimdShrn { rd: 1, rn: 2, esrc: 8, shift: 16, upper: false, round: false });
+        assert_eq!(b, vec![
+            // lane 0
+            0x48, 0x8b, 0x83, 0x30, 0x01, 0x00, 0x00, // mov rax,[rbx+0x130] 64-bit source
+            0x48, 0xc1, 0xe8, 0x10,                   // shr rax,16
+            0x89, 0x83, 0x20, 0x01, 0x00, 0x00,       // mov [rbx+0x120],eax 32-bit dest
+            // lane 1
+            0x48, 0x8b, 0x83, 0x38, 0x01, 0x00, 0x00, // Vn lane1 +8
+            0x48, 0xc1, 0xe8, 0x10,
+            0x89, 0x83, 0x24, 0x01, 0x00, 0x00,       // Vd lane1 +4
+        ]);
+        // the narrowing: a 64-bit source load paired with a 32-bit dest store.
+        assert!(b.windows(7).any(|w| w == [0x48, 0x8b, 0x83, 0x30, 0x01, 0x00, 0x00]), "double-width source load (48 8b 83)");
+        assert!(b.windows(6).any(|w| w == [0x89, 0x83, 0x20, 0x01, 0x00, 0x00]), "half-width dest store (89 83)");
+        assert!(!b.windows(7).any(|w| w == [0x48, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00]), "srn must NOT store the 64-bit dest (no 48 89 83)");
+    }
+
+    #[test]
+    fn sh451_shrn_upper_high_half_destination_offset() {
+        // shrn2 V1.2s, V2.2d, #16 (upper=true): identical emit but the dest lands
+        // in the HIGH half (+8: dst_off=8 -> 0x128/0x12c instead of 0x120/0x124).
+        // The upper flag is the only thing that moves the destination base.
+        let lo = tr_bytes(Inst::SimdShrn { rd: 1, rn: 2, esrc: 8, shift: 16, upper: false, round: false });
+        let hi = tr_bytes(Inst::SimdShrn { rd: 1, rn: 2, esrc: 8, shift: 16, upper: true, round: false });
+        assert!(hi.windows(6).any(|w| w == [0x89, 0x83, 0x28, 0x01, 0x00, 0x00]), "upper lane0 stores Vd@0x128");
+        assert!(hi.windows(6).any(|w| w == [0x89, 0x83, 0x2c, 0x01, 0x00, 0x00]), "upper lane1 stores Vd@0x12c");
+        assert!(!hi.windows(6).any(|w| w == [0x89, 0x83, 0x20, 0x01, 0x00, 0x00]), "upper must NOT write the low-half 0x120");
+        assert!(lo.windows(6).any(|w| w == [0x89, 0x83, 0x20, 0x01, 0x00, 0x00]), "non-upper writes low-half 0x120");
+        // the source lane addressing is unchanged by upper.
+        assert!(hi.windows(7).any(|w| w == [0x48, 0x8b, 0x83, 0x38, 0x01, 0x00, 0x00]), "upper source lane1 still +8 from 0x130");
+    }
+
+    #[test]
+    fn sh451_rshrn_round_add_before_shift_is_the_discriminator() {
+        // rshrn V1.2s, V2.2d, #15 (round=true): the ROUNDING-HALF-UP form emits
+        // `add rax, 1<<(shift-1)` (48 81 c0) BEFORE the shift — shrn (round=false)
+        // has NO such add. The add_ri64 imm32 (48 81 c0 00 40 00 00 = +0x4000 for
+        // shift 15) is the round-vs-no-round discriminator; a flub that shifts
+        // without the round bias truncates instead of rounding.
+        let r = tr_bytes(Inst::SimdShrn { rd: 1, rn: 2, esrc: 8, shift: 15, upper: false, round: true });
+        let n = tr_bytes(Inst::SimdShrn { rd: 1, rn: 2, esrc: 8, shift: 15, upper: false, round: false });
+        assert!(r.windows(6).any(|w| w == [0x48, 0x81, 0xc0, 0x00, 0x40, 0x00, 0x00]) || r.windows(7).any(|w| w == [0x48, 0x81, 0xc0, 0x00, 0x40, 0x00, 0x00]),
+            "rshrn adds 1<<(shift-1)=0x4000 (48 81 c0 imm32)");
+        assert!(!n.windows(6).any(|w| w == [0x48, 0x81, 0xc0, 0x00, 0x40]) && !n.windows(7).any(|w| w == [0x48, 0x81, 0xc0, 0x00, 0x40]),
+            "shrn must NOT emit the round-add");
+        // the add must precede the shift (ordering).
+        let add_pos = r.windows(6).position(|w| w == [0x48, 0x81, 0xc0, 0x00, 0x40, 0x00]).unwrap();
+        let shr_pos = r.windows(4).position(|w| w == [0x48, 0xc1, 0xe8, 0x0f]).unwrap();
+        assert!(add_pos < shr_pos, "round-add must come BEFORE the narrowing shift");
+        assert!(r.windows(4).any(|w| w == [0x48, 0xc1, 0xe8, 0x0f]), "shift 15 = shr rax,0x0f (48 c1 e8 0f)");
+    }
+
+    #[test]
+    fn sh451_shrn_4to2_word_narrowing_16bit_store() {
+        // shrn V1.4h, V2.4s, #8 (esrc=4 shift=8): 4 half-word dest lanes. Each:
+        // mov_load32 (8b 83, 4B source) + shr rax,8 (48 c1 e8 08) + mov_store16
+        // (66 89 83, 2B dest) — the O-word width narrowing vs the 8to4 form's
+        // 32-bit store. The 66 prefix on the store + thread-local 4B source is
+        // the 4to2 discriminator.
+        let b = tr_bytes(Inst::SimdShrn { rd: 1, rn: 2, esrc: 4, shift: 8, upper: false, round: false });
+        assert!(b.windows(6).any(|w| w == [0x8b, 0x83, 0x30, 0x01, 0x00, 0x00]), "4B source load (mov eax)");
+        assert!(b.windows(4).any(|w| w == [0x48, 0xc1, 0xe8, 0x08]), "shr rax,8");
+        assert!(b.windows(7).any(|w| w == [0x66, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00]), "2B dest store (66 89 83)");
+        // 4 lanes: Vn@0x130/0x134/0x138/0x13c, Vd@0x120/0x122/0x124/0x126.
+        assert!(b.windows(7).any(|w| w == [0x66, 0x89, 0x83, 0x26, 0x01, 0x00, 0x00]), "lane3 dest store at 0x126");
+        assert_eq!(b.windows(6).filter(|w| w == &[0x8b, 0x83, 0x34, 0x01, 0x00, 0x00]).count(), 1, "lane1 4B source at 0x134");
+        // no 64-bit store in the 4to2 form.
+        assert!(!b.windows(7).any(|w| w == [0x48, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00]), "4to2 must NOT emit a 64-bit store");
+    }
+
+    #[test]
+    fn sh451_shrn_2to1_byte_narrowing_movzx_word_and_byte_store() {
+        // shrn V1.8b, V2.8h, #4 (esrc=2 shift=4): 8 byte dest lanes. Each lane:
+        // movzx_word_mem (0f b7 83, ZERO-extend the 2B source) + shr rax,4
+        // (48 c1 e8 04) + mov_store8 (88 83, 1B dest). The movzx (not movsx) +
+        // byte store is the narrowest-width narrowing form.
+        let b = tr_bytes(Inst::SimdShrn { rd: 1, rn: 2, esrc: 2, shift: 4, upper: false, round: false });
+        assert!(b.windows(7).any(|w| w == [0x0f, 0xb7, 0x83, 0x30, 0x01, 0x00, 0x00]), "2B source via movzx word (0f b7 83)");
+        assert!(b.windows(4).any(|w| w == [0x48, 0xc1, 0xe8, 0x04]), "shr rax,4");
+        assert!(b.windows(6).any(|w| w == [0x88, 0x83, 0x20, 0x01, 0x00, 0x00]), "lane0 byte store [rbx+0x120]");
+        assert!(b.windows(6).any(|w| w == [0x88, 0x83, 0x27, 0x01, 0x00, 0x00]), "lane7 byte store at 0x127");
+        // movzx (0f b7) means UNSIGNED — the source must NOT be sign-extended.
+        assert!(!b.windows(7).any(|w| w == [0x48, 0x0f, 0xbf, 0x83, 0x30, 0x01, 0x00]), "shrn is unsigned — no movsx word (48 0f bf)");
+    }
+
     // SH440: hermetic coverage of the byte-COUNT + horizontal-SUM codegen pair
     // (translate.rs SimdPopcnt — `cnt Vd.8b, Vn.8b`; SimdSum8 — `uaddlv
     // h{rd}, Vn.8b`). These SWAR reductions had zero direct byte tests. SH440
