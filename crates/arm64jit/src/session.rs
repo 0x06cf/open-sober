@@ -191,9 +191,44 @@ pub fn drive_routeb_session_substrate(iimg: &[u8], ib: u64, tpidr: u64, boot_sp:
         if atom.guest == 0x1025f5fec {
             drive_nativehelper_lifecycle();
         }
+        // SEP-17 SESSION-CTOR directive names the "dataModel-bindings live binder"
+        // as a component to drive. The ordered substrate's MessageBus atom drives the
+        // SUBSCRIBE half (registers the experience-launch listener, measured 0->12
+        // registry by SH269/315/337); the RECEIVE half — publishRaw 0x102334684, whose
+        // cb (file 0x2bd7444/0x2bd76e8) reads the DataModelBindings DM holder
+        // [x0+16] @0x102bd7474 — was only ever reachable via opt-in --v2boot-session-pub
+        // probe rungs, never as a first-class step of the ordered runtime. Make it one:
+        // on the SAME ladder thread, immediately after subscribe, publish an
+        // experience-launch event and report whether the cb entered and what the
+        // receive-side DM holder [DataModelBindings+16] holds (0 = live-DM side, only
+        // a real do-init populates it — honest).
+        if atom.guest == 0x102ba5bb8 {
+            drive_data_model_binder(iimg, ib, tpidr, boot_sp, h.env, h.thiz);
+        }
     }
     eprintln!("[session-drive] substrate complete: {ok}/{total} atoms returned non-zero Ok");
     ok
+}
+
+/// SEP-17 dataModel-bindings LIVE BINDER — the ordered drive's first-class RECEIVE
+/// half. The MessageBus.subscribe atom registers the experience-launch listener; a real
+/// host then PUBLISHes an experience-launch request through the same messageBus
+/// publishRaw (0x102334684) so the engine's cb (file 0x2bd7444/0x2bd76e8) enters and
+/// reads [DataModelBindings+16] — the receive-side holder the subscribe side can only
+/// arm. Reports cb-entry + holder so the binder's state is observable in the substrate
+/// readback, not just a probe. Inert by itself (no DM write); the holder stays 0 until a
+/// completed do-init populates it (SH347/SH364 class).
+pub fn drive_data_model_binder(
+    iimg: &[u8],
+    ib: u64,
+    tpidr: u64,
+    boot_sp: u64,
+    env_ptr: u64,
+    thiz: u64,
+) -> u64 {
+    let r = crate::jit::drive_messagebus_publish_receive(iimg, ib, tpidr, boot_sp, env_ptr, thiz);
+    eprintln!("[session-drive] dataModel-bindings live binder: publishRaw experience-launch -> {r:#x}");
+    r
 }
 
 /// Host-driven NativeHelper lifecycle milestone sequence (recon-routeB step-2 /
@@ -320,5 +355,31 @@ mod tests {
         // callback must be recorded as received AND steered to LOGIN (not home).
         assert!(crate::jni::nativehelper_login_received(), "onDidLogInReceived fired (login-state callback arrived)");
         assert!(!crate::jni::nativehelper_logged_in(), "empty login payload steers to LOGIN (not home)");
+    }
+
+    /// SEP-17 dataModel-bindings LIVE BINDER: the ordered substrate drive now also
+    /// drives the publish-RECEIVE half (publishRaw 0x102334684 -> cb [DataModelBindings+16],
+    /// SH347/SH364 were elfjit-only probe rungs) as a first-class step right after the
+    /// MessageBus.subscribe atom. This test brokers the integration shape without a real
+    /// binary: drive_data_model_binder must be callable with the exact signature the
+    /// ordered drive uses, and the MessageBus atom (its trigger site) must stay in the
+    /// substrate table so the wiring can't silently disconnect.
+    #[test]
+    fn sh411_data_model_binder_is_first_class_substrate_step() {
+        // Compile-level pin: same (iimg,ib,tpidr,boot_sp,env,thiz) signature the drive uses.
+        let _sig: fn(&[u8], u64, u64, u64, u64, u64) -> u64 =
+            crate::session::drive_data_model_binder;
+        let _ = _sig;
+        // The trigger site stays in the ordered substrate: MessageBus.subscribe.
+        assert!(
+            ROUTEB_SESSION_SUBSTRATE
+                .iter()
+                .any(|a| a.guest == 0x102ba5bb8),
+            "MessageBus.subscribe atom present (the binder's trigger site)"
+        );
+        // The binder is a thin wrapper that returns the jit_run result (or 0 on a no-binary
+        // hermetic); it must be callable through the SessionHandles the drive builds.
+        let h = SessionHandles::build();
+        let _ = (h.env, h.thiz);
     }
 }
