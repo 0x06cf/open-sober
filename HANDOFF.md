@@ -1,5 +1,34 @@
 # Open Sober — Agent Handoff
 
+## SH398 (Sep 21, 2026, hermes-worker): MEASURED (never-run intersection closed) — the WORKING DELEGATE observer ON the SH285-CROSSED env (append+pack skips fired, sh285=0) records 0 validated make_shared<DataModel> despite the do-init MAIN dispatch firing and 685 allocations observed — the strongest "no live DM" closure yet, and the persistence-cookie milestone (SH177) landed, so Route B owns the cone again
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified green at this exact
+HEAD first: capture_taskv4_frame.sh attempt 1 = 24 real task-driven frames `present swap Ok(0x1)`, 197
+node pops, 0 json abort, 0 crash; capture_sh304 session-gated producer INERT (3 UNGATED/0 GATED);
+JIT_JSON_ZERO_FIX present at 0x102355d40. New probe
+runs/capture_sh398_dmcap_delegate_lsm_crossed.sh (SH397 env + SH349 APPEND_SKIP + SH350 PACK_SKIP +
+DELEGATE) + docs/frontier-sh398-dmcap-delegate-lsm-crossed.md. Probe-only — no production Rust / guest
+byte / JIT-hook-default touched; tree clean at SH397, workspace green (cargo test --workspace EXIT 0).
+- SH397 left one composition never run: the WORKING DELEGATE observer was only ever combined with a
+  NON-crossed env that terminates AT the SH285 persistence lane (pre-lane reach only), and the
+  SH285-CROSSING env (SH373/385) was never run under an observer. SH398 composes them: SH285 crossed
+  (append-skip+pack-skip fire, `guestpc=0x101db1b08` sh285-hits=0), do-init MAIN dispatch fires
+  (SH361: container+32 non-NULL -> vt[+48]=0x10258b5d8), DELEGATE installs (`routed CRT operator-new
+  ACTIVE` prev_hook 0x1021ebaf4), 685 allocations observed (all 0x18 bytes + ONE 0x20040 pb_defaults
+  registry object at the SH88 hashfix site), and **[validated] make_shared<DataModel> = 0**.
+- Terminal drains to the standing SH285 pool-pop write-site 0x101d9a528 (SH341 family) — the crossed
+  lane lands in the SAME measured-closed seam, no DM event under the only observer that proves absence.
+  This is the deepest, fully-crossed, working-observer reach on record; the "no live DM" verdict is
+  now cornered from every static-composition angle (SH385/393/396/397 now + SH398).
+- Interpretation: map-completion + observer-depth advance (never-run intersection), NOT a DM advance —
+  honest. Route-B live-DM structural gate UNCHANGED (DM-root [0x106a68818]=0, MH_* false, AppBridgeV2
+  0). Session-gated producer + R1 content remain latent-but-correct.
+- SEP-15 directive condition MET: the cookie-value persistence milestone (SH177 readback / classified
+  value via cookie_jar_write_value, committed at HEAD) has landed, so per the operator this cycle
+  STOPs the persistence track and Route B owns the cone again (re-attack live-DM construction; the
+  do-init/StartApp body remains the standing SESSION-CTOR wall). Do-not-re-tread unchanged (incl.
+  LSM-manufactured wiring SH385, setDataModelToCurrent SH388, maps SH396) + SH398: do NOT expect the
+  DELEGATE observer to find a DM past the crossed SH285 lane either (measured 0 validated).
+
 ## SH397 (Sep 21, 2026, hermes-worker): MEASURED (never-run intersection closed) — the SH174 DM-allocation capture latch WITH the working SH395 DELEGATE observer on the deepest do-init DISPATCH-REACHING ladder records 0 validated make_shared<DataModel>, finalizing the "no live DM" verdict AT the actual DM-ctor dispatch junction via a trustworthy observer
 Single-agent (cone suppressed). Recon-v3 immediate-priority deliverables re-verified green at this
 exact HEAD first (capture_taskv4_frame.sh attempt 1 = 24 real task-driven frames `present swap
