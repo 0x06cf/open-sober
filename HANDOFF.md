@@ -1,5 +1,31 @@
 # Open Sober — Agent Handoff
 
+## SH411 (Sep 19, 2026, hermes-worker): promote the SEP-17 dataModel-bindings LIVE BINDER into the ordered session substrate as a first-class driven runtime step — the messageBus publish-RECEIVE half (publishRaw 0x102334684 -> cb [DataModelBindings+16]) now runs on the ladder thread right after MessageBus.subscribe, not just as an opt-in SH347/364 probe rung
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+re-verified green first (attempt 1: 24 real task frames `present swap Ok(0x1)`,
+195 pops, 0 json abort, 0 crash; JIT_JSON_ZERO_FIX present). Production code only
+in session.rs (off the 1MiB hooks, file 16KB); jit.rs/elfjit.rs untouched (both
+at/near the hook, unchanged at byte-level). Workspace green (arm64jit lib
+458/0 incl. new sh411 hermetic; cargo test --workspace 638/0 canonical green —
+the one intermittent parallel-run failure is the SH345/346/357/370 accepted
+load-sensitive family, not sh411).
+- session.rs: +`drive_data_model_binder(iimg,ib,tpidr,boot_sp,env,thiz)` (thin
+  wrapper over the existing serialized `jit::drive_messagebus_publish_receive`),
+  wired into `drive_routeb_session_substrate` immediately after the
+  `MessageBus.subscribe` atom (guest 0x102ba5bb8) — the SEP-17 "dataModel-bindings
+  live binder" is now an ordered step of the runtime, not a probe rung. New
+  hermetic `sh411_data_model_binder_is_first_class_substrate_step` (compile-pins
+  the drive signature; asserts the MessageBus trigger atom stays in the substrate
+  table; brokers the SessionHandles the drive builds).
+- MEASURED (real libroblox.so, SH400 env + JIT_ROUTEB_BUSRECV, EXIT 124, 0 crash):
+  `MessageBus.publishRaw returned Ok(0x3e8)` fires inside the ordered substrate,
+  then the binder reports Ok(0x3e8); substrate completes 11/16 atoms Ok.
+- Honest: NOT a DM (busrecv cb-entry holder guard @0x102bd7474 did NOT fire — cb
+  entry is live-DM-gated, [DataModelBindings+16] stays 0 until a completed
+  do-init populates it; SH364 class). Route-B live-DM structural gate UNCHANGED
+  (DM-root 0, MH_GAME_LOADED false). No re-treads.
+- Files: docs/frontier-sh411-dm-binder-substrate-step.md; commit f70dfb8.
+
 ## SH410 (Sep 19, 2026, hermes-worker): COMPLETE the fuller NativeHelper lifecycle surface — drive the login-vs-home gate `onDidLogInReceived` (VOID-with-String, 0x50a545) with a real login payload, steering a fresh headless session to its OWN login screen; the FULL 5-milestone lifecycle now fires through the engine's own registered slot-61 shim
 Single-agent (cone suppressed). Workspace green (cargo test --workspace EXIT 0;
 arm64jit lib 457/0). Production code only in jni.rs + session.rs (both far under
