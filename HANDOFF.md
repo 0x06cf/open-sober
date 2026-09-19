@@ -1,6 +1,33 @@
 # Open Sober — Agent Handoff
 
-## SH380 (Sep 20, 2026, hermes-worker): MEASURED + REVERTED — SH248's `-9` bad_alloc string-repair and SH248c's 0x102b504e4 NULL-dest seeds BOTH fire 0x on the current full env (both levers already crossed); the continuation's DETERMINISTIC terminal (8/8) is the SH248g map-insert wall guestpc=0x1021dde34 (live-object map construction) — the standing Route-B structural gate re-pinned on the full env; recon-v3 deliverables re-verified green
+## SH381 (Sep 20, 2026, hermes-worker): MEASURED at the exact store on the FULL ladder — the do-init once-lambda's DM-constructor `0x2173b3c` returns the **0x400000b "Execute" service-handle sentinel**, NOT a live DM (answers the EXECUTE-DO-INIT-GATES "LET the once-lambda populate" gate with direct evidence); PLUS an ADDRESS-RECONCILIATION fix the whole probe line conflated for ~30 SH cycles (the once-path writes [0x106a68408], not the probed [0x106a68818])
+Single-agent (cone suppressed). One new READ-ONLY guard
+`routeb_doinit_oncelambda_probe` (jit.rs, opt-in JIT_ROUTEB_DOINIT_ONCELAMBDA, once, ZERO
+guest mutation) + hermetic `sh381_oncelambda_probe_read_only_pc_gated` (arm64jit lib
+436->437) + probe runs/capture_sh381_oncelambda.sh + frontier doc. elfjit.rs product path
+unchanged. Workspace green (cargo test --workspace EXIT 0; arm64jit 437/0). recon-v3
+deliverables re-verified green at HEAD (24 real task frames, swap Ok(0x1), 197 pops,
+0 json, 0 crash).
+- **The measurement** (full --v2boot send-appevent ladder, live x0 at block-entry
+  0x102206d70 = just after `bl 0x2173b3c` @0x2206d6c, before `str x0,[x23,#1032]` @0x2206d74):
+  `[routeb-sh381] ctor RETURN x0=0x400000b (sentinel/handle — NOT a live DM); once-slot
+  [0x106a68408]=0x0 DM-root[0x106a68818]=0x0 once-guard=0x200`. The once-lambda's construct
+  helper returns the SAME 0x400000b "Execute" service-handle sentinel SH316 documented —
+  a handle factory, not a DataModel ctor. LETTING it populate [0x106a68818] (EXECUTE-DO-
+  INIT-GATES) cannot build a DM by itself; the real DM is on the MAIN-branch `br x1`
+  @0x2206e24 -> vt[+48]=0x10258b5d8 dispatch (SH361/SH362) which then hits the standing
+  live-object family.
+- **Address-reconciliation (genuinely new, fixes a 30-cycle conflation)**: do-init's once-path
+  stores to **once-slot [0x106a68408]** (0x6a68000 + #1032), while every harness probe reads
+  **DM-root [0x106a68818]** (+0x818) — DIFFERENT cells. A probe on 0x106a68818 shows 0 even
+  when the once-lambda fires and writes 0x106a68408. Post-run `once-slot` reads (SH155/311/316)
+  were actually reading the write target all along; `DM-root` 0x106a68818 is a separate holder.
+- Terminal on the full ladder: standing SH248g live-map wall guestpc=0x1021dde34 (EXIT 139,
+  signals=3) — unchanged; the guard is read-only and moves nothing. Route-B live-DM structural
+  gate UNCHANGED (DM-root 0, MH_* false, AppBridgeV2 0). Do-not-re-tread: do NOT force/seed the
+  once-lambda store (its ctor returns the sentinel); do NOT read 0x106a68818 as the once-lambda's
+  write target (that's 0x106a68408); standing closures (LSM skips, EC reader-gate, 0x258b5d8,
+  window-attach real, -9 string/0x102b504e4, map-header repair) all stand.
 Single-agent (cone suppressed). Attempted then measured+reverted two named Route-B "next levers":
 (a) `routeb_contstring_repair_guard` (JIT_ROUTEB_CONTSTRING_REPAIR) for SH248's
 `operator_new(-9)->bad_alloc` — MEASURED 0-firement: the assign fn 0x102b505f0 is NEVER entered

@@ -2014,6 +2014,54 @@ fn routeb_doinit_dyn_trace_guard(state: *mut CpuState, pc: u64) {
     }
 }
 
+/// SH381 (opt-in JIT_ROUTEB_DOINIT_ONCELAMBDA=1): READ-ONLY probe of the do-init
+/// once-lambda's DM-constructor RETURN at the exact store — closes the address
+/// reconciliation gap that SH361/311 left open. do-init 0x2206c40 (once-path,
+/// file 0x2206d10): `adrp x23,6a68000; add x0,#0x410` read once-guard; then
+/// `bl 0x284ce54`(acquire-once) -> `bl 0x2173b3c`(construct) @0x2206d6c ->
+/// `str x0,[x23,#1032]` @0x2206d74 stores the ctor return into the once-SLOT
+/// [0x106a68408] (0x6a68000 + 1032 == 0x408). ALL harness probes read a
+/// DIFFERENT cell — DM-root [0x106a68818] (=+0x818) — so whether the once-lambda
+/// actually produces a real host-heap/guest object (DM forward) or only the
+/// 0x400000b sentinel (service-handle) was never directly measured at the store
+/// on the FULL ladder (SH311 logged 0x400000b only on the skip-appstart env and
+/// only after the run, never the live ctor return). This guard fires at the
+/// block-entry pc 0x102206d70 (the `adrp x23` just AFTER the ctor bl, x0 =
+/// ctor return still live) and logs x0 + the current contents of BOTH cells
+/// [0x106a68408] and [0x106a68818], WITHOUT mutating guest state. Classifies:
+/// x0 in guest/heap space (>=0x100000000, top-16-bits 0) = real constructed obj;
+/// x0 small/0x400000b = sentinel/handle (once-path builds no live DM). Fires
+/// once, deduped, default-inert.
+fn routeb_doinit_oncelambda_probe(state: *mut CpuState, pc: u64) {
+    if std::env::var_os("JIT_ROUTEB_DOINIT_ONCELAMBDA").is_none() {
+        return;
+    }
+    if pc != 0x102206d70 {
+        return;
+    }
+    static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if FIRED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return; // once per run — single decisive readout
+    }
+    let s = unsafe { &*state };
+    let ctor_ret = s.x[0]; // return of `bl 0x2173b3c` @0x2206d6c, about to be stored @0x2206d74
+    let rd = |a: u64| -> u64 {
+        if a != 0 && a >= 0x100000000 && a >> 56 == 0 && a & 7 == 0 && any_page_mapped(a) {
+            unsafe { std::ptr::read_unaligned(a as *const u64) }
+        } else {
+            0
+        }
+    };
+    let once_slot = rd(0x106a68408); // the cell the once-path actually writes ([x23,#1032])
+    let dm_root = rd(0x106a68818); // the cell all harness probes read (frequently 0)
+    let once_guard = rd(0x106a68410);
+    let is_real = ctor_ret >= 0x100000000 && ctor_ret >> 56 == 0 && ctor_ret != 0;
+    eprintln!(
+        "[routeb-sh381] do-init once-lambda ctor RETURN x0={ctor_ret:#x} ({}) at block-entry 0x102206d70 (about to store into once-slot); once-slot[0x106a68408]={once_slot:#x} DM-root[0x106a68818]={dm_root:#x} once-guard={once_guard:#x}",
+        if is_real { "REAL constructed obj (guest/heap space)" } else { "sentinel/handle (NOT a live DM)" }
+    );
+}
+
 /// SH362 (opt-in JIT_ROUTEB_DISPATCH_BODY_TRACE=1): READ-ONLY body trace of the do-init
 /// MAIN-branch DM/app-shell dispatch target itself — the function at 0x258b5d8 (guest
 /// 0x10258b5d8 = nativeAppBridgeV2StartAppWithParams+0x494) that SH361's dynamic trace PROVED
@@ -7168,6 +7216,11 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // and logs which way the MAIN branch actually goes on the live ladder. No guest mutation
         // (distinct from SH320's main-id seed). Default-inert, once-per-run.
         routeb_doinit_dyn_trace_guard(state, pc);
+        // SH381 (opt-in JIT_ROUTEB_DOINIT_ONCELAMBDA=1): READ-ONLY probe of the do-init
+        // once-lambda ctor RETURN at the exact store (block-entry 0x102206d70, x0 = return
+        // of `bl 0x2173b3c` about to be stored into once-slot [0x106a68408]); reconciles the
+        // once-path store cell vs the DM-root [0x106a68818] all harness probes read. No mutation.
+        routeb_doinit_oncelambda_probe(state, pc);
         // SH362 (opt-in JIT_ROUTEB_DISPATCH_BODY_TRACE=1): READ-ONLY body trace of the do-init
         // MAIN-branch DM-ctor dispatch TARGET itself — the fn at 0x258b5d8 (guest
         // 0x10258b5d8 = StartAppWithParams+0x494) that SH361's br x1 @0x2206e24 lands on.
@@ -9234,6 +9287,55 @@ mod tests {
             st0.x[0] = 0;
             routeb_startapp_dispatch_body_guard(&mut st0, 0x10258b5d8);
             env_test_remove("JIT_ROUTEB_DISPATCH_BODY_TRACE");
+        }
+    }
+
+    #[test]
+    fn sh381_oncelambda_probe_read_only_pc_gated() {
+        // SH381 (JIT_ROUTEB_DOINIT_ONCELAMBDA): READ-ONLY probe of the do-init once-lambda's
+        // DM-ctor RETURN at block-entry 0x102206d70 (x0 = `bl 0x2173b3c` return, about to be
+        // stored into once-slot [0x106a68408] via str x0,[x23,#1032] @0x2206d74). Must (a) be
+        // inert without env, (b) fire only at pc 0x102206d70, (c) NEVER write any guest state
+        // (pure observation), (d) survive x0=0 / unmapped cells (rd() guarded). Locks the shared
+        // routeb family test lock so the fixed .bss scratch cells aren't clobbered under load.
+        let _proc_g = ROUTEB_PROC_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe {
+            let slot = 0x106a68408u64; // once-slot (what the once-path writes)
+            let root = 0x106a68818u64; // DM-root (all probes read)
+            assert!(routeb_ensure_writable(slot), "once-slot page writable");
+            assert!(routeb_ensure_writable(root), "DM-root page writable");
+            // (a) inert without env: no guest write.
+            env_test_remove("JIT_ROUTEB_DOINIT_ONCELAMBDA");
+            std::ptr::write_unaligned(slot as *mut u64, 0x1111);
+            std::ptr::write_unaligned(root as *mut u64, 0x2222);
+            let mut st: CpuState = unsafe { std::mem::zeroed() };
+            st.x[0] = 0x400000b; // sentinel value if it fired
+            routeb_doinit_oncelambda_probe(&mut st, 0x102206d70);
+            assert_eq!(std::ptr::read_unaligned(slot as *const u64), 0x1111,
+                "SH381 read-only: once-slot untouched without env");
+            assert_eq!(std::ptr::read_unaligned(root as *const u64), 0x2222,
+                "SH381 read-only: DM-root untouched without env");
+            // (b) env set, wrong pc -> inert.
+            env_test_set("JIT_ROUTEB_DOINIT_ONCELAMBDA", "1");
+            std::ptr::write_unaligned(slot as *mut u64, 0x1111);
+            routeb_doinit_oncelambda_probe(&mut st, 0x102206d90);
+            assert_eq!(std::ptr::read_unaligned(slot as *const u64), 0x1111,
+                "SH381 pc-gated: fires only at block-entry 0x102206d70");
+            // (c) env set + correct pc -> fires, but still READ-ONLY (no cell touched).
+            routeb_doinit_oncelambda_probe(&mut st, 0x102206d70);
+            assert_eq!(std::ptr::read_unaligned(slot as *const u64), 0x1111,
+                "SH381 read-only when it fires: once-slot untouched");
+            assert_eq!(std::ptr::read_unaligned(root as *const u64), 0x2222,
+                "SH381 read-only when it fires: DM-root untouched");
+            // (d) x0=0 + unmapped cells (send 0xdead to an unmapped page -> rd returns 0, no fault).
+            let mut st0: CpuState = unsafe { std::mem::zeroed() };
+            st0.x[0] = 0;
+            routeb_doinit_oncelambda_probe(&mut st0, 0x102206d70);
+            // (e) idempotent: a second fire at the same pc is suppressed (once per run).
+            routeb_doinit_oncelambda_probe(&mut st, 0x102206d70);
+            assert_eq!(std::ptr::read_unaligned(slot as *const u64), 0x1111,
+                "SH381 idempotent-second-fire still touches nothing");
+            env_test_remove("JIT_ROUTEB_DOINIT_ONCELAMBDA");
         }
     }
 
