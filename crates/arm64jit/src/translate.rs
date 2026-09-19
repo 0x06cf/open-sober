@@ -7693,4 +7693,143 @@ mod tests {
         assert_eq!(&b[b.len() - 9..b.len() - 3], &[0x89, 0x93, 0x08, 0x01, 0x00, 0x00]);
         assert_eq!(&b[b.len() - 3..], &[0x5a, 0x59, 0x58], "caller regs restored");
     }
+
+    // SH429: hermetic coverage of the load/store-PAIR (LdStPair) and the
+    // scalar FP/SIMD immediate (FpLdStImm) codegen — the families that move
+    // real rendered geometry/vertex data. decode.rs pins decode, jit.rs pins
+    // runtime, but the exact bytes were untested. These pin the semantically
+    // critical discriminators: the stride-16 vector slot for FP d/s-pairs (the
+    // Session-99 BUGFIX: was rt*8, corrupting `ldp d29,d28` follow-on fmadd),
+    // the 32/64-bit pair width, the offset-vs-load addressing, and
+    // fp_scalar_xfer's low-N-bytes slot write (upper lanes preserved).
+    //
+    // Map: [RBX]=CpuState base; GPR slot = [RBX+g*8] (g=8 -> 0x40); vector slot
+    // vt = VECTOR_BASE + vt*16, VECTOR_BASE=0x110 (so d0=0x110, d29=0x2e0,
+    // d28=0x2d0).
+
+    // ldp x0,x1,[x8] (64-bit GPR pair, offset imm=0): mov rdx,[rbx+0x40] (x8),
+    // load [rdx]->slot0, then [rdx+8]->slot1 (the second lane at +esize).
+    #[test]
+    fn sh429_ldp_64_pair_offset_zero() {
+        let b = tr_bytes(Inst::LdStPair { rt: 0, rt2: 1, rn: 8, imm: 0, ld: true, writeback: false, preidx: false, size_64: true, q128: false, fp_d: false, fp_s: false, sext: false });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x53, 0x40, // mov rdx, [rbx+0x40]  (x8)
+            0x48, 0x8b, 0x02, // mov rax, [rdx]  (lane0)
+            0x48, 0x89, 0x03, // mov [rbx], rax  (x0)
+            0x48, 0x8b, 0x42, 0x08, // mov rax, [rdx+8]  (lane1 @ +esize)
+            0x48, 0x89, 0x43, 0x08, // mov [rbx+8], rax  (x1)
+        ]);
+    }
+
+    // stp x0,x1,[x8] (64-bit GPR pair, store): source lanes read from slots0/1,
+    // stored to [rdx] and [rdx+8].
+    #[test]
+    fn sh429_stp_64_pair_offset_zero() {
+        let b = tr_bytes(Inst::LdStPair { rt: 0, rt2: 1, rn: 8, imm: 0, ld: false, writeback: false, preidx: false, size_64: true, q128: false, fp_d: false, fp_s: false, sext: false });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x53, 0x40, // mov rdx, [rbx+0x40]  (x8)
+            0x48, 0x8b, 0x03, // mov rax, [rbx]  (x0 source)
+            0x48, 0x89, 0x02, // mov [rdx], rax
+            0x48, 0x8b, 0x43, 0x08, // mov rax, [rbx+8]  (x1 source)
+            0x48, 0x89, 0x42, 0x08, // mov [rdx+8], rax
+        ]);
+    }
+
+    // ldp x0,x1,[x8,#2] (64-bit GPR pair, offset imm=2 = raw byte offset): the
+    // offset-form immediate applies RAW to the access address (not scaled).
+    // lane0 at [rdx+2], lane1 at [rdx+2+8=0xa].
+    #[test]
+    fn sh429_ldp_64_pair_offset_imm_raw_bytes() {
+        let b = tr_bytes(Inst::LdStPair { rt: 0, rt2: 1, rn: 8, imm: 2, ld: true, writeback: false, preidx: false, size_64: true, q128: false, fp_d: false, fp_s: false, sext: false });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x53, 0x40, // mov rdx, [rbx+0x40]
+            0x48, 0x8b, 0x42, 0x02, // mov rax, [rdx+2]  (lane0 @ off+0)
+            0x48, 0x89, 0x03, // mov [rbx], rax
+            0x48, 0x8b, 0x42, 0x0a, // mov rax, [rdx+0xa]  (lane1 @ off+8)
+            0x48, 0x89, 0x43, 0x08, // mov [rbx+8], rax
+        ]);
+    }
+
+    // ldp w0,w1,[x8] (32-bit GPR pair): 32-bit loads (mov eax,[rdx]) zero-extend
+    // into RAX then full-64 store to slots (W regs live in the low 32 of their
+    // X slots).
+    #[test]
+    fn sh429_ldp_32_pair_zero_extends() {
+        let b = tr_bytes(Inst::LdStPair { rt: 0, rt2: 1, rn: 8, imm: 0, ld: true, writeback: false, preidx: false, size_64: false, q128: false, fp_d: false, fp_s: false, sext: false });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x53, 0x40, // mov rdx, [rbx+0x40]
+            0x8b, 0x02, // mov eax, [rdx]  (w0 zero-extends)
+            0x48, 0x89, 0x03, // mov [rbx], rax  (full-64 store)
+            0x8b, 0x42, 0x04, // mov eax, [rdx+4]  (w1 @ +esize=4)
+            0x48, 0x89, 0x43, 0x08, // mov [rbx+8], rax
+        ]);
+    }
+
+    // stp d29,d28,[x8] FP/vector D-pair store — pins the Session-99 BUGFIX: the
+    // vector stride is 16 (VECTOR_BASE + vt*16), NOT 8. d29 -> 0x2e0, d28 ->
+    // 0x2d0 (a rt*8 stride would have written 0x1f8/0x1f0 and corrupted the
+    // follow-on fmadd, returning 128 vs 52). Sources read from those vector
+    // slots and stored at [rdx] / [rdx+8].
+    #[test]
+    fn sh429_stp_dpair_stride16_vector_slots() {
+        let b = tr_bytes(Inst::LdStPair { rt: 29, rt2: 28, rn: 8, imm: 0, ld: false, writeback: false, preidx: false, size_64: false, q128: false, fp_d: true, fp_s: false, sext: false });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x53, 0x40, // mov rdx, [rbx+0x40]  (x8)
+            0x48, 0x8b, 0x83, 0xe0, 0x02, 0x00, 0x00, // mov rax, [rbx+0x2e0]  (d29, stride 16)
+            0x48, 0x89, 0x02, // mov [rdx], rax
+            0x48, 0x8b, 0x83, 0xd0, 0x02, 0x00, 0x00, // mov rax, [rbx+0x2d0]  (d28)
+            0x48, 0x89, 0x42, 0x08, // mov [rdx+8], rax
+        ]);
+    }
+
+    // ldp d29,d28,[x8] FP/vector D-pair LOAD: loads land in the stride-16 vector
+    // slots.
+    #[test]
+    fn sh429_ldp_dpair_stride16_vector_slots() {
+        let b = tr_bytes(Inst::LdStPair { rt: 29, rt2: 28, rn: 8, imm: 0, ld: true, writeback: false, preidx: false, size_64: false, q128: false, fp_d: true, fp_s: false, sext: false });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x53, 0x40, // mov rdx, [rbx+0x40]
+            0x48, 0x8b, 0x02, // mov rax, [rdx]
+            0x48, 0x89, 0x83, 0xe0, 0x02, 0x00, 0x00, // mov [rbx+0x2e0], rax  (d29)
+            0x48, 0x8b, 0x42, 0x08, // mov rax, [rdx+8]
+            0x48, 0x89, 0x83, 0xd0, 0x02, 0x00, 0x00, // mov [rbx+0x2d0], rax  (d28)
+        ]);
+    }
+
+    // ldr d0,[x1] FpLdStImm 64-bit: fp_scalar_xfer (D) — mov rdx,[rbx+0x08]
+    // (x1), mov rax,[rdx], mov [rbx+0x110] (d0 vector slot VECTOR_BASE+0). Only
+    // the low 8 of the 16-byte slot touched (upper lanes preserved).
+    #[test]
+    fn sh429_ldr_d_scalar_into_vector_base() {
+        let b = tr_bytes(Inst::FpLdStImm { vt: 0, rn: 1, imm: 0, size: 8, ld: true });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x53, 0x08, // mov rdx, [rbx+0x08]  (x1)
+            0x48, 0x8b, 0x02, // mov rax, [rdx]  (8-byte load)
+            0x48, 0x89, 0x83, 0x10, 0x01, 0x00, 0x00, // mov [rbx+0x110], rax  (d0 low 8)
+        ]);
+    }
+
+    // str d0,[x1] FpLdStImm 64-bit store: source from d0 vector slot, store
+    // [rdx].
+    #[test]
+    fn sh429_str_d_scalar_from_vector_base() {
+        let b = tr_bytes(Inst::FpLdStImm { vt: 0, rn: 1, imm: 0, size: 8, ld: false });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x53, 0x08, // mov rdx, [rbx+0x08]
+            0x48, 0x8b, 0x83, 0x10, 0x01, 0x00, 0x00, // mov rax, [rbx+0x110]  (d0)
+            0x48, 0x89, 0x02, // mov [rdx], rax
+        ]);
+    }
+
+    // ldr s0,[x1] FpLdStImm 32-bit: mov eax,[rdx] then 32-bit store to the low
+    // 4 of the d0 vector slot (89 83 — upper lanes preserved).
+    #[test]
+    fn sh429_ldr_s_scalar_32_into_vector_base() {
+        let b = tr_bytes(Inst::FpLdStImm { vt: 0, rn: 1, imm: 0, size: 4, ld: true });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x53, 0x08, // mov rdx, [rbx+0x08]
+            0x8b, 0x02, // mov eax, [rdx]  (32-bit)
+            0x89, 0x83, 0x10, 0x01, 0x00, 0x00, // mov [rbx+0x110], eax  (d0 low 4)
+        ]);
+    }
 }
