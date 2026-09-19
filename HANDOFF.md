@@ -1,5 +1,45 @@
 # Open Sober — Agent Handoff
 
+## SH449 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD COMPARE-TO-ZERO mask codegen family (translate.rs SimdCmpZero — cmeq/cmgt/cmge/cmlt/cmle Vd.T, Vn.T, #0) — 4 exact-byte pins
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+unchanged-green (the change is `#[cfg(test)]`-only, so the runtime deliverable
+is byte-identical — SH445 capture baseline 24 real task-driven frames `present
+swap Ok(0x1)`, 0 json abort, 0 crash, EXIT 0). Workspace green (cargo test
+--workspace EXIT 0; arm64jit lib 626/0 incl. 4 new sh449 pins, was 622; cargo
+build --workspace + --example elfjit OK). Production code ONLY in translate.rs
+`#[cfg(test)]` addition (translator core body byte-untouched; jit.rs
+1,048,390 B < 1MiB hook unchanged; elfjit.rs 1,048,392 B / session.rs
+unchanged). Commit dc84448.
+- SimdCmpZero (the per-lane compare-to-literal-0 mask builder — each lane ->
+  all-ones if the int compare vs 0 holds, else 0; cond 0=eq 1=gt 2=ge 3=lt
+  4=le) had zero direct byte tests (STATUS next-forward #5 named `SimdCmpZero`
+  a remaining family). SH449 pins the exact emit (rd=1 rn=2; Vn@0x130
+  Vd@0x120): (1) cmeq .2s full-buffer — 32-bit zero-extend load (8b 83) +
+  `test rax,rax` (48 85 c0) + `sete al` (0f 94 c0) + `movzx eax,al` (0f b6 c0)
+  + `neg rax` (48 f7 d8 -> 0 or all-ones) + 32-bit store (89 83), NEVER movsxd
+  (eq/cond-0 is UNSIGNED); (2) THE setcc opcode byte is the semantic: eq=0f 94
+  sete / gt=0f 9f setg / ge=0f 9d setge / lt=0f 9c setl / le=0f 9e setle (a
+  wrong cond silently picks the wrong compare, a>=0 becomes a>0), AND signed
+  conds (1-4) MUST movsxd (48 63 c0) the 32-bit lane; (3) cmlt .8b (cond 3) —
+  8 lanes via movsx_byte_mem (48 0f be SIGNED) + setl (0f 9c) + movzx + neg +
+  byte store (88 83), lanes advance +1 (0x130..0x137 / 0x120..0x127), 8x setl
+  counted; (4) cmeq .2d q=true — full 64-bit load (48 8b 83) + test + sete +
+  neg + 64-bit store (48 89 83), 2 lanes +8, 2x sete + 2x neg (result 0 or
+  0xffff_ffff_ffff_ffff).
+- Deterministic: synthetic Inst -> translate() -> CodeBuf.as_slice() (zero-pc
+  0x1000); [RBX]=CpuState, vector slot v[t]=VECTOR_BASE(0x110)+t*16. Emission
+  captured with a one-off probe dump (each cond + esize 1/4/8; removed before
+  commit) so pins match the real emission. 4 exact-byte + window + cc-map +
+  count/negative asserts. No image, no env, parallel-safe.
+- Honest: NOT a DM (SH415 probe re-confirms DM-root [0x106a68818]=0x0 under the
+  complete substrate; Route-B live-DM gate UNCHANGED). BUILD-THE-RUNTIME
+  codegen-surface coverage completion on the compare-to-literal-0 mask family,
+  continuing the SH427-448 translator-core lineage. No re-treads (distinct
+  from SH445 FP compare->mask VecFpCmp — this is the INTEGER compare-to-zero
+  form).
+- Files: docs/frontier-sh449-translator-simdcmpzero.md + crates/arm64jit/src/
+  translate.rs (`#[cfg(test)]` only). Commit dc84448.
+
 ## SH448 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD INTEGER ARITH-UNARY codegen family (translate.rs SimdArithUnary — neg/abs Vd.T, Vn.T) — 4 exact-byte pins
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 unchanged-green (the change is `#[cfg(test)]`-only, so the runtime deliverable
