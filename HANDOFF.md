@@ -1,5 +1,49 @@
 # Open Sober — Agent Handoff
 
+## SH452 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD PAIRWISE-ADD-LONG codegen family (translate.rs SimdAdalp — saddlp/uaddlp/sadalp/uadalp Vd.Td, Vn.Ts) — 3 exact-byte pins
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+unchanged-green (the change is `#[cfg(test)]`-only, so the runtime deliverable
+is byte-identical — SH445 capture baseline 24 real task-driven frames `present
+swap Ok(0x1)`, 0 json abort, 0 crash, EXIT 0). Workspace green (cargo test
+--workspace EXIT 0; arm64jit lib 638/0 incl. 3 new sh452 pins, was 635; cargo
+build --workspace + --example elfjit OK). Production code ONLY in translate.rs
+`#[cfg(test)]` addition (translator core body byte-untouched; jit.rs
+1,048,390 B < 1MiB hook unchanged; elfjit.rs/session.rs unchanged). Commit
+7a75a4f +3.
+- SimdAdalp (pairwise-ADD-LONG — sum each adjacent pair (2i,2i+1) of
+  src_esize-byte elements into a dst lane of DOUBLE width 2*src_esize; the acc
+  forms sadalp/uadalp ADD into the existing dst, the plain uadalp/saddlp
+  overwrite) had zero direct byte tests. SH452 pins the exact emit (rd=1 rn=2;
+  Vn@0x130 Vd@0x120) with 3 exact-byte/window pins:
+  (1) THE double-width dst store (load-bearing): saddlp .2s se=4 np=2 =
+  per-pair mov_load32(RAX,[0x130]) (8b 83, [2i]) + mov_load32(RCX,[0x134])
+  (8b 8b, [2i+1] into RCX) + `add rax,rcx` (48 01 c8) + `mov [0x120],rax`
+  (48 89 83, the 8-byte dst); pairs (0x130,0x134)->0x120 and (0x138,0x13c)->
+  0x128 both counted as 64-bit stores — 4B-in/8B-out IS the pairwise-add-LONG
+  widening, a 32-bit store drops the pair-carry;
+  (2) word-pair narrowing + signed-byte sign-EXTEND: se=2 signed=false =
+  movzx_word (0f b7 83 / 0f b7 8b) + add + 32-bit store (89 83); se=1
+  signed=true byte sources SIGN-extend via movsx_byte (48 0f be, NOT 0f b6
+  zero-extend) then sum into a 2-byte dst (66 89 83);
+  (3) THE accumulate (acc) discriminator: acc=true reads the dst lane into R10
+  (mov_load64 = 4c 8b 93) + `add rax,r10` (4c 01 d0) BEFORE the store; plain
+  saddlp (acc=false) never touches the dst (positional assert R10-load precedes
+  the store; negative assert non-acc has no R10 load).
+- Deterministic: synthetic Inst -> translate() -> CodeBuf.as_slice() (zero-pc
+  0x1000); [RBX]=CpuState, vector slot v[t]=VECTOR_BASE(0x110)+t*16. Emission
+  captured with a one-off probe test (eprintln dump, removed before commit) so
+  pins match the real emission; se=4 full-buffer assert_eq matched first try.
+  Dev-time fixes: the R10 load and 2B/1B stores are 7 bytes (4c 8b 93 + dw /
+  66 89 83 + dw) -> windows(7) not windows(6), and a raw `!windows(6)==[89 83]`
+  negative is ambiguous (the 64-bit store's tail contains it) -> replaced with
+  a counted 64-bit-store assertion. 3 pins, parallel-safe, no image/env.
+- Honest: NOT a DM (SH415 probe re-confirms DM-root [0x106a68818]=0x0 under the
+  complete substrate; Route-B live-DM gate UNCHANGED). BUILD-THE-RUNTIME
+  codegen-surface coverage completion on the pairwise-add-long family, adjacent
+  to SH451 (narrowing shift) and SH440 (SimdSum8 uaddlv). No re-treads.
+- Files: docs/frontier-sh452-translator-adalp.md + crates/arm64jit/src/
+  translate.rs (`#[cfg(test)]` only). Commit 7a75a4f +3.
+
 ## SH451 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD NARROWING-SHIFT codegen family (translate.rs SimdShrn — shrn/shrn2/rshrn/rshrn2 Vd.T, Vn.U, #imm) — 5 exact-byte pins
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 unchanged-green (the change is `#[cfg(test)]`-only, so the runtime deliverable
