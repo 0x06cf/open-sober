@@ -1,6 +1,36 @@
 # Open Sober — Agent Handoff
 
-## SH439 (Sep 19, 2026, hermes-worker): hermetic coverage of the float→int UNSIGNED BIG-PATH + fixed-point codegen family (translate.rs FcvtToInt over [2^63, 2^64) — fcvtzu) — 3 exact-byte pins, closes the SH435-named next-forward
+## SH440 (Sep 19, 2026, hermes-worker): hermetic coverage of the byte-COUNT + horizontal-SUM codegen pair (SimdPopcnt `cnt` / SimdSum8 `uaddlv`) — 2 exact-byte pins
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables were
+re-verified green at HEAD first (capture_taskv4_frame.sh: 24 real task-driven
+frames `present swap Ok(0x1)`, 0 json abort, 0 crash — SH439 baseline
+unchanged). Workspace green (cargo test --workspace EXIT 0; arm64jit lib 590/0
+incl. 2 new sh440 pins, was 588; cargo build --example elfjit OK + cargo build
+--workspace OK). Production code ONLY in translate.rs `#[cfg(test)]` addition
+(translator core body byte-untouched; jit.rs 1,048,390 B < 1MiB hook unchanged;
+elfjit.rs/session.rs unchanged).
+- SimdPopcnt/SimdSum8 had no direct byte tests. SH440 pins both to the exact
+  emitted x86 (rd=1, rn=2; Vn@0x130, Vd@0x120): (1) SimdPopcnt full SWAR
+  popcount — load + shr 1/and 0x5555../sub + (x&0x3333..)+((x>>2)&0x3333..) +
+  (x+(x>>4))&0x0f0f.., the three masks ascending + shift ladder 1/2/4;
+  (2) SimdSum8 horizontal byte sum (uaddlv) — three widening sums with shr
+  8/16/32 + masks 0x00ff00ff../0x0000ffff0000ffff/0x00000000ffffffff; the
+  8/16/32-vs-1/2/4 ladder is the count-vs-sum discriminator. Each pins the
+  exact full emit AND the masks/shrs individually incl. negative asserts
+  (popcnt never shr-by-8, sum never shr-by-1) so a ladder cross fails.
+- Deterministic: synthetic Inst -> translate() -> CodeBuf.as_slice() (zero-pc
+  0x1000); [RBX]=CpuState, vector slot v[t]=VECTOR_BASE(0x110)+t*16. Trunk
+  verified by a one-off eprintln dump (removed before commit) so pins match the
+  real emission.
+- Honest: NOT a DM (SH415 probe re-confirms DM-root [0x106a68818]=0x0 under the
+  complete substrate; Route-B live-DM gate UNCHANGED). BUILD-THE-RUNTIME
+  codegen-surface coverage completion on the byte-count + horizontal-reduce
+  family, distinct from SH439 (fcvtzu), SH437 (lanecopy), SH436 (bswl/high-
+  narrow). No re-treads.
+- Files: docs/frontier-sh440-translator-popcnt-sum8.md + crates/arm64jit/src/
+  translate.rs (`#[cfg(test)]` only). Commit 63c17cb.
+
+## SH439 onward (see commit history for the full lantern ledger)
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables were
 re-verified green THIS cycle (capture_taskv4_frame.sh: 24 real task-driven
 frames `present swap Ok(0x1)`, 197 node pops, 0 json abort, 0 crash, EXIT 124).
