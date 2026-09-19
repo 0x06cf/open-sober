@@ -626,7 +626,14 @@ fn auto_value_string_getter(name: &[u8]) -> Option<&'static [u8]> {
         // getrandom all already forward to host) target a real endpoint on the
         // reachable path; "" gave the writer a valid 0-length but no host.
         b"getBaseURL" => Some(b"https://www.roblox.com"),
-        b"getBuildVariant" => Some(b""),
+        // buildVariant (recon-framework-boot-order.md InitParams map: "release").
+        // A production shipping client must present a REAL variant, not empty:
+        // the engine consumes it in config/telemetry identity
+        // (BuildVariant, AddBuildVariantToGlobalTags) and compares against
+        // "release"/"debug"/"production" literals. Empty is a degenerate value
+        // with no correct-world interpretation; "release" is the unambiguous
+        // production constant.
+        b"getBuildVariant" => Some(b"release"),
         b"getUserAgent" => Some(b""),
         b"getAppStarterPlace" => Some(b""),
         b"getAppStarterScript" => Some(b""),
@@ -1936,6 +1943,7 @@ mod tests {
                 match name {
                     b"getBaseURL" => assert_eq!(len, "https://www.roblox.com".len() as u64,
                         "getBaseURL defaults to the real production web root (SH134)"),
+                    b"getBuildVariant" => assert_eq!(len, 7, "getBuildVariant defaults to \"release\" (7 chars)"),
                     b"getSelectedTheme" => assert_eq!(len, 4, "selectedTheme defaults to \"Dark\""),
                     b"getOsVersion" => assert_eq!(len, 2, "osVersion defaults to \"33\""),
                     b"getDeviceName" => assert_eq!(len, 7, "getDeviceName \"Cordial\""),
@@ -2090,7 +2098,6 @@ mod tests {
         assert_eq!(g_sl(env, h, 0, 0, 0, 0, 0, 0) as usize, base.len());
         // The rest of the string params resolve to readable empty jstrings.
         for name in [
-            &b"getBuildVariant"[..],
             &b"getUserAgent"[..],
             &b"getAppStarterPlace"[..],
             &b"getAppStarterScript"[..],
