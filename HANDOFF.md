@@ -1,33 +1,34 @@
 # Open Sober — Agent Handoff
 
-## SH427 (Sep 19, 2026, hermes-worker): hermetic coverage of the arm64→x86 translator CORE (translate.rs) — the single byte-emission mapping every translated block flows through had ZERO direct hermetics; SH427 pins it byte-exactly with 13 deterministic tests (movz-imm32-shortcut, movn-w32 zero-extend truncation, movk read-modify-write clear-mask+or, sub sp,sp imm SP-writeback, cmp wzr XZR-zero + no-SP-writeback + C-pack, neg XZR-zero, sub sp,sp,x1 extended-form slots, adds-32 cmc+nzcv+zext-store, adc cmc+adc, sbc sbb-direct, bic not+and, orr xzr-zero, bcond je rel32)
+## SH428 (Sep 19, 2026, hermes-worker): hermetic coverage of the load/store codegen families (translate.rs LdStrImm + cmn carry path) — the single most load-bearing translation surface (every guest memory access flows through Inst::LdStrImm) had no direct byte tests; SH428 pins it with 9 deterministic exact-byte hermetics (XZR-source store, zero- vs sign-extend loads, scaled-offset lea forms, cmn carry-borrow pack)
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 re-verified green at this exact HEAD first (capture_taskv4_frame.sh attempt 1:
 24 real task-driven frames `present swap Ok(0x1)`, ~196 node pops, 0 json abort,
-0 crash). Workspace green (cargo test --workspace EXIT 0; arm64jit lib 515/0
-incl. 13 new sh427 hermetics; cargo build --workspace OK, 0 errors). Production
-code ONLY in translate.rs tests (`#[cfg(test)]` addition — the translator core
-body is byte-untouched); jit.rs/elfjit.rs/session.rs unchanged.
-- `translate(Inst -> CodeBuf)` is the arm64→x86 byte-emission core (translate.rs
-  ~605): every decoded AArch64 instruction becomes concrete x86 machine-code
-  through this one `match`. decode.rs pins decode (word -> Inst, 76 tests) and
-  jit.rs pins runtime (295 tests), but the STEPS BETWEEN them — how an `Inst`
-  value becomes bytes — had ZERO direct hermetics. A byte error here decodes-
-  ambiguously or faults at runtime with no code-level anchor (the SH423-426
-  coverage-lineage hole; those pinned fsmap/boot/signals/x86-emitter, this pins
-  the arm64-side translator driving them).
-- 13 exact-byte pins via synthetic `Inst` -> translate() -> CodeBuf.as_slice().
-  RBX = CpuState base, guest reg g at [RBX+g*8], SP slot = 0xf8. Pins document
-  intent AND catch regression (e.g. a real `mov r64,imm` leaking into movn-w32,
-  or the SP writeback appearing in `cmp wzr`). Deterministic, no image, no env,
-  runs in parallel with no shared-static race (local buffers only).
+0 crash). Workspace green (cargo test --workspace EXIT 0; arm64jit lib 524/0
+incl. 9 new sh428 hermetics; workspace 705/0; cargo build --workspace OK).
+Production code ONLY in translate.rs tests (`#[cfg(test)]` addition); translator
+core body byte-untouched, jit.rs/elfjit.rs/session.rs unchanged.
+- The exact bytes for `ldr/str` (LdStrImm) were untested (decode has 76 pins,
+  jit has 295, but the load/store EMISSION between them was uncovered). SH428
+  pins the semantically-critical discriminators a byte error would silently
+  corrupt: (1) `str xzr,[..]` stores ZERO (reads x31 as XZR), NEVER the SP slot
+  (64 + 32-bit — a regression writes the stack pointer into memory); (2)
+  zero- vs sign-extending loads (`ldr w` 8b 02 full-64 store / `ldrsb` movzx +
+  shl+sar 56 / `ldrsw` movsxd 48 63 c0); (3) scaled-offset lea addressing
+  (imm*size; imm=2 size=8 -> lea 16); (4) `cmn x,#imm` (shifted, S=1) carry-
+  borrow pack: add imm32 (0x01000000), cmc (f5), C-store `89 93 08 01 00 00` +
+  caller-reg restores.
+- 9 exact-byte pins via synthetic `Inst` -> translate() -> CodeBuf.as_slice().
+  RBX = CpuState base, slot g = [RBX+g*8], SP slot = 0xf8. Deterministic, no
+  image, no env, parallel-safe (local buffers).
 - Honest: NOT a DM (SH415 probe re-confirms DM-root [0x106a68818]=0x0 under the
   complete substrate; Route-B live-DM gate UNCHANGED). BUILD-THE-RUNTIME
-  codegen-surface coverage completion — the translator core was the last big
-  decode-driven surface without self-tests, now pinned byte-exactly. No re-treads
-  (distinct from SH423 fsmap / SH424 boot / SH425 signals / SH426 x86-emitter).
-- Files: docs/frontier-sh427-translator-core-hermetics.md +
-  crates/arm64jit/src/translate.rs (`#[cfg(test)]` only). Commit eb4f40e.
+  codegen-surface coverage completion — continues the SH427 translator-core
+  lineage onto the load/store surface. No re-treads (distinct from SH427's
+  move/add/logic/bcond pins, SH423 fsmap, SH424 boot, SH425 signals, SH426
+  x86-emitter).
+- Files: docs/frontier-sh428-translator-loadstore-hermetics.md +
+  crates/arm64jit/src/translate.rs (`#[cfg(test)]` only). Commit 2c295e9.
 
 ## SH425 (Sep 19, 2026, hermes-worker): hermetic coverage of the guest signal-delivery core (signals.rs) — rt_sigaction/sigprocmask install-query + BLOCK/UNBLOCK/SETMASK with silent SIGKILL/SIGSTOP drop, pending/deliverable ascending-order hold-and-release, and the full installed-handler dispatch → sigreturn context-restore ABI (x0=signo/x1=siginfo/x2=ucontext/x30=SIGRET) had ZERO tests; SH425 pins all of it with 5 deterministic hermetics. The surface a real client leans on for fatal-path diagnostics (SIGTRAP default-terminate exit 133) and cross-thread cooperative signal pickup
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
