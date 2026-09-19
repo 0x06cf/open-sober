@@ -1,6 +1,33 @@
 # Open Sober — Agent Handoff
 
-## SH352 (Sep 19, 2026, hermes-worker): fix the R1 content-path flags-loaded gate address (0x1072739d4, was the read-only 0x10672739d4 -> primary gate silently never armed) + measure the completing skip-appstart ladder end-to-end (app-events return, R1 stages, once-slot "Execute" handle)
+## SH354 (Sep 19, 2026, hermes-worker): close the R1 content-half art — prove the staged CoreScript is SERVICEABLE end-to-end (new hermetic sh354: a guest open of the exact files-dir CoreScript path resolves through fsmap::remap_path to the staged mirror and is readable) + measure that even with the SH352-corrected flags-loaded gate armed (5/5), a completing ladder runs JIT_ASSET_TRACE with 0 hits (content staged-but-DORMANT — loader still waits on a live DM)
+Single-agent (cone suppressed). One new hermetic `sh354_r1_core_script_is_serviceable_through_remap`
+(arm64jit lib 418->419) + a shared module-level `FS_ROOT_LOCK` serializing fsmap-root-mutating tests
+(sh351/sh354) against the parallel-test race (two per-fn OnceLock guards were separate -> both mutated
+the global override concurrently). One genuine new measurement: with `[r1] gate @0x1072739d4 0x0->0x1`
+(the SH352-corrected primary latch) armed and all 5 loader gates writing, 2/2 clean completions of the
+completing ladder show **0 `[asset-trace]` hits** — the staged AppShell/CoreScripts.lua are never opened
+by the loader. This is new (my prior "asset-trace 0" note predates SH352's gate-addr fix). Interpretation:
+arming the loader GATES does not run the loader; ScriptContext (0x101f1d8ac) stays 0-hit because only a
+live DataModel session drives it (SH340/344c). R1 content half is now proven staged + armed + serviceable;
+only the live-DM SESSION half remains the Route-B gate. Workspace green (arm64jit lib 419/0; elfjit
+examples ~159/0; cargo test --workspace exit 0). elfjit.rs 1,048,523 B (<1MB hook, unchanged).
+
+### The forward this cycle
+The content half of the Route-B marker is as complete as it can be WITHOUT a live DM: staged (SH351),
+gates armed (SH352), AND now provably serveable (SH354 — a guest open of the exact CoreScript path
+resolves via remap_path to the mirror and returns the self-constructing ScreenGui module). Plus the
+honest measurement that arming gates alone does not drive the loader (0 asset-trace hits). This isolates
+the remaining Route-B wall precisely to the SESSION half (do-init owning a live DataModel).
+
+### Honest
+No DataModel manufactured; DM-root [0x106a68818]=0, MH_* false; Route-B live-DM structural gate
+UNCHANGED. SH174 capture-latch stays the single forward hook.
+
+### Next (unchanged, authoritative)
+Route-B live-DM structural gate stands (SESSION-CTOR / do-init, SH184/185 four-stacked closure).
+R1 content half: staged (SH351) + gate-armed-verified (SH352) + serviceable-verified (SH354); the SESSION
+half (do-init owning a live DM) remains THE wall. SH174 capture-latch stays the single forward hook.
 Single-agent (cone suppressed). Production fix: `stage_r1_core_scripts` (jit.rs) arming the loader
 gates wrote the flags-loaded latch to 0x10672739d4 (=file 0x672739d4, read-only), so `page_writable_rw`
 refused it and that PRIMARY gate never armed — the other 4 armed, R1 content staged but the
