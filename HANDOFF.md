@@ -1,5 +1,46 @@
 # Open Sober — Agent Handoff
 
+## SH446 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD by-element FMUL codegen family (translate.rs SimdFmulEl — fmul Vd.T, Vn.T, Vm.T[L]) — 4 exact-byte pins
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+unchanged-green (test-only change, runtime byte-identical; SH445 capture
+baseline 24 real task-driven frames `present swap Ok(0x1)`, 0 json abort, 0
+crash, EXIT 0). Workspace green (cargo test --workspace EXIT 0; arm64jit lib
+613/0 incl. 4 new sh446 pins, was 609; cargo build --example elfjit OK).
+Production code ONLY in translate.rs `#[cfg(test)]` addition (translator core
+body byte-untouched; jit.rs 1,048,390 B < 1MiB hook unchanged;
+elfjit.rs/session.rs unchanged).
+- SimdFmulEl (by-element FMUL — each lane Vd = Vn[lane] * Vm[L], a common
+  vector-by-element multiply on vertex/weight/color paths) had zero direct
+  byte tests, and is DISTINCT from SH433's FmlaEl (which is a multiply-
+  ACCUMULATE into the dst; this is a plain multiply). SH446 pins the exact
+  emit (rd=1 rn=2 rm=4; Vd@0x120 Vn@0x130 Vm@0x150): single .2s per lane
+  `movd xmm2,eax` element-broadcast (66 0f 6e d0) ONCE up front + movd xmm0 +
+  `mulss xmm0,xmm2` (F3 0F 59 C2) + movd-back store; double .2d swaps to
+  movq_load xmm2 (f3 48 0f 7e 93 — reg-field=2 -> 0x93) + mulsd (F2 0F 59 C2)
+  + movq_store (66 48 0f d6).
+- THE load-bearing discriminator (the rd==rm clobber guard): the element Vm[L]
+  must be broadcast into xmm2 EXACTLY ONCE, BEFORE the lane loop. When rd==rm
+  (a self-multiply), the first lane's store overlaps the element source, so a
+  per-lane re-read corrupts every lane after 0 with a clobbered value — a
+  silent wrong vector (SH399's FmlaEl ABI noted the broadcast form; the
+  plain-FMUL variant was untested). SH446 pins: broadcast (66 0f 6e d0)
+  precedes the overlapping Vd store; the element source is read from memory
+  exactly once. Also pinned: broadcast-count (1 regardless of lanes) vs
+  product-count (= lane count), element addressing = Vm base + index*es
+  (0x150 idx0 / 0x154 idx1), and the double width discriminator (mulsd f2 +
+  movq 66 48 0f, never single mulss).
+- Deterministic: synthetic Inst -> translate() -> CodeBuf.as_slice() (zero-pc
+  0x1000); [RBX]=CpuState, vector slot v[t]=VECTOR_BASE(0x110)+t*16. Emission
+  established precisely with a one-off eprintln dump (removed before commit)
+  so pins match the real emission. 4 exact-byte pins. A windows(7)-vs-9-byte
+  window-length bug in the double test was corrected (windows(9)) during dev.
+- Honest: NOT a DM (SH415 probe re-confirms DM-root [0x106a68818]=0x0 under the
+  complete substrate; Route-B live-DM gate UNCHANGED). BUILD-THE-RUNTIME
+  codegen-surface coverage completion on the by-element FMUL family, distinct
+  from SH433 (FmlaEl multiply-accumulate). No re-treads.
+- Files: docs/frontier-sh446-translator-fmulel.md + crates/arm64jit/src/
+  translate.rs (`#[cfg(test)]` only). Commit (pending).
+
 ## SH445 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD single-precision FP COMPARE->mask codegen family (translate.rs VecFpCmp — fcmeq/fcmgt/fcmge/facgt/facge) — 3 exact-byte pins
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 re-verified green at this HEAD first (capture_taskv4_frame.sh attempt 1: 24

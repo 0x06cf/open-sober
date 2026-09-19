@@ -9402,6 +9402,88 @@ mod tests {
     }
 
 #[test]
+    fn sh446_fmulel_2s_full_buffer_broadcast_once() {
+        // fmul V1.2s, V2.2s, V4.s[0] (esize=4, q=false, idx=0): each lane =
+        // V2[lane] * V4[0]. The element Vm[0] (rd=1 rm=4 -> Vm@0x150) is
+        // broadcast into xmm2 ONCE up front, then per-lane mulss xmm0,xmm2.
+        let b = tr_bytes(Inst::SimdFmulEl { rd: 1, rn: 2, rm: 4, esize: 4, index: 0, q: false });
+        assert_eq!(b, vec![
+            // broadcast element ONCE into xmm2
+            0x8b, 0x83, 0x50, 0x01, 0x00, 0x00, // mov eax,[rbx+0x150] Vm[0]
+            0x66, 0x0f, 0x6e, 0xd0,             // movd xmm2,eax
+            // lane 0: Vn@0x130 * xmm2 -> Vd@0x120
+            0x8b, 0x83, 0x30, 0x01, 0x00, 0x00, // mov eax,[rbx+0x130] Vn lane0
+            0x66, 0x0f, 0x6e, 0xc0,             // movd xmm0,eax
+            0xf3, 0x0f, 0x59, 0xc2,             // mulss xmm0,xmm2
+            0x66, 0x0f, 0x7e, 0xc0,             // movd eax,xmm0
+            0x89, 0x83, 0x20, 0x01, 0x00, 0x00, // mov [rbx+0x120],eax Vd lane0
+            // lane 1: Vn@0x134 -> Vd@0x124
+            0x8b, 0x83, 0x34, 0x01, 0x00, 0x00, // mov eax,[rbx+0x134] Vn lane1
+            0x66, 0x0f, 0x6e, 0xc0,
+            0xf3, 0x0f, 0x59, 0xc2,             // mulss xmm0,xmm2
+            0x66, 0x0f, 0x7e, 0xc0,
+            0x89, 0x83, 0x24, 0x01, 0x00, 0x00, // mov [rbx+0x124],eax Vd lane1
+        ]);
+        // broadcast-once: exactly ONE movd xmm2 (66 0f 6e d0).
+        assert_eq!(b.windows(4).filter(|w| w == &[0x66, 0x0f, 0x6e, 0xd0]).count(), 1,
+            "fmul-el must broadcast the element into xmm2 exactly ONCE");
+        // element source = Vm base + index*es (rm=4 -> +16, idx0 -> +0 => 0x150).
+        assert!(b.windows(6).any(|w| w == [0x8b, 0x83, 0x50, 0x01, 0x00, 0x00]), "element read at Vm[0]=0x150");
+        // per-lane product uses the SH433-familiar mulss but dst=xmm0 src=xmm2.
+        assert_eq!(b.windows(4).filter(|w| w == &[0xf3, 0x0f, 0x59, 0xc2]).count(), 2,
+            "each of the 2 lanes multiplies via mulss xmm0,xmm2 (f3 0f 59 c2)");
+    }
+
+    #[test]
+    fn sh446_fmulel_4s_index_and_lane_advance() {
+        // fmul V1.4s, V2.4s, V4.s[1] (q=true, idx=1): element at Vm[1] = 0x154
+        // (index*4), 4 lanes. Broadcast still once, dst lanes 0x120..0x12c.
+        let b = tr_bytes(Inst::SimdFmulEl { rd: 1, rn: 2, rm: 4, esize: 4, index: 1, q: true });
+        assert!(b.windows(6).any(|w| w == [0x8b, 0x83, 0x54, 0x01, 0x00, 0x00]), "element read at Vm[1]=0x154 (index*es)");
+        assert_eq!(b.windows(4).filter(|w| w == &[0x66, 0x0f, 0x6e, 0xd0]).count(), 1, ".4s still broadcasts xmm2 once");
+        assert_eq!(b.windows(4).filter(|w| w == &[0xf3, 0x0f, 0x59, 0xc2]).count(), 4, ".4s has 4 lane mulss");
+        // 4 distinct dst lanes advance +4 from 0x120.
+        assert!(b.windows(6).any(|w| w == [0x89, 0x83, 0x28, 0x01, 0x00, 0x00]));
+        assert!(b.windows(6).any(|w| w == [0x89, 0x83, 0x2c, 0x01, 0x00, 0x00]));
+    }
+
+    #[test]
+    fn sh446_fmulel_2d_double_broadcast_and_mulsd_width() {
+        // fmul V1.2d, V2.2d, V4.d[1] (esize=8, idx=1): element via movq_load at
+        // 0x158, per-lane movq_load + mulsd (f2 0f 59 c2) + movq_store (66 48 0f d6).
+        let b = tr_bytes(Inst::SimdFmulEl { rd: 1, rn: 2, rm: 4, esize: 8, index: 1, q: false });
+        assert_eq!(b, vec![
+            0xf3, 0x48, 0x0f, 0x7e, 0x93, 0x58, 0x01, 0x00, 0x00, // movq xmm2,[rbx+0x158] Vm[1]
+            0xf3, 0x48, 0x0f, 0x7e, 0x83, 0x30, 0x01, 0x00, 0x00, // movq xmm0,[rbx+0x130] Vn lane0
+            0xf2, 0x0f, 0x59, 0xc2,                               // mulsd xmm0,xmm2
+            0x66, 0x48, 0x0f, 0xd6, 0x83, 0x20, 0x01, 0x00, 0x00, // movq [rbx+0x120],xmm0 Vd
+        ]);
+        assert!(b.windows(9).any(|w| w == [0xf3, 0x48, 0x0f, 0x7e, 0x93, 0x58, 0x01, 0x00, 0x00]), "double element via movq xmm2 @0x158");
+        assert!(b.windows(4).any(|w| w == [0xf2, 0x0f, 0x59, 0xc2]), "double product via mulsd xmm0,xmm2 (f2 0f 59 c2)");
+        assert!(b.windows(9).any(|w| w == [0x66, 0x48, 0x0f, 0xd6, 0x83, 0x20, 0x01, 0x00, 0x00]), "double store via movq (66 48 0f d6)");
+        assert!(!b.windows(4).any(|w| w == [0xf3, 0x0f, 0x59, 0xc2]), "double must NOT emit single mulss");
+    }
+
+    #[test]
+    fn sh446_fmulel_rd_eq_rm_broadcast_captures_before_overlap_store() {
+        // fmul V4.2s, V2.2s, V4.s[0] (rd==rm==4): the rd==rm clobber guard —
+        // the element V4[0] (also the dst Vd@0x150) must be captured into xmm2
+        // BEFORE the first lane stores back over Vd@0x150, else all lanes after
+        // 0 read the clobbered element. Pin: movd xmm2 (66 0f 6e d0) precedes the
+        // store to 0x150.
+        let b = tr_bytes(Inst::SimdFmulEl { rd: 4, rn: 2, rm: 4, esize: 4, index: 0, q: false });
+        let e_pos = b.windows(4).position(|w| w == &[0x66, 0x0f, 0x6e, 0xd0]).unwrap(); // element->xmm2
+        let s_pos = b.windows(6).position(|w| w == &[0x89, 0x83, 0x50, 0x01, 0x00, 0x00]).unwrap(); // store Vd@0x150
+        assert!(e_pos < s_pos, "rd==rm: must capture the element into xmm2 BEFORE the overlapping Vd store");
+        assert_eq!(b.windows(6).filter(|w| w == &[0x89, 0x83, 0x50, 0x01, 0x00, 0x00]).count(), 1, "dst lane0 stores Vd@0x150 (=Vm[0] source)");
+        // a re-read-implementation would load the element from [rbx+0x150]
+        // inside the lane loop again after the clobbering store — assert the
+        // element source is read exactly ONCE (moves into xmm2 only at the top).
+        assert_eq!(b.windows(6).filter(|w| w == &[0x8b, 0x83, 0x50, 0x01, 0x00, 0x00]).count(), 1,
+            "the element source must be read from memory exactly ONCE (guard corrupts a per-lane re-read)");
+    }
+
+#[test]
     fn sh439_fcvtztoint_fixed_point_fbits_scales_by_2pown_mulsd() {
         // fcvtzu x0, s1, #4 (fixed-point, fbits=4): result = Fn * 2^4.
         // The scale const (2^4 = 16.0 double = 0x4030_0000_0000_0000) is
