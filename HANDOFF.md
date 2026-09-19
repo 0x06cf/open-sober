@@ -1,5 +1,37 @@
 # Open Sober — Agent Handoff
 
+## SH407+SH408 (Sep 21, 2026, hermes-worker): measured the do-init MAIN-arm terminal decisively — the app-start MAIN body [0x10258b5d8,0x10258bbb0] now runs END-TO-END (biggest app-start reach on record; SH362-404 called it unreachable), then drains into the SH341 pool-pop persistence lane; DMCONT 0x102bd1d68 = 0 hits from the MAIN arm. SH408: same env + files-dir/R1 rungs (which did NOT fire) shows LSM init ADVANCES through initStorageManagerNative + crosses the SH285 reader (0x101db1b08 now 0 hits) then next-faults at fault=0x0 in the operator-new/insert-leaf band — the standing unbound whack-a-mole, not a DM advance.
+Single-agent (cone suppressed). Two probes (runs/capture_sh407_appstart_main_terminal.sh,
+runs/capture_sh408_filesdir_lsm.sh) at the SH406 far-reach (DONEPATH_MAIN + SETFIX + GOVFLAG)
+on real libroblox.so. New hermetic `sh407_appstart_body_full_span_runs_end_to_end_and_lsm_init_crosses_reader`
+(arm64jit lib 455->456) byte-pins the FULL app-start body span + the LSM-init deepen. elfjit.rs
+untouched; jit.rs added only the hermetic (default-inert, no production path change).
+
+- **SH407 verdict**: SH406 left the MAIN-arm terminal ambiguous (log ended mid-pool-pop). With
+  region-watch over the whole [0x10258b5d8,0x102590000) + DMCONT + app-shell + governor +
+  scriptctx + pool-pop: ALL 14 block-entry pcs of the app-start body fire (0x10258b5d8..0x10258bbb0,
+  each 1×), NOTHING past the 0x10258bbb0 terminal block, then 190 valid-key pool-pops (SETFIX fired,
+  LR=0x10626b6dc) and EXIT 139 (host-side, no guestpc line). **DMCONT [0x102bd1d68] = 0 real hits**
+  — the MAIN arm does not reach the do-init-completion construction gate; it drains to the standing
+  LSM persistence lane (answers SH405's frontier "Next").
+- **SH408 verdict**: same env + --v2boot-set-filesdir/--v2boot-r1-stage (the files-dir [0x10726d600]
+  global the SH406 env never seeds; real host surface). The seed rungs did NOT fire (no log line —
+  unreached), yet the run reached DEEPER into LSM: initStorageManagerNative 0x101db1050 ENTERED,
+  SH285 reader 0x1d99e30 band entered, append 0x1d9a15c entered, operator-new 0x101db1a38 band
+  entered, insert-leaf 0x101db1d04 fired, and **the SH285 reader wall pc 0x101db1b08 = 0 hits
+  (CROSSED — the old fault terminal from SH260/284/285/344/348/371/372 is bypassed)**. But the run
+  still EXIT 139 with fault=0x0 in the just-entered opnew/insert band — the SH349/350/358/396
+  unconstructed-object whack-a-mole (one fencepost deeper; SH385: node value set only by a real LSM
+  session ctor). Not a DM advance.
+- **Honest**: no DM (DM-root 0, once-slot 0x400000b sentinel, MH_* false, DMCONT unreached from the
+  MAIN arm). Route-B live-DM structural gate UNCHANGED. This is map-completion + two successive
+  persistence-lane fenceposts (reader crossed, opnew/insert fault), not a DM advance. The app-start
+  body is now fully cleared — the single biggest SESSION-CTOR reach on record.
+- Do-not-re-tread unchanged: do NOT re-drive LSM skips (SH349/350/358), do NOT re-manufacture the
+  map to cross SH285 (SH396), standing closures (setDataModelToCurrent SH388, EC reader SH355/356/374,
+  window-attach real SH367, ALooper SH365, -9 string SH380, map-header SH248h, once-lambda SH381).
+  SH174 capture-latch single forward observer (with DELEGATE=1, SH395).
+
 ## SH406 (Sep 21, 2026, hermes-worker): extended the SH269 GOVFLAG fixed-.bss flag seed to the SH405 MAIN-arm app-start continuation — the 0x10258b5d8 app-start body's continuation now PASSES the NULL-controller deref it faulted at (guestpc 0x1025f501c) and drains into the standing SH285/SH341 persistence lane; DMCONT 0x102bd1d68 still 0 hits
 Single-agent (cone suppressed). No production behavior change (default-inert opt-in
 JIT_ROUTEB_APPSART_GOVFLAG; widening the guard's pc-window does nothing when unselected).

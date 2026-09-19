@@ -6264,34 +6264,27 @@ fn cached_block(
     Ok(leaked)
 }
 
-/// A block-level, PC-driven JIT executor for a guest image whose AArch64 bytes
-/// live at guest address `base` (guest vaddr == host address). This supports
-/// single-shot `compile_image` cannot: each reachable region is compiled via
-/// `compile_image` (which inlines static `b`/`b.cond`/`cbz`/`bl` and stops with
-/// `pc=…; ret` at a `br`/`blr`/`ret`), then run; when it returns because of such
-/// an indirect/return transfer, `state.pc` holds the next address, so the
+/// A block-level, PC-driven JIT executor for a guest image whose AArch64 bytes live at guest
+/// address `base`. Supports what single-shot `compile_image` cannot: each reachable region is
+/// compiled via `compile_image` (inlining static b/b.cond/cbz/bl, stopping at br/blr/ret), run,
+/// and when it returns on an indirect/return transfer, `state.pc` holds the next address, so the
 /// dispatcher compiles & re-enters there. Halts when `pc == 0`.
 // ---------------------------------------------------------------------------
-// SH202: on-demand single-site V2 singleton-dispatch family patcher.
-// SH200 patched 4 located objB-vtable sites deterministically, but the ~365-site
-// family (sh201_v2_family_scan) stops V2Init/V2Start run-variably at OTHER sites
-// (blr 0x1062514e0/0x106259a50/0x106265f40 measured), so SH199 world-build gate
-// 0x102ea3b14 is never reliably reached. Family-wide patch crash-loops (SH201
-// over-patch: touches genuine in-band N<0xf0 -> SIGABRT), so not pre-scribable.
-// SH202's lever: patch ONLY the exact site the run ACTUALLY dispatches through,
-// ON DEMAND, at the outside-image stop (guest `blr x8` into host box-alloc set
-// x30=blr+4 -> `blr_site=x30-4`). Safe to: verify family member, patch dispatch
-// window (materialize stable singleton into x0 + nop blr), drop block cache,
-// rewind pc, `continue` run_loop. Blinded clearing one site at a time.
-// Default-INERT: only fires when JIT_ROUTEB_V2_ONDEMAND=1.
+// SH202: on-demand single-site V2 singleton-dispatch family patcher. SH200 patched 4 located objB
+// vtable sites, but the ~365-site family stops V2Init/V2Start run-variably at OTHER sites (blr
+// 0x1062514e0/0x106259a50/0x106265f40); SH199 world-build gate 0x102ea3b14 never reliably reached.
+// Family-wide patch crash-loops (SH201 over-patch touches in-band N<0xf0 -> SIGABRT). SH202's
+// lever: patch ONLY the exact site the run ACTUALLY dispatches through, ON DEMAND, at the
+// outside-image stop (guest `blr x8` into host box-alloc set x30=blr+4 -> blr_site=x30-4). Safe:
+// verify family member, patch dispatch window (materialize stable singleton into x0 + nop blr),
+// drop block cache, rewind pc, continue run_loop. Blinded one site at a time. Default-INERT
+// (JIT_ROUTEB_V2_ONDEMAND=1).
 // ---------------------------------------------------------------------------
-/// SH202 pure classifier: given the guest address of a candidate `blr x8`,
-/// decide whether it is a genuine objB-getter singleton-dispatch family site
-/// and, if so, return the guest address where its patch window must START (the
-/// `ldr x8,[x0]` guard). Mirrors sh201_v2_family_scan's discriminators exactly:
-/// a `bl 0x6249eb8` (objB getter) within 16 back, an `ldr x8,[x0]` AFTER it,
-/// and a past-0x60 `ldr x8,[x8,#N]` (N*8>=0x60) within the 4 slots before the
-/// blr. `word_at` uses `base`/`image` in guest space. Pure + hermetic-tested.
+/// SH202 pure classifier: given a candidate `blr x8` guest address, decide whether it is a genuine
+/// objB-getter singleton-dispatch family site and, if so, return the guest address where its patch
+/// window must START (the `ldr x8,[x0]` guard). Mirrors sh201_v2_family_scan: a `bl 0x6249eb8`
+/// (objB getter) within 16 back, an `ldr x8,[x0]` AFTER it, and a past-0x60 `ldr x8,[x8,#N]`
+/// (N*8>=0x60) within the 4 slots before the blr. `word_at` uses `base`/`image`. Pure + hermetic.
 fn v2_family_window_base() -> u64 {
     (0x6249eb8u64) + 0x100000000 // guest addr of the objB singleton getter
 }
@@ -6994,28 +6987,18 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
                         }
                     }
                 }
-                // SH92: at INSERT entry (0x1029f3e70), a NON-FAMILY map/this must also substitute.
-                // The OTel registrar loop (file 0x29b3814) reads its INSERT map from [0x106838380];
-                // that slot can hold the `.data` descriptor-table base 0x1067da308 (in-image, so
-                // SH88's v<0x100000000 predicate passes it) — a NON-coherent object, not the seeded
-                // empty map. Its +0x10 (=[0x67da318]=0x00a80000003f0060) is not a family hash, so
-                // the +0x18 repair `continue`s and INSERT runs with garbage -> its +0x30 stack-spill
-                // slot executes as code (fault==rip==stack, observed 0x1029b3828). Overwrite the
-                // candidate with the seeded substitute iff NOT a real family map:
-                //   m==0 or m<0x100000000  -> invalid/sub-image -> substitute
-                //   else [m+0x10] not in {SPAN_HASH,STRING_HASH} -> non-family object -> substitute
-                // (A real family map's +0x10 IS one of those hashes and is never overwritten;
-                // the seeded substitute itself has +0x10==SPAN_HASH so it is never re-substituted.)
-                // SH94: CRITICAL — only substitute x0 unconditionally; substitute x19 ONLY when
-                // x0 is ALSO non-family. In the registrar loop (file 0x29b37e0: `mov x1,x19;
-                // bl 29f3e70; ldr x8,[x19,#16]!; cbnz x8,<loop>`) x19 is the WALK ITERATOR / KEY
-                // (callee-saved, survives the INSERT call), NOT the map. INSERT's prologue
-                // reloads its map from x0 (0x29f3e98 mov x19,x0), so substituting x19 is useless
-                // to the call BUT — because x19 is callee-saved — returns the corrupted value to
-                // the caller whose `[x19+16]` then reads the substitute's +0x10 = SPAN_HASH
-                // (nonzero) FOREVER -> the registrar's `cbnz` never terminates -> 6.6M-iteration
-                // spin. Only clobber x19 when the real crash case applies (x0 is ALSO non-family,
-                // so x0 got the substitute and x19 was observed holding the real span map).
+                // SH92: at INSERT entry (0x1029f3e70) a NON-FAMILY map/this must also substitute.
+                // OTel registrar loop (0x29b3814) reads its INSERT map from [0x106838380], which can
+                // hold the `.data` descriptor-table base 0x1067da308 (in-image => SH88 predicate passes).
+                // +0x10 (=[0x67da318]=0x00a80000003f0060) is not a family hash, so +0x18 repair
+                // continues and INSERT runs with garbage -> +0x30 stack-spill executes (fault==rip==stack
+                // 0x1029b3828). Substitute the candidate iff NOT a real family map: m==0 / m<0x100000000
+                // invalid; else [m+0x10] not in {SPAN_HASH 0x1029b4a84, STRING_HASH 0x102a25dec} => non-family.
+                // SH94: only substitute x0 unconditionally; x19 ONLY when x0 is ALSO non-family. In the
+                // registrar loop (0x29b37e0 `mov x1,x19; bl 29f3e70; ldr x8,[x19,#16]!; cbnz`) x19 is the
+                // WALK iterator / KEY (callee-saved), not the map (INSERT reloads map from x0 @0x29f3e98
+                // mov x19,x0); clobbering x19 returns the substitute's +0x10=SPAN_HASH (nonzero) forever ->
+                // `cbnz` never terminates -> 6.6M-iter spin. Clobber x19 only when x0 is also non-family.
                 const FAMILY_HASHES: [u64; 2] = [0x1029b4a84, 0x102a25dec]; // span + string
                 if pc == 0x1029f3e70 {
                     if let Some(s) = sub {
@@ -10336,21 +10319,17 @@ mod tests {
 
     #[test]
     fn sh355_ec_reader_block_no_softreturn_gate_is_live_object_slot() {
-        // SH355 (single-agent, real-image): CORRECTS the sh301/sh302 record. sh301's doctrine
-        // asserted the EC body "provably soft-returns BEFORE the reader at 0x2e246f4". Fresh
-        // disasm of the real block [0x2e245f4..0x2e247dc] REFUTES that: there is NO `ret`
-        // (0xd65f03c0) anywhere in [0x2e245f4, 0x2e246dc] — the block's only out to the reader
-        // is the REAL data-dependent branch `cbz x0, 0x2e246f4` at 0x2e246dc, where
-        // x0 = [x8+#32] = [[x29,#104]+0x20], and [x29,#104] is loaded at 0x2e246b0. So the
-        // reader is gated on a CLOSED-LOOP live-object slot (SH174/SH204 class), NOT a compile-
-        // block "internal early-exit" artifact. The interior string-assign `bl 0x2b504e4` at
-        // 0x2e24690 returns to 0x2e24694 = a REAL block boundary (sh301 proved interior bls
-        // open block entries), so the reader-gate block starts at 0x2e24694. Consequence for
-        // the next frontier: sh302's seed of entry_sp+8 is mechanism-correct but only helps if
-        // the SAME frame that reaches 0x2e246dc is the one seeded (entry-timing, not block-cache);
-        // the residual is the live-object pointer value at [x29,#104]+0x20, i.e. we must hand a
-        // coherent object whose [+0x20]==0 to the actual construction entry — a value seed that
-        // fabricates the live object, not a compile/early-exit fix.
+        // SH355 (single-agent, real-image): CORRECTS sh301/sh302. sh301 claimed the EC body
+        // "provably soft-returns BEFORE the reader at 0x2e246f4"; fresh disasm of [0x2e245f4..0x2e247dc]
+        // REFUTES that — NO `ret` (0xd65f03c0) in [0x2e245f4,0x2e246dc]; the block's only out to
+        // the reader is the REAL data-dependent `cbz x0,0x2e246f4` @0x2e246dc, x0=[x8+#32]=
+        // [[x29,#104]+0x20], [x29,#104] loaded @0x2e246b0. So the reader is gated on a CLOSED-LOOP
+        // live-object slot (SH174/SH204), NOT a compile-block early-exit. The interior `bl 0x2b504e4`
+        // @0x2e24690 returns to 0x2e24694 = a real block boundary (sh301 proved interior bls open
+        // block entries), so the reader-gate block starts at 0x2e24694. sh302's entry_sp+8 seed is
+        // mechanism-correct but only helps if the SAME frame reaching 0x2e246dc is seeded
+        // (entry-timing); the residual is the live-object pointer at [x29,#104]+0x20 — hand a
+        // coherent object whose [+0x20]==0 to the construction entry (a value seed, not a compile fix).
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let img = std::fs::read(p).expect("read real libroblox.so");
@@ -17267,23 +17246,16 @@ mod fp16_and_fabd_fccmp_exec {
 
     #[test]
     fn type4_taskv4_vector_has_no_in_code_install_site_and_uses_static_base() {
-        // SH44/SH46: the drain's type-4 popped-task dispatch reads guest
-        // `0x106829ea8` via `adrp x8,6829000; ldr x3,[x8,#3752]` (dispatcher
-        // file 0x2853784). The vector is runtime-.bss, populated only by real
-        // Android-framework producer glue absent headlessly. SH46's full-image
-        // objdump scan proved NO guest instruction stores to it with that static
-        // base (every other `[x,#3752]` store is struct-relative on heap/sp
-        // regs). These constants pin that dead-end so future cycles don't re-derive
-        // it, and identify exactly what a framework-glue seed must write.
-        // SH52 additionally ruled out the *computed-base* install A 2026-09-12
-        // recon (docs/recon-framework-boot-order.md) claimed the vector is
-        // installed IN-IMAGE by TaskScheduler/V2-init code that SH46's scan just
-        // "never reached" (a plausible-sounding reframe: guest 0x106829ea8 == the
-        //   so `adrp 6829000; str [xN,#0x28]` would escape a literal scan — disasm disproves:
-        //   0x2953e30 clears bss first qword (0x6829e80), 0x295427c/2ec use +0x8 atomic counter;
-        //   other adrp-6829000 adds target #0xba8/#0xe80/#0xe88/#0xf00, none #0xea8. No in-image
-        //   store reaches the vector => installed only by cross-module glue or a host seed (out of
-        //   an in-binary scan). See docs/frontier-sh52-media-keys-data.md.
+        // SH44/SH46: the drain's type-4 popped-task dispatch reads `0x106829ea8` via
+        // `adrp x8,6829000; ldr x3,[x8,#3752]` (dispatcher file 0x2853784). The vector is
+        // runtime-.bss, populated only by real Android-framework producer glue absent headlessly.
+        // SH46's full-image objdump scan proved NO guest instruction stores to that static base
+        // (every other `[x,#3752]` store is struct-relative on heap/sp regs). SH52 also disproved
+        // the computed-base "in-image install" reframe (recon-framework-boot-order): disasm shows
+        // 0x2953e30 clears bss first qword (0x6829e80), 0x295427c/2ec use +0x8 atomic counter, other
+        // adrp-6829000 adds target #0xba8/#0xe80/#0xe88/#0xf00, none #0xea8 — no in-image store
+        // reaches the vector => installed only by cross-module glue or a host seed. Pin the fixed
+        // guest target so a framework-glue/host seed writes exactly this cell.
         const DISPATCH_ADRP_PAGE: u64 = 0x6829000; // file vaddr of `adrp x8, 6829000`
         const DISPATCH_OFF: u64 = 3752; // `ldr x3,[x8,#3752]` -> file 0x6829ea8
         const VECTOR_FILE: u64 = DISPATCH_ADRP_PAGE + DISPATCH_OFF;
@@ -17780,6 +17752,44 @@ mod fp16_and_fabd_fccmp_exec {
     }
 
     #[test]
+    fn sh407_appstart_body_full_span_runs_end_to_end_and_lsm_init_crosses_reader() {
+        // SH407 probe: do-init MAIN arm (DONEPATH_MAIN) runs the app-start body 0x10258b5d8
+        // through its FULL terminal block 0x10258bbb0 (all block-entry pcs fire, nothing past),
+        // then drains to the SH341 pool-pop lane (190 valid-key pops, SETFIX). DMCONT
+        // 0x102bd1d68 NOT reached from this arm — biggest app-start reach on record (SH362/404
+        // called it unreachable). SH408 probe (same env, files-dir/R1 rungs did NOT fire): LSM init
+        // ADVANCES through initStorageManagerNative + crosses the SH285 reader (0x101db1b08=0)
+        // then next-faults fault=0x0 in opnew/insert (whack-a-mole). Byte-pin both.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let word_at = |vaddr: u64| -> u32 {
+                let off = (vaddr & 0xffff_ffff) as usize;
+                u32::from_le_bytes([img[off], img[off + 1], img[off + 2], img[off + 3]])
+            };
+            // App-start MAIN body (SH407 full-span).
+            assert_eq!(word_at(0x10258b5d8), 0xd105_c3ff, "sh407 body prologue sub sp,#0x170");
+            assert_eq!(word_at(0x10258b644), 0xf940_0008, "sh407 mid ldr x8,[x0]");
+            assert_eq!(word_at(0x10258b850), 0x3941_23e8, "sh407 mid ldrb w8,[x31,#72]");
+            assert_eq!(word_at(0x10258bbb0), 0xf940_02e8, "sh407 TERMINAL block ldr x8,[x23] (body end)");
+            assert_eq!(word_at(0x10258c000), 0x5280_0061, "sh407 next fn (mov w1,#1) — body bounded at 0x10258bbb0");
+            // LSM-init deepen (SH408): initStorage + real LSM ctor + reader/append/opnew/insert.
+            assert_eq!(word_at(0x101db0dfc), 0xa9bc_7bfd, "sh408 LSM ctor prologue stp x29,x30,[sp,#-64]!");
+            assert_eq!(word_at(0x101db1050), 0xa9bf_7bfd, "sh408 initStorageManagerNative prologue");
+            assert_eq!(word_at(0x101db1084), 0xd002_ac08, "sh408 initStorage adrp");
+            assert_eq!(word_at(0x101db1a38), 0xd102_43ff, "sh408 operator-new band sub sp,#0x90");
+            assert_eq!(word_at(0x101db1b08), 0xd100_83a2, "sh408 SH285 reader footer — CROSSED (old terminal bypassed)");
+            assert_eq!(word_at(0x101db1d04), 0xb400_0240, "sh408 insert-leaf cbz-then-ldset");
+            assert_eq!(word_at(0x101d99e30), 0x1400_0001, "sh408 reader 0x1d99e30 leaf");
+            assert_eq!(word_at(0x101d9a15c), 0xb940_0048, "sh408 append base ldr w8,[x0]");
+            assert_eq!(word_at(0x101d9a5a0), 0xd101_c3ff, "sh408 pool-pop entry sub sp,#0x70");
+            eprintln!("[abi] sh407/408 pinned: app-start 0x10258b5d8..0x10258bbb0 full span + LSM 0x101db1050..0x101db1d04 (reader crossed)");
+        } else {
+            eprintln!("sh407 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn routeb_hashfix_repairs_garbage_hash_fn2_slot() {
         // SH83 (--v2boot ladder): nativeGameGlobalInit's registration path builds a
         // string-keyed hash-map whose insert dispatch (file 0x29f3f6c `ldp x1,x8,[x19,#16]`)
@@ -18024,28 +18034,17 @@ mod fp16_and_fabd_fccmp_exec {
 
     #[test]
     fn type4_vector_seed_accepts_real_in_image_guest_function() {
-        // SH58: the recon §3.6 "interim fallback" — seed the type-4 popped-task
-        // vector [0x106829ea8] with a REAL in-image guest handler (not the host
-        // `probe` thunk that every SH44-57 run used) — was empirically executed
-        // for the first time on the real libroblox.so:
-        //
-        //   --taskv4-seed 0x105b32c00 (the engine's own frame-fn)
-        //     + --deque-node-live + --drain-poll
-        //
-        // Seeding the vector with the engine's REAL frame-fn made the drain's
-        // type-4 dispatch (`adrp x8,6829000; ldr x3,[x8,#3752]; br x3` at file
-        // 0x2853784) ACTUALLY br into real engine code: the frame-fn body
-        // executed its own renderer list-find at guest 0x105b2e98c before
-        // faulting on the ABI mismatch (the vector passes
-        // handler(node, [node+32]&~1, consumer, ...) but frame-fn expects a
-        // coherent renderer/view). Confirms the plane mechanically dispatches a
-        // real guest function pointer — the wall is (and only ever was) that
-        // the framework-installed "process popped task node" worker address is
-        // external glue absent in-image, NOT that the vector rejects guest code.
-        // These constants pin that the seed accepts a real in-image guest fn so
-        // a future real-producer seed is mechanically valid (must match the
-        // (node, [node+32]&~1, consumer) ABI, not frame-fn's). See
-        // docs/frontier-sh58-taskv4-realseed.md.
+        // SH58: seed the type-4 popped-task vector [0x106829ea8] with a REAL in-image guest handler
+        // (not the host `probe` thunk of SH44-57), first executed on real libroblox.so via
+        // `--taskv4-seed 0x105b32c00` + --deque-node-live + --drain-poll. Seeding the vector with the
+        // engine's real frame-fn made the type-4 dispatch (`adrp x8,6829000; ldr x3,[x8,#3752]; br x3`
+        // @file 0x2853784) ACTUALLY br into real code: frame-fn ran its own renderer list-find
+        // 0x105b2e98c before faulting on the ABI mismatch (vector passes handler(node,[node+32]&~1,
+        // consumer); frame-fn wants a coherent renderer/view). Proves the plane mechanically
+        // dispatches a real guest fn — the wall is (and only ever was) that the installed worker
+        // pointer is external glue absent in-image, NOT that the vector rejects guest code.
+        // Any real-producer seed must match the (node,[node+32]&~1,consumer) ABI, not frame-fn's.
+        // See docs/frontier-sh58-taskv4-realseed.md.
         const TASKV4_VECTOR: u64 = 0x106829ea8; // guest addr the drain br's to (w4=4)
         const FRAME_FN: u64 = 0x105b32c00; // the engine's own real frame function
         // The vector is a plain READABLE function-pointer slot (guest==host here),
@@ -18127,26 +18126,18 @@ mod fp16_and_fabd_fccmp_exec {
 
     #[test]
     fn scene_renderer_constructs_frame_desc_even_with_empty_scene() {
-        // SH62 (docs/frontier-sh62-renderscene.md): the engine's REAL frame-plane
-        // driver is guest 0x105b2ead4 (the scene renderer) — NOT the clear-path
-        // frame-fn 0x105b32c00 the SH60/61 harness drove with a host-FABRICATED
-        // coherent renderer. Driving it with a fabricated-but-engine-native
-        // render-manager R makes the ENGINE construct+register its own real
-        // 0x98-byte frame-desc (its own operator-new 0x1d96768 / frame ctor
-        // 0x5b34de8 / linker 0x5b2d9e0) and present it via the real ctx swap.
-        //
-        // Verified on the real libroblox.so headlessly (the run is the artifact;
-        // this test pins the derived contract): R+0x160=ctx, R+0x170=view
-        // (W/H at +112/+116), R+0x180/0x188=scene-list head/tail. The disasm
-        // (file 0x5b2ead4) reads: `ldr x8,[R+352]`(ctx); ctx-vt[+16]=make-current
-        // 0x105b3b358 bind; `ldp w1,w2,[view+112]`; dims-query ctx-vt[+64]; then
-        // — UNCONDITIONALLY, before ever checking the scene array — operator-new
-        // 0x98, frame ctor 0x5b34de8, linker 0x5b2d9e0(&R+0x170,frame). Only then
-        // `ldp x8,x24,[R+384]` compares scene head/tail; equal (empty) => skip =>
-        // return 1. So even an empty scene array yields a constructed+registered
-        // real frame. The frame ctor sets vtable 0x6731000+0x7b0=0x106731b00 at
-        // [+0], a w7-derived u32 at [+140], and the [+144] byte flag =1 — the
-        // engine_registered predicate the --renderscene lever checks.
+        // SH62 (frontier-sh62-renderscene): the engine's REAL frame-plane driver is 0x105b2ead4
+        // (the scene renderer) — NOT the SH60/61 clear-path frame-fn 0x105b32c00 driven with a
+        // host-fabricated renderer. Driving it with a fabricated-but-engine-native render-manager R
+        // makes the ENGINE construct+register its own real 0x98-byte frame-desc (own operator-new
+        // 0x1d96768 / frame ctor 0x5b34de8 / linker 0x5b2d9e0) and present via the real ctx swap.
+        // Verified headlessly on real libroblox.so: R+0x160=ctx, R+0x170=view (W/H at +112/+116),
+        // R+0x180/0x188=scene-list head/tail. Disasm 0x5b2ead4: `ldr x8,[R+352]`(ctx);
+        // ctx-vt[+16]=make-current 0x105b3b358; `ldp w1,w2,[view+112]`; dims-query ctx-vt[+64]; then
+        // UNCONDITIONALLY (before the scene check) operator-new 0x98 + frame ctor 0x5b34de8 +
+        // linker 0x5b2d9e0(&R+0x170). Only then `ldp x8,x24,[R+384]` compares head/tail; empty =>
+        // skip => return 1. Frame ctor sets vtable 0x6731000+0x7b0=0x106731b00 at [+0], a w7-derived
+        // u32 at [+140], [+144] byte flag=1 — the engine_registered predicate --renderscene checks.
         const SCENE_RENDERER: u64 = 0x105b2ead4; // engine's real scene/frame-plane driver
         const FRAME_CTOR: u64 = 0x105b34de8; // frame-desc ctor (vtable 0x106731b00, [+144]=1)
         const FRAME_LINKER: u64 = 0x105b2d9e0; // link(container=&R+0x170, frame)

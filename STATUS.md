@@ -1,50 +1,57 @@
 # Open-Sober run status (hermes-worker)
 
-Updated 2026-09-20, this cycle: SH378 + SH379 closed two never-run intersections — 
-(378) the SH174 DM-allocation capture latch (CAPTURE-ONLY) is silent even on the furthest-advancing
-skip-appstart env (SendAppEventOnAppReady returns Ok; 0 validated make_shared<DataModel>, trail never
-installs, terminal = LSM pool-pop 0x101d9a528); (379) the GOVFLAG+PRELOAD+PACK_SKIP governor gates are
-INEFFECTUAL on the FULL ladder (app-start driven) — governor/DM-creator/setDataModelToCurrent/
-ScriptContext 0 hits, drains to the same closed persistence lane. Confirms the Route-B live-DM wall is
-path-independent and still structural. recon-v3 deliverables re-verified green.
+Updated 2026-09-21, this cycle: SH407+SH408 — two probes decisively characterized the do-init
+MAIN-arm terminal. SH407: the app-start MAIN body [0x10258b5d8,0x10258bbb0] now runs END-TO-END
+(biggest app-start reach on record; SH362-404 called it unreachable — all 14 block-entry pcs fire),
+then drains into the SH341 pool-pop persistence lane (190 valid-key pops, SETFIX fired); DMCONT
+0x102bd1d68 = 0 real hits from the MAIN arm (region-watch distinction vs the spec-string count).
+SH408: same env + files-dir/R1 rungs (which did NOT fire — unreached) shows LSM init ADVANCES
+through initStorageManagerNative + crosses the SH285 reader (0x101db1b08 now 0 hits = old fault
+terminal bypassed) then next-faults at fault=0x0 in the opnew/insert band — the standing unbound
+whack-a-mole, one fencepost deeper, not a DM advance. New hermetic sh407 byte-pins the full
+app-start body span + the LSM-init deepen (arm64jit lib 455->456).
 
 ## Current state
 
-- `dev` HEAD (local): SH379 (probes + frontier docs + ledger). Workspace green (cargo test --workspace
-  EXIT 0, 616 passed/0 failed, arm64jit 436/0). elfjit.rs under 1MiB hook.
-- recon-v3 deliverables CONFIRMED green this cycle (capture_taskv4_frame.sh attempt 1: 24 real
-  task-driven frames swap Ok(0x1), 197 node pops, 0 json abort, 0 crash; JIT_JSON_ZERO_FIX present).
-- Route-B live-DM structural gate UNCHANGED: DM-root [0x106a68818]=0, MH_* all false, AppBridgeV2
-  [0x106a705e8]=0x0.
+- `dev` HEAD: SH407 (app-start MAIN body full-span hermetic + frontier doc; workspace green,
+  456 arm64jit lib tests; elfjit.rs untouched, jit.rs + hermetic only).
+- Workspace green (cargo test --workspace EXIT 0 re-confirmed this cycle).
+- recon-v3 deliverables green (24 real task frames swap Ok(0x1), producer INERT, JSON fix).
 
-## What advanced this cycle
+## Session's advances (SH406 -> SH407+SH408)
 
-- **SH378**: clean readback of the single SH174 forward hook at the farthest reach (closes SH344's
-  unread DELEGATE record). Capture-ONLY (no disruptive DELEGATE) on the SH377 advancing skip-appstart
-  env: SendAppEventOnAppReady returns Ok(0x107273d50) but the trail never installs and `[validated]`=0 —
-  no make_shared<DataModel> even at the furthest-forward write. Also caller-attributed the SH377
-  terminal 0x10284cf5c: all its callers pass FIXED bss globals (adrp 6dd4000/7273000/683c000...), never
-  NULL, so the x0=0 fault is a run-variable create-once fence in the persistence family (not seedable).
-- **SH379**: the governor-crossing gates (GOVFLAG+PRELOAD+PACK_SKIP) only matter on the skip-appstart
-  send-appevent env (SH376/377); on the FULL app-start-driven ladder they are INEFFECTUAL — the run
-  drains into the LSM pool-pop lane (0x101d9a528) before the governor is reached (0 gov/DM-creator/
-  ScriptContext hits). Refines SH376's corrected terminal sequence as path-specific; both paths converge
-  on the same closed persistence lane.
+- **SH406**: extended SH269 GOVFLAG seed to the SH405 MAIN-arm app-start continuation; the
+  0x10258b5d8 body's continuation PASSES the NULL-controller deref (0x1025f501c) and drains into
+  the SH341 persistence lane; DMCONT 0.
+- **SH407** (this cycle): measured the MAIN-arm terminal — the app-start body runs END-TO-END
+  (0x10258b5d8..0x10258bbb0 all 14 block-entry pcs fire, nothing past), then 190 valid-key
+  pool-pops (SETFIX fired) and EXIT 139 (host-side). DMCONT = 0 real hits; the MAIN arm drains to
+  the standing LSM persistence lane, not do-init-completion (closes SH405's frontier question).
+- **SH408** (this cycle): same env + files-dir/R1 rungs (seed unreached) — LSM init ADVANCES
+  through initStorageManagerNative + crosses the SH285 reader (0x101db1b08 = 0) then faults
+  fault=0x0 in opnew/insert band (whack-a-mole one deeper; SH385 node value needs a real LSM ctor).
 
 ## Honest status
 
-- Route-B live-DM structural gate UNCHANGED; SH174 capture-latch stays the single forward observer.
-  Both recon-v3 deliverables re-verified green. Two new never-run intersections measured negative — the
-  wall is confirmed path-independent (full ladder and skip-appstart env both drain into the closed LSM
-  family before any live DM / governor / Lua).
+- Route-B live-DM structural gate UNCHANGED (DM-root [0x106a68818]=0, MH_* false, AppBridgeV2
+  genuine vt 0x1063a3410 unchanged). No DM manufactured; DMCONT unreached from the MAIN arm
+  (reachable only via the settings-state/SH371 env, where it also terminates at the LSM lane SH372).
+- The app-start MAIN body is now fully cleared end-to-end (the biggest SESSION-CTOR reach on
+  record); the persistence lane is measured-returned at two successive fenceposts (reader crossed,
+  opnew/insert fault). Only a real session ctor (LocalStorageManager, do-init completion) crosses
+  it — the standing SESSION-CTOR / BUILD-THE-RUNTIME deliverable.
 
 ## Next-forward candidates
 
-1. (PRIMARY, standing) SESSION half remains THE wall: do-init must own a live DM (SH184/185). The
-   governor/preload walls pass only on the skip-appstart env; the residual is the SH350/378/379 pack-lane
-   (measured-closed — do NOT re-drive LSM sub-call skips, SH349/350/358/373/375/377/378/379 stand).
-2. R1 content half staged+armed+serviceable (SH351/352/354); fires the moment a live DM drives the loader.
-3. Do NOT re-drive LSM skips; do NOT re-attack EC reader-gate (SH356/374); do NOT re-attack 0x258b5d8/
-   SetInitParams (SH362/375); do NOT re-arm window-attach once-guard (SH367); do NOT re-enter ALooper
-   (SH365); do NOT re-arm JIT_DM_ALLOC_CAPTURE_DELEGATE (SH344/378); do NOT expect governor gates to
-   change the full-ladder terminal (SH379).
+1. (standing, TOP — Route B) The persistence lane is measured-returned at two fenceposts (SH407/408).
+   The app-start body is clear; the forward is the real session-compat runtime surface (SH400
+   substrate + a real LSM/EGL/onAppReady host drive) so the engine SELF-constructs its
+   LocalStorageManager + DM. Do NOT re-drive LSM skips (SH349/350/358) or re-manufacture the map
+   (SH396).
+2. DMCONT 0x102bd1d68 = 0 from the MAIN arm; reachable only via the SH371 settings-state env.
+3. R1 content half staged+armed (SH351/352/354); fires the instant a live DM drives the loader.
+4. Do NOT re-tread: setDataModelToCurrent (SH388), LSM crossings/composed (SH385/393/396),
+   SH285/SH341 family (SH349/350/358/373/395-398), EC reader-gate (SH355/356/374), 0x258b5d8/
+   SetInitParams (SH362/375), window-attach real (SH367), ALooper (SH365), governor-gates (SH379),
+   once-lambda store (SH381), app-cmd 1/13/15/17/18 (SH393).
+5. Do NOT run the SH174 latch without JIT_DM_ALLOC_CAPTURE_DELEGATE=1 (SH395).
