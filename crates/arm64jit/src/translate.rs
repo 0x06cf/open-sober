@@ -7366,6 +7366,8 @@ mod tests {
         c.as_slice().to_vec()
     }
 
+    // TEMPORARY-REMOVED probe (captured emission, then deleted).
+
     // SH440: hermetic coverage of the byte-COUNT + horizontal-SUM codegen pair
     // (translate.rs SimdPopcnt — `cnt Vd.8b, Vn.8b`; SimdSum8 — `uaddlv
     // h{rd}, Vn.8b`). These SWAR reductions had zero direct byte tests. SH440
@@ -9724,5 +9726,112 @@ mod tests {
         // the all-ones mask construction appears once/lane: test + sete + neg =
         // every lane's result is 0 or 0xffffffffffffffff (64-bit neg of 0/1).
         assert_eq!(b.windows(3).filter(|w| *w == [0x48, 0xf7, 0xd8]).count(), 2, "2 neg rax (0-or-allones)");
+    }
+
+    #[test]
+    fn sh450_vfpcz_2s_fcmeq_pxor_zero_operand_full_buffer() {
+        // fcmeq V1.2s V2.2s,#0.0 (rd=1 rn=2 esize=4 op=0 q=false): per-lane
+        // all-ones mask if Vn == +0.0 else 0. The SECOND operand is a ZEROED
+        // xmm1 — each lane emits pxor xmm1,xmm1 (66 0f ef c9) to materialize
+        // +0.0, then mov_load32 (8b 83) + movd xmm0,eax (66 0f 6e c0) + comiss
+        // (40 0f 2f c1) + sete al (0f 94 c0) + movzx (0f b6 c0) + neg rax
+        // (48 f7 d8) + 32-bit store (89 83). This is the DISTINCTIVE marker vs
+        // SH445's two-operand VecFpCmp, which loads Vm — VecFpCmpZero instead
+        // pxor's a fresh zero operand every lane. Full-buffer (2 lanes, +4/lane).
+        let b = tr_bytes(Inst::VecFpCmpZero { rd: 1, rn: 2, op: 0, esize: 4, q: false });
+        assert_eq!(b, vec![
+            // lane 0
+            0x66, 0x0f, 0xef, 0xc9,             // pxor xmm1,xmm1 (+0.0 second operand)
+            0x8b, 0x83, 0x30, 0x01, 0x00, 0x00, // mov eax,[rbx+0x130] Vn lane0
+            0x66, 0x0f, 0x6e, 0xc0,             // movd xmm0,eax
+            0x40, 0x0f, 0x2f, 0xc1,             // comiss xmm0,xmm1
+            0x0f, 0x94, 0xc0,                   // sete al (cc op=0 eq)
+            0x0f, 0xb6, 0xc0,                   // movzx eax,al
+            0x48, 0xf7, 0xd8,                   // neg rax -> 0 or all-ones
+            0x89, 0x83, 0x20, 0x01, 0x00, 0x00, // mov [rbx+0x120],eax Vd lane0
+            // lane 1
+            0x66, 0x0f, 0xef, 0xc9,
+            0x8b, 0x83, 0x34, 0x01, 0x00, 0x00, // Vn lane1
+            0x66, 0x0f, 0x6e, 0xc0,
+            0x40, 0x0f, 0x2f, 0xc1,
+            0x0f, 0x94, 0xc0,
+            0x0f, 0xb6, 0xc0,
+            0x48, 0xf7, 0xd8,
+            0x89, 0x83, 0x24, 0x01, 0x00, 0x00, // Vd lane1 0x124
+        ]);
+        // the zero-operand discriminant: pxor xmm1,xmm1 (66 0f ef c9) appears
+        // once per lane (2 here), and the parser NEVER emits a Vm load (there is
+        // no third operand) — the 2-operand VecFpCmp's mov eax,[rbx+0x140/0x144]
+        // Vm loads are absent. A flub that reuses a shared/garbage register
+        // instead of re-zeroing per lane compares against stale state.
+        assert_eq!(b.windows(4).filter(|w| *w == [0x66, 0x0f, 0xef, 0xc9]).count(), 2, "a fresh pxor xmm1,xmm1 per lane (2)");
+        assert!(!b.windows(6).any(|w| w == [0x8b, 0x83, 0x40, 0x01, 0x00, 0x00]), "no Vm load at 0x140 (zero-operand form)");
+        assert!(!b.windows(6).any(|w| w == [0x8b, 0x83, 0x44, 0x01, 0x00, 0x00]), "no Vm load at 0x144");
+    }
+
+    #[test]
+    fn sh450_vfpcz_cc_map_eq_gt_ge_lt_le() {
+        // The setcc condition byte maps op -> cc: op0 fcmeq=sete 0f 94, op1
+        // fcmgt=seta 0f 97, op2 fcmge=setae 0f 93, op3 fcmlt=setb 0f 92, op4
+        // fcmle=setbe 0f 96. A wrong cond silently picks the wrong comparison
+        // (a wrong op turns eq-into-0 into gt-into-0). Also equivalence to
+        // SH445's two-operand form: same comiss+cc byte, so a lone setcc pin
+        // CANNOT distinguish the zero-vs-loaded second operand — the pxor is
+        // the real discriminant (pinned above).
+        let cc_byte = |op| {
+            let b = tr_bytes(Inst::VecFpCmpZero { rd: 1, rn: 2, op, esize: 4, q: false });
+            // the first setcc 0f 9X (skipping the leading pxor + loads)
+            let i = b.windows(2).position(|w| w == [0x0f, 0x94]).unwrap();
+            let (a, c) = (b[i], b[i + 1]);
+            // must land in the 0f 9X family and be a real setcc
+            (a, c)
+        };
+        assert_eq!(cc_byte(0), (0x0f, 0x94), "fcmeq=sete");
+        assert!(tr_bytes(Inst::VecFpCmpZero { rd: 1, rn: 2, op: 1, esize: 4, q: false }).windows(3).any(|w| w == [0x0f, 0x97, 0xc0]), "fcmgt=seta");
+        assert!(tr_bytes(Inst::VecFpCmpZero { rd: 1, rn: 2, op: 2, esize: 4, q: false }).windows(3).any(|w| w == [0x0f, 0x93, 0xc0]), "fcmge=setae");
+        assert!(tr_bytes(Inst::VecFpCmpZero { rd: 1, rn: 2, op: 3, esize: 4, q: false }).windows(3).any(|w| w == [0x0f, 0x92, 0xc0]), "fcmlt=setb");
+        assert!(tr_bytes(Inst::VecFpCmpZero { rd: 1, rn: 2, op: 4, esize: 4, q: false }).windows(3).any(|w| w == [0x0f, 0x96, 0xc0]), "fcmle=setbe");
+        // negative: a transposed op must NOT emit the wrong cc. fcmgt must not
+        // emit sete (0f 94), fcmeq must not emit seta (0f 97).
+        assert!(!tr_bytes(Inst::VecFpCmpZero { rd: 1, rn: 2, op: 1, esize: 4, q: false }).windows(3).any(|w| w == [0x0f, 0x94, 0xc0]), "fcmgt must not emit sete");
+        assert!(!tr_bytes(Inst::VecFpCmpZero { rd: 1, rn: 2, op: 0, esize: 4, q: false }).windows(3).any(|w| w == [0x0f, 0x97, 0xc0]), "fcmeq must not emit seta");
+    }
+
+    #[test]
+    fn sh450_vfpcz_2d_comisd_width_discriminator() {
+        // fcmeq V1.2d V2.2d,#0.0 (esize=8 op=0 q=false): 1 lane (8/8). Double
+        // uses movq_load (f3 48 0f 7e) + comisd (66 40 0f 2f c1) + 64-bit
+        // store (48 89 83). esize-width discriminator vs the single path.
+        let b = tr_bytes(Inst::VecFpCmpZero { rd: 1, rn: 2, op: 0, esize: 8, q: false });
+        assert_eq!(b, vec![
+            0x66, 0x0f, 0xef, 0xc9,                         // pxor xmm1,xmm1 (+0.0)
+            0xf3, 0x48, 0x0f, 0x7e, 0x83, 0x30, 0x01, 0x00, 0x00, // movq xmm0,[rbx+0x130] Vn
+            0x66, 0x40, 0x0f, 0x2f, 0xc1,                   // comisd xmm0,xmm1
+            0x0f, 0x94, 0xc0,                               // sete al
+            0x0f, 0xb6, 0xc0,                               // movzx eax,al
+            0x48, 0xf7, 0xd8,                               // neg rax
+            0x48, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00,       // mov [rbx+0x120],rax (64-bit)
+        ]);
+        assert!(b.windows(5).any(|w| w == [0x66, 0x40, 0x0f, 0x2f, 0xc1]), "double-path compare = comisd (66 40 0f 2f c1)");
+        assert!(b.windows(7).any(|w| w == [0x48, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00]), "double-path stores 64-bit mask (48 89 83)");
+        // width discriminator: double path exclusively uses movq_load (f3 48 0f
+        // 7e) — it must NOT emit the single-path movd (66 0f 6e c0).
+        assert!(!b.windows(4).any(|w| w == [0x66, 0x0f, 0x6e, 0xc0]), "double-path must NOT emit movd (66 0f 6e c0)");
+    }
+
+    #[test]
+    fn sh450_vfpcz_4s_q_true_lane_addressing_advances_4() {
+        // fcmeq V1.4s V2.4s,#0.0 (esize=4 q=true): 4 lanes; Vd@0x120/0x124/
+        // 0x128/0x12c, Vn@0x130/0x134/0x138/0x13c. The q bit doubles the lane
+        // count (4 vs 2), confirming the lane-advance math for the full-register
+        // form. Each lane still re-pxors the zero operand.
+        let b = tr_bytes(Inst::VecFpCmpZero { rd: 1, rn: 2, op: 0, esize: 4, q: true });
+        assert!(b.windows(6).any(|w| w == [0x8b, 0x83, 0x38, 0x01, 0x00, 0x00]), "lane2 loads Vn@0x138");
+        assert!(b.windows(6).any(|w| w == [0x8b, 0x83, 0x3c, 0x01, 0x00, 0x00]), "lane3 loads Vn@0x13c");
+        assert!(b.windows(6).any(|w| w == [0x89, 0x83, 0x28, 0x01, 0x00, 0x00]), "lane2 stores Vd@0x128");
+        assert!(b.windows(6).any(|w| w == [0x89, 0x83, 0x2c, 0x01, 0x00, 0x00]), "lane3 stores Vd@0x12c");
+        assert_eq!(b.windows(4).filter(|w| *w == [0x66, 0x0f, 0xef, 0xc9]).count(), 4, "4 lanes, 4 pxor xmm1,xmm1 (a fresh zero operand each)");
+        // no 64-bit movq in the single-precision q form.
+        assert!(!b.windows(9).any(|w| w == [0xf3, 0x48, 0x0f, 0x7e, 0x83, 0x30, 0x01, 0x00, 0x00]), "4s q must stay single-path (no movq)");
     }
 }
