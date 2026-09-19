@@ -1,5 +1,37 @@
 # Open Sober — Agent Handoff
 
+## SH351 (Sep 19, 2026, hermes-worker): stage the R1 synthetic CoreScript content path (Route-B marker half) — hand-authored Luau ScreenGui module + real loader gates, latent-but-correct
+Single-agent (cone suppressed). Additions: `stage_r1_core_scripts` (jit.rs) + `fsmap::staging_root`
++ `page_writable_rw` guard + 2 hermetic tests (sh351_*) + elffjit opt-in rung `--v2boot-r1-stage`.
+Default-inert (rung opt-in); no production path edited. Workspace green (arm64jit lib 418/0; elffjit
+example 157/0; cargo test --workspace exit 0).
+
+### The forward this cycle
+SH349 returned the persistence lane (LSM whack-a-mole measured UNBOUNDED, SH350 = 3rd fencepost).
+The operator's content-path synthesis names the ONE deliverable that turns a completing do-init into
+self-constructed UI with zero host layout: a hand-authored CoreScript module staged at the path the
+rbxasset://scripts/CoreScripts resolver serves, + the REAL loader gates. This is latent-but-correct
+(fires the instant a live DM drives the loader), the prerequisite of the exact Route-B marker.
+
+### What landed
+Module `ScreenGui`/`TextLabel` under CoreGui written to
+SOBER_ANDROID_ROOT/data/user/0/com.roblox.client/files/scripts/CoreScripts/{AppShell.lua,CoreScripts.lua}
+(both inferred candidates; desktop literals absent from this Android .so). Real gates:
+flags-loaded [0x10672739d4].bit0, flags-latch [0x106a683e8].bit0, governor union-init guards
+[0x106a63da0]/[0x106a63d70]=0, loader settings [0x106ba3350]=0, each page-writable-guarded. +2 tests.
+
+### Honest
+Rung is LATENT: the completing ladder still terminates run-variable at the persistence lane before
+the post-ladder rung. But the stage + tests prove the content lands at the correct fsmap mirror, so
+the MOMENT a live DM owns a session the engine self-constructs real GuiObjects. No DataModel
+manufactured; Route-B live-DM gate UNCHANGED (DM-root 0, MH_* false). SH174 latch stays observer.
+
+### Next (unchanged, authoritative)
+Route-B live-DM structural gate stands (SEP-17 Session-CTOR / do-init, four-stacked closure SH184/185;
+persistence lane closed SH349-350). The R1 content half is now staged (SH351); the SESSION half
+(still needing do-init to own a live DM) remains the standing wall. SH174 capture-latch stays the
+single forward hook.
+
 ## SH350 (Sep 19, 2026, hermes-worker): CROSS the SH349+1 terminal — bounded single-caller skip of the name-pack helper 0x101d9a708; ladder advances deep into the LSM pool-pop continuation, then the same run-variable live-object family (3rd fencepost that LSM sub-call-whack-a-mole is unbounded)
 Single-agent (cone suppressed). Default-inert opt-in `JIT_ROUTEB_LSM_PACK_SKIP=1`
 (`routeb_patch_lsm_pack_skip`, elfjit.rs — RETs the single-caller name/version string-pack

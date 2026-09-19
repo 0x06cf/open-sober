@@ -153,11 +153,9 @@ static RENDERCTX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 /// drives; guest==host engine derefs it directly. Built once lazily.
 static TASK_FRAME_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Base fabricated-but-engine-native render-manager R that
-/// `--renderscene` drives the engine's REAL scene renderer 0x105b2ead4 with.
-/// Layout mirrors what the engine's own render-manager ctor 0x5b2b0d4
-/// produces (R+0x160=ctx, R+0x170=frame-list root/view, R+0x180/0x188=scene
-/// list head/tail) engine's own frame construction code runs verbatim.
+/// Base fabricated-but-engine-native render-manager R that `--renderscene` drives the engine's REAL
+/// scene renderer 0x105b2ead4 with. Layout mirrors render-manager ctor 0x5b2b0d4 (R+0x160=ctx,
+/// R+0x170=frame-list root/view, R+0x180/0x188=scene head/tail) so that code runs verbatim.
 /// Built once lazily; guest==host so engine code derefs it directly.
 static RENDERSCENE_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// SH126-gate: set once the --v2boot ladder's rungs complete.
@@ -420,11 +418,10 @@ fn render_scene_base(node_count: u64) -> u64 {
     r
 }
 
-/// Drive the engine's REAL scene renderer (guest 0x105b2ead4) current with the
-/// fabricated-but-engine-native R from `render_scene_base`. Binds ctx, lets the engine's
-/// frame-desc ctor + linker build a real 0x98 frame into R+0x170 AND, when node_count>0, one
-/// frame per populated 0x28-stride node (SH63), then swaps. Returns swap result (1=present).
-/// Verifies frames (R+0x170 + nodes point at nonzero frames, [+140] set, [+144]==1).
+/// Drive the engine's REAL scene renderer (guest 0x105b2ead4) with the
+/// fabricated-but-engine-native R from `render_scene_base`. Binds ctx, lets the engine's frame-desc
+/// ctor+linker build a real 0x98 frame into R+0x170 AND one per 0x28 node (SH63) when node_count>0,
+/// then swaps (1=present). Verifies frames (R+0x170+nodes nonzero, [+140] set, [+144]==1).
 fn render_engine_scene(ctx: u64, n: u64, node_count: u64) -> u64 {
     if !(ctx >= 0x100000000 && ctx >> 56 == 0) {
         return 0;
@@ -1369,9 +1366,8 @@ fn routeb_patch_lsm_init_skip() {
 }
 
 /// SH349 (opt-in JIT_ROUTEB_LSM_APPEND_SKIP=1, default-INERT): RET the faulty byte-copy sub-call
-/// 0x101d9a15c the SH285 fault lives inside. SH348 showed the fault survives a whole-init leaf-ret
-/// (caller block reached by mid-function direct jump past the entry), so skip the FAILING SUB-CALL:
-/// a pure-memcpy leaf, stubbing EVERY path into the 0x101db1b08 strb. CAUSE-level (SH117), not SH248h.
+/// 0x101d9a15c (SH285 fault body). SH348 showed the fault survives a whole-init leaf-ret (caller
+/// block reached by a mid-function direct jump); a pure-memcpy leaf stubs every path in. SH117, not SH248h.
 fn routeb_patch_lsm_append_skip() {
     if std::env::var_os("JIT_ROUTEB_LSM_APPEND_SKIP").is_none() {
         return;
@@ -1409,7 +1405,7 @@ fn routeb_patch_lsm_pack_skip() {
     if std::env::var_os("JIT_ROUTEB_LSM_PACK_SKIP").is_none() {
         return;
     }
-    const ENTRY: u64 = 0x101_d9a_708; // name-pack helper entry (sub sp,#0x50)
+    const ENTRY: u64 = 0x101_d9a_708; // name-pack helper entry
     const PROLOGUE: u32 = 0xd101_43ff;
     const RET: u32 = 0xd65f_03c0;
     let page = ENTRY & !0xfff;
@@ -1904,20 +1900,19 @@ fn repoint_early_branch(branch: u64, expect_target: u64, new_target: u64, tag: &
         true
     }
 }
-// -- SH201: precise v2-family scanner (characterization lever) ----
-// SH200 patched 4 V2 singleton-dispatch sites but the run still stops in the ~365-site family
-// (each reads objB's vtable PAST the seeded 0x60 leaf, slot>=0x60 -> blr outside image). SH201
-// derives a precise objB-getter discriminator + hermetic tests. RUNTIME patch deliberately NOT
-// shipped (naive scribble crash-loops the SH55/64 region). Stays a characterized lever.
+// -- SH201: precise v2-family scanner (characterization lever) --
+// SH200 patched 4 V2 singleton-dispatch sites but the ~365-site family still stops (each reads
+// objB's vtable PAST the seeded 0x60 leaf, slot>=0x60 -> blr outside image). SH201 derives a precise
+// objB-getter discriminator + hermetic tests. RUNTIME patch NOT shipped (naive scribble crash-loops
+// SH55/64). Stays a characterized lever.
 
 const SH201_OBJ_GETTER: u64 = 0x6249eb8; // link vaddr of the objB singleton getter
 const SH201_LDR_X8_X0: u32 = 0xf940_0008; // ldr x8,[x0]
 const SH201_BLR_X8: u32 = 0xd63f_0100; // blr x8
 
-/// Pure SH201 classifier over raw image bytes (link-vaddr space; guest =
-/// link + 0x100000000, identity-loaded). Returns guest `(start, blr)` pairs where
-/// `start` `ldr x8,[x0]` + `blr` dispatch, gated by a preceding `bl 0x6249eb8`
-/// objB-getter within 16 slots and a vtable slot-load byte offset >= 0x60.
+/// Pure SH201 classifier over raw image bytes (link-vaddr; guest = link + 0x100000000). Returns
+/// guest `(start, blr)` pairs where `start` `ldr x8,[x0]` + `blr` dispatch, gated by a preceding
+/// `bl 0x6249eb8` objB-getter within 16 slots and a vtable slot-load byte offset >= 0x60.
 /// Unit-tested; `routeb_patch_v2_family` patches each site with the SH200 window.
 pub fn sh201_v2_family_scan(image: &[u8]) -> Vec<(u64, u64)> {
     let n = image.len() / 4;
@@ -1951,11 +1946,9 @@ pub fn sh201_v2_family_scan(image: &[u8]) -> Vec<(u64, u64)> {
             if wb == SH201_LDR_X8_X0 {
                 ldr_x0_idx = Some(bi);
             }
-            // bl 0x6249eb8: imm26 branch whose target == SH201_OBJ_GETTER.
-            // Sign-extend imm26 (26 bits, sign bit = bit25 = 0x200_0000): a set
-            // sign bit means backward; subtract 2^26 (**0x400_0000**, NOT
-            // 0x4000_0000=2^30 - that broke real backward `bl`s; only forward
-            // branches passed the hermetic test).
+            // bl 0x6249eb8: imm26 branch to SH201_OBJ_GETTER.
+            // Sign-extend imm26 (sign bit = bit25 = 0x200_0000; subtract 0x**400_0000**=2^26 for
+            // backward, NOT 0x4000_0000=2^30 — that broke real backward bls; only forward passed).
             if (wb & 0xfc00_0000) == 0x9400_0000 {
                 let imm = wb & 0x3ff_ffff;
                 let imm = if imm & 0x2000_000 != 0 { imm.wrapping_sub(0x400_0000) } else { imm };
@@ -2017,11 +2010,8 @@ fn routeb_patch_nativeinit_lock_owner() {
         return;
     }
     let s = Box::leak(vec![0u8; 0x60usize].into_boxed_slice()).as_mut_ptr() as u64;
-    // helper slots (file vaddr) to overwrite:
-    // 0x2320710 adrp x8,7273000 (f0027a88)
-    // 0x2320714 ldr x0,[x8,#2480] (f944d900)
-    // 0x2320718 b 232071c (14000001, dead hop)
-    // -> movz x0,#s_lo (hw0); movk x0,#s(16) (hw1); movk x0,#s(32) (hw2).
+    // helper slots: 0x2320710 adrp / 0x2320714 ldr [x8,#2480] / 0x2320718 dead-hop
+    // -> movz x0,#s(hw0); movk x0,#s(16); movk x0,#s(32).
     let start = 0x102320710_u64; // guest = file(0x2320710) + 0x100000000
     let words: [u32; 3] = [
         0xD280_0000u32 | (((s & 0xffff) as u32) << 5),       // movz x0,#imm16 hw0
@@ -7758,10 +7748,8 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                     eprintln!("[elfjit:v2boot-pub] post-publish DM-root[0x106a68818]={dm:#x}");
                     dump("MessageBus.publishRaw");
                 }
-                // SH131 (disasm 21f7654): seed engine's OWN files-dir global. Real client stores it via
-                // nativeSetFilesDirectory (0x1021f7654) - 24-byte libc++ std::string at 0x10726d600.
-                // Without it the SQLite datastore gets no base path -> fsmap unreached. Seed LONG
-                // form ([0..7]=data,[8]=size,[16]=cap bit0=0). Opt-in --v2boot-set-filesdir.
+                // SH131 (disasm 21f7654): seed engine's OWN files-dir global - 24B libc++ std::string
+                // at 0x10726d600 (see frontier-sh131b; long form, cap bit0 clear). Opt-in --v2boot-set-filesdir.
                 if std::env::args().any(|a| a == "--v2boot-set-filesdir") {
                     const FILES_DIR_GLOBAL: u64 = 0x10726d600;
                     const DIR: &[u8] = b"/data/user/0/com.roblox.client/files";
@@ -7790,6 +7778,14 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                         eprintln!("[elfjit:v2boot-setfilesdir] WARN guest arena not set — cannot seed files-dir global");
                     }
                     dump("nativeSetFilesDirectory (host-seeded)");
+                }
+                // SH351 (--v2boot-r1-stage): stage the R1 synthetic CoreScript module into the fsmap
+                // filesdir mirror + arm the real loader gates (content-path synthesis, deleg_dbfc8eb2),
+                // so the engine SELF-constructs a ScreenGui/TextLabel scene the instant do-init owns a
+                // live DM. Default-inert (opt-in). See crate::jit::stage_r1_core_scripts.
+                if std::env::args().any(|a| a == "--v2boot-r1-stage") {
+                    let wrote = arm64jit::jit::stage_r1_core_scripts();
+                    eprintln!("[elfjit:v2boot-r1] stage results: {} ({} mirrored files)", wrote.join(", "), wrote.len());
                 }
                 eprintln!("[elfjit:v2boot] ladder done; final [0x106829ea8] = {:#x}", dw(BSS_TASKV4));
                     // SH126-gate: signal the render pipeline it may start now

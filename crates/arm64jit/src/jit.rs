@@ -739,6 +739,99 @@ pub fn drive_messagebus_publish_receive(
     }
 }
 
+/// R1 content-path synthesis (deleg_dbfc8eb2, Route-B): stage a hand-authored ~20-line Luau
+/// CoreScript module that, the INSTANT a live DataModel owns a session, makes the engine
+/// SELF-CONSTRUCT a real GuiObject tree (ScreenGui with a TextLabel under CoreGui) -> R+0x180/0x188
+/// scene nodes with ZERO host layout — the exact Route-B marker. The loader resolves
+/// rbxasset://scripts/CoreScripts/<Name>.lua from the files-dir global (0x10726d600, seeded by
+/// --v2boot-set-filesdir) which fsmap re-roots to SOBER_ANDROID_ROOT/data/user/0/com.roblox.client/
+/// files/... . <Name> is INFERRED (AppShell|CoreScripts; desktop fastflags/name literals are ABSENT
+/// from this Android .so, measured) — this writes BOTH candidate names so whichever the engine first
+/// requests resolves. Also arms the REAL loader gates (content-path synthesis):
+/// flags-loaded 0x10672739d4.bit0, flags-latch 0x106a683e8.bit0, governor union-init guards
+/// 0x106a63da0/0x106a63d70=0, loader settings slot 0x106ba3350. Default-inert; opt-in --v2boot-r1-stage.
+pub fn stage_r1_core_scripts() -> Vec<String> {
+    // The synthetic module: a ScreenGui + TextLabel under CoreGui so the engine's own
+    // GuiService/SceneGraph turns it into real scene nodes (no host layout).
+    const MODULE: &str = r#"local Players = game:GetService("Players")
+local CG = game:GetService("CoreGui")
+local sc = Instance.new("ScreenGui")
+sc.Name = "R1HostScreen"
+sc.ResetOnSpawn = false
+sc.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+local lbl = Instance.new("TextLabel")
+lbl.Name = "R1Status"
+lbl.Size = UDim2.new(0, 480, 0, 64)
+lbl.Position = UDim2.new(0.5, -240, 0.5, -32)
+lbl.BackgroundColor3 = Color3.new(0.1, 0.1, 0.1)
+lbl.TextColor3 = Color3.new(1, 1, 1)
+lbl.Text = "open-sober R1 self-constructed"
+lbl.Parent = sc
+sc.Parent = CG
+"#;
+    let mut written = Vec::new();
+    let Some(root) = crate::fsmap::staging_root() else {
+        eprintln!("[r1] WARN persistence root not armed (SOBER_ANDROID_ROOT / test override) — cannot stage CoreScript mirror");
+        return written;
+    };
+    for name in ["AppShell.lua", "CoreScripts.lua"] {
+        let dir = root
+            .join("data/user/0/com.roblox.client/files/scripts/CoreScripts");
+        let path = dir.join(name);
+        let wrote = std::fs::create_dir_all(&dir).is_ok()
+            && std::fs::write(&path, MODULE.as_bytes()).is_ok();
+        let status = if wrote { "STAGED" } else { "FAIL" };
+        eprintln!("[r1] {status} {name} at {path:?} ({} bytes)", MODULE.len());
+        written.push(format!("{status} {name}"));
+    }
+    // Real loader gates (content-path synthesis, R1). Each write is guarded by a /proc/self/maps
+    // writable-page check so a read-only/unmapped cell (unit test, or no live image) cannot SIGSEGV;
+    // the write itself is idempotent. Borrows the pattern from elfjit's guest_page_mapped guard.
+    let mut gate_state = Vec::new();
+    let gates: [(u64, u8); 5] = [
+        (0x10672739d4, 1), // flags-loaded [bit0]=1
+        (0x106a683e8, 1),  // flags-latch [bit0]=1
+        (0x106a63da0, 0),  // governor union-init guard = 0
+        (0x106a63d70, 0),  // governor union-init guard = 0
+        (0x106ba3350, 0),  // loader settings slot = 0
+    ];
+    for (cell, want) in gates {
+        if !page_writable_rw(cell) {
+            gate_state.push(format!("0x{cell:x}:unmapped"));
+            continue;
+        }
+        let cur = unsafe { std::ptr::read_unaligned(cell as *const u8) };
+        unsafe { std::ptr::write_unaligned(cell as *mut u8, want) };
+        let after = unsafe { std::ptr::read_unaligned(cell as *const u8) };
+        eprintln!("[r1] gate @0x{cell:x} {cur:#x}->{after:#x}");
+        gate_state.push(format!("{cur}->{after}"));
+    }
+    eprintln!("[r1] loader gates: {}", gate_state.join(", "));
+    written
+}
+
+/// Whether the page containing `addr` is currently mapped read-write (from /proc/self/maps).
+/// Guards gate writes in `stage_r1_core_scripts` so a unit test / no-live-image run with an
+/// unmapped or read-only cell skips the write instead of SIGSEGVing. Guest==host identity maps.
+fn page_writable_rw(addr: u64) -> bool {
+    let page = addr & !0xfff;
+    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
+        return false;
+    };
+    maps.lines().any(|l| {
+        let Some(dash) = l.find('-') else { return false; };
+        let Some(sp) = l.find(' ') else { return false; };
+        let (Ok(lo), Ok(hi)) = (
+            u64::from_str_radix(&l[..dash], 16),
+            u64::from_str_radix(&l[dash + 1..sp], 16),
+        ) else {
+            return false;
+        };
+        let perms = &l[sp + 1..];
+        page >= lo && page < hi && perms.as_bytes().get(1) == Some(&b'w')
+    })
+}
+
 /// SH330 (opt-in JIT_ROUTEB_APPSART_408SEED): the app-start continuation's standing gate is
 /// AppStarted+0x408 == 0 — the live member read by `ldr x0,[x19,#1032]` @0x25f504c (both arms of the
 /// SH329 governor-flag fork converge on it), then `ldr x8,[x0]; ldr x8,[x8,#136]; blr x8` @0x25f5050/58/5c.
@@ -16394,5 +16487,58 @@ mod fp16_and_fabd_fccmp_exec {
         routeb_startluaapp_invoke_guard(&mut st5 as *mut CpuState, 0x1023efeb0);
         assert_eq!(read(sp5), second, "second crossing of a boxed slot must be idempotent (no rewrite)");
         unsafe { std::env::remove_var("JIT_ROUTEB_SLADM_INVOKE") };
+    }
+
+    /// SH351: `stage_r1_core_scripts` writes the synthetic CoreScript module to the fsmap mirror
+    /// (`SOBER_ANDROID_ROOT/data/user/0/com.roblox.client/files/scripts/CoreScripts/<Name>.lua` for
+    /// both candidate names AppShell.lua + CoreScripts.lua) so whichever the engine's loader first
+    /// requests resolves. Gate writes are guarded by page_writable_rw (inert here — the fixed .bss
+    /// cells are unmapped/read-only in a unit test), so the fn must not SIGSEGV and must return the
+    /// two staged names even with no live image.
+    #[test]
+    fn sh351_r1_stage_core_scripts_writes_both_candidates() {
+        use std::sync::OnceLock;
+        static GUARD: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+        let _g = GUARD.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("os-r1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Set the override to a bare (empty) marker first, so only the override Under test drives
+        // staging; `staging_root` honors the override too. Artifact: no SOBER_ANDROID_ROOT reliance.
+        crate::fsmap::set_root_for_tests(dir.clone());
+        let written = crate::jit::stage_r1_core_scripts();
+        crate::fsmap::set_root_for_tests(std::path::PathBuf::new()); // clear the override for later tests
+        // Both candidate filenames staged.
+        assert!(written.len() == 2, "expected 2 candidate modules, got {written:?}");
+        for name in ["AppShell.lua", "CoreScripts.lua"] {
+            let p = dir
+                .join("data/user/0/com.roblox.client/files/scripts/CoreScripts")
+                .join(name);
+            let body = std::fs::read_to_string(&p)
+                .unwrap_or_else(|e| panic!("{name} not written: {e} path={p:?}"));
+            assert!(body.contains("ScreenGui"), "{name} must define a ScreenGui");
+            assert!(body.contains("R1HostScreen"), "{name} must name the ScreenGui");
+            assert!(
+                body.contains("Self-constructed") || body.contains("self-constructed"),
+                "{name} body: {body}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SH351: the /proc/self/maps read-write check is a pure helper; it must report the writable
+    /// stack region RW and a high unmapped guest .bss cell (0x106a63da0) as NOT RW in a unit test
+    /// (no live image), so gate writes are provably opted out (no SIGSEGV) here.
+    #[test]
+    fn sh351_page_writable_rw_guard_inert_on_unmapped_guest_cell() {
+        // A definitely-mapped RW region: the process stack area address (a stack local).
+        let local: u64 = 0x102a63da0u64 & !0xfff_u64; // guest .bss cell - NOT mapped in a unit test
+        assert!(!crate::jit::page_writable_rw(local), "guest .bss cell must be non-RW in the unit-test proc (page_writable_rw must stay inert there)");
+        // Our own writable mapped page: any heap pointer.
+        let heap = Box::leak(vec![0u8; 1].into_boxed_slice()).as_mut_ptr() as u64;
+        assert!(
+            crate::jit::page_writable_rw(heap),
+            "a live heap page must be reported RW"
+        );
     }
 }

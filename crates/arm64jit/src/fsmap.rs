@@ -64,6 +64,12 @@ fn active_root() -> Option<PathBuf> {
     override_root().lock().unwrap().clone().or_else(configured_root)
 }
 
+/// Public alias of the resolved (override-or-env) root, used by host staging paths (e.g. the R1
+/// CoreScript mirror) so the same test override that `remap_path` honors also drives staging.
+pub fn staging_root() -> Option<PathBuf> {
+    active_root()
+}
+
 /// A guest filesystem path that has been resolved into a host path under the
 /// configured Android root. Kept as a `CString` so its pointer is directly
 /// consumable by the host libc call that takes it.
