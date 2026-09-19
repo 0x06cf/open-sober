@@ -1,6 +1,42 @@
 # Open Sober — Agent Handoff
 
-## SH433 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD FP multiply-accumulate codegen family (translate.rs Fmla, FmlaEl) — 4 exact-byte pins of the most render-heavy translate.rs surface (matrix/vertex/lighting transforms accumulate as SIMD FMAs): the product DIRECTION (mulss/mulsd targets xmm1 => the accumulate addss into xmm0 gives fmls the CORRECT sign — Vd − Vn·Vm, never Vn·Vm − Vd), the add-vs-sub accumulate opcode (addss 0x58 / subss 0x5C), the .2s single- (F3+movd) vs .2d double- (F2+movq) lane width (a width flub silently halves/squares transform math), and the FmlaEl by-element broadcast into xmm2 (movd xmm2,eax 66 0F 6E D0) + mulss xmm1,xmm2 (F3 0F 59 CA) vs the 3-operand Fmla's full-Vm-lane multiply (F3 0F 59 C8)
+## SH434 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD shift-and-accumulate codegen families (translate.rs SimdShl, SimdShr, SimdShrAcc) — 6 exact-byte pins of the integer shift/rounding math every vertex-index/packed-color/image-lane path leans on: the shl-vs-shr opcode byte (shl C1/E0 vs unsigned shr C1/E8 vs signed arithmetic sar C1/F8 — a shift-direction flub moves every lane the wrong way), the SIGN-extend-before-arithmetic-shift requirement (sshr esize=4 movsxd 48 63 then sar; ushr zero-extend movzx + shr, never movsxd — a zero-extended negative element flips its sign bit), the shift>=esize-bits guard (unsigned xor-to-zero 48 31 C0 vs signed all-ones sign-fill sar,63 48 C1 F8 3F — a bare x86 imm clamps instead), and the SimdShrAcc accumulate ordering (Vd read AFTER the shift, add rcx,rax 48 01 C1, re-store — separates usra/ssra from a plain overwrite)
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+re-verified green at this exact HEAD first (capture_taskv4_frame.sh attempt 1:
+24 real task-driven frames `present swap Ok(0x1)`, 194 node pops, 0 json abort,
+0 crash, EXIT 124). Workspace green (cargo test --workspace EXIT 0; arm64jit lib
+566/0 incl. 6 new sh434 pins, was 560; cargo build --example elfjit OK).
+Production code ONLY in translate.rs `#[cfg(test)]` addition (translator core
+body byte-untouched; jit.rs 1,048,390 B < 1MiB hook; elfjit.rs/session.rs
+unchanged).
+- The SimdShl/SimdShr/SimdShrAcc families had no direct byte tests. SH434 pins
+  the semantically-critical discriminators a byte error silently corrupts:
+  (1) SimdShl esize=8 shift=1 — full 2-lane buffer `mov_load64 [Vn0x120];
+  shl rax,1 (48 C1 E0 01); mov_store64 [Vd0x110]`, lane2 at +8 (0x128->0x118);
+  asserts shl never emits shr(E8)/sar(F8); (2) SimdShr SIGNED (sshr) esize=8
+  shift=2 — full buffer with `sar rax,2` (48 C1 F8 02), the arithmetic form;
+  (3) SimdShr UNSIGNED (ushr) — full buffer with `shr rax,2` (48 C1 E8 02),
+  the logical form — E8-vs-F8 is the signed/unsigned opcode discriminator;
+  (4) esize=4 signed MUST movsxd (48 63 C0) before sar, unsigned MUST NOT
+  (zero-extend + shr) — a zero-extended negative element becomes positive;
+  (5) shift>=esize-bits guard: unsigned all-zeros `xor rax,rax` (48 31 C0),
+  signed all-ones `sar rax,63` (48 C1 F8 3F) — a bare x86 imm clamps instead;
+  (6) SimdShrAcc usra lane-0 buffer pins the accumulate ordering — load Vn ->
+  shr -> load Vd accumulator into RCX AFTER the shift -> add rcx,rax (48 01
+  C1) -> re-store Vd.
+- 6 exact-byte pins via synthetic `Inst` -> translate() -> CodeBuf.as_slice()
+  (zero-pc 0x1000 = deterministic); full-buffer + subsequence-window asserts
+  for the multi-lane bodies. [RBX]=CpuState; vector slot v[t]=VECTOR_BASE
+  (0x110)+t*16. Deterministic, no image, no env, parallel-safe.
+- Honest: NOT a DM (SH415 probe re-confirms DM-root [0x106a68818]=0x0 under the
+  complete substrate; Route-B live-DM gate UNCHANGED). BUILD-THE-RUNTIME
+  codegen-surface coverage completion on the integer shift family, continuing
+  the SH427-433 translator-core lineage. No re-treads (distinct from SH432
+  SminMax/SimdSatAdd, SH433 Fmla/FmlaEl).
+- Files: docs/frontier-sh434-translator-simd-shift-accumulate.md +
+  crates/arm64jit/src/translate.rs (`#[cfg(test)]` only). Commit 3026eee.
+
+## SH433 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD FP multiply-accumulate codegen family (translate.rs Fmla, FmlaEl) — 4 exact-byte pins of the most render-heavy translate.rs surface (matrix/vertex/lighting transforms accumulate as SIMD FMAs): the product DIRECTION (mulss/mulsd targets xmm1 => the accumulate addss into xmm0 gives fmls the CORRECT sign − Vd − Vn·Vm, never Vn·Vm − Vd), the add-vs-sub accumulate opcode (addss 0x58 / subss 0x5C), the .2s single- (F3+movd) vs .2d double- (F2+movq) lane width (a width flub silently halves/squares transform math), and the FmlaEl by-element broadcast into xmm2 (movd xmm2,eax 66 0F 6E D0) + mulss xmm1,xmm2 (F3 0F 59 CA) vs the 3-operand Fmla's full-Vm-lane multiply (F3 0F 59 C8)
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 re-verified green at this exact HEAD first (capture_taskv4_frame.sh attempt 1:
 24 real task-driven frames `present swap Ok(0x1)`, 194 node pops, 0 json abort,
