@@ -1,6 +1,31 @@
 # Open Sober — Agent Handoff
 
-## SH407+SH408 (Sep 21, 2026, hermes-worker): measured the do-init MAIN-arm terminal decisively — the app-start MAIN body [0x10258b5d8,0x10258bbb0] now runs END-TO-END (biggest app-start reach on record; SH362-404 called it unreachable), then drains into the SH341 pool-pop persistence lane; DMCONT 0x102bd1d68 = 0 hits from the MAIN arm. SH408: same env + files-dir/R1 rungs (which did NOT fire) shows LSM init ADVANCES through initStorageManagerNative + crosses the SH285 reader (0x101db1b08 now 0 hits) then next-faults at fault=0x0 in the operator-new/insert-leaf band — the standing unbound whack-a-mole, not a DM advance.
+## SH409 (Sep 21, 2026, hermes-worker): the SH400 substrate's missing onAppReady host surface — drive the NativeHelper lifecycle milestones (onFlagsLoaded -> onEngineInitialized -> onAppReady) through the engine's own registered JNI CallVoidMethod shim, in the recon-routeB step-2 position (after surface, before SendAppEventOnAppReady); MEASURED on real libroblox.so MH_APP_READY now latches (was always 0)
+Single-agent (cone suppressed). The SH407/408 frontier "Next" named the one
+genuinely-open surface: "REAL session-compat runtime (SH400 substrate + a real
+LSM/EGL/onAppReady host drive)". Recon-routeB step-2 + SEP-18 BUILD-THE-RUNTIME both
+wanted the NativeHelper lifecycle callbacks "actually DRIVEN" — the SH400 substrate
+only ever waited for the engine to reach those CallVoidMethod sites, so none fired
+headlessly. Production code (off the 1MiB hooks; jit.rs/elfjit.rs untouched):
+- jni.rs: `fire_nativehelper_milestone(name)` — intern the milestone name to a
+  readable method-id handle (== engine GetMethodID return) and dispatch through the
+  SAME registered slot-61 CallVoidMethod shim, so MH_* transition as a real session's
+  callbacks would.
+- session.rs: `drive_nativehelper_lifecycle()` drives the ordered sequence through
+  that shim, wired into `drive_routeb_session_substrate` right after the
+  V2UpdateSurface atom (0x1025f5fec) — the exact recon step-2 position.
+- New hermetic `lifecycle_milestones_driven_in_order` (no real binary).
+MEASURED (real libroblox.so, SH400 capture, EXIT 124, 11-16 Ok): the three milestones
+now log IN ORDER and MH_APP_READY latches (MH_FLAGS_LOADED/ENGINE_INITIALIZED/APP_READY
+all true; was all-false on every SH400-408 run). AppBridgeV2 stays at genuine vt
+0x1063a3410. Honest: NOT a DM manufacture (DM-root 0, once-slot sentinel, MH_GAME_LOADED
+false, no make_shared); the MH_* observables don't boot Lua by themselves (SH405) — but
+the substrate now exercises the exact host-to-engine lifecycle call sequence recon-routeB
+step-2 / SEP-18 name, a concrete testable shippable BUILD-THE-RUNTIME piece. Route-B
+live-DM structural gate UNCHANGED (DM-root 0). No re-treads. Workspace green (cargo test
+--workspace EXIT 0; arm64jit lib 457/0). +docs/frontier-sh409-onappready-driven-surface.md.
+
+## SH407+SH408 (Sep 21, 2026, hermes-worker): measured the do-init MAIN-arm terminal decisively — the app-start MAIN body [0x10258b5d8,0x10258bbb0] now runs END-TO-END (biggest app-start reach on record; SH362-404 called it unreachable), then drains into the SH341 pool-pop persistence lane; DMCONT 0x102bd1d68 = 0 hits from the MAIN arm. SH408: same env + files-dir/R1 rungs (which did NOT fire) shows LSM init ADVANCES through initStorageManagerNative + crosses the SH285 reader (0x101db1b08 now 0 hits = old fault terminal bypassed) then next-faults at fault=0x0 in the opnew/insert band — the standing unbound whack-a-mole, one fencepost deeper, not a DM advance. New hermetic sh407 byte-pins the full app-start body span + the LSM-init deepen (arm64jit lib 455->456).
 Single-agent (cone suppressed). Two probes (runs/capture_sh407_appstart_main_terminal.sh,
 runs/capture_sh408_filesdir_lsm.sh) at the SH406 far-reach (DONEPATH_MAIN + SETFIX + GOVFLAG)
 on real libroblox.so. New hermetic `sh407_appstart_body_full_span_runs_end_to_end_and_lsm_init_crosses_reader`

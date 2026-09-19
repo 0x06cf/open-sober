@@ -746,6 +746,23 @@ pub fn nativehelper_engine_initialized() -> bool { MH_ENGINE_INITIALIZED.load(At
 pub fn nativehelper_app_ready() -> bool { MH_APP_READY.load(AtOrd::Relaxed) != 0 }
 pub fn nativehelper_game_loaded() -> bool { MH_GAME_LOADED.load(AtOrd::Relaxed) != 0 }
 
+/// Force a NativeHelper `gameActivity_*` lifecycle milestone through the SAME
+/// registered JNI CallVoidMethod shim (slot 61) the engine uses, so the MH_*
+/// observables transition exactly as they would when the engine's own session
+/// fires the callback. `name` is interned to a readable NULL-terminated method-id
+/// handle (identical to the engine's GetMethodID return) and dispatched by
+/// `jni_call_void_method`. Returns the shim's return (always 0 for VOID). This is
+/// the SEP-18 "onAppReady/MH_* lifecycle callbacks actually DRIVEN" host surface
+/// recon-routeB step-2 prescribes (a real host invokes onFlagsLoaded ->
+/// onEngineInitialized -> onAppReady on the gameActivity object); the SH400
+/// substrate previously only ever waited for the engine to reach them, so none
+/// ever fired headlessly. Inert on real boot unless a host drive calls it
+/// (no state change beyond setting the milestone latches).
+pub fn fire_nativehelper_milestone(name: &[u8]) -> u64 {
+    let mid = str_handle(name);
+    jni_call_void_method(0, 0, mid, 0, 0, 0, 0, 0)
+}
+
 /// CallVoidMethod(env, obj, methodID, ...): the NativeHelper `gameActivity_*`
 /// callbacks fire through here. All five are VOID-descriptor, so the return is
 /// always 0; the load-bearing effect is the milestone signal (the session-advance
