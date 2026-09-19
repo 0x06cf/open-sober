@@ -238,10 +238,29 @@ pub fn drive_routeb_session_substrate(iimg: &[u8], ib: u64, tpidr: u64, boot_sp:
             // instant a completed do-init owns a live DM (latent-but-correct, fires on the
             // session at the right time).
             drive_content_surface();
+            // SH418: the host-input loop as a FIRST-CLASS driven substrate step
+            // (same promotion SH411/412 did for DM binder, nativeAppBridgeAppStart,
+            // and the G3 content surface). A real host delivers desktop pointer input
+            // to the constructed login/home screen at session frame cadence; this
+            // drives INPUT_LOOP_ITERS (default 8) persistent-tracker drains of the
+            // registered ANativeWindow into guest nativePassInput right after the
+            // post-bus content surface step. Inert-by-construction on boot (three
+            // guards: JIT_AINPUT_BRIDGE + window XID + live image) — the moment a
+            // live DM owns a constructed screen this step becomes the input source.
+            drive_host_input_loop(iimg, ib, tpidr, boot_sp, input_loop_iters());
         }
     }
     eprintln!("[session-drive] substrate complete: {ok}/{total} atoms returned non-zero Ok");
     ok
+}
+
+/// INPUT_LOOP_ITERS (default 8) for the SH418 host-input substrate step — bounded
+/// so the ordered drive never spins, overridable for longer/short session drains.
+pub fn input_loop_iters() -> usize {
+    std::env::var("INPUT_LOOP_ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8)
 }
 
 /// SEP-17 nativeAppBridgeAppStart (V1, guest 0x102338510, SH336/SH337 ABI) as a
@@ -1066,6 +1085,37 @@ mod tests {
             "0 iterations -> 0 delivered, bounded"
         );
         // Restore prior XID/env so parallel tests observe clean state.
+        crate::shims::set_anativewindow_xid(prev_xid);
+        unsafe { std::env::remove_var(crate::ainput::AINPUT_BRIDGE_ENV) };
+    }
+
+    /// SH418: the host-input LOOP is a first-class driven substrate step (same
+    /// promotion SH411/412 did for the DM binder / app-start / content surface).
+    /// On a no-live-image hermetic the three inert guards (bridge, window XID,
+    /// live image) make it return 0 exactly once as a substrate step, so the
+    /// ordered drive completes without touching the guest — and over a real
+    /// session it is the source of desktop pointer input to a constructed screen.
+    #[test]
+    fn sh418_host_input_loop_is_first_class_substrate_step() {
+        // INPUT_LOOP_ITERS helper is bounded + defaulted (never spins).
+        unsafe { std::env::remove_var("INPUT_LOOP_ITERS") };
+        assert_eq!(crate::session::input_loop_iters(), 8, "default bounded (8)");
+        unsafe { std::env::set_var("INPUT_LOOP_ITERS", "2") };
+        assert_eq!(crate::session::input_loop_iters(), 2, "env override honored");
+        unsafe { std::env::remove_var("INPUT_LOOP_ITERS") };
+        // The loop is wired into drive_routeb_session_substrate after the
+        // post-bus step (the trigger site is the MessageBus.subscribe atom). A
+        // no-live-image drive with the bridge unset stays inert (returns 0, no X
+        // connect, no guest call) and does NOT panic — prove by calling the loop
+        // directly with an empty image + no XID armed.
+        unsafe { std::env::remove_var(crate::ainput::AINPUT_BRIDGE_ENV) };
+        let prev_xid = crate::shims::anativewindow_xid();
+        crate::shims::set_anativewindow_xid(0);
+        assert_eq!(
+            crate::session::drive_host_input_loop(&[0u8; 64], 0x100000000, 0, 0x200000, 4),
+            0,
+            "first-class step inert on boot (no X connect, no guest call)"
+        );
         crate::shims::set_anativewindow_xid(prev_xid);
         unsafe { std::env::remove_var(crate::ainput::AINPUT_BRIDGE_ENV) };
     }
