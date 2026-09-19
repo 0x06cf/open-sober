@@ -2489,4 +2489,54 @@ mod tests {
         assert_eq!(g_im(env, 0x4321, nmid(b"getFlagsCount"), 0, 0, 0, 0, 0), 1, "getFlagsCount untouched");
         } // unsafe
     }
+
+    /// SH479: pin the END-TO-END HOST half of the Route-B G2 gate — the
+    /// SendAppEventOnAppReady 'Home' fabricate pipeline. SH475 pinned only the
+    /// pure SSO-decode fn (feeding raw bytes); SH339 MEASURED the fabricated
+    /// "Home" jstring materializing as a 6-byte SSO (event-code 0, NOT 4) on
+    /// the deeper send-appevent route. This closes the fabricate half: a
+    /// silent drift in str_handle / GetStringUTFLength that makes "Home"
+    /// materialize non-4 (the SH339 defect class) must break the suite. A
+    /// genuine "Home" handle MUST read back as exactly 4 bytes and route to
+    /// the operator-pinned w19-event=0x4. Pure host logic, no image/env.
+    #[test]
+    fn home_fabricate_materializes_size4_routes_event4() {
+        let home = new_string_utf_handle(b"Home");
+        assert_ne!(home, 0, "Home fabricate handle non-null");
+        // Materialized bytes must be exactly "Home" (4), never "Home"+trailing
+        // garbage — the size-6 non-"Home" that SH339 measured.
+        assert_eq!(
+            read_cstr(home),
+            Some(b"Home".to_vec()),
+            "fabricated Home materializes as the exact 4-byte 'Home'"
+        );
+        // GetStringUTFLength (the real JNI thunk) must read 4 — a size-6
+        // collapse would reroute the discriminator away from 'Home'.
+        unsafe {
+            let (env, _vm) = build_jni();
+            let get = |i: usize| -> u64 { *(*(env as *const *const u64)).add(i) };
+            let (g_sl, _) = host_call_at(get(GET_STRING_UTF_LEN)).expect("GetStringUTFLength thunk");
+            let len = g_sl(env, home, 0, 0, 0, 0, 0, 0);
+            assert_eq!(
+                len, 4,
+                "Home GetStringUTFLength == 4 (a size-6 non-'Home' would reroute the G2 gate)"
+            );
+            // Model the engine's libc++ SSO header for the materialized size-4
+            // short string: b0 = (size<<1)|longbit(0) = 8. The discriminator at
+            // 0x102bb46b8 reads b0 and maps size4 -> event-code 4 (oper-pinned).
+            let b0 = ((len as u8) << 1) | 0;
+            assert_eq!(
+                crate::jit::routeb_appevent_sso_size_to_event_code(b0, 0xdead),
+                4,
+                "a size-4 'Home' SSO header MUST route to event-code 4 (SH475 pin)"
+            );
+        }
+        // Regression guard on the SH339 class: the measured size-6
+        // materialization must NOT silently reroute to "Home" (it decodes 0).
+        assert_eq!(
+            crate::jit::routeb_appevent_sso_size_to_event_code(0x0c, 0),
+            0,
+            "SH339's measured size-6 materialization stays event-code 0, never 4"
+        );
+    }
 }

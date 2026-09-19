@@ -1,5 +1,33 @@
 # Open Sober — Agent Handoff
 
+## SH479 (Sep 20, 2026, hermes-worker): pin the END-TO-END HOST half of the Route-B G2 'Home' fabricate pipeline (materialize -> GetStringUTFLength -> SSO decode -> operator-pinned event-code 4)
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables unchanged-green
+(test-only jni.rs change, so the runtime deliverable is byte-identical to the SH461-VERIFY
+24-frame capture baseline). Workspace green (cargo test --workspace EXIT 0; arm64jit lib
+683->684 incl. 1 new sh479 hermetic). Production code UNCHANGED (test-only jni.rs
+addition; jit.rs/elfjit.rs/session.rs untouched).
+- **The gap closed:** SH475 pinned only the pure `routeb_appevent_sso_size_to_event_code`
+  decode fn + the discriminator's real-image bytes, and explicitly left OPEN "NOT a fix of
+  the fabricate path itself". SH339 MEASURED the fabricated "Home" jstring materializing as
+  a 6-byte SSO (b0=0x0c) -> event-code 0, NOT 4. That measured negative was never pinned as
+  a HOST regression contract, so a silent drift in str_handle / GetStringUTFLength that made
+  "Home" materialize as anything-but-4 would silently reroute the G2 gate (operator-pinned
+  w19-event=0x4) with no test catching it. New hermetic
+  `home_fabricate_materializes_size4_routes_event4` pins the 3-stage host pipeline: (1)
+  `new_string_utf_handle(b"Home")` reads back as EXACTLY "Home" (4 bytes, never
+  "Home"+trailing — the size-6 collapse); (2) GetStringUTFLength (real fn-table thunk)
+  reads 4; (3) the libc++ SSO header for size-4 (b0=0x08) fed to the decode -> 4. Plus the
+  negative guard: SH339's size-6 (0x0c) decodes to 0, never 4 — the exact regression that
+  produced the measured defect cannot silently pass.
+- Honest: NOT a DM (Route-B live-DM gate UNCHANGED; DM-root 0 structural per SH462/467), and
+  NOT a fix of the deeper route where SH339 measured the size-6 (downstream of the structural
+  live-DM wall; substrate SendAppEventOnAppReady still soft-returns Ok(0x3e8) pre-discriminator).
+  This CLOSES the HOST half as a tested contract — the operator's step-2 note ("existing
+  new_string_utf_handle(b"Home") suffices") is now byte-anchored so any residual size-6 on a
+  live-DM session is provably NOT a str_handle/length/handle drift. No re-treads.
+- Files: docs/frontier-sh479-home-fabricate-host-contract.md + crates/arm64jit/src/jni.rs
+  (test-only). Commit (SH479).
+
 ## SH478 (Sep 19/20, 2026, hermes-worker): set InitParams.buildVariant to the real production variant ("release") — an authoritative-doc-vs-code mismatch, latent session-config identity
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified
 GREEN at fresh SH477 HEAD first (capture_taskv4_frame.sh attempt 1: 24 real task-driven
