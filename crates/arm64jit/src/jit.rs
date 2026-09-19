@@ -3188,8 +3188,60 @@ fn routeb_dm_real_ctor_drive_guard(_state: *mut CpuState, pc: u64) {
     });
 }
 
+/// SH384 (SH383 next-step): DRIVE the GENUINE LocalStorageManager ctor 0x1db0dfc
+/// through real code with a coherent `container`, manufacturing a real vtable-owning
+/// manager — the MIGRATION-directive manufacture lever, previously only pinned (SH383),
+/// never driven. Prior persistence cycles were all SKIP (SH348 leaf-ret, SH349/350
+/// sub-call-skip) or SEED (SH267/285 map/nodes) — none ran the real ctor. Disasm: outer
+/// ctor reads [container+8] (sub-object) with `cbz x0` @0x40 (NULL -> benign), [container+16]
+/// 16-byte payload -> [this+16], [container+32] word -> [this+32]; then bl inner ctor
+/// 0x1db0748 which re-reads [container+8] `cbz x9` @0x2c -> `mov x19,xzr` @0x78 (NULL ->
+/// x19=0) and its stack canary check reads the same global twice (self-consistent, passes
+/// with no patch). So a ZEROED coherent container drives the genuine ctor to manufacture a
+/// genuine-vt owning manager cleanly. default-inert (env JIT_ROUTEB_LSM_CTOR_MANUFACTURE=1),
+/// idempotent, best-effort (a guest fault returns Ok + is reported). This is cause-not-
+/// symptom: it manufactures the missing object the SH285 reader/pop faults on, rather than
+/// skipping/repairing it.
+fn routeb_lsm_ctor_manufacture_drive(_state: *mut CpuState, pc: u64) {
+    if std::env::var_os("JIT_ROUTEB_LSM_CTOR_MANUFACTURE").is_none() {
+        return;
+    }
+    const SLADM_LO: u64 = 0x1023efe2c; // StartLuaAppDM entry (canonical ladder drives it)
+    const SLADM_HI: u64 = 0x1023eff40;
+    if pc < SLADM_LO || pc > SLADM_HI {
+        return;
+    }
+    const LSM_CTOR: u64 = 0x101db0dfc; // GENUINE LocalStorageManager ctor guest addr (file 0x1db0dfc in r-x text segment guest [0x100000000,0x1062d8190), ELF file-offset==vaddr; this=x0, container=x1)
+    const INNER_CTOR: u64 = 0x101db0748; // its inner ctor guest addr (file 0x1db0748)
+    use std::sync::OnceLock;
+    static DRIVEN: OnceLock<()> = OnceLock::new();
+    DRIVEN.get_or_init(|| {
+        // this = leaked zeroed 0x100 guest-visible manager object (genuine vt written by ctor).
+        let this = Box::leak(vec![0x0u8; 0x100].into_boxed_slice()).as_mut_ptr() as u64;
+        // container = coherent nil sub-object: [8]=0 (cbz benign), [16..32]=16 zero payload,
+        // [32]=0 word. Both outer + inner ctors take NULL-tolerant paths -> clean manufacture.
+        let container = Box::leak(vec![0x0u8; 0x40].into_boxed_slice()).as_mut_ptr() as u64;
+        let tp = crate::jit::current_guest_tp();
+        match crate::jit::run_guest_callback(LSM_CTOR, [this, container, 0, 0, 0, 0, 0, 0], tp) {
+            Ok(r) => {
+                let vt0 = unsafe { std::ptr::read_unaligned(this as *const u64) };
+                let vt8 = unsafe { std::ptr::read_unaligned((this + 0x8) as *const u64) };
+                let w32 = unsafe { std::ptr::read_unaligned((this + 0x20) as *const u64) };
+                let vt40 = unsafe { std::ptr::read_unaligned((this + 0x28) as *const u64) };
+                let vt48 = unsafe { std::ptr::read_unaligned((this + 0x30) as *const u64) };
+                let in_image = |a: u64| a >= 0x100000000 && a <= 0x200000000;
+                eprintln!(
+                    "[routeb-lsm-ctor] SH384: GENUINE LocalStorageManager ctor 0x{LSM_CTOR:x} DROVE ok ret x0={r:#x}; [this]=vt {vt0:#x} {vt8:#x} this+0x20={w32:#x} this+0x28={vt40:#x} this+0x30={vt48:#x} (in-image vt={} inner 0x{INNER_CTOR:x} ran through real code)",
+                    in_image(vt0) && in_image(vt40) && in_image(vt48)
+                );
+            }
+            Err(e) => eprintln!("[routeb-lsm-ctor] SH384: genuine LSM ctor 0x{LSM_CTOR:x} drive err: {e} (next gate)"),
+        }
+    });
+}
+
 /// SH189 (Route-B): the genuine DM's service container ([dm+0x68] singly-linked list,
-/// [dm+0x78] 16-byte-stride class-descriptor vector) is built LAZILY by name-resolution,
+/// [dm+0x78] 16-byte-stride class-descriptor vector) is built LAZYLY by name-resolution,
 /// and the global class-name registry (header guest 0x106dca0e70, resolver 0x102373dec)
 /// is .bss-zeroed until a class-registration once-init runs. PlayerGui/CoreGui/ScreenGui
 /// are NEVER constructed in the DM ctor (SH189 recon deleg_58cfcb06 authoritative) — the
@@ -7155,6 +7207,7 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
             routeb_dm_ctor_driver_guard(state, pc); // SH182: host-drive the manufactured DM through its genuine app-shell ctor 0x1057d6ef4 (JIT_ROUTEB_DM_CTOR_DRIVER)
             routeb_dm_real_ctor_drive_guard(state, pc); // SH187: drive the REAL DataModel ctor wrapper 0x1023f5ff8 -> 0x1023f6038 (JIT_ROUTEB_DM_REALCTOR)
             routeb_dm_service_seed_guard(state, pc); // SH189: seed empty DM service container + drive PlayerGui class-registry register (JIT_ROUTEB_DM_SERVICES)
+            routeb_lsm_ctor_manufacture_drive(state, pc); // SH384: DRIVE the GENUINE LocalStorageManager ctor 0x1db0dfc with a coherent container -> manufacture a real vtable-owning manager (JIT_ROUTEB_LSM_CTOR_MANUFACTURE)
             routeb_dm_instance_guard(state, pc); // SH189c: drive the real PlayerGui/ScreenGui INSTANCE ctor chain (JIT_ROUTEB_DM_INSTANCE)
             routeb_dm_service_resolve_guard(state, pc); // SH191: host-link the constructed PlayerGui as a service node on [dm+0x68] + drive getService walker (JIT_ROUTEB_DM_SERVICE_NODE)
             routeb_tail_eq_guard(state, pc); // SH161b: seed impl[+0x2b8]=2 (governor-tail epilogue b.eq)
@@ -9581,6 +9634,44 @@ mod tests {
             eprintln!("sh383 genuine LocalStorageManager ctor 0x1db0dfc pinned (this=x0, container x1, inner 0x1db0748, SH285 leaf 0x1d9a15c) — MIGRATION manufacture target");
         } else {
             eprintln!("sh383 real-image guard: no real libroblox.so, skipping ctor pins");
+        }
+    }
+
+    #[test]
+    fn sh384_lsm_ctor_null_tolerant_drive_path_pinned() {
+        // SH384 (real-image): pin the GENUINE LocalStorageManager ctor 0x1db0dfc's
+        // NULL-tolerant drive path — the exact words that let a ZEROED coherent container
+        // drive it cleanly (the SH384 manufacture drive's premise), vs SH383 which only
+        // pinned the entry/ret/leaf. Outer ctor: `ldr x0,[x1,#8]` @0x1db0e24 then
+        // `cbz x0, 0x50` @0x1db0e3c (NULL sub-object -> benign, no vt dispatch). Inner ctor
+        // 0x1db0748: `cbz x9, 0x78` @0x1db0774 -> `mov x19,xzr` @0x1db07c0 (NULL container
+        // sub -> x19=0, no dispatch). Stack canary: inner reads [x22] @0x1db076c and again
+        // @0x1db0810 (same global twice -> self-consistent, passes without a canary patch).
+        // Index by FILE OFFSET (guest-0x100000000).
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let word_at = |vaddr: u64| -> u32 {
+                let off = vaddr as usize;
+                let b = &img[off..off + 4];
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            };
+            // outer ctor: sub-object load + NULL-`cbz`.
+            assert_eq!(word_at(0x1db0e20), 0xf9400420, "sh384 outer ldr x0,[x1,#8] (container sub)");
+            assert_eq!(word_at(0x1db0e3c), 0xb4000080, "sh384 outer cbz x0 (NULL sub -> benign)");
+            // outer ctor: 16-byte payload + word from container -> this.
+            assert_eq!(word_at(0x1db0e58), 0x3dc006a0, "sh384 outer ldr q0,[x21,#16] (payload)");
+            assert_eq!(word_at(0x1db0e4c), 0xb94022a8, "sh384 outer ldr w8,[x21,#32] (word)");
+            // inner ctor: NULL-tolerant sub dispatch.
+            assert_eq!(word_at(0x1db0774), 0xf9400429, "sh384 inner ldr x9,[x1,#8] (container sub)");
+            assert_eq!(word_at(0x1db0778), 0xb4000249, "sh384 inner cbz x9 (NULL container sub)");
+            assert_eq!(word_at(0x1db07c0), 0xaa1f03f3, "sh384 inner mov x19,xzr (NULL -> no dispatch)");
+            // inner canary: same global loaded twice (self-consistent).
+            assert_eq!(word_at(0x1db076c), 0xf94002c8, "sh384 inner canary read #1 ldr x8,[x22]");
+            assert_eq!(word_at(0x1db0810), 0xf94002c8, "sh384 inner canary read #2 ldr x8,[x22]");
+            eprintln!("sh384 genuine LSM ctor NULL-tolerant drive path pinned (outer cbz 0x1db0e3c / payload 0x1db0e5c, inner cbz 0x1db0774 -> mov xzr 0x1db07c0, self-consistent canary) — zeroed-container drive premise anchored");
+        } else {
+            eprintln!("sh384 real-image guard: no real libroblox.so, skipping drive-path pins");
         }
     }
 

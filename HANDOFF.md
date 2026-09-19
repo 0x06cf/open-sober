@@ -1,5 +1,31 @@
 # Open Sober — Agent Handoff
 
+## SH384 (Sep 20, 2026, hermes-worker): implemented + MEASURED the DRIVE of the GENUINE
+LocalStorageManager ctor (guest 0x101db0dfc, file 0x1db0dfc, r-x text seg [0x100000000,0x1062d8190),
+ELF file-offset==vaddr) through real relocated engine code with a coherent zeroed container —
+manufacturing a real vtable-owning manager — SH383's explicitly-named next-step (was only pinned)
+Single-agent (cone suppressed). New default-inert opt-in drive `routeb_lsm_ctor_manufacture_drive`
+(JIT_ROUTEB_LSM_CTOR_MANUFACTURE=1, scoped to StartLuaAppDM entry, idempotent) + real-image hermetic
+`sh384_lsm_ctor_null_tolerant_drive_path_pinned` (arm64jit lib 438->439) + repro
+`runs/capture_sh384_lsm_ctor_manufacture.sh` + frontier doc. NO production path / JIT hook default /
+guest byte touched (pure opt-in + hermetic; standard ladder default unchanged).
+MEASURED (real libroblox.so, completing ladder + the drive env, 2/3): the genuine ctor DROVE ok
+ret x0=0 and manufactured a genuine vtable-owning manager — [this+0]=0x10635bf88 (vt page
+0x10635b000+0xf88), this+0x28=0x10635bfb8 (+0xfb8), this+0x30=0x10635bff8 (+0xff8), the EXACT words
+the ctor's `add x8,x9,#0x30/#0x70` computes; inner ctor 0x101db0748 ran through real code;
+in-image vt=true. The drive premise is disasm-anchored (outer cbz x0 @0x1db0e3c, inner cbz x9
+@0x1db0778 -> mov x19,xzr @0x1db07c0, self-consistent canary @0x1db076c/@0x1db0810 — a zeroed
+container drives it cleanly). First time the genuine LocalStorageManager ctor has ever been DRIVEN
+headlessly (SH348-350/373 only skipped/seeded the lane). This is the MIGRATION-directive manufacture
+lever: a real vtable-owning manager OBJECT constructed by running the engine's own ctor code.
+Workspace green (cargo test --workspace EXIT 0; arm64jit lib 439/0; jit.rs 1,011,782 B <1MiB).
+Route-B live-DM structural gate UNCHANGED (DM-root [0x106a68818]=0, MH_* false, AppBridgeV2 0);
+terminal still the SH285 persistence-lane wall guestpc=0x101db1b08 — wiring the manufactured
+manager INTO the lane so the SH285 reader consumes it is the further step (needs a coherent
+`container` sub-object whose vt[+24] dispatch survives; structural, not a fixed-.bss seed).
+SH174 capture-latch stays the single forward observer. Do-not-re-tread unchanged (incl. LSM skips
+SH349/350/358/373, once-lambda store seeding SH381).
+
 ## SH383 (Sep 20, 2026, hermes-worker): pin the GENUINE LocalStorageManager constructor (0x1db0dfc) as the MIGRATION-directive manufacture target — the persistence funnel (SH285 reader/pop wall, [obj+0x50]=0xff..ff) was only ever skipped (SH348 leaf-ret) or map-seeded (SH267/285); SH383 byte-pins the real vtable-owning object ctor (this=x0, vt 0x10635b000+0xd58 & +0xe68, reads [x1+8]/[x1+16]/[x1+32], inner ctor 0x1db0748, SH285 byte-copy leaf 0x1d9a15c) so a future run_guest_callback drive is byte-anchored
 Single-agent (cone suppressed). recon-v3 self-driven-frame + JSON deliverables
 re-verified green at HEAD (capture_taskv4_frame.sh attempt 1: 24 real task-driven
