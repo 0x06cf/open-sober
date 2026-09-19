@@ -9550,6 +9550,41 @@ mod tests {
     }
 
     #[test]
+    fn sh383_lsm_ctor_manufacture_target_pinned() {
+        // SH383 (real-image): pin the GENUINE LocalStorageManager ctor 0x1db0dfc as the
+        // MIGRATION-directive manufacture target. SH348 only leaf-`ret`ed initStorageManagerNative
+        // (skip); SH267/285 only map-seeded the .bss map. NO cycle pinned the real vtable-owning
+        // object ctor that initializes the SH285 reader/pop string buffer ([obj+0x50]=0xff..ff
+        // because the ctor never ran). this=x0 sets vt 0x10635b000+0xd58 & +0xe68, reads [x1+8]/
+        // [x1+16]/[x1+32], calls inner ctor 0x1db0748; SH285 byte-copy leaf 0x1d9a15c. Pins so a
+        // future run_guest_callback drive is byte-anchored. Index by FILE OFFSET (guest-0x100000000).
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let word_at = |vaddr: u64| -> u32 {
+                let off = vaddr as usize;
+                let b = &img[off..off + 4];
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            };
+            assert_eq!(word_at(0x1db0dfc), 0xa9bc7bfd, "sh383 ctor stp x29,x30,[sp,#-64]!");
+            assert_eq!(word_at(0x1db0e34), 0xf9000277, "sh383 ctor str x23,[x19] (vt+0 store)");
+            assert_eq!(word_at(0x1db0e84), 0x97fffe31, "sh383 ctor bl 0x1db0748 (inner ctor)");
+            assert_eq!(word_at(0x1db0e98), 0xd65f03c0, "sh383 ctor ret");
+            assert_eq!(word_at(0x1db0748), 0xd10103ff, "sh383 inner ctor sub sp,#0x40");
+            assert_eq!(word_at(0x1d9a15c), 0xb9400048, "sh383 SH285 byte-copy leaf ldr w8,[x2]");
+            for (g, name) in [
+                (0x1db0dfcu64, "ctor-entry"), (0x1db0e84u64, "ctor-inner-bl"),
+                (0x1db0748u64, "inner-ctor"), (0x1d9a15cu64, "sh285-leaf"),
+            ] {
+                assert!(g & 3 == 0, "sh383 {name} {g:#x} 4-aligned");
+            }
+            eprintln!("sh383 genuine LocalStorageManager ctor 0x1db0dfc pinned (this=x0, container x1, inner 0x1db0748, SH285 leaf 0x1d9a15c) — MIGRATION manufacture target");
+        } else {
+            eprintln!("sh383 real-image guard: no real libroblox.so, skipping ctor pins");
+        }
+    }
+
+    #[test]
     fn sh375_setinitparams_is_genuine_3f0_frame_lsm_consumer() {
         // SH375 (real-image): with the SH373 reaching-env (LSM_APPEND_SKIP + DM_CONT_M48_SEED
         // + CONT_APPNAME_SEED) the SH285 persistence wall is deterministically CROSSED and the
