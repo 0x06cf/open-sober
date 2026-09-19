@@ -1,5 +1,46 @@
 # Open Sober — Agent Handoff
 
+## SH447 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD FP UNARY codegen family (translate.rs SimdFpUnary — fneg/fabs/fsqrt Vd.T, Vn.T) — 5 exact-byte pins
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+unchanged-green (the change is `#[cfg(test)]`-only, so the runtime deliverable
+is byte-identical — SH445 capture baseline 24 real task-driven frames `present
+swap Ok(0x1)`, 0 json abort, 0 crash, EXIT 0). Workspace green (cargo test
+--workspace EXIT 0; arm64jit lib 618/0 incl. 5 new sh447 pins, was 613; cargo
+build --workspace + --example elfjit OK). Production code ONLY in translate.rs
+`#[cfg(test)]` addition (translator core body byte-untouched; jit.rs
+1,048,390 B < 1MiB hook unchanged; elfjit.rs 1,048,392 B / session.rs
+unchanged). Commit b5497f5.
+- SimdFpUnary (the per-lane 1-source FP unary — fneg/fabs/fsqrt) had zero
+  direct byte tests (decode pins decode, jit pins runtime, but the byte
+  EMISSION between them was unpinned; STATUS next-forward #5 named
+  `SimdFpUnary/SimdArithUnary` a remaining family). SH447 pins the exact emit
+  (rd=1 rn=2; Vn@0x130 Vd@0x120): (1) fneg .2s full-buffer — per-lane
+  `movq xmm0,[Vn+l]` (f3 48 0f 7e 83) + `movq rax,xmm0` (66 48 0f 7e c0) +
+  sign const bit31 0x8000_0000 in RCX (48 b9 ..00 00 00 80..) + `xor rax,rcx`
+  (48 31 c8 — the FLIP) + `movq xmm0,rax` + `movd eax,xmm0` + 32-bit store
+  `[Vd+l],eax` (89 83); (2) fabs clears the sign via `mov rdx,const` (48 ba) +
+  `not rdx` (48 f7 d2) + `and rax,rdx` (48 21 d0), NEVER xor — and+not (vs
+  fneg's xor-flip) is the fabs-vs-fneg discriminator, a transposed op toggles
+  instead of clears; (3) fsqrt .2d full-buffer — `sqrtsd xmm0,xmm0` (f2 0f 51
+  c0) + `movq [Vd],xmm0` (66 48 0f d6), with ZERO GPR sign-bit manipulation (no
+  48 b9 const, no xor); (4) esize width discriminator — esize8 loads the 64-bit
+  sign (0x8000_0000_0000_0000 imm ..00*7 80) + 64-bit movq store (lane1 at +8),
+  esize2 loads bit15 (0x8000) + 16-bit store (66 89); (5) q lane advance (.4s)
+  — loads 0x130/0x134/0x138/0x13c, stores 0x120/0x124/0x128/0x12c (+esize).
+- Deterministic: synthetic Inst -> translate() -> CodeBuf.as_slice() (zero-pc
+  0x1000); [RBX]=CpuState, vector slot v[t]=VECTOR_BASE(0x110)+t*16. Emission
+  established with a one-off probe dump (captured fneg/fabs/fsqrt + lane-width
+  variants; removed before commit) so pins match the real emission. 5
+  exact-byte + window + negative/order asserts. No image, no env,
+  parallel-safe.
+- Honest: NOT a DM (SH415 probe re-confirms DM-root [0x106a68818]=0x0 under the
+  complete substrate; Route-B live-DM gate UNCHANGED). BUILD-THE-RUNTIME
+  codegen-surface coverage completion on the 1-source FP unary family,
+  continuing the SH427-446 translator-core lineage. No re-treads (distinct
+  from SH446 by-element FMUL, SH444 2-src scalar FP).
+- Files: docs/frontier-sh447-translator-simdfpunary.md + crates/arm64jit/src/
+  translate.rs (`#[cfg(test)]` only). Commit b5497f5.
+
 ## SH446 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD by-element FMUL codegen family (translate.rs SimdFmulEl — fmul Vd.T, Vn.T, Vm.T[L]) — 4 exact-byte pins
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 unchanged-green (test-only change, runtime byte-identical; SH445 capture
