@@ -1,5 +1,43 @@
 # Open Sober — Agent Handoff
 
+## SH444 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD single-precision FP TWO-SOURCE arithmetic codegen family (translate.rs VecFpArith — fadd/fsub/fmul/fdiv op 0..3 + fmax/fmin/fmaxnm/fminnm op 4..7 + frecps/frsqrts op 8/9) — 3 exact-byte pins
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+unchanged-green (the change is `#[cfg(test)]`-only, so the runtime deliverable
+is byte-identical — SH443 baseline). Workspace green (cargo test --workspace
+EXIT 0; arm64jit lib 606/0 incl. 3 new sh444 pins, was 603; cargo build
+--workspace + --example elfjit OK). Production code ONLY in translate.rs
+`#[cfg(test)]` addition (translator core body byte-untouched; jit.rs
+1,048,390 B < 1MiB hook unchanged; elfjit.rs/session.rs unchanged).
+- VecFpArith (the plain per-lane 2-src FP arithmetic — every geometry/color
+  lane's add/sub/mul/div/max/min) had zero direct byte tests: SH433 only pinned
+  the Fmla multiply-ACCUMULATE, not this family. SH444 pins the exact emit
+  (rd=1 rn=2 rm=3; Vd@0x120 Vn@0x130 Vm@0x140): per lane `mov eax,[Vn+4l]` +
+  movd xmm0 (66 0f 6e c0) + `mov eax,[Vm+4l]` + movd xmm1 (66 0f 6e c8) + the
+  FP op + movd eax,xmm0 (66 0f 7e c0) + `mov [Vd+4l],eax` (89 83 d32). The
+  ONLY semantic bit is the opcode: addss F3 0F 58 C1 / subss 5C / mulss 59 /
+  divss 5E / maxss F3 40 0F 5F C1 / minss F3 40 0F 5D C1.
+- Discriminator facts: (1) the opcode byte 58/5C/59/5E/5F/5D a flub silently
+  corrupts; (2) maxss/minss ALWAYS emit the REX prefix 0x40 (CodeBuf::maxss/
+  minss calls x86::rex() unconditionally), so the real bytes are F3 40 0F 5F/
+  5D C1 NOT F3 0F — my first attempt assumed REX=0x41; reading rex() confirmed
+  register<8 -> no bit3 -> 0x40 (a genuine always-present-vs-absent
+  discriminator vs the non-REX add/sub/mul/div); (3) frecps (op 8) uses the
+  INVERTED sub `subss xmm1,xmm0` (F3 0F 5C C8, dst=1 rm=0) over mulss to
+  compute 2.0-prod; frsqrts (op 9) adds movd xmm3 (66 0f 6e d8) of 0.5f +
+  mulss xmm1,xmm3 (F3 0F 59 CB); (4) Vn/Vm/Vd all advance exactly +4/lane.
+- Deterministic: synthetic Inst -> translate() -> CodeBuf.as_slice() (zero-pc
+  0x1000); [RBX]=CpuState, vector slot v[t]=VECTOR_BASE(0x110)+t*16. The
+  full-buffer .2s fadd assert_eq matched real emission first try (add/movd/
+  store primitives are the SH433-proven forms); only the max/min REX form
+  needed the emitter re-read. 3 exact-byte pins.
+- Honest: NOT a DM (SH415 probe re-confirms DM-root [0x106a68818]=0x0 under the
+  complete substrate; Route-B live-DM gate UNCHANGED). BUILD-THE-RUNTIME
+  codegen-surface coverage completion on the 2-src scalar-FP family, distinct
+  from SH441 (cross-lane FMaxV reduction) and SH433 (Fmla accumulate). No
+  re-treads.
+- Files: docs/frontier-sh444-translator-vecfparith.md + crates/arm64jit/src/
+  translate.rs (`#[cfg(test)]` only). Commit (pending).
+
 ## SH443 (Sep 19, 2026, hermes-worker): hermetic coverage of the BYTE-REVERSE codegen family (translate.rs SimdRev `rev64`/`rev32`/`rev16`) — 4 exact-byte pins
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 unchanged-green (24 real task-driven frames `present swap Ok(0x1)`, 0 json

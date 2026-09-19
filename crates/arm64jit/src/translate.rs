@@ -9223,6 +9223,100 @@ mod tests {
         assert!(!b.windows(10).any(|w| w == [0x48, 0xb8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]), "signed fcvtzs must NOT saturate to u64::MAX");
     }
 
+    // SH444: hermetic coverage of the SIMD single-precision FP TWO-SOURCE
+    // arithmetic codegen family (translate.rs VecFpArith — fadd/fsub/fmul/fdiv
+    // op 0..3 + fmax/fmin/fmaxnm/fminnm op 4..7 on Vd.2s/.4s lanes; and the
+    // frecps/frsqrts op 8/9 reciprocal-estimate helpers). SH433 pinned Fmla
+    // (the FP multiply-ACCUMULATE with a vector-3/4-operand dst) but not the
+    // plain 2-src per-lane arithmetic, which is every geometry/color lane's
+    // add/sub/mul/div/max/min. The whole family shares one movd-xmm0/1 +
+    // opcode + movd-back store shape, so the ONLY semantic bit is the opcode
+    // byte: addss 0x58 / subss 0x5C / mulss 0x59 / divss 0x5E on (xmm0,xmm1)
+    // = F3 0F {58,5C,59,5E} C1, maxss 0x5F, minss 0x5D. A flub (say mulss where
+    // fsub was wanted) silently wrong-computes every lane. The frecps/frsqrts
+    // path is DELIBERATELY different: it loads the product into a temp then
+    // emits `subss xmm1,xmm0` (F3 0F 5C C8 — inversion of the fsub register
+    // direction) to compute 2-prod / (3-prod), and frsqrts adds a `mulss
+    // xmm1,xmm3` by 0.5f (F3 0F 59 CB). rd=1 rn=2 rm=3: Vd slot VECTOR_BASE
+    // 0x110+1*16=0x120, Vn slot 0x130, Vm slot 0x140.
+    #[test]
+    fn sh444_vecfparith_2s_add_full_lane_addressing() {
+        // fadd V1.2s, V2.2s, V3.2s (op=0, q=false): 2 lanes, dst 0x120/0x124.
+        let b = tr_bytes(Inst::VecFpArith { rd: 1, rn: 2, rm: 3, op: 0, q: false });
+        assert_eq!(b, vec![
+            // lane 0: Vn@0x130, Vm@0x140, addss, store Vd@0x120
+            0x8b, 0x83, 0x30, 0x01, 0x00, 0x00, // mov eax,[rbx+0x130]  Vn lane0
+            0x66, 0x0f, 0x6e, 0xc0,             // movd xmm0,eax
+            0x8b, 0x83, 0x40, 0x01, 0x00, 0x00, // mov eax,[rbx+0x140]  Vm lane0
+            0x66, 0x0f, 0x6e, 0xc8,             // movd xmm1,eax
+            0xf3, 0x0f, 0x58, 0xc1,             // addss xmm0,xmm1
+            0x66, 0x0f, 0x7e, 0xc0,             // movd eax,xmm0
+            0x89, 0x83, 0x20, 0x01, 0x00, 0x00, // mov [rbx+0x120],eax  Vd lane0
+            // lane 1: Vn@0x134, Vm@0x144, addss, store Vd@0x124
+            0x8b, 0x83, 0x34, 0x01, 0x00, 0x00, // mov eax,[rbx+0x134]  Vn lane1
+            0x66, 0x0f, 0x6e, 0xc0,
+            0x8b, 0x83, 0x44, 0x01, 0x00, 0x00, // mov eax,[rbx+0x144]  Vm lane1
+            0x66, 0x0f, 0x6e, 0xc8,
+            0xf3, 0x0f, 0x58, 0xc1,             // addss xmm0,xmm1
+            0x66, 0x0f, 0x7e, 0xc0,             // movd eax,xmm0
+            0x89, 0x83, 0x24, 0x01, 0x00, 0x00, // mov [rbx+0x124],eax  Vd lane1
+        ]);
+        // lane addressing: dst advances by 4 per lane (0x120 -> 0x124), both Vn
+        // (0x130->0x134) and Vm (0x140->0x144) too — never a stale/fixed stride.
+        assert!(b.windows(6).any(|w| w == [0x89, 0x83, 0x24, 0x01, 0x00, 0x00]),
+            "lane1 must store Vd@0x124 (dst advances by esize=4 per lane)");
+        assert!(b.windows(6).any(|w| w == [0x8b, 0x83, 0x34, 0x01, 0x00, 0x00]),
+            "lane1 must read Vn@0x134 (src advances +4)");
+        assert!(b.windows(6).any(|w| w == [0x8b, 0x83, 0x44, 0x01, 0x00, 0x00]),
+            "lane1 must read Vm@0x144 (src advances +4)");
+    }
+
+    #[test]
+    fn sh444_vecfparith_opcode_discriminators_add_sub_mul_div_max_min() {
+        // The whole family shares the movd-in/opcode/movd-out shape; only the
+        // opcode byte changes. Verify each is EXACT and cross-absent so a flub
+        // (mulss where fsub was wanted) fails.
+        let sub = tr_bytes(Inst::VecFpArith { rd: 1, rn: 2, rm: 3, op: 1, q: false });
+        assert!(sub.windows(4).any(|w| w == [0xf3, 0x0f, 0x5c, 0xc1]), "fsub = subss (F3 0F 5C C1)");
+        assert!(!sub.windows(4).any(|w| w == [0xf3, 0x0f, 0x58, 0xc1]), "fsub must NOT emit addss");
+        let mul = tr_bytes(Inst::VecFpArith { rd: 1, rn: 2, rm: 3, op: 2, q: false });
+        assert!(mul.windows(4).any(|w| w == [0xf3, 0x0f, 0x59, 0xc1]), "fmul = mulss (F3 0F 59 C1)");
+        assert!(!mul.windows(4).any(|w| w == [0xf3, 0x0f, 0x5c, 0xc1]), "fmul must NOT emit subss");
+        let div = tr_bytes(Inst::VecFpArith { rd: 1, rn: 2, rm: 3, op: 3, q: false });
+        assert!(div.windows(4).any(|w| w == [0xf3, 0x0f, 0x5e, 0xc1]), "fdiv = divss (F3 0F 5E C1)");
+        let mx = tr_bytes(Inst::VecFpArith { rd: 1, rn: 2, rm: 3, op: 4, q: false });
+        assert!(mx.windows(5).any(|w| w == [0xf3, 0x40, 0x0f, 0x5f, 0xc1]), "fmax/fmaxnm = maxss (F3 40 0F 5F C1 — ALWAYS emits the no-op REX)");
+        assert!(!mx.windows(5).any(|w| w == [0xf3, 0x40, 0x0f, 0x5d, 0xc1]), "fmax must NOT emit minss");
+        let mn = tr_bytes(Inst::VecFpArith { rd: 1, rn: 2, rm: 3, op: 5, q: false });
+        assert!(mn.windows(5).any(|w| w == [0xf3, 0x40, 0x0f, 0x5d, 0xc1]), "fmin/fminnm = minss (F3 40 0F 5D C1 — ALWAYS emits the no-op REX)");
+        assert!(!mn.windows(5).any(|w| w == [0xf3, 0x40, 0x0f, 0x5f, 0xc1]), "fmin must NOT emit maxss");
+        // op 6/7 (fmaxnm/fminnm) reuse the maxss/minss opcode (NaN edge is a
+        // documented approximation), so they must match 4/5 respectively.
+        let mxnm = tr_bytes(Inst::VecFpArith { rd: 1, rn: 2, rm: 3, op: 6, q: false });
+        assert!(mxnm.windows(5).any(|w| w == [0xf3, 0x40, 0x0f, 0x5f, 0xc1]), "fmaxnm = maxss (same opcode)");
+        let mnnm = tr_bytes(Inst::VecFpArith { rd: 1, rn: 2, rm: 3, op: 7, q: false });
+        assert!(mnnm.windows(5).any(|w| w == [0xf3, 0x40, 0x0f, 0x5d, 0xc1]), "fminnm = minss (same opcode)");
+    }
+
+    #[test]
+    fn sh444_vecfparith_frecps_inverted_sub_and_frsqrts_half_scale() {
+        // frecps (op 8): computes 2.0 - Vn*Vm -> the emit is mulss(xmm0,xmm1)
+        // for the product, materializes 2.0f32 (0x40000000), then `subss
+        // xmm1,xmm0` (F3 0F 5C C8) — the INVERTED register direction vs the
+        // plain fsub (F3 0F 5C C1) — so xmm1 = 2.0 - prod. frsqrts (op 9) adds
+        // `movd xmm3,eax` of 0.5f (0x3f000000) + `mulss xmm1,xmm3` (F3 0F 59 CB).
+        let f = tr_bytes(Inst::VecFpArith { rd: 1, rn: 2, rm: 3, op: 8, q: false });
+        assert!(f.windows(4).any(|w| w == [0xf3, 0x0f, 0x59, 0xc1]), "frecps multiplies the product first (mulss xmm0,xmm1)");
+        assert!(f.windows(4).any(|w| w == [0xf3, 0x0f, 0x5c, 0xc8]), "frecps inverted sub = subss xmm1,xmm0 (F3 0F 5C C8), the frecps-vs-fsub discriminator");
+        assert!(!f.windows(4).any(|w| w == [0xf3, 0x0f, 0x5c, 0xc1]), "frecps must NOT emit the fsub register direction");
+        // 2.0f32 little-endian 0x40000000 materialized as an imm32 word
+        assert!(f.windows(4).any(|w| w == [0x00, 0x00, 0x80, 0x40]) || f.windows(3).any(|w| w == [0x00, 0x00, 0x40]) && f.windows(4).any(|w| w == [0x00, 0x00, 0x00, 0x40]),
+            "frecps materializes 2.0f32 (0x40000000)");
+        let r = tr_bytes(Inst::VecFpArith { rd: 1, rn: 2, rm: 3, op: 9, q: false });
+        assert!(r.windows(4).any(|w| w == [0x66, 0x0f, 0x6e, 0xd8]), "frsqrts loads 0.5 into xmm3 (movd xmm3,eax)");
+        assert!(r.windows(4).any(|w| w == [0xf3, 0x0f, 0x59, 0xcb]), "frsqrts scales by 0.5 via mulss xmm1,xmm3 (F3 0F 59 CB)");
+    }
+
     #[test]
     fn sh439_fcvtztoint_fixed_point_fbits_scales_by_2pown_mulsd() {
         // fcvtzu x0, s1, #4 (fixed-point, fbits=4): result = Fn * 2^4.
