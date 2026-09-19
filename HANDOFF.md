@@ -1,5 +1,43 @@
 # Open Sober — Agent Handoff
 
+## SH369 (Sep 20, 2026, hermes-worker): MEASURED structural pin — window-attach COMPLETION funnels into the CLOSED persistence lane (flags-latch 0x72739d4 -> initStorageManagerNative 0x1db1050), NOT to a live DM; refines SH367's "needs a real surface" reading
+Single-agent (cone suppressed). One new real-image hermetic
+`sh369_window_attach_completion_converges_to_persistence_lane` (arm64jit lib 432; 11 word-pins
+verified on real libroblox.so) + docs/frontier-sh369-windowattach-persistence-convergence.md.
+No production path edited (read-only pin). recon-v3 immediate-priority deliverables re-verified
+green at HEAD this cycle (24 real task-driven frames, swap Ok(0x1), 0 json abort, 0 crash).
+Workspace green (cargo test --workspace EXIT 0, 612 passed/0 failed incl sh369).
+
+### The forward this cycle
+SH367 measured that arming the window-attach once-guard + a crafted [win+0x278] hard-faults and
+attributed the wall to "needs a REAL EGL surface, only a live Activity/AppBridge session provides".
+SH369 pins the COMPLETION chain the armed path would take and shows it is NOT a route to a live DM:
+disasm-verified `bl 0x22985c0 (deep GL post-init) -> bl 0x2270a98 -> bl 0x2270b24 (real body)`; the
+body gates on the SAME flags-loaded latch the --v2boot ladder seeds (`adrp 0x7273000; ldrb
+[x9,#2516]` = [0x72739d4] @0x2270b64) and, when bit0=1, falls through the `cbz w9,0x2270be8`
+@0x2270b78 to `bl 0x1db1050` = initStorageManagerNative — the SH285-family persistence lane
+(the SH285 fault site 0x101db1b08 is inside it; SH349 crossed it, SH350/358 closed the lane as
+measured-unbounded). So window-attach COMPLETION is a SECOND entry into the already-closed
+persistence lane, not a path to a live DM. This de-risks the SESSION-CTOR window precondition:
+even a REAL surface hands control to a lane already measured returned — that is partly why Route-B's
+live-DM gate stands (the window precondition alone cannot produce a DM).
+
+### Honest
+Does NOT manufacture a DataModel (DM-root [0x106a68818]=0, MH_* false unchanged). No re-run of the
+SH367 armed-fault (already 8/8 measured negative). Route-B live-DM structural gate UNCHANGED;
+SH174 capture-latch stays the single forward hook. This cycle is pin/verify, not a new session
+drive — but the pin is genuinely new (SH367 stopped at bl 0x22985c0; SH369 traces past it).
+
+### Next (unchanged, authoritative)
+Route-B live-DM structural gate stands (SESSION-CTOR / do-init four-stacked closure SH184/185;
+REG_LIVE SH352). R1 content half staged+armed+serviceable (SH351/352/354). SESSION half (do-init
+owning a live DM) remains THE wall — reached only by a REAL Activity/AppBridge session drive that
+constructs the upstream ctor for real. SH174 capture-latch stays the single forward hook. The
+window precondition is now pinned as persistence-lane-bound (SH369), so re-attacking it alone
+expecting a DM is closed; the genuine EGL-surface/governor/onAppReady home-cone (SH126+ captures)
+is still the live session lever. Do NOT re-arm the fabricated once-guard (SH367); do NOT re-enter
+the ALooper loop (SH365); bounded process_cmd stays the guarded entry (SH366/368).
+
 ## SH368 (Sep 20, 2026, hermes-worker): bounded app-command SEQUENCE drive on the guarded SH366 entry — the engine's own process_cmd dispatcher drives cmds {6,8,11} cleanly (marker IN INIT_WINDOW), session observables measured after EACH command confirm the dispatcher alone does NOT self-transition AppBridgeV2/surface (SESSION-CTOR wall pinned precisely); full 20-entry jump table + window-attach contract pinned in a new real-image hermetic
 Single-agent (cone suppressed). New opt-in rung `--v2boot-glue-cmd-seq` ->
 `drive_glue_process_cmd_seq` (jit.rs) on the SAME bounded SH366 dispatcher entry (once-guard stays

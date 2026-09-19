@@ -9390,6 +9390,54 @@ mod tests {
     }
 
     #[test]
+    fn sh369_window_attach_completion_converges_to_persistence_lane() {
+        // SH369 (real-image): pin the SH367 window-attach COMPLETION path and show it funnels
+        // into the ALREADY-closed persistence lane, NOT into DM construction. SH367 measured that
+        // arming window-attach's once-guard + a crafted [win+0x278] faults inside host GL dispatch
+        // (deep GL post-init 0x22985c0); it attributed the wall to "needs a REAL EGL surface".
+        // That is incomplete: the deep body reached by bl 0x22985c0 -> bl 0x2270a98 ->
+        // bl 0x2270b24 reads the SAME flags-loaded latch the --v2boot ladder seeds
+        // ([0x72739d4], adrp 0x7273000 + ldrb [x9,#2516] @0x2270b64) and, when bit0=1,
+        // calls initStorageManagerNative 0x1db1050 (the SH285-family persistence lane,
+        // SH349 measured-returned, SH350/358 closed). So window-attach completion = a second
+        // entry into the persistence lane, not a path to a live DM. This de-risks the SESSION-CTOR
+        // window precondition: even a REAL surface hands control to a lane that is already
+        // measured unbounded. Guard-worthy read-only (no guest mutation).
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let word_at = |vaddr: u64| -> u32 {
+                let off = vaddr as usize;
+                let b = &img[off..off + 4];
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            };
+            // 0x22985c0 (SH367 deep-GL post-init): ldr x8,[x0]; cbz -> fast-return 1 / else bl 0x2270a98.
+            assert_eq!(word_at(0x22985c0), 0xf9400008, "sh369 22985c0 ldr x8,[x0]");
+            assert_eq!(word_at(0x22985c4), 0xb4000148, "sh369 22985c0 cbz [x0]");
+            assert_eq!(word_at(0x22985d8), 0x97ff6130, "sh369 22985d8 bl 0x2270a98 (deep GL post-init)");
+            // 0x2270a98 body gate: add-imm target 0x6ed70cc; ldr x0,[x19,#3256]; the once-check
+            // `ldarb w8,[x8]` @0x2270ab4 gates the populating branch. If the once-cell is set it
+            // returns the stored pointer (skip), else locks + allocs 0x30 + calls 0x2270b24.
+            assert_eq!(word_at(0x2270aac), 0xf0026333, "sh369 2270aac adrp x19,6ed7000");
+            assert_eq!(word_at(0x2270ab4), 0x360000a8, "sh369 2270ab4 tbz w8,#0");
+            assert_eq!(word_at(0x2270ad0), 0x941770e1, "sh369 2270ad0 bl 0x284ce54 (lock)");
+            assert_eq!(word_at(0x2270adc), 0x97ec9723, "sh369 2270adc bl 0x1d96768 (alloc 0x30)");
+            assert_eq!(word_at(0x2270ae4), 0x94000010, "sh369 2270ae4 bl 0x2270b24 (real body)");
+            // 0x2270b24 body: SAME flags-latch as the ladder seeds (0x72739d4).
+            assert_eq!(word_at(0x2270b5c), 0xf0028009, "sh369 2270b5c adrp x9,7273000");
+            assert_eq!(word_at(0x2270b64), 0x39675129, "sh369 2270b64 ldrb w9,[x9,#2516] (=flags-latch 0x72739d4)");
+            // cbz w9,0x2270be8 @0x2270b78: if flags-loaded bit set -> FALL THROUGH to LSM.
+            assert_eq!(word_at(0x2270b78), 0x34000389, "sh369 2270b78 cbz w9");
+            assert_eq!(word_at(0x2270b7c), 0x97ed0135, "sh369 2270b7c bl 0x1db1050 initStorageManagerNative (persistence lane)");
+            // initStorageManagerNative 0x1db1050 is the SH285-family entry (once-guarded).
+            assert_eq!(word_at(0x1db1050), 0xa9bf7bfd, "sh369 1db1050 stp x29,x30 (initStorageManagerNative)");
+            eprintln!("sh369 window-attach completion converges into the persistence lane (flags-latch 0x72739d4 -> initStorageManagerNative 0x1db1050) pinned on libroblox.so");
+        } else {
+            eprintln!("sh369 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh322_lifecycle_wall_earlyret_guard_is_env_pc_gated_and_seeds_pair() {
         // SH322 (SESSION-CTOR, crossing the SH273 lifecycle wall on the SH320/321 MAIN path):
         // fn 0x21f3748 faults 0x50 on `ldrb [x8,#80]` when [x1]==0 (sh321 measured). This guard
