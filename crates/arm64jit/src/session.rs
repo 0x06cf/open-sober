@@ -406,7 +406,55 @@ pub fn drive_content_surface() -> usize {
         wrote.len(),
         wrote.join(", ")
     );
+    // (SH419) also mirror the module under the APP CACHE root. recon-v3 R1 says
+    // "also mirror under cache-root": the fsmap remaps guest `/cache` and real
+    // Android asset resolvers probe the app cache before the files dir, so a
+    // cache-only probe would miss the module if it lived only under
+    // files/scripts/CoreScripts. Idempotent; honors the same test override;
+    // degrades to 0 candidates on a bare no-root harness (guarded, no SIGSEGV).
+    let cache = mirror_r1_cache_root();
+    eprintln!(
+        "[session-drive] SH419 R1 cache-root mirror: {} ({})",
+        cache.len(),
+        cache.join(", ")
+    );
     seeded
+}
+
+/// SH419: mirror the staged R1 CoreScript module under the APP CACHE root.
+/// The fsmap remaps guest `/cache`, and real Android asset resolvers probe the app
+/// cache before the files dir; this fn copies the STAGED FILES (SH412) from the
+/// files-dir mirror into the app-cache mirror
+/// `<root>/data/user/0/com.roblox.client/cache/scripts/CoreScripts/`, the
+/// guest-visible path a cache-probing resolver reads first. Pure file staging: honors
+/// the fsmap test override, returns [] on a no-root harness, idempotent, no guest byte
+/// touched. Latent-but-correct exactly like SH412 — the mirror is only READ once a live
+/// DM drives the Lua loader. Returns the list of mirrored candidates (or [] if nothing
+/// to copy).
+pub fn mirror_r1_cache_root() -> Vec<String> {
+    let mut mirrored = Vec::new();
+    let Some(root) = crate::fsmap::staging_root() else {
+        eprintln!("[sh419] WARN persistence root not armed — cannot mirror R1 into the cache root");
+        return mirrored;
+    };
+    let src_dir = root
+        .join("data/user/0/com.roblox.client/files/scripts/CoreScripts");
+    let dst_dir = root
+        .join("data/user/0/com.roblox.client/cache/scripts/CoreScripts");
+    for name in ["AppShell.lua", "CoreScripts.lua"] {
+        let src = src_dir.join(name);
+        let dst = dst_dir.join(name);
+        if !src.is_file() {
+            continue; // files-dir mirror not staged -> nothing to copy
+        }
+        let body = std::fs::read(&src).unwrap_or_default();
+        let ok = std::fs::create_dir_all(&dst_dir).is_ok()
+            && std::fs::write(&dst, &body).is_ok();
+        let status = if ok { "CACHE-STAGED" } else { "FAIL" };
+        eprintln!("[sh419] {status} {name} at {dst:?} (mirrored from {src:?})");
+        mirrored.push(format!("{status} {name}"));
+    }
+    mirrored
 }
 
 /// Host-driven NativeHelper lifecycle milestone sequence (recon-routeB step-2 /
@@ -914,6 +962,57 @@ mod tests {
             1,
             "no-live-image: files-dir cell mapped by ensure_writable, drive must seed it (1), no SIGSEGV"
         );
+    }
+
+    /// SH419: the R1 content surface now spans BOTH roots a cache-probing resolver
+    /// may read — the files-dir mirror (SH412/sh351/sh354) AND the app-cache mirror
+    /// (recon-v3 R1 "also mirror under cache-root"). Under a test fs root: stage the
+    /// files mirror (SH412), mirror into the cache root (SH419), and prove (a) each
+    /// cache file exists + names a self-constructing ScreenGui, and (b) a guest open
+    /// of the app-cache path `/data/user/0/com.roblox.client/cache/scripts/CoreScripts/
+    /// <Name>.lua` resolves through `fsmap::remap_path` to exactly that mirror (the
+    /// serve half, SH354-style). No live binary needed.
+    #[test]
+    fn sh419_r1_cache_mirror_serves_both_roots() {
+        use std::ffi::CString;
+        static CACHE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = CACHE_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("os-r1-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::fsmap::set_root_for_tests(dir.clone());
+        // Stage the files-dir mirror (SH412) then mirror into the cache root (SH419).
+        let _staged = crate::jit::stage_r1_core_scripts();
+        let mirrored = crate::session::mirror_r1_cache_root();
+        assert!(
+            mirrored.len() == 2,
+            "expected 2 cache-mirrored candidates, got {mirrored:?}"
+        );
+        for name in ["AppShell.lua", "CoreScripts.lua"] {
+            let cached = dir
+                .join("data/user/0/com.roblox.client/cache/scripts/CoreScripts")
+                .join(name);
+            let body = std::fs::read_to_string(&cached).unwrap_or_else(|e| {
+                panic!("cache mirror {name} not written: {e} path={cached:?}")
+            });
+            assert!(body.contains("ScreenGui"), "{name} cache mirror must define a ScreenGui");
+            assert!(body.contains("R1HostScreen"), "{name} cache mirror must name the ScreenGui");
+            // Serve half: a guest open of the app-cache path resolves to the cache mirror.
+            let guest = format!(
+                "/data/user/0/com.roblox.client/cache/scripts/CoreScripts/{name}"
+            );
+            let g = CString::new(guest.clone()).unwrap();
+            let rm = crate::fsmap::remap_path(g.as_ptr())
+                .unwrap_or_else(|| panic!("remap_path must resolve {guest}"));
+            assert_eq!(
+                rm.host_path(),
+                cached,
+                "remap of {guest} must be the cache mirror"
+            );
+            assert!(rm.host_path().is_file(), "{guest} must be a readable file");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::fsmap::set_root_for_tests(std::path::PathBuf::new()); // clear override
     }
 
     /// SH414: the host-input pump is the executable half of the input axis — it

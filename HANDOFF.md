@@ -1,6 +1,36 @@
 # Open Sober — Agent Handoff
 
-## SH417c (Sep 19, 2026, hermes-worker): extend the SH417b crossing-env audit to the canonical stable `--v2boot` FULL-BOOT runbooks — capture_v2boot.sh (SH54) + capture_v2boot_gate.sh (SH81) both omitted the crossing env and silently inherited the SH83/SH91 hashfix-lane SIGSEGV that SH417b cleaned from the input loop; env added + MEASURED
+## SH419 (Sep 19, 2026, hermes-worker): the R1 content surface now spans BOTH roots a cache-probing resolver may read — files-dir mirror (SH412) + app-CACHE mirror (recon-v3 R1 "also mirror under cache-root" from deleg_8d5648cf); verified the missing-env audit is complete + re-confirmed the recon-v3 frame deliverable green at this exact HEAD
+
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+re-verified green at this exact HEAD first (capture_taskv4_frame.sh attempt 1:
+real task-driven frames `present swap Ok(0x1)`, 0 json abort, 0 crash — run-variable
+frame/node counts; both the 24-frame baseline and this run are crash-free real
+frames; the `--startapp` frame path does not touch the session substrate).
+Workspace green (cargo test --workspace EXIT 0; arm64jit lib 473/0 incl. new
+sh419; cargo build --example elfjit OK). Production code ONLY in session.rs
+(off the 1MiB hooks, file 61 KB); jit.rs untouched (1,048,571 B < 1,048,576 hook).
+- VERIFIED the STATUS next-forward #1 (missing-env crossing audit) is COMPLETE:
+  a full sweep of every `--v2boot` boot-path runbook shows only
+  `capture_sh416_input_poll.sh` lacks the 3-gate env, and SH417b deliberately
+  reverted it unchanged (env does not cleanse that LSM lane); the two canonical
+  full-boot runbooks carry the env (SH417c measured). Audit done.
+- session.rs: +`mirror_r1_cache_root() -> Vec<String>` — copies the two staged R1
+  candidates (AppShell.lua, CoreScripts.lua) from the files-dir mirror into the
+  guest app-cache mirror `<root>/data/user/0/com.roblox.client/cache/scripts/CoreScripts/<Name>.lua`
+  (pure file staging, idempotent, honors the test override, guarded src.is_file()
+  skip, no guest byte touched); wired into `drive_content_surface()` right after
+  `stage_r1_core_scripts()` so the ordered substrate's G3 content surface serves
+  BOTH roots a cache-probing resolver probes first.
+- New hermetic `sh419_r1_cache_mirror_serves_both_roots` (session.rs): stages the
+  files mirror, mirrors into the cache root, proves each cache file exists + names
+  a self-constructing ScreenGui AND a guest open of the app-cache path resolves
+  through `fsmap::remap_path` to exactly that mirror (SH354-style serve half).
+- Honest: NOT a DM (DM-root 0, no make_shared, MH_GAME_LOADED false). Route-B
+  live-DM structural gate UNCHANGED. Content-side BUILD-THE-RUNTIME completion —
+  removes the cache-probe miss that would blunt R1-first screens the instant a
+  live DM arrives (latent-but-correct, exactly like SH412). No re-treads.
+- Files: docs/frontier-sh419-r1-cache-root-mirror.md + crates/arm64jit/src/session.rs.
 Single-agent (cone suppressed). recon-v3 deliverables re-verified green at HEAD first
 (capture_taskv4_frame.sh attempt 1: 24 real task frames `present swap Ok(0x1)`, 197 node
 pops, 0 json abort, 0 crash). Workspace green (cargo test --workspace EXIT 0; arm64jit lib
