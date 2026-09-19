@@ -1,6 +1,33 @@
 # Open Sober — Agent Handoff
 
-## SH361 (Sep 20, 2026, hermes-worker): implement + MEASURE the operator's "dynamic DM-ctor trace rather than a static seed" — a read-only observation guard at the do-init worker entry 0x2206db8 that measures whether the MAIN branch's DM-holder field [container+32] is NULL (cbz @0x2206df8 -> MessageBus_getLastRaw bail 0x2206ea4) or non-NULL (-> `br x1` @0x2206e24 DM/app-shell dispatch). MEASURED (full app-start ladder): the container field IS non-NULL ([obj]vt=0x10635dde8) and the dispatch fires, landing at **0x10258b5d8 = nativeAppBridgeV2StartAppWithParams+0x494** (app-bridge StartApp body, not a DataModel ctor) — refining SH320's assumed "DM-ctor entry": the MAIN dispatch converges on StartAppWithParams, then runs dies at the SH285 persistence wall 0x101db1b08, DM-root 0
+## SH362 (Sep 20, 2026, hermes-worker): MEASURED — the do-init MAIN dispatch body fn 0x258b5d8 (StartAppWithParams+0x494) NEVER EXECUTES headlessly; SH361 read only the dispatch *target pointer* (vt[+48]=0x10258b5d8), SH362's body trace proves the body is never entered — every run faults at the SH285 persistence wall (0x101db1b08) before control reaches it (3/3)
+Single-agent (cone suppressed). One new READ-ONLY observation guard
+`routeb_startapp_dispatch_body_guard` (jit.rs, opt-in JIT_ROUTEB_DISPATCH_BODY_TRACE=1,
+default-inert, once-per-run, ZERO guest mutation) + one hermetic sh362
+(arm64jit lib 424->425) + runs/capture_sh362_dispatch_body.sh. elfjit.rs product
+path unchanged. Workspace green (cargo test --workspace EXIT 0; 605 passed/0
+failed — was 604).
+- STATUS.md next-forward #1 named "trace whether the measured dispatch target
+  0x10258b5d8 body can be advanced past the SH285 wall." SH361 measured the br x1
+  @0x2206e24 lands at vt[+48]=0x10258b5d8. SH362 closes the body-EXECUTION gap:
+- Disasm of the dispatch fn (0x258b5d8, a real `sub sp,#0x170` function): it
+  immediately branches on flag byte [0x106a64da0] (`adrp x8,6a64000; ldrb w8,[x8,#3488]`
+  @0x258b604 -> `cbz w8,0x258b640` @0x258b608): nonzero -> path A @0x258b60c
+  (nativePreloadFlagOverrides 0x2dae640 -> blr vt[+144] -> 0x2366694 ->
+  nativePreloadFlagOverrides -> blr vt[+296]); zero -> path B @0x258b640 (0x2367270 ->
+  blr vt[+144] -> 0x2366694 -> 0x2367270 -> blr vt[+296]); both converge @0x258b670
+  -> 0x23c19e0 -> canary check -> ret.
+- MEASURED (full app-start ladder, 3/3): `[routeb-dispatch-body] SH362` fires 0/3
+  (guard wired into the same per-block-entry hook that DOES fire SH361 at 0x2206db8,
+  so the miss is the body, not the hook). Every run EXIT 134, SIGSEGV guestpc=
+  0x101db1b08 (SH285 persistence-lane live-object wall), DM-root 0, MH_* false.
+- Conclusion: the StartAppWithParams+0x494 body is entirely unreachable headlessly —
+  the run faults at SH285 BETWEEN the do-init dispatch (reached) and the body entry
+  (never reached). Route-B live-DM structural gate UNCHANGED (no DM manufactured).
+  Do NOT re-drive LSM skips to "reach" 0x258b5d8 (SH358/349/350 closed); do NOT
+  attack [0x106a64da0] with the ladder (the body never runs so the flag is moot).
+  Files: docs/frontier-sh362-dispatch-body-unreachable.md, runs/capture_sh362_dispatch_body.sh,
+  sh362 hermetic (arm64jit lib 425).
 Single-agent (cone suppressed). One new READ-ONLY observation guard
 `routeb_doinit_dyn_trace_guard` (jit.rs, opt-in JIT_ROUTEB_DOINIT_DYN_TRACE=1,
 default-inert, once-per-run, ZERO guest mutation) + one hermetic sh361 +

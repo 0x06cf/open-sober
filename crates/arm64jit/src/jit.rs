@@ -1768,6 +1768,55 @@ fn routeb_doinit_dyn_trace_guard(state: *mut CpuState, pc: u64) {
     }
 }
 
+/// SH362 (opt-in JIT_ROUTEB_DISPATCH_BODY_TRACE=1): READ-ONLY body trace of the do-init
+/// MAIN-branch DM/app-shell dispatch target itself — the function at 0x258b5d8 (guest
+/// 0x10258b5d8 = nativeAppBridgeV2StartAppWithParams+0x494) that SH361's dynamic trace PROVED
+/// the `br x1` @0x2206e24 lands on. SH361 measured the dispatch LANDS here; nobody measured
+/// whether this landed body actually EXECUTES headlessly or WHICH of its two divergent init
+/// paths it takes. The body: `sub sp,#0x170` prologue @0x258b5d8, `adrp x20,67d1000 -> ldr
+/// canary`, `mov x19,x0` (obj) — then `adrp x8,6a64000; ldrb w8,[x8,#3488]` @0x258b604 reads
+/// flag byte [0x106a64da0], `cbz w8,0x258b640` @0x258b608: nonzero -> path A @0x258b60c (bl
+/// nativePreloadFlagOverrides 0x2dae640 -> blr vt[+144] -> bl 0x2366694 -> bl
+/// nativePreloadFlagOverrides -> blr vt[+296]); zero -> path B @0x258b640 (bl 0x2367270 ->
+/// blr vt[+144] -> bl 0x2366694 -> bl 0x2367270 -> blr vt[+296]). Both converge @0x258b670 ->
+/// bl 0x23c19e0 then stack-canary check -> `ret`. The guard OBSERVES the inbound args x0/x1/x2,
+/// the flag byte [0x106a64da0] (the cbz @0x258b608 decision) + the obj vt + vt[+144]/vt[+296]
+/// (the two blr dispatch slots) and reports which path the ladder actually takes, WITHOUT
+/// mutating guest state. Fires once per run at the true block entry pc 0x10258b5d8.
+fn routeb_startapp_dispatch_body_guard(state: *mut CpuState, pc: u64) {
+    if std::env::var_os("JIT_ROUTEB_DISPATCH_BODY_TRACE").is_none() {
+        return;
+    }
+    if pc != 0x10258b5d8 {
+        return;
+    }
+    static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if FIRED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return; // once per run
+    }
+    let s = unsafe { &*state };
+    let obj = s.x[0]; // this (mov x19,x0 @0x258b5f0)
+    let a1 = s.x[1];
+    let a2 = s.x[2];
+    // Safe guest reads: page-guard first (any of these may be unmapped/NULL headlessly).
+    let rd = |a: u64| -> u64 {
+        if a != 0 && a >= 0x100000000 && a >> 56 == 0 && a & 7 == 0 && any_page_mapped(a) {
+            unsafe { std::ptr::read_unaligned(a as *const u64) }
+        } else {
+            0
+        }
+    };
+    let flag = rd(0x106a64da0) & 0xff; // ldrb w8,[0x6a64000,#3488] = [0x106a64da0]
+    let vt = rd(obj);
+    let vt144 = rd(vt.wrapping_add(144));
+    let vt296 = rd(vt.wrapping_add(296));
+    // Which path does the body take? nonzero -> path A (preload-overrides), zero -> path B.
+    let path = if flag != 0 { "A(nonzero-preload)" } else { "B(zero-direct)" };
+    eprintln!(
+        "[routeb-dispatch-body] SH362 body trace @0x10258b5d8: obj={obj:#x} a1={a1:#x} a2={a2:#x} flag[0x106a64da0]={flag:#x} -> path {path} vt={vt:#x} vt[+144]={vt144:#x} vt[+296]={vt296:#x}"
+    );
+}
+
 /// SH334 (opt-in JIT_ROUTEB_REG_LIVE=1): LIVE dump of the service-registry + DM-root +
 /// tier-2 controller-name cell at the exact moment the DM-controller ctor's name->service
 /// lookup (fn 0x2168798, block entry 0x102168798) runs on the MAIN path. The SH332/333
@@ -6871,6 +6920,13 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // and logs which way the MAIN branch actually goes on the live ladder. No guest mutation
         // (distinct from SH320's main-id seed). Default-inert, once-per-run.
         routeb_doinit_dyn_trace_guard(state, pc);
+        // SH362 (opt-in JIT_ROUTEB_DISPATCH_BODY_TRACE=1): READ-ONLY body trace of the do-init
+        // MAIN-branch DM-ctor dispatch TARGET itself — the fn at 0x258b5d8 (guest
+        // 0x10258b5d8 = StartAppWithParams+0x494) that SH361's br x1 @0x2206e24 lands on.
+        // Observes inbound args + the flag byte [0x106a64da0] (the cbz @0x258b608 decision ->
+        // path A preload-overrides vs path B zero-direct) + vt[+144]/vt[+296] blr targets on the
+        // LIVE ladder, without mutating guest state. Default-inert, once-per-run.
+        routeb_startapp_dispatch_body_guard(state, pc);
         // SH322 (opt-in JIT_ROUTEB_LIFECYCLE_EARLYRET): cross the SH273 lifecycle-notifier
         // live-object wall the SH320/321 MAIN-path reaches (fn 0x21f3748 faults 0x50 on
         // [x1]==0). Seed the caller pair [x1] = obj with byte[+80].bit1=1 so the tbnz @0x21f3774
@@ -8838,6 +8894,53 @@ mod tests {
             st0.x[1] = 0;
             routeb_doinit_dyn_trace_guard(&mut st0, 0x102206db8);
             env_test_remove("JIT_ROUTEB_DOINIT_DYN_TRACE");
+        }
+    }
+
+    #[test]
+    fn sh362_dispatch_body_trace_is_read_only_env_pc_gated() {
+        // SH362 (JIT_ROUTEB_DISPATCH_BODY_TRACE): READ-ONLY body trace of the do-init MAIN-branch
+        // dispatch target fn 0x258b5d8 (guest 0x10258b5d8, StartAppWithParams+0x494) that SH361's
+        // br x1 @0x2206e24 lands on. Must (a) be inert without env, (b) fire only at pc
+        // 0x10258b5d8, (c) READ the obj's vt + vt[+144]/vt[+296] + the flag byte [0x106a64da0]
+        // WITHOUT writing any guest state (pure observation — never seeds/mutates), (d) survive
+        // a NULL obj (rd() guarded). Use a scratch guest cell for obj so vt walks are real reads.
+        let cell: u64 = 0x1063_1129;
+        unsafe {
+            assert!(routeb_ensure_writable(cell), "scratch .bss page must be writable");
+            // (a) inert without env: no guest write (only observable via a null y).
+            env_test_remove("JIT_ROUTEB_DISPATCH_BODY_TRACE");
+            std::ptr::write_unaligned(cell as *mut u64, 0xdead); // obj->vt = sentinel
+            let mut st: CpuState = unsafe { std::mem::zeroed() };
+            st.x[0] = cell;
+            routeb_startapp_dispatch_body_guard(&mut st, 0x10258b5d8);
+            assert_eq!(
+                std::ptr::read_unaligned(cell as *const u64),
+                0xdead,
+                "SH362 read-only: [obj]vt left untouched without env (never mutates)"
+            );
+            // (b) env set, wrong pc -> inert (no write, no effect).
+            env_test_set("JIT_ROUTEB_DISPATCH_BODY_TRACE", "1");
+            std::ptr::write_unaligned(cell as *mut u64, 0xdead);
+            routeb_startapp_dispatch_body_guard(&mut st, 0x10258b6c0);
+            assert_eq!(
+                std::ptr::read_unaligned(cell as *const u64),
+                0xdead,
+                "SH362 pc-gated: fires only at body entry 0x10258b5d8"
+            );
+            // (c) env set + body entry pc -> still read-only (obj->vt untouched through the fires).
+            std::ptr::write_unaligned(cell as *mut u64, 0xdead);
+            routeb_startapp_dispatch_body_guard(&mut st, 0x10258b5d8);
+            assert_eq!(
+                std::ptr::read_unaligned(cell as *const u64),
+                0xdead,
+                "SH362 read-only even when it fires: vt left untouched"
+            );
+            // (d) obj=0 -> must not fault (rd(0) guarded returns 0).
+            let mut st0: CpuState = unsafe { std::mem::zeroed() };
+            st0.x[0] = 0;
+            routeb_startapp_dispatch_body_guard(&mut st0, 0x10258b5d8);
+            env_test_remove("JIT_ROUTEB_DISPATCH_BODY_TRACE");
         }
     }
 
