@@ -1,5 +1,37 @@
 # Open Sober — Agent Handoff
 
+## SH437 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD lane-COPY codegen family (translate.rs SimdInsD — `mov Vd.T[dst], Vn.T[src]`, the per-element lane move used to splat/broadcast/shuffle one value across a vector: color/texel lane packing + 8-bit channel moves on render data paths) — 5 exact-byte pins
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables were
+re-verified green at the SH436 HEAD before adding coverage (capture_taskv4_frame.sh
+attempt 1: 24 real task-driven frames `present swap Ok(0x1)`, 195 node pops, 0 json
+abort, 0 crash, EXIT 124). Workspace green (cargo test --workspace EXIT 0; arm64jit
+lib 582/0 incl. 5 new sh437 pins, was 577; cargo build --example elfjit OK).
+Production code ONLY in translate.rs `#[cfg(test)]` addition (translator core body
+byte-untouched; jit.rs 1,048,390 B < 1MiB hook; elfjit.rs/session.rs unchanged).
+- SimdInsD had no direct byte tests (decode pins decode, jit pins runtime, but the
+  byte EMISSION between them was unpinned). SH437 pins the esize discriminator chain
+  AND the lane-addressing math a byte error silently corrupts: (1) d-lane esize=8
+  full-buffer — `mov_load64` (48 8B 83 20 01 00 00: src 0x110+rn*16+src_idx*8) +
+  `mov_store64` (48 89 83 18 01 00 00: dst 0x110+rd*16+dst_idx*8); (2) s-lane esize=4
+  — `mov_load32` (8B, no-REX.W zero-ext) + `mov_store32` (89), asserts NO 48 8B d-lane
+  form; (3) h-lane esize=2 — `movzx_word_mem` (0F B7) + 16-bit 0x66-prefixed
+  `mov_store16` (66 89) — the only esize whose store carries the 66 operand-size
+  prefix; (4) b-lane esize=1 — `movzx_byte_mem` (0F B6) + byte `mov_store8` (88),
+  asserts no 64-bit mov; (5) the lane-ADDRESSING discriminator — stepping src_idx by
+  one d-lane moves the source disp exactly +esize (0x140→0x148) while the dest stays
+  fixed at VECTOR_BASE 0x110+rd*16, proving `Vn*16 + src_idx*esize/·dst_idx*esize`,
+  never a fixed/vt-stale stride.
+- 5 exact-byte pins via synthetic `Inst` -> translate() -> CodeBuf.as_slice()
+  (zero-pc 0x1000 = deterministic); full-buffer + window/subsequence asserts. [RBX]=
+  CpuState; vector slot v[t]=VECTOR_BASE(0x110)+t*16. Deterministic, no image/env.
+- Honest: NOT a DM (SH415 probe re-confirms DM-root [0x106a68818]=0x0 under the
+  complete substrate; Route-B live-DM gate UNCHANGED). BUILD-THE-RUNTIME codegen-
+  surface coverage completion on the lane-copy family, continuing the SH427-436
+  translator-core lineage. No re-treads (distinct from SH436 SimdSel/SimdHighNarrow,
+  SH435 fcvt, SH434 shifts).
+- Files: docs/frontier-sh437-translator-simd-lanecopy.md +
+  crates/arm64jit/src/translate.rs (`#[cfg(test)]` only). Commit 0c894cd.
+
 ## SH436 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD bitwise-select + high-narrow codegen families (translate.rs SimdSel, SimdHighNarrow) — 4 exact-byte pins of the 3-input bitwise select (bsl/bit/bif) and narrowing add (addhn/raddhn) that drive blend masks + byte-level color/normal packing: the BSL (Rn&Rd)|(~Rd&Rm) full-buffer pins the exact pand/pandn/por operand mapping (pandn dst=xmm2 rm=xmm1); the BIT/BIF op=1 inverts the operand ORDER (leads pandn xmm0,xmm1 ~Rm&Rn then pand xmm2,xmm1, never BSL's Rn&Rd first — a transposed mask picks the wrong source); addhn no-round shr-by-dst_bits with no round-carry + Q=0 zeroes the Vd upper half (mov rax,0 + mov [Vd+8],rax); raddhn adds 1<<(dst_bits-1)=0x8000 BEFORE the narrowing shift — round-carry presence + position is the raddhn-vs-addhn discriminator
 Single-agent (cone suppressed). recon-v3 deliverables re-verified green at the
 SH435 HEAD first (capture_taskv4_frame.sh attempt 1: 24 real task-driven frames
