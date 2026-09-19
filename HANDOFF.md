@@ -1,5 +1,33 @@
 # Open Sober — Agent Handoff
 
+## SH359 (Sep 20, 2026, hermes-worker): measured negative on the SH358 NULL-JNIEnv lane's root cause — the JNI_OnLoad cached-JavaVM cell [0x107275550] is NOT causal (GetEnv 11x with AND without the seed on pure boot; the 0x1021e1c00 fault needs the full ladder); both recon-v3 deliverables re-verified green at HEAD; production code unchanged (seed tried + reverted after control refuted it)
+Single-agent (cone suppressed). No production path edited (elfjit.rs/jit.rs product
+identical to HEAD SH358). Workspace green (cargo test --workspace exit 0).
+- recon-v3 deliverables re-verified green: capture_taskv4_frame.sh = 24 real frames
+  `present swap Ok(0x1)`, dispatch #2718000, 197 node pops, 0 json abort, 0 crash,
+  EXIT 0/124. JIT_JSON_ZERO_FIX present (jit.rs:6390).
+- SH359 ATTEMPT (the fresh datum): SH358's NULL-JNIEnv fault at 0x1021e1c00. Disassembled
+  JNI_OnLoad+0xc10 (0x2174c04) -> reads cached JavaVM from guest [0x107275550], cbz-out
+  leaves env NULL, else vm->GetEnv (slot 6). Hypothesis: seed that cell with fabricated vm.
+  MEASURED NEGATIVE: seed + control BOTH trace VM_GetEnv 11x with 0 fault on pure --jni
+  boot — the cell is not what gates env acquisition, the fault needs the full ladder.
+  AND [0x107275550] is the SH243 DM-manager getter cell (seeding it would clobber DM-force).
+  Reverted the seed (honest negative); kept descriptive hermetic pins.
+- Do NOT re-attempt a seed of [0x107275550] for the NULL-env lane. SH358's cause-level
+  reading stands with the boot/cell hypothesis eliminated.
+
+### Forward this cycle
+A genuinely-new cause-level candidate (the only concrete "cell to seed" SH358's datum
+surfaced) was implemented and MEASURED as non-causal on the boot path, then cleanly
+reverted. The NULL-JNIEnv in the full ladder remains a cause-level lifecycle
+precondition (Route-B wall), not a boot cell seed.
+
+### Honest
+Does NOT manufacture a DataModel. Route-B live-DM structural gate UNCHANGED (DM-root
+[0x106a68818]=0, MH_* false). SH174 capture-latch stays the single forward observer.
+Files: docs/frontier-sh359-jnienv-cache-negative.md, runs/capture_sh359_jnienv_cache.sh,
+sh359_jnienv_cache_tests (2 hermetic).
+
 ## SH358 (Sep 20, 2026, hermes-worker): measured negative (run-variable) — the DMCONT-session-ctor + LSM-skip combination is NOT a Route-B forward; recon-v3 immediate-priority deliverables re-verified green at HEAD
 Single-agent (cone suppressed). No production code edited (measurement-only + one
 probe script). Workspace green at HEAD SH357 (cargo test --workspace exit 0, 24 test

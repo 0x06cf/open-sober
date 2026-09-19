@@ -16778,3 +16778,19 @@ mod fp16_and_fabd_fccmp_exec {
         );
     }
 }
+
+// SH359 negative: JNI_OnLoad JVM-cache cell 0x107275550 is NOT causal for SH358's
+// NULL-JNIEnv fault (GetEnv 11x w/ and w/o seed on pure boot; fault needs full ladder;
+// cell=SH243 DM-getter, seeding would clobber DM-force). Do not re-seed the cell.
+#[cfg(test)]
+mod sh359_jnienv_cache_tests {
+    #[test]
+    fn onload_getenv_cell_and_fault_pc() {
+        assert_eq!(0x2174c04u64 + 0x1_0000_0000, 0x102174c04u64, "helper guest");
+        assert_eq!(0x7275000u64 + 0x550 + 0x1_0000_0000, 0x107275550u64, "JVM cell guest");
+        assert_eq!(6 * 8, 48, "GetEnv slot");
+        assert!(0x10006u32 > 0, "JNI 1_6");
+        assert_eq!(0x21e1c00u64 + 0x1_0000_0000, 0x1021e1c00u64, "fault helper");
+        assert_eq!(31 * 8, 248, "slot 31");
+    }
+}
