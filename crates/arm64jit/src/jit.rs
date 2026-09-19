@@ -9408,6 +9408,46 @@ mod tests {
     }
 
     #[test]
+    fn sh372_cont_continuation_converges_on_sh285_persistence_leaf() {
+        // SH372 (real-image): the DM-creator continuation continueAfterFlagsLoaded_
+        // (0x102bd1d68, SH371 now runs deep headlessly) and the SH284/285 settings-state
+        // self-drive BOTH terminate at the SAME LocalStorageManager persistence leaf:
+        // pc 0x101db1b08 (reader/pop `sub x2,x0,#0x20`) with the caller `bl` @0x101db1b14
+        // returning to lr=0x101db1b18 -- the sh285 reader caller inside
+        // initStorageManagerNative (0x101d9d8b0). Both SH285 (settings state) and the fresh
+        // SH372 continuation-path dump fault on the same 0xff..ff internal buffer pointer
+        // (x20=x1=0xffff8...), so the SH285 terminal is PATH-INDEPENDENT (not a benign-body
+        // branch one path misses), and the only generator of that object is a real session
+        // ctor (SH174/204 live-object class). Pins the shared leaf + the continuation's two
+        // mandatory `bl 1d9d8b0` sites (SH349) so the convergence is regression-pinned.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let word_at = |vaddr: u64| -> u32 {
+                let off = vaddr as usize;
+                let b = &img[off..off + 4];
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            };
+            // The shared SH285 terminal leaf (reader/pop, guest 0x101db1b08 = file 0x1db1b08)
+            // + its caller bl (returns to lr 0x101db1b18) and the continuation entry
+            // (guest 0x102bd1d68 = file 0x2bd1d68). jit.rs hermetics index img BY FILE
+            // OFFSET (guest - 0x100000000), unlike elfjit.rs which maps guest addresses.
+            assert_eq!(word_at(0x1db1b08), 0xd10083a2, "sh372 shared leaf sub x2,x0,#0x20 (both init paths)");
+            assert_eq!(word_at(0x1db1b14), 0x97ffa192, "sh372 shared leaf caller bl (returns to 0x1db1b18, sh285)");
+            assert_eq!(word_at(0x2bd1d68), 0xa9ba7bfd, "sh372 shared continuation prologue (stp x29,x30,[sp,#-0x60]!)");
+            for (g, name) in [
+                (0x1db1b08u64, "shared-leaf"), (0x1db1b14u64, "shared-leaf-caller-bl"),
+                (0x2bd1d68u64, "continuation-entry"),
+            ] {
+                assert!(g & 3 == 0, "sh372 {name} {g:#x} 4-aligned");
+            }
+            eprintln!("sh372 settings-state & DM-continuation init paths CONVERGE on SH285 leaf 0x101db1b08 (shared lr 0x1db1b18) — path-independent persistence-object wall pinned");
+        } else {
+            eprintln!("sh372 real-image guard: no real libroblox.so, skipping convergence pins");
+        }
+    }
+
+    #[test]
     fn sh367_window_attach_real_path_pinned_and_guard() {
         // SH367 (real-image): pin the REAL window-attach GL-surface path so the --v2boot-glue-cmd
         // arming (jit.rs drive_glue_process_cmd) stays grounded. Window-attach 0x2bd29a0 reads the

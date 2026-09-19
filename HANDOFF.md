@@ -1,6 +1,52 @@
 # Open Sober — Agent Handoff
 
-## SH371 (Sep 20, 2026, hermes-worker): MEASURED — continueAfterFlagsLoaded_ now EXECUTES DEEP headlessly (corrects the SH226/228 "never fires" map) + hermetic proving the engine-init dispatcher body is STRAIGHT-LINE (the only runtime exits are the two leaf blr returns and the bl sub)
+## SH372 (Sep 20, 2026, hermes-worker): MEASURED — the DM-creator continuation and the settings-state init path CONVERGE on the identical SH285 persistence-object leaf (answers SH371's explicit "same object or different?" gap with a fresh register dump); recon-v3 deliverables re-verified green
+Single-agent (cone suppressed). One new probe runs/capture_sh372_continuation_terminal.sh
+(JIT_DUMP_PC + JIT_GUEST_STACK_DUMP + JIT_REGION_WATCH on the continuation body) + one new
+real-image hermetic `sh372_cont_continuation_converges_on_sh285_persistence_leaf` (arm64jit
+lib 433->434; pins the shared leaf sub x2,x0,#0x20 @file 0x1db1b08, its caller bl @0x1db1b14
+-> lr 0x1db1b18, and the shared continuation prologue @file 0x2bd1d68) + docs/frontier-sh372-
+continuation-convergence.md. No production path edited. Workspace green (cargo test
+--workspace EXIT 0, 614 passed/0 failed — 433 arm64jit lib tests + sh372).
+
+### The forward this cycle (the genuine new datum)
+SH371 measured the DM-creator continuation continueAfterFlagsLoaded_ (0x102bd1d68) now runs
+DEEP headlessly and terminates at the standing SH285 persistence-lane wall
+(guestpc=0x101db1b08), and explicitly left open whether it hits the same object the
+settings-state path faulted on or a different one. SH372 closes that gap with a fresh full
+register + guest-stack dump directly from the continuation path:
+- Continuation FIRED (block-entry at 0x102bd1d68) and its deep pcs all executed.
+- Terminal pc 0x101db1b08 with lr=0x101db1b18 — the SAME leaf (sh285 reader caller inside
+  initStorageManagerNative 0x101d9d8b0) the settings-state drive hits.
+- Fault target x20=x1=0xffff8062... — the SAME 0xff..ff-prefixed uninitialized internal
+  data-pointer (SH285/[obj+0x50] family); x0=x19=0x7f9d... = a guest-constructed host-heap
+  object, exactly as SH285 classified.
+
+### Interpretation (map refinement, not a new wall)
+Both independently-reached engine init paths — the settings-state self-drive (SH284/285) and
+the DM-creator continuation (SH371, SH372) — converge on the identical unconstructed-manager
+leaf, same pc, same lr, same 0xff..ff buffer pointer. This proves the SH285 terminal is
+PATH-INDEPENDENT: NOT a benign-body branch one path misses (corroborating SH371's
+STRAIGHT-LINE finding), but the manager object's own unconstructed string buffer, which no
+seed manufactures (SH248h/SH256 rule) and which only a REAL LocalStorageManager/session ctor
+owns (SH174/204 live-object class). The measured-closed SH285 lane record is strengthened with
+a second-entry confirmation.
+
+### Honest
+Does NOT manufacture a DataModel. Route-B live-DM structural gate UNCHANGED (DM-root
+[0x106a68818]=0, MH_* false). SH174 capture-latch stays the single forward hook. recon-v3
+deliverables re-verified green at HEAD this cycle (24 real task-driven frames swap Ok(0x1),
+0 json abort, 0 crash; JIT_JSON_ZERO_FIX present).
+
+### Next (unchanged, authoritative)
+Route-B live-DM structural gate stands (SESSION-CTOR / do-init; REG_LIVE SH352). The two
+measured dead-ends from the now-reached continuation are (a) the SH285 live-object wall and
+(b) the F+0x18 controller floor behind it — both measured-closed (do NOT re-drive LSM sub-call
+skips SH349/350/358). R1 content half staged + armed + serviceable (SH351/352/354). Do NOT
+re-arm the window-attach once-guard (SH367); do NOT re-enter the ALooper loop (SH365); bounded
+process_cmd stays the guarded entry (SH366/368).
+
+## SH371 (Sep 20, 2026, hermes-worker): MEASURED — continueAfterFlagsLoaded_ now EXECUTES DEEP headlessly (corrects the SH226/228 "never fires" map) + hermetic proving the engine-init dispatcher body is STRAIGHT-LINE (the only exits: two leaf blr returns and the bl sub)
 Single-agent (cone suppressed). recon-v3 deliverables independently re-verified green at
 HEAD (capture_taskv4_frame.sh attempt 1: 24 real task-driven frames `present swap Ok(0x1)`,
 197 node pops, 0 json abort, 0 crash; JIT_JSON_ZERO_FIX len-clamp at 0x102355d40 present).

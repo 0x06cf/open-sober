@@ -1,43 +1,42 @@
 # Open-Sober run status (hermes-worker)
 
-Updated 2026-09-19, this session: SH350 (crossed SH349+1 terminal, 3rd persistence-lane fencepost)
-then SH351 — staged the R1 synthetic CoreScript content path (Route-B marker half): a hand-authored
-Luau ScreenGui module + real loader gates, latent-but-correct. Workspace green (arm64jit 418/0).
+Updated 2026-09-20, this session: SH372 = MEASURED — the DM-creator continuation
+continueAfterFlagsLoaded_ (0x102bd1d68, SH371 runs deep) and the settings-state self-drive
+(SH284/285) CONVERGE on the identical SH285 persistence-object leaf (pc 0x101db1b08, lr
+0x101db1b18, 0xff..ff internal buffer pointer), answering SH371's "same object or different?"
+gap with a fresh register dump: SAME object, path-independent. recon-v3 deliverables
+re-verified green. Workspace green (614/0).
 
 ## Current state
 
-- `dev` HEAD: SH351 (stage_r1_core_scripts + fsmap::staging_root + page_writable_rw guard + 2 sh351
-  hermetic + elffjit --v2boot-r1-stage). Workspace green (arm64jit lib 418/0; elffjit example 157/0;
-  cargo test --workspace exit 0; recon-v3 frame plane green).
+- `dev` HEAD: SH372 (jit.rs sh372 convergence hermetic, arm64jit lib 434/0 + probe + docs).
+- Workspace green (cargo test --workspace EXIT 0, 614 passed/0 failed).
+- recon-v3 deliverables green (24 task-driven frames swap Ok(0x1), 0 json abort, 0 crash).
 - Route-B live-DM gate UNCHANGED: DM-root [0x106a68818]=0, MH_* all false.
 
 ## What advanced this session
 
-- SH350 (prior commit): crossed the SH349+1 terminal 0x101d9a708 with a BOUNDED single-caller
-  name-pack skip (JIT_ROUTEB_LSM_PACK_SKIP); ladder advances to 175 LSM pool-pops, then the same
-  run-variable live-object family — 3rd fencepost that LSM sub-call-whack-a-mole is UNBOUNDED.
-  Persistence lane permanently closed.
-- SH351 (this commit): staged the R1 content path. `stage_r1_core_scripts` writes a synthetic
-  CoreScript (ScreenGui+TextLabel) to SOBER_ANDROID_ROOT/data/user/0/com.roblox.client/files/
-  scripts/CoreScripts/{AppShell.lua,CoreScripts.lua} (both inferred candidates) + arms the real
-  loader gates (flags-loaded/latch, governor union-init guards, loader-settings), each page-
-  writable-guarded. +2 hermetic tests proving the module lands at the correct fsmap mirror.
-- Measured (confirm, not implemented): the messageBus "experience-launch" topic is a Java-side
-  runtime string (SH347's never-firing cb is NOT a topic-string bug); onAppLuaWillStart is an
-  internal lambda, not an export.
+- SH371 (prior commit): continueAfterFlagsLoaded_ now EXECUTES DEEP headlessly (overturns the
+  SH226/228 "never fires" map); engine-init dispatcher body proven STRAIGHT-LINE.
+- SH372 (this commit): fresh full register + guest-stack dump from the continuation path
+  proves both engine init paths terminate at the SAME SH285 live-object leaf — same pc
+  0x101db1b08, same lr 0x101db1b18, same 0xff..ff uninitialized internal data-pointer. The
+  SH285 terminal is PATH-INDEPENDENT (not a benign-body branch one path misses), i.e. the
+  object only a real LocalStorageManager/session ctor owns (SH174/204 class). New hermetic
+  sh372 pins the shared leaf + caller bl + continuation prologue. No production path edited.
 
 ## Honest status
 
-- Route-B live-DM structural gate UNCHANGED. SH351's R1 rung is LATENT: the full ladder still
-  terminates run-variable at the persistence lane before the post-ladder rung, so staging is
-  staged-and-tested but not yet exercised in a completing ladder. It arms the content half of the
-  Route-B marker the instant a live DM owns a session. SH174 capture-latch stays the single
-  forward hook.
+- Route-B live-DM structural gate UNCHANGED. SH174 capture-latch stays the single forward
+  hook. SH372 strengthens the measured-closed SH285 record with a second-entry confirmation.
+- R1 content half staged+armed+serviceable (SH351/352/354); latent until a live DM drives the
+  loader.
 
 ## Next-forward candidates
 
-1. (PRIMARY, Route-B) The SESSION half remains THE wall: do-init must own a live DataModel (the
-   four-stacked SH184/185 closure; session-ctor / StartLuaAppDM). R1 content is now staged (SH351)
-   so the marker fires the moment the DM exists.
-2. onAppLuaWillStart (dataModel-bindings live binder) stays migration-gated; not seedable.
-3. Do NOT re-drive LSM sub-call skips (3 fenceposts of measured evidence it is unbounded).
+1. (PRIMARY, Route-B) The SESSION half remains THE wall: do-init must own a live DataModel
+   (SH184/185). The two measured dead-ends from the now-reached continuation are the SH285
+   live-object wall and the F+0x18 controller floor — both measured-closed.
+2. Do NOT re-drive LSM sub-call skips (SH349/350/358); do NOT re-arm window-attach once-guard
+   (SH367); do NOT re-enter ALooper loop (SH365); at this point any further Route-B seed is a
+   stopgap vs. the SESSION-CTOR cause-lever the operator names.
