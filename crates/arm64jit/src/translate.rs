@@ -7367,6 +7367,87 @@ mod tests {
     }
 
     #[test]
+    fn sh453_addl_widen_add_doublewidth_signed_movsxd() {
+        // saddl V1.2s, V2.2s, V3.2s (esrc=4 sign=true sub=false): widen-and-add —
+        // each 4-byte element of Vn/Vm is SIGN-extended (movsxd 48 63 c0/c9 after
+        // the mov_load32) then summed into a DOUBLE-width 8-byte dst (mov_store64
+        // 48 89 83). The movsxd sign-extend + the 8B dst store IS the widening:
+        // a zero-extend (no movsxd) flips a negative element's high bits and a
+        // 4B store truncates. rd=1 rn=2 rm=3 -> Vn@0x130 Vm@0x140 Vd@0x120.
+        let b = tr_bytes(Inst::SimdAddl { rd: 1, rn: 2, rm: 3, esrc: 4, sign: true, sub: false, upper: false });
+        assert_eq!(b, vec![
+            // lane 0: Vn[0] + Vm[0] -> Vd[0] (8B)
+            0x8b, 0x83, 0x30, 0x01, 0x00, 0x00, // mov eax,[rbx+0x130] Vn lane0
+            0x48, 0x63, 0xc0,                   // movsxd rax,eax (sign extend)
+            0x8b, 0x8b, 0x40, 0x01, 0x00, 0x00, // mov ecx,[rbx+0x140] Vm lane0
+            0x48, 0x63, 0xc9,                   // movsxd rcx,ecx
+            0x48, 0x01, 0xc8,                   // add rax,rcx
+            0x48, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00, // mov [rbx+0x120],rax (8B dst)
+            // lane 1: Vn[1] + Vm[1] -> Vd[1]
+            0x8b, 0x83, 0x34, 0x01, 0x00, 0x00, // Vn lane1 0x134
+            0x48, 0x63, 0xc0,
+            0x8b, 0x8b, 0x44, 0x01, 0x00, 0x00, // Vm lane1 0x144
+            0x48, 0x63, 0xc9,
+            0x48, 0x01, 0xc8,
+            0x48, 0x89, 0x83, 0x28, 0x01, 0x00, 0x00, // Vd lane1 0x128
+        ]);
+        assert!(b.windows(3).any(|w| w == [0x48, 0x63, 0xc0]), "signed 4B lane sign-extends via movsxd");
+        assert!(b.windows(7).any(|w| w == [0x48, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00]), "double-width 8B dst store");
+    }
+
+    #[test]
+    fn sh453_addl_sub_direction_and_word_movzx() {
+        // usubl V1.4s, V2.4h, V3.4h (esrc=2 sign=false sub=true): ZERO-extended
+        // word sources (movzx 0f b7 83 / 0f b7 8b) with SUB rax,rcx (48 29 c8)
+        // into 4B dst. The 0x29 opcode byte-vs-0x01 is the sub-vs-add
+        // discriminator (a transposed op adds instead of subtracting). 4 lanes.
+        let s = tr_bytes(Inst::SimdAddl { rd: 1, rn: 2, rm: 3, esrc: 2, sign: false, sub: true, upper: false });
+        assert!(s.windows(7).any(|w| w == [0x0f, 0xb7, 0x83, 0x30, 0x01, 0x00, 0x00]), "unsigned word source zero-extends (movzx 0f b7)");
+        assert!(s.windows(3).any(|w| w == [0x48, 0x29, 0xc8]), "usubl = sub rax,rcx (48 29 c8)");
+        assert!(!s.windows(3).any(|w| w == [0x48, 0x01, 0xc8]), "sub form must NOT emit add rax,rcx (48 01 c8)");
+        assert!(!s.windows(3).any(|w| w == [0x48, 0x63, 0xc0]), "sign=false must NOT movsxd");
+        assert!(s.windows(6).any(|w| w == [0x89, 0x83, 0x2c, 0x01, 0x00, 0x00]), "lane3 4B dst store at 0x12c");
+        // the add form (control) DOES emit add rax,rcx.
+        let a = tr_bytes(Inst::SimdAddl { rd: 1, rn: 2, rm: 3, esrc: 2, sign: false, sub: false, upper: false });
+        assert!(a.windows(3).any(|w| w == [0x48, 0x01, 0xc8]), "uaddl = add rax,rcx (48 01 c8)");
+    }
+
+    #[test]
+    fn sh453_addl_upper_high_half_source_offset_and_signed_byte() {
+        // saddl2 V1.8h, V2.8b, V3.8b (esrc=1 sign=true upper=true): SIGN-extend
+        // byte sources (movsx 48 0f be) from the HIGH half (upper=true adds +8
+        // to the source bases -> Vn@0x138 Vm@0x148) summed into 2B dst (66 89).
+        let b = tr_bytes(Inst::SimdAddl { rd: 1, rn: 2, rm: 3, esrc: 1, sign: true, sub: false, upper: true });
+        assert!(b.windows(7).any(|w| w == [0x48, 0x0f, 0xbe, 0x83, 0x38, 0x01, 0x00, 0x00]) || b.windows(8).any(|w| w == [0x48, 0x0f, 0xbe, 0x83, 0x38, 0x01, 0x00, 0x00]), "upper lane0 Vn byte source at 0x138 (high half)");
+        assert!(b.windows(7).any(|w| w == [0x48, 0x0f, 0xbe, 0x8b, 0x48, 0x01, 0x00, 0x00]) || b.windows(8).any(|w| w == [0x48, 0x0f, 0xbe, 0x8b, 0x48, 0x01, 0x00, 0x00]), "upper lane0 Vm byte source at 0x148 (high half)");
+        assert!(b.windows(7).any(|w| w == [0x66, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00]), "byte-wide sum -> 2B dst store (66 89 83)");
+        // upper must NOT read the low-half sources.
+        assert!(!b.windows(7).any(|w| w == [0x48, 0x0f, 0xbe, 0x83, 0x30, 0x01, 0x00, 0x00]), "upper must NOT read Vn@0x130 low half");
+    }
+
+    #[test]
+    fn sh453_addl_inplace_alias_permute_source_snapshot() {
+        // gcc's `saddl v1.4s, v1.4h, v2.4h` (rd==rn==1): the widened 2*esrc dst
+        // write at i*2*esrc OVERLAPS the narrow source bytes of lane i+1 (at
+        // (i+1)*esrc), so a read-then-write loop clobbers the still-needed
+        // source. The emit snapshots the full 16B dest/source register to perm-
+        // scratch FIRST (mov_load64 [0x120] -> [0x320], [0x128] -> [0x328]),
+        // then reads the Vn operands from that scratch (48 0f bf 83 20 03..) —
+        // the [.., 0x320] perm-scratch reads are the in-place-alias signature.
+        // PERMSCRATCH_OFF = 0x200 (VECTOR_BASE 0x110 + 33*16 = 0x320).
+        let b = tr_bytes(Inst::SimdAddl { rd: 1, rn: 1, rm: 3, esrc: 2, sign: true, sub: false, upper: false });
+        // snapshot: two u64 halves pushed to 0x320/0x328.
+        assert!(b.windows(7).any(|w| w == [0x48, 0x8b, 0x83, 0x20, 0x01, 0x00, 0x00]), "alias snapshots rd/rn low u64 (mov rax,[0x120])");
+        assert!(b.windows(7).any(|w| w == [0x48, 0x89, 0x83, 0x20, 0x03, 0x00, 0x00]), "alias stores snap to perm-scratch 0x320");
+        assert!(b.windows(7).any(|w| w == [0x48, 0x89, 0x83, 0x28, 0x03, 0x00, 0x00]), "alias snapshots high u64 to 0x328");
+        // the widened reads come FROM the scratch (0x320,0x322,...) not the live dst.
+        assert!(b.windows(7).any(|w| w == [0x48, 0x0f, 0xbf, 0x83, 0x20, 0x03, 0x00, 0x00]) || b.windows(8).any(|w| w == [0x48, 0x0f, 0xbf, 0x83, 0x20, 0x03, 0x00, 0x00]), "source lane0 reads Vn from perm-scratch 0x320");
+        assert!(b.windows(7).any(|w| w == [0x48, 0x0f, 0xbf, 0x83, 0x22, 0x03, 0x00, 0x00]) || b.windows(8).any(|w| w == [0x48, 0x0f, 0xbf, 0x83, 0x22, 0x03, 0x00, 0x00]), "source lane1 reads Vn from perm-scratch 0x322 (not live 0x122)");
+        // rm=3 does NOT alias rd, so Vm is read directly at 0x140 (no snapshot).
+        assert!(b.windows(7).any(|w| w == [0x48, 0x0f, 0xbf, 0x8b, 0x40, 0x01, 0x00, 0x00]) || b.windows(8).any(|w| w == [0x48, 0x0f, 0xbf, 0x8b, 0x40, 0x01, 0x00, 0x00]), "Vm lane0 read directly at 0x140");
+    }
+
+    #[test]
     fn sh452_adalp_pairwise_sum_doublewidth_full_buffer() {
         // saddlp V1.2s, V2.2s (se=4 np=2 signed=true acc=false): pairwise-ADD-
         // LONG — sum each adjacent pair (2i,2i+1) of 4-byte srcs into a dst lane
