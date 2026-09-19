@@ -337,7 +337,7 @@ fn live_dm_cell_value_ok(v: u64) -> bool {
 /// reconciliation — the once-lambda's ACTUAL write target once-slot [0x106a68408]
 /// (str x0,[x23,#1032] @0x2206d74, x23=adrp 6a68000). The once-slot is a DISTINCT
 /// cell from DM-root; a live DM written there (a coherent guest vtable) counts.
-/// All reads page-guarded via read_visible_u64.
+/// NOTE: reads are NOT page-guarded (bare deref); safe only when the image maps them.
 fn session_live_dm() -> bool {
     let holder = read_visible_u64(0x106391908u64);
     let root = read_visible_u64(0x106a68818u64);
