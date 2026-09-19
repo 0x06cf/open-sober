@@ -582,22 +582,18 @@ fn routeb_tail_dispatch_guard(state: *mut CpuState, pc: u64) {
     );
 }
 
-/// SH161b (deleg_61f88e9a, authoritative): the governor-TAIL epilogue calls fn 0x1023c12c0 with
-/// mode=2 (`mov x0,x19; mov w1,#0x2; bl 0x1023c12c0` @0x102e9fe04/8, bl ret-lnding 0x102e9fe0c).
-/// fn 0x1023c12c0 begins `ldr w8,[x0,#696](=impl[+0x2b8]); cmp w8,w1; b.eq 0x...1434`, and its
-/// b.eq target 0x1023c1434 is a pure stack-canary check + `ret` (benign mode-2 no-op). Under the
-/// partial do-init impl is the Box::leak zeroed 0x500 buffer so impl[+0x2b8]==0 today -> the b.eq
-/// is NOT taken -> the fn falls into a fault-prone transition body (reads global [0x6a70700],
-/// dispatches 0x23c14dc/0x23c1504/0x23c1574 + conditional FMOD AAudio 0x626b6d0). Seed
-/// impl[+0x2b8]=2 at the governor-tail ENTRY so fn 0x1023c12c0's b.eq early-return fires and the
-/// whole transition body (incl. its run-variable FMOD-AAudio crash 0x6240d8c, SH212 crash A) is
-/// bypassed.
-/// WINDOW (corrected SH217): the tail is translated as ONE block entered at 0x102e9fcc4 (the call
-/// site is entered THERE, never at 0x102e9fe04; region-watch saw 0x102e9fcc4 + the 0x102e9fe0c
-/// bl-ret-lndng, NOT 0x102e9fe04). The strict `pc==0x102e9fe04` window fired ZERO times, leaving
-/// the transition body live. Fire on the SAME window as routeb_tail_dispatch_guard (the operator's
-/// "exact SH159c pattern") so the seed lands before the bl executes. Idempotent (writes only when
-/// 0). Gated JIT_ROUTEB_SETFIX.
+/// SH161b (deleg_61f88e9a): the governor-TAIL epilogue calls fn 0x1023c12c0 with mode=2
+/// (`mov x0,x19; mov w1,#0x2; bl` @0x102e9fe04/8). fn 0x1023c12c0 begins
+/// `ldr w8,[x0,#696](=impl[+0x2b8]); cmp w8,w1; b.eq 0x...1434`, and that b.eq target is a pure
+/// stack-canary check + `ret` (benign mode-2 no-op). The partial do-init impl = Box::leak zeroed
+/// 0x500 buffer, so impl[+0x2b8]==0 -> b.eq NOT taken -> the fn falls into a fault-prone
+/// transition body (reads [0x6a70700], dispatches 0x23c14dc/0x23c1504/0x23c1574 + FMOD AAudio
+/// 0x626b6d0). Seed impl[+0x2b8]=2 at the tail ENTRY so the b.eq early-return fires and bypasses
+/// the transition body (incl. run-variable FMOD-AAudio crash 0x6240d8c, SH212 crash A).
+/// WINDOW (corrected SH217): the tail is translated as ONE block entered at 0x102e9fcc4 (never
+/// at 0x102e9fe04; the strict pc==0x102e9fe04 window fired ZERO times). Fire on the SAME window
+/// as routeb_tail_dispatch_guard (SH159c pattern) so the seed lands before the bl. Idempotent
+/// (writes only when 0). Gated JIT_ROUTEB_SETFIX.
 fn routeb_tail_eq_guard(state: *mut CpuState, pc: u64) {
     if pc < 0x102e9fcc4 || pc > 0x102e9fdc8 {
         return;
@@ -834,14 +830,13 @@ pub fn drive_messagebus_publish_receive_payload(
 
 /// SH366 (--v2boot-glue-cmd): drive the guest app-command DISPATCHER `process_cmd` (0x102bcd6e4)
 /// to deliver INIT_WINDOW through the engine's real window/GL-surface chain — the SESSION-CTOR
-/// precondition named since SH39b (glue LOOP 0 hits), dead-drain SH365. Never ENTERED (ALooper loop
+/// precondition named since SH39b (glue LOOP 0 hits), dead-drain SH365. Never ENTERED (ALooper
 /// can't jit_run; this bounded dispatcher CAN). ABI process_cmd(app=x0,cmd=x1):
 ///   entry sub w8,w1,#1; cmp #0x13; b.hi default; `ldr x20,[x0]` then ::tbl; INIT_WINDOW(11)->0x2bcd78c
-///   case: `ldr x0,[x20,#64]; strb w8,#1,[x20,#9]; bl 0x2bd29a0` (window-attach); version gate
-///   [0x10683d8b0]: keep 0 (skip BODY check). Window-attach 0x2bd29a0 reads [this+0x268] once-guard;
-///   a zeroed obj skips the once-body + rets clean. Fabricated app ([app]=inner, inner[+64]=zeroed win)
-///   makes the dispatcher run INIT_WINDOW, set [inner+9]=1 + call real window-attach headlessly.
-///   Returns Ok(0); [inner+9]==1 proves INIT_WINDOW EXECUTED. Single serialized jit_run.
+///   case: `ldr x0,[x20,#64]; strb w8,#1,[x20,#9]; bl 0x2bd29a0` (window-attach); gate [0x10683d8b0]:0.
+///   Window-attach 0x2bd29a0 reads [this+0x268] once-guard; a zeroed obj skips the once-body + rets.
+///   Fabricated app ([app]=inner, inner[+64]=zeroed win) makes the dispatcher set [inner+9]=1 + call
+///   real window-attach headlessly. Returns Ok(0); [inner+9]==1 proves INIT_WINDOW EXECUTED; single jit_run.
 /// SH367 (--v2boot-glue-cmd, MEASURED NEGATIVE): once-guard-ARMED real attach faults — with
 /// [win+0x268].bit0 ARMED, 0x2bd29a0 enters real GL post-init bl 0x2291c24 (( [?win+0x278]!=0)) then
 /// bl 0x22985c0, whose DEEP body needs a REAL EGL surface/context (fabricated NULL obj can't) ->
@@ -971,22 +966,17 @@ pub fn drive_glue_process_cmd_seq(iimg: &[u8], ib: u64, tpidr: u64, boot_sp: u64
 }
 
 /// SH393 (--v2boot-glue-cmd-full): extend the SH366-entry sequence to the FULL app-command
-/// jump table (real Activity consumes a queue of APP_CMD in lifecycle order; SH368 drove only
-/// {6,8,11}). Each command on its OWN fresh CpuState jit_run, sharing one fabricated app/inner/win
-/// so glue state accumulates like a real queue; session observables read after EVERY command:
-///   - [inner+9] = INIT_WINDOW case marker (only cmd 11) | [0x10683d8b0] version gate (kept 0)
-///   - [0x106a705e8] AppBridgeV2 singleton | [0x10683d348] surface XID (0x200000, SH112)
-///   - [0x10672739d4] flags-loaded latch | [0x106dca0e70] DM world-build/class-registry base
-/// SH393 MEASURED + disasm-scoped (frontier-sh393): every case EXCEPT cmd 1 starts with the
-/// version gate `adrp x8,683d000; ldr x0,[x8,#2224]; and w8; cmp w8,#6; b.cc epilogue 0x2bcdbf0`
-/// at byte0<6 -> clean return (cmd 19/20 map straight to epilogue). cmd 1 does a PRE-GATE live-
-/// object deref `ldr x8,[x20,#24]; ldr x9,[x8,#56]` (0x2bcd9fc..0x2bcda00, fault=0x38 on zeroed
-/// app) = the SH366/367 class, not headless-drivable. Sequence below drives the 19 gate-checked
-/// cmds + EXCLUDES cmd 1 (the one measured-unsafe) = an honest per-command safety map. Once-guard
-/// stays OFF (SH367); ALooper NOT entered (SH365). Default-inert; single serialized jit_run;
-/// ZERO change to the confirmed SH366/367/368 clean drive.
-/// Real first-boot order (native_app_glue): START(1)->RESUME(8)->INIT_WINDOW(11)..; ascending
-/// dispatch order with SH368-proven cmds (6,8) + INIT_WINDOW(11) leading, cmd 1 excluded.
+/// jump table. Each command on its OWN fresh CpuState jit_run, sharing one fabricated app/inner/win;
+/// session observables read after EVERY command: [inner+9] INIT_WINDOW marker | [0x10683d8b0] gate |
+/// [0x106a705e8] AppBridgeV2 | [0x10683d348] surface XID | [0x10672739d4] flags latch | [0x106dca0e70] DM base.
+/// SH393 measured + disasm-scoped (frontier-sh393): every case except cmd 1 starts with the version
+/// gate `adrp x8,683d000; ldr x0,[x8,#2224]; cmp w8,#6; b.cc epilogue 0x2bcdbf0` -> clean return.
+/// cmd 1 does a PRE-GATE live-object deref `ldr x8,[x20,#24]; ldr x9,[x8,#56]` (0x2bcd9fc..0x2bcda00,
+/// fault=0x38) = the SH366/367 class, not drivable. Drives the 19 gate-checked + excludes cmd 1 = an
+/// honest per-command safety map. Once-guard OFF (SH367); ALooper NOT entered (SH365); single
+/// serialized jit_run; ZERO change to the confirmed SH366/367/368 clean drive.
+/// Real first-boot order (native_app_glue): START(1)->RESUME(8)->INIT_WINDOW(11)..; ascending with
+/// SH368-proven cmds (6,8) + INIT_WINDOW(11) leading, cmd 1 excluded.
 pub fn drive_glue_process_cmd_full(iimg: &[u8], ib: u64, tpidr: u64, boot_sp: u64) -> u64 {
     const VERSION_GATE: u64 = 0x10683d8b0;
     const APPBRIDGE_SINGLETON: u64 = 0x106a705e8;
@@ -1164,20 +1154,17 @@ fn page_writable_rw(addr: u64) -> bool {
 }
 
 /// SH330 (opt-in JIT_ROUTEB_APPSART_408SEED): the app-start continuation's standing gate is
-/// AppStarted+0x408 == 0 — the live member read by `ldr x0,[x19,#1032]` @0x25f504c (both arms of
-/// the SH329 governor-flag fork converge on it), then `ldr x8,[x0]; ldr x8,[x8,#136]; blr x8`
+/// AppStarted+0x408 == 0 — the live member read by `ldr x0,[x19,#1032]` @0x25f504c (both arms of the
+/// SH329 governor-flag fork converge on it), then `ldr x8,[x0]; ldr x8,[x8,#136]; blr x8`
 /// @0x25f5050/58/5c. SH329 closed only the fork; a seed on the MEMBER was never tested, and (unlike
-/// SH324's x8-out-param dead-end) this is a plain vt[+136] blr — a fabricated object whose vt[+136]
-/// is a benign host leaf passes 0x25f5050 and reveals the NEXT gate (`ldr x8,[x21]` @0x25f5060).
+/// SH324's dead-end) this is a plain vt[+136] blr — a fabricated object whose vt[+136] is a benign
+/// host leaf passes 0x25f5050 and reveals the NEXT gate (`ldr x8,[x21]` @0x25f5060).
 /// The faulting base x19 is a RUNTIME heap AppStarted (only known in-process), so this seeds
-/// [x19+0x408] at block-entry into the gate window. FORWARD-PROBE only: reveals what the real
-/// session ctor must build at +0x408, NOT a live DM. Default-inert; idempotent.
-/// NOTE (SH330b, 8-run A/B): the epilogue canary re-read `ldr x8,[x21]` @0x25f5060 needs x21 still
-/// == the guard-GOT slot (host leaf preserves callee-saved regs, so x21===guardGOT in practice);
-/// defensively restoring x21 measured 0 firings + no change and was reverted (no-cruft). The gate
-/// crosses deterministically but the DOWNSTREAM is run-variable on the full recipe: ~5/8 clean
-/// EXIT 0, rest abort at a host-pc/AAudio site — so the next wall is that run-variable leak
-/// (SH320/SH212-class), not the canary epilogue.
+/// [x19+0x408] at block-entry into the gate window. FORWARD-PROBE only (NOT a live DM).
+/// NOTE (SH330b, 8-run A/B): the epilogue canary `ldr x8,[x21]` @0x25f5060 needs x21==guard-GOT;
+/// defensively restoring x21 measured 0 firings + no change, reverted (no-cruft). Gate crosses
+/// deterministically but the DOWNSTREAM is run-variable (~5/8 clean EXIT 0, rest abort at a
+/// host-pc/AAudio site) — the next wall is that run-variable leak (SH320/SH212-class).
 fn routeb_appstart_408_guard(state: *mut CpuState, pc: u64) {
     if std::env::var_os("JIT_ROUTEB_APPSART_408SEED").is_none() {
         return;
@@ -1598,13 +1585,11 @@ pub fn ring_ordered(ring: &[u64], ring_i: usize) -> Vec<u64> {
 /// structural/non-seedable. WRONG: the jar container is a seedable .bss global, not a constructed
 /// object. This guard fires at the worker's block entry and (JIT_ROUTEB_COOKIE=1) ensures
 /// [0x106ed7a20] points at a valid EMPTY libc++ std::string (a zeroed 0x20 SSO buffer: size=0,
-/// cap=0 => short empty) + clears BOTH boot-latch gate bits ([0x106dcfc30].bit0 and
+/// cap=0 => short empty) + clears both boot-latch gate bits ([0x106dcfc30].bit0 and
 /// [0x1072739d4].bit0) so the worker classifies+records a `.ROBLESECURITY` cookie instead of
-/// faulting. Default-inert (env off -> no write).
-/// Idempotent: only seeds when the slot is 0 (a real session's constructed jar is
-/// preserved untouched). Honest boundary: clearing the jar-init deref is the proven
-/// advance; the deeper insert/commit path (0x22035c0..) may touch further unexercised
-/// singletons, observed as the NEXT gate if it faults.
+/// faulting. Default-inert (env off -> no write). Idempotent (only seeds when slot==0; a real
+/// session's constructed jar is preserved). Honest boundary: the deeper insert/commit path
+/// (0x22035c0..) may touch further singletons = the NEXT gate if it faults.
 fn routeb_cookie_jar_guard(_state: *mut CpuState, pc: u64) {
     if std::env::var_os("JIT_ROUTEB_COOKIE").is_none() {
         return;
@@ -1785,20 +1770,18 @@ pub fn routeb_appstart_adapter_object() -> u64 {
 
 /// SH259 (opt-in JIT_ROUTEB_APPSART_SETTINGS_ONCE): seed the once-guard of the settings/registry
 /// singleton factory the deepest app-start reach bl's. SH258 measured nativeAppBridgeAppStart's
-/// orchestrator 0x2339d0c reaching its DEEPEST point 0x102339d44 = `bl 0x21dac2c` (a once-guarded
-/// settings singleton factory), then EXIT 134 at the live-object map wall 0x1021dde34. Disasm of
-/// 0x21dac2c: `adrp x8,6a6f000; add x8,#0x430; ldar w8,[x8]; tbz w8,#0,0x21dac54` reads the
-/// once-guard byte [0x106a6f430]. bit0 CLEAR (headless) -> builder path (`bl 0x284ce54` __call_once
-/// then `bl 0x21dac80`; body registry setters 0x21dad40/0x21e126c/0x21e1470/0x21e1668/0x21e1830/
-/// 0x21e1a34/0x2e88f5c) hands into the map-construction chain (0x21ddc44->0x21ddcac, stride-0x2a0
-/// live-object map) = the SH174/SH204 wall. bit0 SET -> 0x21dac2c takes `adrp x0,6a6f000; add
-/// x0,#0x3f0; ret` = early-ret the (zeroed .bss) registry 0x6a6f3f0 WITHOUT the builder, so control
-/// returns to 0x2339d48 and it walks its OWN real app-start body (0x233a804/0x233af10/0x233bbac/
-/// 0x233bf20/0x233d11c/0x233d2bc..) — a fresh Path-B surface never reached headlessly. Unlike
-/// SH248e (seeds the -1 CELL at [0x106b0bdf0]) this seeds the once-guard FLAG itself, the SH156
-/// "flags-latch" pattern at a NEW cell. Fires at block-entry [0x102339d40,0x102339d4c) (immediately
-/// before the bl); idempotent (ORs bit0 only); default-inert.
-/// idempotent (only ORs bit0, never clobbers); default-inert.
+/// orchestrator 0x2339d0c reaching 0x102339d44 = `bl 0x21dac2c` (a once-guarded settings singleton
+/// factory), then EXIT 134 at the live-object map wall 0x1021dde34. Disasm of 0x21dac2c:
+/// `adrp x8,6a6f000; add x8,#0x430; ldar w8,[x8]; tbz w8,#0,0x21dac54` reads once-guard
+/// [0x106a6f430]. bit0 CLEAR (headless) -> builder path (`bl 0x284ce54` __call_once
+/// then `bl 0x21dac80`; body registry setters) hands into the map-construction chain (0x21ddc44 ->
+/// 0x21ddcac, stride-0x2a0 live-object map) = the SH174/SH204 wall. bit0 SET -> 0x21dac2c takes
+/// `adrp x0,6a6f000; add x0,#0x3f0; ret` = early-ret the (zeroed .bss) registry 0x6a6f3f0 WITHOUT
+/// the builder, so control returns to 0x2339d48 and it walks its OWN real app-start body
+/// (0x233a804/0x233af10/0x233bbac/0x233bf20/0x233d11c/0x233d2bc..) — a fresh Path-B surface never
+/// reached headlessly. Unlike SH248e (seeds the -1 CELL [0x106b0bdf0]) this seeds the once-guard
+/// FLAG itself, the SH156 "flags-latch" pattern at a NEW cell. Fires at block-entry
+/// [0x102339d40,0x102339d4c) (immediately before the bl); idempotent (ORs bit0 only); default-inert.
 fn routeb_appstart_settings_once_seed_guard(_state: *mut CpuState, pc: u64) {
     if std::env::var_os("JIT_ROUTEB_APPSART_SETTINGS_ONCE").is_none() {
         return;
@@ -2055,19 +2038,15 @@ fn routeb_donepath_main_branch_guard(_state: *mut CpuState, pc: u64) {
 
 /// SH361 (opt-in JIT_ROUTEB_DOINIT_DYN_TRACE=1): READ-ONLY "dynamic DM-ctor trace" at the
 /// do-init worker entry 0x2206db8 (a true block entry, SH320's dispatcher pc). The worker's
-/// MAIN branch reads `ldr x0,[x19,#32]` @0x2206df4 (x19 = the container arg, saved from x1
+/// MAIN branch reads `ldr x0,[x19,#32]` @0x2206df4 (x19 = container arg, saved from x1
 /// @0x2206dd0) then `cbz x0, 0x2206ea4` @0x2206df8: NULL -> bails to MessageBus_getLastRaw
 /// (DM-ctor dispatch 0x2206e24 `br x1` NOT attempted); non-NULL -> falls through to
 /// `ldr x8,[x0]; ldr x1,[x8,#48]` @0x2206e00 and `br x1` @0x2206e24 = the DM/app-shell ctor
-/// dispatch. This is the exact decision point the operator's "dynamic DM-ctor trace rather
-/// than a static seed" (EXECUTE-DO-INIT-GATES) names. The guard OBSERVES [container+32] +
+/// dispatch — the exact decision point the operator's "dynamic DM-ctor trace rather than a
+/// static seed" (EXECUTE-DO-INIT-GATES) names. The guard OBSERVES [container+32] +
 /// the once/DM-root cells and logs which way the MAIN branch actually goes on the live ladder,
 /// WITHOUT mutating guest state. It does NOT force anything (distinct from SH320 which seeds
-/// main-id); it answers "does the ladder's do-init reach the DM-ctor dispatch or not" — the
-/// measured-versus-assumed gap SH320's docs flagged ('MAIN branch binder-dispatch 0x206df4 ->
-/// vt+0x30 -> br x1' was described as a DM-ctor entry without ever reading [container+32]).
-/// Default-inert, read-only, fires once per run (deduped by pc). Fire at block entry 0x2206db8
-/// so x1 (the container) is already set by the caller (the worker saves it to x19 mid-block).
+/// main-id). Default-inert, read-only, fires once per run (deduped by pc) at 0x2206db8.
 fn routeb_doinit_dyn_trace_guard(state: *mut CpuState, pc: u64) {
     if std::env::var_os("JIT_ROUTEB_DOINIT_DYN_TRACE").is_none() {
         return;
@@ -2367,22 +2346,21 @@ fn routeb_ec_world_realsession_guard(_state: *mut CpuState, pc: u64) {
     eprintln!("[routeb-sh300] seeded EC-world realsession flag [0x{cell:x}]=1 at pc={pc:#x} (was 0 -> EC body took benign 23c1b0c branch, skipped real V2Init 23c5538 + StartLuaAppDM 23f1654)");
 }
 
-/// SH302 (opt-in JIT_ROUTEB_EC_READERGATE=1): SH300's realsession flag at [0x106d31e28] is
-/// CORRECT + latched but its READER at 0x2e246f4 is never reached (SH301 block-entry proof: neither
-/// the real V2Init bl-target 0x1023c5538 nor benign 0x1023c1b0c ever fires). Disasm of the EC body
-/// [0x2e24598..0x2e247dc] pinpoints WHY: the reader is gated behind a caller-frame OBJECT read
+/// SH302 (opt-in JIT_ROUTEB_EC_READERGATE=1): SH300's realsession flag [0x106d31e28] is
+/// correct+latched but its READER at 0x2e246f4 is never reached (SH301 block-entry proof). Disasm
+/// of the EC body [0x2e24598..0x2e247dc]: the reader is gated behind a caller-frame OBJECT read
 /// `ldr x8,[x29,#104]` @0x2e246b0 -> `ldr x0,[x8,#32]` @0x2e246d8 -> `cbz x0,0x2e246f4` @0x2e246dc:
-///   - [x29,#104]+0x20 == 0 -> cbz TAKEN -> falls STRAIGHT into the reader 0x2e246f4 (reads the flag;
+///   - [x29,#104]+0x20 == 0 -> cbz TAKEN -> falls straight into the reader 0x2e246f4;
 ///     flag==1 makes real V2Init 0x1023c5538 + StartLuaAppDM 0x1023f1654 reachable).
 ///   - [x29,#104]+0x20 != 0 -> 0x2e246f0 `blr vt[+48]` CONSUMES control into a live-object dispatch
 ///     and never falls through to the reader (the "pre-reader continuation" SH301 names as the real
 ///     gate — why the SH300 flag-only seed measured dormant).
 /// The slot [x29,#104] = caller-frame memory = caller SP + 8 after the EC prologue (stp x29,x30,
 /// [sp,#-96]! + mov x29,sp) = entry x31 + 8. This guard, firing at EC entry 0x102e24598 (before the
-/// prologue runs), reads entry x31 and seeds `space at [x31+8]` to a leaked
-/// ZEROED buffer so [+0x20]==0 -> the cbz @0x2e246dc is taken -> the reader is
-/// reached. Idempotent, env-gated, default-inert. Does NOT restore the object;
-/// the reader's real V2Init/StartLuaAppDM execute next if flag also ==1.
+/// prologue runs), reads entry x31 and seeds `space at [x31+8]` to a leaked ZEROED buffer so
+/// [+0x20]==0 -> the cbz @0x2e246dc is taken -> the reader is reached. Idempotent, env-gated,
+/// default-inert. Does NOT restore the object; the reader's real V2Init/StartLuaAppDM run next if
+/// the flag is also ==1.
 fn routeb_ec_world_reader_gate_guard(state: *mut CpuState, pc: u64) {
     if std::env::var("JIT_ROUTEB_EC_READERGATE").ok().as_deref() != Some("1") {
         return;
@@ -3289,18 +3267,14 @@ fn routeb_dm_real_ctor_drive_guard(_state: *mut CpuState, pc: u64) {
 
 /// SH384 (SH383 next-step): DRIVE the GENUINE LocalStorageManager ctor 0x1db0dfc
 /// through real code with a coherent `container`, manufacturing a real vtable-owning
-/// manager — the MIGRATION-directive manufacture lever, previously only pinned (SH383),
-/// never driven. Prior persistence cycles were all SKIP (SH348 leaf-ret, SH349/350
-/// sub-call-skip) or SEED (SH267/285 map/nodes) — none ran the real ctor. Disasm: outer
-/// ctor reads [container+8] (sub-object) with `cbz x0` @0x40 (NULL -> benign), [container+16]
-/// 16-byte payload -> [this+16], [container+32] word -> [this+32]; then bl inner ctor
-/// 0x1db0748 which re-reads [container+8] `cbz x9` @0x2c -> `mov x19,xzr` @0x78 (NULL ->
-/// x19=0) and its stack canary check reads the same global twice (self-consistent, passes
-/// with no patch). So a ZEROED coherent container drives the genuine ctor to manufacture a
-/// genuine-vt owning manager cleanly. default-inert (env JIT_ROUTEB_LSM_CTOR_MANUFACTURE=1),
-/// idempotent, best-effort (a guest fault returns Ok + is reported). This is cause-not-
-/// symptom: it manufactures the missing object the SH285 reader/pop faults on, rather than
-/// skipping/repairing it.
+/// manager — the MIGRATION-directive manufacture lever (previously only pinned, SH383).
+/// Prior persistence cycles were all SKIP (SH348/349/350) or SEED (SH267/285) — none ran the
+/// real ctor. Disasm: outer ctor reads [container+8] `cbz x0` @0x40 (NULL -> benign),
+/// [container+16] payload -> [this+16], [container+32] -> [this+32]; inner ctor 0x1db0748
+/// re-reads [container+8] `cbz x9` @0x2c -> `mov x19,xzr` @0x78 (NULL -> x19=0), stack canary
+/// self-consistent. So a ZEROED coherent container drives the genuine ctor to manufacture a
+/// genuine-vt manager cleanly. default-inert (JIT_ROUTEB_LSM_CTOR_MANUFACTURE=1), idempotent,
+/// best-effort; cause-not-symptom (manufactures the object the SH285 reader/pop faults on).
 fn routeb_lsm_ctor_manufacture_drive(_state: *mut CpuState, pc: u64) {
     if std::env::var_os("JIT_ROUTEB_LSM_CTOR_MANUFACTURE").is_none() {
         return;
@@ -3832,8 +3806,8 @@ fn routeb_dm_instance_guard(_state: *mut CpuState, pc: u64) {
 /// ==classid, [node+0x68]=next), on match materializer 0x2377600 copies [node+8]/[node+16].
 /// NAME decode (0x5e09bfc): `ldrb w8,[x1]; lsr w8,#1` — byte0=(cap|bit0=long); long => [x1+16].
 /// Fabricate long-form name {__cap_=0x13 (long), __size_=9, __data_=&"PlayerGui"} -> key ptr+len=9 ->
-/// resolver matches engine's own "PlayerGui" key (9 chars). default-inert (JIT_ROUTEB_DM_SERVICE_NODE=1).
-/// Node thin+host-leaked; gated on genuinely constructed instance (vptr 0x106648950).
+/// resolver matches engine's own 9-char "PlayerGui" key. default-inert (JIT_ROUTEB_DM_SERVICE_NODE=1);
+/// node thin+host-leaked; gated on genuinely constructed instance (vptr 0x106648950).
 fn routeb_dm_service_resolve_guard(_state: *mut CpuState, pc: u64) {
     if std::env::var_os("JIT_ROUTEB_DM_SERVICE_NODE").is_none() {
         return;
@@ -17771,6 +17745,36 @@ mod fp16_and_fabd_fccmp_exec {
             eprintln!("[abi] sh404 do-init FALL-THROUGH (br x1 @0x2206e24 bypassed) -> app-shell band [0x102207000..0x102209000) deep reach pinned");
         } else {
             eprintln!("sh404 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
+    fn sh405_donepath_main_flips_doinit_to_main_dispatch_into_appstart() {
+        // SH405: arming JIT_ROUTEB_DONEPATH_MAIN (SH320 main-id seed) flips the do-init thread-dispatch
+        // (pthread_self vs [0x106863a68]; b.eq @0x2206df0 NOT taken -> MAIN branch, `br x1` @0x2206e24)
+        // OFF the fall-through box-build SH404 measured and ONTO the MAIN arm — the never-executed
+        // 0x10258b5d8 dispatch body finally RUNS deep (region pcs 0x10258b5d8..0x10258bbb0), crosses the
+        // SH322 lifecycle wall (0x21f3748, seeded caller-pair) + SH323 SSO fencepost, then drains into the
+        // standing SH285/LSM persistence lane (SH341 pool-pop write-site fires immediately before the
+        // SIGSEGV at guestpc 0x1025f501c). So the persistence lane is ARM-RELATIVE: reached from BOTH the
+        // fall-through (SH404) and the MAIN app-start path (SH405). Byte-pin the MAIN-arm app-start call chain.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let word_at = |vaddr: u64| -> u32 {
+                let off = (vaddr & 0xffff_ffff) as usize;
+                let b = &img[off..off + 4];
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            };
+            // MAIN dispatch br x1 (SH320) -> 0x10258b5d8 body prologue (SH404); the app-start continuation
+            // bl 0x25f52b4 @0x25f5018 (x0=[x19,#1088] app obj) + the post-dispatch flag read @0x25f502c.
+            assert_eq!(word_at(0x102206e24), 0xd61f_0020, "sh405 do-init MAIN dispatch br x1");
+            assert_eq!(word_at(0x10258b5d8), 0xd105_c3ff, "sh405 dispatch body prologue (sub sp,#0x170)");
+            assert_eq!(word_at(0x1025f5018), 0x9400_00a7, "sh405 app-start bl 0x25f52b4 @0x25f5018");
+            assert_eq!(word_at(0x1025f52b4), 0xa9bb_7bfd, "sh405 app-start callee prologue stp x29,x30,[sp,#-80]!");
+            eprintln!("[abi] sh405 MAIN-arm app-start call chain beyond the do-init dispatch pinned (persistence-lane is arm-relative: fall-through SH404 + MAIN SH405)");
+        } else {
+            eprintln!("sh405 real-image guard: no real libroblox.so, skipping anchors");
         }
     }
 

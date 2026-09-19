@@ -1,5 +1,23 @@
 # Open Sober — Agent Handoff
 
+## SH405 (Sep 21, 2026, hermes-worker): arming the SH320 main-id seed (JIT_ROUTEB_DONEPATH_MAIN) flips the do-init onto its MAIN dispatch — the never-executed 0x10258b5d8 app-start body finally RUNS deep headlessly (crosses SH322 lifecycle + SH323 SSO), then drains into the standing SH285/LSM persistence lane from a SECOND (MAIN-arm) entry point; the persistence lane is now measured ARM-RELATIVE (fall-through SH404 + MAIN SH405)
+Single-agent (cone suppressed). New probe runs/capture_sh405_donepath_main.sh (SH404 env +
+JIT_ROUTEB_DONEPATH_MAIN + LIFECYCLE_EARLYRET + SETTINGS_SSO_SEED) + new real-image hermetic
+`sh405_donepath_main_flips_doinit_to_main_dispatch_into_appstart` (arm64jit lib 453->454),
++ frontier-sh405 doc. No production path / JIT hook default / guest byte changed.
+MEASURED (real libroblox.so, 2/2, EXIT 134-139, 0 main-thread crash): SH320 fires (seeds
+main-id [0x106863a68] to the executing thread at 0x2206db8, was 0x3) -> the thread-match
+`b.eq @0x2206df0` is NOT taken -> MAIN branch -> `br x1 @0x2206e24` -> **0x10258b5d8 body
+finally ENTERS** (region pcs 0x10258b5d8..0x10258bbb0 all hit), crosses SH322 (0x21f3748
+caller-pair seed) + SH323 (0x21f5078/0x1025f36ac SSO seeds), then drains into the standing
+SH285/LSM lane (SH341 pool-pop write-site 0x101d9a528 fires right before SIGSEGV at
+guestpc 0x1025f501c, the app-start continuation after `bl 0x25f52b4 @0x25f5018`). So the
+persistence lane is arm-relative: it swallows BOTH the SH404 fall-through AND the SH405 MAIN
+app-start arm (strengthens SH372 path-independence from the MAIN arm). Honest: no DM
+(DM-root [0x106a68818]=0, MH_* false, AppBridgeV2 genuine vt 0x1063a3410 unchanged);
+DMCONT 0x102bd1d68 = 0 (standing next construction gate). Workspace green (cargo test
+--workspace EXIT 0, 635/0 incl sh405; jit.rs condensed under 1MiB hook, elfjit.rs untouched).
+
 ## SH404 (Sep 20, 2026, hermes-worker): the do-init FALL-THROUGH arm runs DEEP into the app-shell ctor band; the main dispatch `br x1` is bypassed — corrects SH362's root cause (0x10258b5d8 unreachable by branch-choice, not by a pre-body fault)
 Single-agent (cone suppressed). SH403 reached StartApp boot body -> app-bridge pipe 0x2baeeec ->
 do-init 0x102206c40 DEEP body + post-doinit worker 0x1023eff4c. SH404 answers "where does the
