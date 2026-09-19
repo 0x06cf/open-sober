@@ -7460,6 +7460,109 @@ mod tests {
         assert!(b.windows(10).any(|w| w[0] == 0x48 && w[1] == 0xb9 && w[2] == 0xff && w[3] == 0xff && w[4] == 0xff && w[5] == 0xff && w[6] == 0x00 && w[7] == 0x00));
     }
 
+    // SH441: hermetic coverage of the SCALAR-REDUCTION + WIDEN codegen families
+    // (translate.rs FMaxV — `fmaxv/fminv Sd, Vn.4s`; WidenShl — `shll/shll2
+    // Vd.Td, Vn.Ts`). Both had zero direct byte tests. SH441 pins the exact
+    // emitted x86 with rd=1, rn=2:
+    //  (1) FMaxV full buffer — reduce the 4 single lanes of Vn (base
+    //      0x130=0x110+2*16) into scalar Sd@0x120 (0x110+1*16): movd xmm0=<Vn.0>,
+    //      then movd xmm1=<Vn.i> + maxss/minss xmm0,xmm1 for i=1..3, movd eax,
+    //      mov [0x120],eax. The 0x5f (maxss) vs 0x5d (minss) opcode is the
+    //      fmaxv-vs-fminv discriminator; the REX.B `40` (f3 40 0f 5f c1) and
+    //      the advancing src displacement +0x4-lane are pinned.
+    //  (2) WidenShl — reverse-iteration shll: dst_esize=4 dst-lanes 4 apart
+    //      (0x124, 0x120), src src_esize=2 (so 0x132, 0x130), signed uses
+    //      movsx_word_mem (`48 0f bf`) / unsigned uses movzx_word_mem (`0f b7`)
+    //      — the REX.W presence is the signed-vs-unsigned discriminator; the
+    //      shll2 upper-half (uh=8 -> src base 0x138) + dst_esize=2 case uses
+    //      movsx_byte_mem (`48 0f be`) + the 16-bit `66 89` store, stepping
+    //      src -1 and dst -2 lanes 3..0.
+    #[test]
+    fn sh441_fmaxv_cross_lane_scalar_reduce_maxss_ladder() {
+        let b = tr_bytes(Inst::FMaxV { rd: 1, rn: 2, min: false });
+        assert_eq!(b, vec![
+            0x8b, 0x83, 0x30, 0x01, 0x00, 0x00, // mov eax,[rbx+0x130] Vn.0
+            0x66, 0x0f, 0x6e, 0xc0,             // movd xmm0,eax
+            0x8b, 0x83, 0x34, 0x01, 0x00, 0x00, // mov eax,[rbx+0x134] Vn.1
+            0x66, 0x0f, 0x6e, 0xc8,             // movd xmm1,eax
+            0xf3, 0x40, 0x0f, 0x5f, 0xc1,       // maxss xmm0,xmm1
+            0x8b, 0x83, 0x38, 0x01, 0x00, 0x00, // mov eax,[rbx+0x138] Vn.2
+            0x66, 0x0f, 0x6e, 0xc8,             // movd xmm1,eax
+            0xf3, 0x40, 0x0f, 0x5f, 0xc1,       // maxss xmm0,xmm1
+            0x8b, 0x83, 0x3c, 0x01, 0x00, 0x00, // mov eax,[rbx+0x13c] Vn.3
+            0x66, 0x0f, 0x6e, 0xc8,             // movd xmm1,eax
+            0xf3, 0x40, 0x0f, 0x5f, 0xc1,       // maxss xmm0,xmm1
+            0x66, 0x0f, 0x7e, 0xc0,             // movd eax,xmm0
+            0x89, 0x83, 0x20, 0x01, 0x00, 0x00, // mov [rbx+0x120],eax Sd
+        ]);
+        // The three source lanes advance +4 (0x134, 0x138, 0x13c) from base 0x130.
+        assert!(b.windows(6).any(|w| w == [0x8b, 0x83, 0x34, 0x01, 0x00, 0x00]));
+        assert!(b.windows(6).any(|w| w == [0x8b, 0x83, 0x3c, 0x01, 0x00, 0x00]));
+        // maxss opcode byte 0x5f present, fminv's 0x5d (minss) absent.
+        assert!(b.windows(5).any(|w| w == [0xf3, 0x40, 0x0f, 0x5f, 0xc1]));
+        assert!(!b.windows(5).any(|w| w == [0xf3, 0x40, 0x0f, 0x5d, 0xc1]));
+    }
+
+    #[test]
+    fn sh441_fminv_cross_lane_scalar_reduce_minss_ladder() {
+        let b = tr_bytes(Inst::FMaxV { rd: 1, rn: 2, min: true });
+        // Same ladder shape but opcode 0x5d (minss) instead of 0x5f (maxss).
+        assert!(!b.windows(5).any(|w| w == [0xf3, 0x40, 0x0f, 0x5f, 0xc1]),
+            "fminv must not emit maxss");
+        assert!(b.windows(5).any(|w| w == [0xf3, 0x40, 0x0f, 0x5d, 0xc1]));
+        // Still reduces all 4 lanes into Sd@0x120.
+        assert!(b.windows(6).any(|w| w == [0x8b, 0x83, 0x30, 0x01, 0x00, 0x00]));
+        assert!(b.windows(6).any(|w| w == [0x8b, 0x83, 0x3c, 0x01, 0x00, 0x00]));
+        assert!(b.windows(6).any(|w| w == [0x89, 0x83, 0x20, 0x01, 0x00, 0x00]));
+    }
+
+    #[test]
+    fn sh441_widenshl_reverse_iteration_signed_movsx_vs_unsigned_movzx() {
+        // shll Vd.4s, Vn.4h : dst_esize=4, nlanes=2 => src_esize=2. Reverse
+        // iteration writes i=1 first (dst 0x124 from src 0x132) then i=0
+        // (dst 0x120 from src 0x130) — the widening reverse order.
+        let s = tr_bytes(Inst::WidenShl { rd: 1, rn: 2, dst_esize: 4, nlanes: 2, signed: true, upper: false });
+        assert_eq!(s, vec![
+            0x48, 0x0f, 0xbf, 0x83, 0x32, 0x01, 0x00, 0x00, // movsx_word_mem rax,[rbx+0x132]
+            0x89, 0x83, 0x24, 0x01, 0x00, 0x00,             // mov [rbx+0x124],eax  dst lane1
+            0x48, 0x0f, 0xbf, 0x83, 0x30, 0x01, 0x00, 0x00, // movsx_word_mem rax,[rbx+0x130]
+            0x89, 0x83, 0x20, 0x01, 0x00, 0x00,             // mov [rbx+0x120],eax  dst lane0
+        ]);
+        assert!(s.windows(8).any(|w| w == [0x48, 0x0f, 0xbf, 0x83, 0x32, 0x01, 0x00, 0x00]));
+        let u = tr_bytes(Inst::WidenShl { rd: 1, rn: 2, dst_esize: 4, nlanes: 2, signed: false, upper: false });
+        // unsigned uses movzx_word_mem (0f b7, NO 0x48 REX.W) — the signed-vs-
+        // unsigned discriminator (a sign-extended lane picks the wrong value).
+        assert!(u.windows(7).any(|w| w == [0x0f, 0xb7, 0x83, 0x32, 0x01, 0x00, 0x00]));
+        assert!(!u.windows(8).any(|w| w == [0x48, 0x0f, 0xbf, 0x83, 0x32, 0x01, 0x00, 0x00]),
+            "unsigned shll must not emit movsx (REX.W)");
+    }
+
+    #[test]
+    fn sh441_widenshl2_upper_half_byte_widen_16bit_store() {
+        // shll2 Vd.8h, Vn.8b : dst_esize=2 (=> src_esize=1), nlanes=4, upper
+        // => src base = Vn + 8 = 0x138. Reverse iteration: src 0x13b..0x138,
+        // dst lanes 0x126,0x124,0x122,0x120 (2 apart). Signed byte widen via
+        // movsx_byte_mem (48 0f be) + 16-bit store (66 89).
+        let b = tr_bytes(Inst::WidenShl { rd: 1, rn: 2, dst_esize: 2, nlanes: 4, signed: true, upper: true });
+        assert_eq!(b, vec![
+            0x48, 0x0f, 0xbe, 0x83, 0x3b, 0x01, 0x00, 0x00, // movsx_byte_mem rax,[rbx+0x13b]
+            0x66, 0x89, 0x83, 0x26, 0x01, 0x00, 0x00,     // mov [rbx+0x126],ax  dst lane3
+            0x48, 0x0f, 0xbe, 0x83, 0x3a, 0x01, 0x00, 0x00, // movsx_byte_mem rax,[rbx+0x13a]
+            0x66, 0x89, 0x83, 0x24, 0x01, 0x00, 0x00,     // mov [rbx+0x124],ax  dst lane2
+            0x48, 0x0f, 0xbe, 0x83, 0x39, 0x01, 0x00, 0x00, // movsx_byte_mem rax,[rbx+0x139]
+            0x66, 0x89, 0x83, 0x22, 0x01, 0x00, 0x00,     // mov [rbx+0x122],ax  dst lane1
+            0x48, 0x0f, 0xbe, 0x83, 0x38, 0x01, 0x00, 0x00, // movsx_byte_mem rax,[rbx+0x138]
+            0x66, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00,     // mov [rbx+0x120],ax  dst lane0
+        ]);
+        // upper-half base: src must start at 0x138 (Vn base 0x130 + uh 8), never 0x130.
+        assert!(b.windows(8).any(|w| w == [0x48, 0x0f, 0xbe, 0x83, 0x38, 0x01, 0x00, 0x00]));
+        assert!(!b.windows(8).any(|w| w == [0x48, 0x0f, 0xbe, 0x83, 0x30, 0x01, 0x00, 0x00]),
+            "shll2 upper half must not read the low Vn base");
+        // 16-bit stores: opcode 66 89 present, 32-bit 89 absent.
+        assert!(b.windows(7).any(|w| w == [0x66, 0x89, 0x83, 0x26, 0x01, 0x00, 0x00]));
+        assert!(!b.windows(7).any(|w| w == [0x89, 0x83, 0x24, 0x01, 0x00, 0x00]));
+    }
+
     #[test]
     fn sh431_logicimm_orr_xzr_mov_alias_materializes_mask() {
         // `mov x0,#7` = ORR x0,xzr,#7 (op=1, rn==31): rn==31 must read as XZR
