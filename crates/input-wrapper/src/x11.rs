@@ -7,13 +7,36 @@
 //! `input.rs` and is fully unit-tested. The `pump` function here only proves the
 //! X11 wiring compiles and can pull real events headlessly (Xvfb smoke test).
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{ConnectionExt, CreateWindowAux, EventMask, WindowClass};
+use x11rb::protocol::xproto::{
+    ChangeWindowAttributesAux, ConnectionExt, CreateWindowAux, EventMask, WindowClass,
+};
 use x11rb::rust_connection::RustConnection;
 
 use crate::input::{self, PointerTracker, MotionEvent};
+
+/// The connection that owns the runtime's ANativeWindow X11 window. X11 only
+/// allows a client to register input interest (ChangeWindowAttributes/event_mask)
+/// on a window from ITS OWN connection; a second connection's attempt is a
+/// BadAccess. So the window-creating connection is registered here (by the runtime
+/// window layer, which otherwise `Box::leak`s it just to keep the window alive) and
+/// [`pump_registered_window`] reuses it to select + drain that window's events.
+static OWNER_CONN: OnceLock<RustConnection> = OnceLock::new();
+
+/// Register the connection that created the runtime's desktop X11 window so the
+/// input pump can select input on that window (same client = no BadAccess).
+/// Called once by the window layer after it opens the window. A leaked clone is
+/// what keeps the window alive for the boot; here we also hand the pump a live
+/// handle to drain events on it.
+pub fn register_window_connection(conn: RustConnection) {
+    // Keep ONE owner connection; a fresh one per window replaces the prior. The
+    // first wins so a second window-layer registration in the same process keeps
+    // the earliest (which is also the one whose XID is registered as ANativeWindow).
+    let _ = OWNER_CONN.set(conn);
+}
 
 /// Errors surfaced from the X11 layer.
 #[derive(Debug)]
@@ -108,6 +131,55 @@ pub fn pump(
         }
     }
     Ok(())
+}
+
+/// Subscribe an EXISTING window (e.g. the guest's registered ANativeWindow XID)
+/// to pointer/button/motion events on `display`, then drain any already-queued
+/// events once through the tracker, dispatching each translated Android touch
+/// event to `dispatch`. Returns the number of native Android events dispatched.
+///
+/// Unlike [`open_window_sized`] this does NOT create a window — it consumes the
+/// window the runtime already created and registered as the guest ANativeWindow,
+/// so a host poll loop can deliver real pointer input to a constructed
+/// login/home screen. Non-blocking (single drain), safe to poll repeatedly.
+///
+/// The event interest is selected, not grabbed, so the pointer stays with X and
+/// other clients are untouched; the window itself stays alive because the runtime
+/// leaks the connection that created it.
+pub fn pump_registered_window(
+    _display: Option<&str>,
+    window: u32,
+    tracker: &mut PointerTracker,
+    dispatch: &mut dyn FnMut(MotionEvent),
+) -> Result<usize, XError> {
+    // Use the connection that CREATED the window: X11 only lets a client select
+    // input interest (event_mask on ChangeWindowAttributes) on a window it owns.
+    // A fresh connection would get BadAccess on Xvfb.
+    let conn = match OWNER_CONN.get() {
+        Some(c) => c,
+        None => {
+            return Err(XError::Connect(
+                "no owner connection registered for the input pump".into(),
+            ));
+        }
+    };
+    // Select (not grab) pointer/button/motion interest for THIS client on the
+    // existing window, so its events are delivered to our connection.
+    conn.change_window_attributes(
+        window,
+        &ChangeWindowAttributesAux::new().event_mask(
+            EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION,
+        ),
+    )
+    .map_err(|e| XError::Create(format!("change_window_attributes: {e}")))?
+    .check()
+    .map_err(|e| XError::Create(format!("change_window_attributes check: {e}")))?;
+    let mut dispatched = 0usize;
+    pump(conn, tracker, &mut |e| {
+        dispatch(e);
+        dispatched += 1;
+    })?;
+    Ok(dispatched)
 }
 
 /// Block for a short time (used in the smoke test to let a real server run).

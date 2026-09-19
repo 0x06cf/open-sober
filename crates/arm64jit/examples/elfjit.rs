@@ -5948,7 +5948,7 @@ fn wire_real_window() -> u64 {
         let display = format!(":{display_num}");
         // 1) Try the display as-is (it may already be a live server).
         if let Ok((conn, win)) = x11::open_window_sized(Some(&display), 1280, 720) {
-            Box::leak(Box::new(conn)); // keep the window alive for the boot
+            input_wrapper::x11::register_window_connection(conn); // SH416: owner conn for the real-input pump
             unsafe {
                 std::env::set_var("DISPLAY", &display);
                 std::env::set_var("EGL_PLATFORM", "x11");
@@ -5979,7 +5979,7 @@ fn wire_real_window() -> u64 {
                     // SH303: this spawned Xvfb is now ours - register it so the
                     // process-exit reaper kills it (it would otherwise leak).
                     SPAWNED_XVFB.lock().unwrap_or_else(|p| p.into_inner()).push(c);
-                    Box::leak(Box::new(conn));
+                    input_wrapper::x11::register_window_connection(conn); // SH416: owner conn for the real-input pump
                     unsafe {
                         std::env::set_var("DISPLAY", &display);
                         std::env::set_var("EGL_PLATFORM", "x11");
@@ -6519,10 +6519,7 @@ fn main() {
             routeb_patch_opnew_size_gate();
             // SH115: the nullable-singleton dispatch accessors soft-return because their
             // `blr` reads past the 0x60 vtable. Scoped-patch each site to materialize the
-            // stable zeroed singleton so those bodies COMPLETE (session advance), leaving
-            // nativeInit's own 0x60 reads + shared vtable untouched. OPT-IN
-            // (JIT_SH115_SINGLETON_PATCH=1): makes the render pipeline run but advances
-            // nativeInit past its soft-return into a 0x28-getter fault (SH116), inert by default.
+            // stable zeroed singleton; OPT-IN (JIT_SH115_SINGLETON_PATCH=1).
             if std::env::var("JIT_SH115_SINGLETON_PATCH").ok().as_deref() == Some("1") {
                 routeb_patch_singleton_dispatch();
                 // SH116: the advanced nativeInit path locks an unmapped .bss
@@ -6544,21 +6541,15 @@ fn main() {
                 routeb_patch_sendapp_singleton_lambdas();
                 // SH200: V2Init/V2Start run-variable "outside image" stop = a 4th singleton-dispatch site
                 // (fn 0x6251e0c reads objB vt slot +0x118 past 0x60 seed -> blr host bytes).
-                // Patch like SH115/119 so V2Init/V2Start reach the SH199 world-build gate
-                // 0x102368100 soft-returning first.
                 routeb_patch_v2_dispatch();
-                // SH201: objB-getter singleton-dispatch family LOCATED but not runtime-patched (crash-loops);
-                // characterized lever+scanner only. SH120: app-bridge event dispatch reads unseeded
-                // dispatcher .bss (0x10683a460); seed DATA (not the shared leaf) to benign empty state.
+                // SH201: objB-getter singleton-dispatch family located, not runtime-patched (crash-loops); SH120 seeds
+                // dispatcher .bss (0x10683a460) DATA (not shared leaf) to benign empty state.
                 routeb_seed_dispatcher_node();
                 // SH126-r0: rung-0 nativeInit null-map dispatch (vt[+232] -> flag-recorder
-                // 0x101d97c70, null map store). Leaf-rewrite the callee store no-ops
-                // (residual 1/3 crash w/ serialized render).
+                // 0x101d97c70). Leaf-rewrite the callee store no-ops (residual 1/3 crash w/ serialized render).
                 routeb_patch_rung0_flag_recorder();
-                // SH121: setTaskSchedulerBM builds the TaskScheduler whose ctor asserts [0x72739d4].bit0
-                // ("flags loaded") -> raise(SIGTRAP) exit 133. NOP the tbz + seed the REAL
-                // setTaskSchedulerBM version-gate [0x10683cff8] (SH109's [0x10683d350] is V2Init/
-                // V2Start). OPT-IN: defaulting ON faults the next gate (0x106241c70) - regression.
+                // SH121: setTaskSchedulerBM asserts flags-loaded [0x72739d4].bit0 -> raise(SIGTRAP) exit 133.
+                // NOP the tbz + seed the version-gate [0x10683cff8]. OPT-IN: default ON faults next gate.
                 routeb_patch_taskscheduler_flags_gate();
                 unsafe {
                     *(0x10683cff8u64 as *mut u64) = 0x0306u64; // low byte 6, byte1 3
@@ -6770,6 +6761,19 @@ fn main() {
                     eprintln!("[elfjit:v2boot-session-drive] SH400 substrate drive done: {ok} Ok");
                     dump("session-substrate-drive");
                 }
+                // SH416 (--v2boot-input-poll): one-shot real X event-source poll on the
+                // registered ANativeWindow. The input delivery path (deliver_motion ->
+                // nativePassInput) was complete but never fed real desktop events; this
+                // drains one non-blocking batch of pointer/button motion from the runtime's
+                // own window into the guest. Inert unless JIT_AINPUT_BRIDGE + real XID
+                // (no live DM yet -> 0 on this boot path; fires once a screen exists).
+                if std::env::args().any(|a| a == "--v2boot-input-poll") {
+                    let delivered =
+                        arm64jit::session::drive_host_input_poll(iimg, ib, tpidr, boot_sp);
+                    eprintln!(
+                        "[elfjit:v2boot-input-poll] SH416 one-shot real-input poll delivered {delivered} events"
+                    );
+                }
                 // SH269 (--v2boot-skip-appstart): the two app-start self-driver rungs
                 // (StartLuaAppDM 0x1023efe2c via DMCONT, V2StartAppWithParams 0x10258b144)
                 // terminate the PROCESS before the POST-LADDER session-ctor rungs run; skipping
@@ -6872,10 +6876,9 @@ fn main() {
                                     // gate calls (appData[+0x28] 'init3 provider' live-heap obj); zero out-buffer.
                                     routeb_patch_startapp_init3_gates();
                                     // SH161: governor-TAIL continuation (0x2e9fdf4) calls device-display refcount
-                                    // helper 24c3768 with x0=impl[+0x440]==NULL (fault [x0,#320]); return discarded,
-                                    // NOP the 3-insn window.
+                                    // helper 24c3768 with x0=impl[+0x440]==NULL (fault [x0,#320]); NOP the 3-insn window.
                                     routeb_patch_gov_tail_cont();
-                                    // SH159b (deleg_0eff24ca): governor 0x102e9fa84 reads x19=[x0+0x20] @0x2e9fac0 (x0=wrapper@[0x106a705e8]);
+                                    // SH159b: governor 0x102e9fa84 reads x19=[x0+0x20] @0x2e9fac0 (x0=wrapper@[0x106a705e8]);
                                     // x19=impl=[0x106a70608]; host-garbage -> MODERN appendix SIGSEGV.
                                     // Seed a real guest impl buffer + +0x408 DISPATCH obj + DISPATCH vt[+0x18]=benign.
                                     let gov_leaf = *ROUTEB_LEAF_ADDR.get_or_init(|| {
@@ -6898,9 +6901,7 @@ fn main() {
                                     }
                                     eprintln!("[elfjit:v2boot] SH159b seeded gov impl@[0x106a70608]=0x{impl_buf:x} [+0x408]=DISPATCH 0x{disptch_buf:x} vt[0x18]=leaf");
                                 }
-                                // SH156: ctor 0x102207b50 reads globals whose pages boot left unmapped
-                                // (flags 0x7285fb0, once-guard2 0x6c347c0, telemetry 0x6dcd380/0x6dca000/0x6dce218,
-                                // thread-mutex 0x7333aac, 0x6ed9000). Map only genuinely-unmapped pages.
+                                // SH156: ctor 0x102207b50 reads globals whose pages boot unmapped. Map only unmapped.
                                 for g in [
                                     0x1067285fb0u64, // flags byte gate @ ctor 2207bec
                                     0x1067285fb8u64, // loadLocalFlags arg

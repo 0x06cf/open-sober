@@ -486,6 +486,77 @@ pub fn drive_host_input_pump(
     delivered
 }
 
+/// SH416 — the real X event source for the input axis (STATUS next-forward #3).
+///
+/// `drive_host_input_pump` (SH414) is the executable delivery path, but it was
+/// never fed REAL desktop events: its only consumers were synthetic-vector tests
+/// and a latent caller network, while the X window the runtime registers as the
+/// guest ANativeWindow (`set_anativewindow_xid`, shims.rs) had no host poll that
+/// turned its pointer/button/motion events into the guest `nativePassInput`
+/// stream. This step closes that gap: it subscribes the REGISTERED window (not a
+/// new one) to pointer/button/motion on the DISPLAY it lives on, drains one
+/// non-blocking batch of real X events through input-wrapper's PointerTracker,
+/// and marshals each translated Android MotionEvent into the guest input native
+/// via the exact SH413/414 ABI (deliver_motion -> nativePassInput 0x2bbba88).
+///
+/// This is a poll step (one batch per call), so a host loop calls it repeatedly
+/// while a session owns a screen — the natural integration point once a live DM
+/// advances. Inert-by-construction on the current boot path (no live DM, so no
+/// constructed login/home screen yet): it is gated on the SAME three guards as
+/// the SH414 pump (bridge env armed + a real registered window XID + a live input
+/// image), so it returns 0 without touching the guest when any trip. Env-gated
+/// (JIT_AINPUT_BRIDGE) -> default product path byte-identical.
+pub fn drive_host_input_poll(
+    iimg: &[u8],
+    ib: u64,
+    tpidr: u64,
+    boot_sp: u64,
+) -> usize {
+    if !crate::ainput::bridge_enabled() {
+        eprintln!("[session-drive] host-input poll: JIT_AINPUT_BRIDGE unset — inert (no guest call)");
+        return 0;
+    }
+    let xid = window_xid();
+    if xid == 0 {
+        eprintln!("[session-drive] host-input poll: no registered ANativeWindow XID — inert");
+        return 0;
+    }
+    #[allow(unused_mut)]
+    let mut tracker = input_wrapper::input::PointerTracker::default();
+    #[allow(unused_mut)]
+    let mut events: Vec<input_wrapper::input::MotionEvent> = Vec::new();
+    let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
+    eprintln!(
+        "[session-drive] host-input poll: polling real window 0x{xid:x} on {display} for pointer/button/motion (bridge armed)"
+    );
+    let batch = input_wrapper::x11::pump_registered_window(
+        Some(&display),
+        xid as u32,
+        &mut tracker,
+        &mut |e| events.push(e.clone()),
+    );
+    match batch {
+        Err(e) => {
+            eprintln!(
+                "[session-drive] host-input poll: X poll error on {display}: {e:?} — inert (kept 0 delivered)"
+            );
+            0
+        }
+        Ok(raw_count) => {
+            eprintln!(
+                "[session-drive] host-input poll: drained {raw_count} raw X events -> {} translated Android events -> guest",
+                events.len()
+            );
+            let delivered = drive_host_input_pump(iimg, ib, tpidr, boot_sp, &events);
+            eprintln!(
+                "[session-drive] host-input poll: {delivered}/{} real events delivered -> nativePassInput",
+                events.len()
+            );
+            delivered
+        }
+    }
+}
+
 /// EXECUTE-DO-INIT-GATES live-DM completion probe (RECON-V3, authoritative).
 ///
 /// A real completed do-init owns a live DataModel; the gate spec names four
@@ -831,5 +902,35 @@ mod tests {
             2,
             "StartLuaAppDM (0x1023efe2c) + V2StartAppWithParams (0x10258b144) both present in the substrate"
         );
+    }
+
+    /// SH416: the real X event-source poll is inert unless ALL three guards hold
+    /// (bridge env armed, a real registered window XID, no X connection needed for
+    /// the guard checks). This hermetic never needs an X server: both guard trips
+    /// return 0 BEFORE `pump_registered_window` is reached, so there is no X
+    /// connect attempt — the poll is provably a no-op on the current boot path
+    /// (no XID registered until the runtime wires a real window).
+    #[test]
+    fn sh416_host_input_poll_inert_without_all_guards() {
+        let prev_xid = crate::shims::anativewindow_xid();
+        // (a) bridge env unset -> inert regardless of XID.
+        unsafe { std::env::remove_var(crate::ainput::AINPUT_BRIDGE_ENV) };
+        crate::shims::set_anativewindow_xid(0x2c00000du64);
+        assert_eq!(
+            crate::session::drive_host_input_poll(&[0u8; 64], 0x100000000, 0, 0x200000),
+            0,
+            "bridge disabled -> inert (0 delivered), no X connect"
+        );
+        // (b) bridge set but no registered window XID -> inert, no X connect.
+        unsafe { std::env::set_var(crate::ainput::AINPUT_BRIDGE_ENV, "1") };
+        crate::shims::set_anativewindow_xid(0);
+        assert_eq!(
+            crate::session::drive_host_input_poll(&[0u8; 64], 0x100000000, 0, 0x200000),
+            0,
+            "no registered ANativeWindow XID -> inert (0 delivered), no X connect"
+        );
+        // Restore prior XID/env so parallel tests observe clean state.
+        crate::shims::set_anativewindow_xid(prev_xid);
+        unsafe { std::env::remove_var(crate::ainput::AINPUT_BRIDGE_ENV) };
     }
 }
