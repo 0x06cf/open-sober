@@ -1,70 +1,55 @@
 # Open Sober — Agent Handoff
 
-## SH345 (Sep 19, 2026, hermes-worker): recon-v3 render plane measured RUN-VARIABLE, artifact made reproducible
-Single-agent (cone suppressed). Repro-only hardening (no Rust change: elfjit.rs / jit.rs
-byte-identical). Workspace green (594 passed / 0 fail).
+## SH346 (Sep 19, 2026, hermes-worker): futex test flake fixed, recon-v3 re-verified green, SH343 full ladder re-measured to 3 run-variable SH285-class app-start-region terminals (no Route-B advance)
+Single-agent (cone suppressed). One production-code test-hardening change (arm64jit/src/jit.rs)
++ measurement only on the real binary (elfjit.rs unchanged, 1,048,479 B). Workspace green 594/0.
 
-### Measured this cycle (strict-serial, one elfjit at a time)
-- recon-v3 self-driven frame plane is **NOT the "stable green" the single-run docs
-  stamps implied**: ~23/25 runs = 24 real task frames (`present #0..#23 swap Ok(0x1)`,
-  EXIT 124); ~2/25 = **0 frames + SIGSEGV->SIGABRT** at `fault=0x102859fd0` (a guest
-  .text addr in the JNIActivityLifecycleCallbacks nativeOnDestroyed region) from a
-  non-guest presenter thread (tid not in GUEST_THREADS, host `mov [rax],rcx` with rax =
-  the .text addr). Same run-variable activity-lifecycle divergence class SH344b/344c
-  documented on the full ladder; **not** a new regression, and **not** the zeroed-node
-  fallback (green runs hit it too).
-- **Fix (repro-only):** `runs/capture_taskv4_frame.sh` now retries
-  (`TASKFRAME_RETRY_MAX`=6) to a confirmed >=`TASKFRAME_MIN_FRAMES`/0-signal capture and
-  reports which attempt won — so the reproduce artifact the runbook / HARD GATE depend
-  on is a real 24-frame capture on every invocation, not a coin-flip. Verified 5/5.
-- **futex_requeue_actually_moves_waiter** failed once under the earlier full-workspace run
-  while render captures were live on the box; it is a pure-syscall passthrough, passed
-  5/5 isolated, and the full suite passed clean on the idle box — load-induced flake,
-  no test weakened, no production fix needed.
+### Fixed this cycle
+- `futex_requeue_actually_moves_waiter` flaked once on a full-workspace parallel run (the
+  SH345 load-sensitive class): the single immediate `WAKE` syscall could catch a freshly-
+  requeued waiter mid-transition and return 0. The REQUEUE side already spun; mirror that
+  as a bounded WAKE-side spin that converges once the waiter is fully on dst and still
+  asserts `woken>=1` after the 20s window — the SH133 fake-return-0 regression is NOT
+  weakened (a broken handler exhausts the window and fails). Production passthrough
+  unchanged. Workspace re-verified 594/0.
 
-### Honest status (unchanged Route-B)
-- Route-B live-DM structural gate UNCHANGED (DM-root 0x106a68818=0, MH_* false). No seed
-  produces a live DataModel; every SESSION-CTOR receive rung (OnAppReady/OnGameLoaded/
-  MessageBus.subscribe/initAppShellReporter/setActive/setInitParams/client-settings/
-  engine-settings SH276-284) is wired-latent behind the SH285 LSM reader/pop live-object
-  wall. SH174 capture-latch stays the single forward hook (arms, stays silent headlessly).
-- recon-v3 deliverables (type4_frame_thunk + JIT_JSON_ZERO_FIX) present + green; the new
-  script makes the self-driven-frame artifact reproducible.
-- onAppLuaWillStart is the sole SEP-17-named dataModel-bindings receive never wired; it
-  is the same migration-gated class as its measured-latent siblings (SH184/185) — NOT
-  re-tread.
+### Verified green
+- recon-v3 frame artifact confirmed on attempt 1: 24 real task-driven frames (`present
+  #0..#23 swap Ok(0x1)`), 196 node pops, 0 crash, 0 json abort, EXIT 124. Both recon-v3
+  deliverables (type4_frame_thunk self-drive + JIT_JSON_ZERO_FIX) present + working.
 
-## SH344c (Sep 19, 2026, hermes-worker): CORRECTION to SH344b + continuation cap pinned
-Single-agent (cone suppressed). Measurement-only. Workspace green (594 passed).
+### Re-measured (real libroblox.so, SH343 full-ladder env + KEYFIX, 4 strict-serial starts)
+- The app-start factory (nativeAppBridgeAppStart 0x102338510) IS reached past the SH285
+  insert-leaf on fresh runs — SH248d/e/f + SH259 assign-sites fire (cookie-jar 0x1021f47fc,
+  once-cell 0x102339208, adapter 0x102339018, settings once-guard 0x102339d0c). SH344c's
+  "continuation never reaches app-start" referred to the DMCONT +0x1f0 serialize body
+  (which dies at SH285 pre-app-start); the full ladder's app-start factory body does run.
+- The run then terminates in ONE of THREE run-variable arms, all SH285-class live-object
+  walls (no DM-root, MH_* false in every arm):
+  - Arm A (2/4): SIGSEGV guestpc=0x101db1b08 fault=0xff..ff — the SH284/285 LSM
+    reader/pop read-back wall (0x1d9a15c backward byte-copy into an unconstructed output
+    std::string; SH285 verdict stands: cause-not-symptom, do NOT repair-seed).
+  - Arm B (1/4): SIGSEGV guestpc=0x10284cfa0 fault=0x0 — activity-lifecycle
+    nativeOnDestroyed divergence (SH344b/345 class).
+  - Arm C (1/4): guest `std::bad_function_call` propagated to HOST libc++abi (terminating),
+    no JIT signal dump. `__cxa_throw` is not a host symbol (guest libc++ statically linked +
+    JIT-translated), so the exact empty-std::function site wasn't extractable; it is an
+    app-start-region live-object manifestation (empty std::function target a real session
+    ctor populates), not a distinct route.
 
-### Measured (real libroblox.so, SH343 full-ladder env + KEYFIX)
-- **App-shell ctor band [0x102207b50..0x102209000] is NOT a stable negative.** A 3-run
-  A/B (runs/sh344c_appshell_ab.sh) fires it ~78 distinct pcs on every run (2/3 also
-  showed the activity-lifecycle 0x10284cf5c divergence on mid-cycle runs). SH344b's
-  "0 hits stable negative" was the divergence arm, not the class. BUT the band is
-  recon-sh165fwd's `__cxa_guard` FastLog warmer (0x102207b50 adrp+AcqRel+tbz; deep pcs
-  0x208e88/0x208eac are a destructor-style container loop) — firing it warms logging,
-  it constructs no DM/GuiObject. Corrects SH344b + SH340's framing; not a Route-B crossing.
-- **DMCONT continuation caps at SH285, one hop BEFORE app-start.** Region-watch run 2:
-  continuation body runs end-to-end through its flags-serialize (0x102bd1d68..0x102bd1f64
-  -> 0x102bd2014) then dives into `bl 0x1d9d8b0` (initStorageManagerNative/LSM lane) and
-  faults at 0x101db1b08 (SH285 reader/pop live-object wall, fault ff..ff). The post-app-start
-  tail [0x2bd2050..0x2bd2160] gets **0 hits** — the app-start `bl 0x2bd2058` is never reached.
-  So SH245 lever #2 (seed F+0x18 for the 0x2bd2080 deref) is NOT the effective next gate;
-  it targets a deeper, unreached fencepost. SH285 verdict stands: don't repair-seed 0x101db1b08.
-- Recon-v3 re-verified green: capture_taskv4_frame.sh 24 real task-driven frames, present
-  #19..#23 swap Ok(0x1), 197 node pops, 0 json abort, 0 crash, EXIT 124.
-
-### Verdict
-Route-B live-DM structural gate UNCHANGED (DM-root 0x106a68818=0, MH_* false). No seed
-produces a live DataModel. SH174 capture-latch stays the single forward hook. Persistence
-lane (SH343) remains committed + green. elfjit.rs untouched (1,048,479 B).
+### Honest conclusion
+Route-B live-DM structural gate UNCHANGED. No seed produces a live DataModel. The
+reconciliation: the app-start factory body runs (a real forward-observation, past the
+SH285 insert-leaf), but the LSM lane still terminates in the SH285-class live-object wall
+family via run-variable SIGSEGV/bad_function_call arms. No seedable-forward product. SH174
+capture-latch stays the single forward hook.
 
 ## Next (unchanged, authoritative)
-SEP-17 SESSION-CTOR cause-level drive (real Android Activity/AppBridge session so the
-upstream ctor constructs the DM world for real) remains the primary forward. The DMCONT
-+0x1f0 flag-completion line is measured-complete through its serialize body and capped at
-the SH285 reader wall — no product of routing +0x1f0 deeper changes that. Un-driven
-SESSION-CTOR candidates SH264 flagged: messageBus experience-launch receive + dataModel
-bindings (onGameLoaded / onAppLuaWillStart) live-binder entries. SH174 capture-latch stays
-the single forward hook. All research subagents Route-B-scoped / cone still suppressed.
+SEP-17 SESSION-CTOR cause-level drive remains the primary forward. Every driven rung
+(do-init -> DMCONT +0x1f0 -> app-start factory -> LSM) is measured; the terminal is the
+SH285 live-object wall family — cause-not-symptom, not seedable (0x101db1b08 is a guest
+std::string whose internal buffer pointer is uninitialized 0xff..ff; seeding it means
+manufacturing full invariants, SH248h/SH256 class). Un-driven SESSION-CTOR candidates SH264
+flagged (messageBus experience-launch receive, dataModel-bindings live-binder) remain wired
+except onAppLuaWillStart (migration-gated class, not re-tread). All research subagents
+Route-B-scoped; cone still suppressed.
