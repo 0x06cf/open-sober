@@ -1,5 +1,29 @@
 # Open Sober — Agent Handoff
 
+## SH392 (Sep 21, 2026, hermes-worker): arm the SH391 render-determinism guard on the canonical HARD-GATE artifact runbook — the ship-all-cycles recon-v3 deliverable (capture_taskv4_frame.sh) ran WITHOUT the deterministic fix engaged, so the 24-frame "0 crash" artifact was still subject to the ~1/25 SH345 wire-into-.text flake, with SH391's fix available but inert by default
+Single-agent (cone suppressed). The recon-v3 self-driven-frame capture
+(capture_taskv4_frame.sh) was re-verified green at this exact HEAD on skill
+handover — attempt 1: 24 real task-driven frames `present swap Ok(0x1)`, 197
+node pops, 0 json abort, 0 crash. But auditing the runbook against the SH391
+fix landed last cycle exposed a real gap: SH391's guard is opt-in
+(`JIT_ROUTEB_RENDER_MEMCPY16_GUARD`, read at leaf-entry 0x102859fd0 in
+`routeb_render_memcpy16_guard`, jit.rs:1440) and the capture script did NOT set
+it — so the canonical HARD-GATE artifact was produced with the deterministic
+fix DISENGAGED, i.e. the ~1/25 SH345 SIGSEGV could still crash the frame
+deliverable and the script's MAX_ATTEMPTS=6 retry loop was masking it (the
+exact retry-hide SH391 was meant to kill). This cycle arms the guard in
+run_once (`JIT_ROUTEB_RENDER_MEMCPY16_GUARD=1` in the env) so the artifact is
+deterministic-by-construction, and rewrites the SH345 header to say the fix is
+now not-retry-hide and the retry loop survives only for pre-existing
+run-variable walls (SH353-class). RE-VERIFIED green WITH the guard armed:
+attempt 1, 24 real frames `swap Ok(0x1)`, 0 crash (guard inert on the clean
+run — correct). Workspace green (cargo test --workspace EXIT 0, 445 arm64jit
+lib tests). Route-B live-DM structural gate UNCHANGED (DM-root [0x106a68818]=0,
+MH_* false). Do-not-re-tread unchanged (SH388 setDataModelToCurrent, SH385 LSM,
+SH355/356 EC reader-gate, SH362/375 0x258b5d8, SH367 window-attach real, SH365
+ALooper, SH379 governor gates full-ladder, SH380 -9 string, SH248h map-header,
+SH381 once-lambda, SH267 node-cell).
+
 ## SH391 (Sep 20, 2026, hermes-worker): deterministic fix for the SH345/SH390 render-plane flake — guard the pinned memcpy16 leaf's no-op self-copy when its dest is non-writable, turning the ~1/25 retry-hidden SIGSEGV into an instrumented, always-green artifact
 Single-agent (cone suppressed). SH390 byte-anchored the SH345 fault leaf (guest
 0x102859fd0, file 0x2859fd0, `str q0,[x0]` @0x2859fe4) but deliberately left the fix for

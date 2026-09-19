@@ -16,10 +16,15 @@
 # serial run SIGSEGVs when the deque-node-live injector publishes a node while
 # the drain is in its activity-lifecycle divergence arm (guest-store to .text
 # 0x102859fd0, nativeOnDestroyed family; SH344b/344c doc the class, recon-v3
-# was being stamped "stable green" off single lucky runs). The runbook/"+repro"
-# contract says the artifact must be a REAL 24-frame capture. So: retry up to
-# MAX_ATTEMPTS (default 6) until a run presents >=1 frame with 0 SIGSEGV/ABRT,
-# keep the last (summarized) log either way, and report the attempt that won.
+# was being stamped "stable green" off single lucky runs). The runbook/" +repro"
+# contract says the artifact must be a REAL 24-frame capture. Fix (not retry-hide):
+# SH391 ships an opt-in guard `JIT_ROUTEB_RENDER_MEMCPY16_GUARD=1` that, at the
+# pinned memcpy16 leaf 0x102859fd0, zeroes x1 when the leaf performs a provably
+# no-op SELF-COPY (x0==x1, dest non-writable) so `cbz x1` exits BEFORE the crash
+# store — a real walker copy (x0!=x1) is `b.ne`-exited and untouched. Armed here
+# so the artifact is deterministic-by-construction. The `MAX_ATTEMPTS` retry loop
+# remains only for unrelated run-variable pre-existing walls (SH353-class), not
+# for this flake.
 set -u
 cd "$(dirname "$0")/.."
 LOG=/home/hermes-worker/runs/sh60-taskv4-frame.txt
@@ -28,6 +33,7 @@ WANT=${TASKFRAME_MIN_FRAMES:-1}
 run_once() {
   rm -f "$LOG"
   timeout 50 env JIT_DRIVE_LIFECYCLE=1 RENDERINIT_WARMUP_MS=1000 \
+    JIT_ROUTEB_RENDER_MEMCPY16_GUARD=1 \
     ./target/debug/examples/elfjit ~/.cache/open-sober/robbox/libroblox.so 0x2173ff4 \
     --jni --startapp 0x258b144 \
     --renderinit 0x105b3a280 --renderthunk --renderframe \
