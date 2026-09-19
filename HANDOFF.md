@@ -1,5 +1,51 @@
 # Open Sober — Agent Handoff
 
+## SH451 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD NARROWING-SHIFT codegen family (translate.rs SimdShrn — shrn/shrn2/rshrn/rshrn2 Vd.T, Vn.U, #imm) — 5 exact-byte pins
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+unchanged-green (the change is `#[cfg(test)]`-only, so the runtime deliverable
+is byte-identical — SH445 capture baseline 24 real task-driven frames `present
+swap Ok(0x1)`, 0 json abort, 0 crash, EXIT 0). Workspace green (cargo test
+--workspace EXIT 0; arm64jit lib 635/0 incl. 5 new sh451 pins, was 630; cargo
+build --workspace + --example elfjit OK). Production code ONLY in translate.rs
+`#[cfg(test)]` addition (translator core body byte-untouched; jit.rs
+1,048,390 B < 1MiB hook unchanged; elfjit.rs/session.rs unchanged). Commit
+7a75a4f +2.
+- SimdShrn (shift each DOUBLE-width source element right by `shift`, truncate
+  [shrn] or round-half-up [rshrn: add 1<<(shift-1)] to a HALF-width dest
+  element; shrn2 writes the dest high half) had zero direct byte tests. SH451
+  pins the exact emit (rd=1 rn=2, non-alias so permute_source is a no-op;
+  Vn@0x130 Vd@0x120) with 5 exact-byte/window pins:
+  (1) THE narrowing width pair (load-bearing): shrn .2s esrc=8 shift=16 = per-lane
+  `mov rax,[rbx+0x130]` (48 8b 83, 64-bit source, +8B/lane) + `shr rax,16`
+  (48 c1 e8 10) + `mov [rbx+0x120],eax` (89 83, 32-bit dest) — an 8B-in/4B-out
+  flub store corrupts every lane (assert NOT 48 89 83);
+  (2) THE upper high-half offset: shrn2 (upper=true) is byte-identical except
+  the dest base shifts +8 (dst_off=8 -> 0x128/0x12c vs 0x120/0x124); the upper
+  flag is the ONLY thing that moves the destination base, source lanes at +8
+  unchanged (assert 0x120 NOT written);
+  (3) THE rshrn round-add is the round discriminator: round=true emits `add
+  rax, 1<<(shift-1)=0x4000` (48 81 c0 00 40 00 00) BEFORE `shr rax,0x0f`
+  (48 c1 e8 0f); round=false has NO add — positional assert the add precedes
+  shr (a flub shifts-without-rounding, truncating);
+  (4) 4to2 O-word narrowing (esrc=4 shift=8): mov_load32 (8b 83) + shr + 16-bit
+  `66 89 83` 2B store, lane1 src 0x134 counted-exactly-once, lane3 dest 0x126,
+  no 64-bit store;
+  (5) 2to1 byte narrowing (esrc=2 shift=4): 8 bytes via movzx_word (0f b7 83 —
+  UNSIGNED, NO movsx 48 0f bf — + shr + 88 83 byte store 0x120..0x127).
+- Deterministic: synthetic Inst -> translate() -> CodeBuf.as_slice() (zero-pc
+  0x1000); [RBX]=CpuState, vector slot v[t]=VECTOR_BASE(0x110)+t*16. Emission
+  captured with a one-off probe test (eprintln dump, removed before commit) so
+  pins match the real emission; 8to4 full-buffer assert_eq matched first try.
+  One dev-time fix: the 2B/1B stores are 7 bytes (66+89/88+83+dw), so those
+  windows are windows(7), not windows(6). 5 pins, parallel-safe, no image/env.
+- Honest: NOT a DM (SH415 probe re-confirms DM-root [0x106a68818]=0x0 under the
+  complete substrate; Route-B live-DM gate UNCHANGED). BUILD-THE-RUNTIME
+  codegen-surface coverage completion on the narrowing-shift family, adjacent
+  to SH434 (element-wise same-width shift) — this is the HALVING-width form,
+  distinct. No re-treads.
+- Files: docs/frontier-sh451-translator-shrn.md + crates/arm64jit/src/
+  translate.rs (`#[cfg(test)]` only). Commit 7a75a4f +2.
+
 ## SH450 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD FP COMPARE-TO-LITERAL-ZERO codegen family (translate.rs VecFpCmpZero — fcmeq/fcmgt/fcmge/fcmlt/fcmle Vd.T, Vn.T, #0.0) — 4 exact-byte pins
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 unchanged-green (the change is `#[cfg(test)]`-only, so the runtime deliverable
