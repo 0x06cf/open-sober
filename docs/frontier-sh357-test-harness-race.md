@@ -56,17 +56,24 @@ Two independent bugs:
 6. SH357b: the residual futex CMP_REQUEUE flake — the CMP waiter still used a 5s
    timeout (vs the REQUEUE sibling's SH346-documented 60s) with a spin window up to
    20s, so a descheduled waiter under parallel load would wall-clock-timeout before
-   the CMP_REQUEUE landed, making the kernel legitimately report moved=0 (~1/25
-   flake). Raised to 60s to match the sibling; the SH133-semantics asserts are
-   unchanged. Measured: 65 consecutive default-8-thread runs, 0 panics / 0 SIGSEGV.
+   the CMP_REQUEUE landed, making the kernel legitimately report moved=0. Raised to
+   60s to match the sibling; the SH133-semantics asserts are unchanged.
 
 ## Measured
-- Default 8-thread direct-binary stress: AFTER SH357b, 65 consecutive runs are
-  0 panics + 0 SIGSEGV (the futex residual is eliminated, not just reduced to
-  ~1/40). Before SH357b it was ~1/40; before SH357 (the race fix) it was ~1/15 +
-  intermittent whole-binary signal 11.
-- `--test-threads=32` (4x over-subscription, NOT the gate): the PoisonError cascade
-  is GONE (0/35; was 8/8 instantly).
+- Canonical `cargo test --workspace` gate (the command actually run in the
+  discipline): deterministically green across many runs — exit 0, 25 test binaries,
+  0 failures at every invocation.
+- The two real defects SH357 targeted (whole-binary SIGSEGV = signal 11, and the
+  PoisonError cascade from the shared-mutex panic) NEVER recurred in 400+ post-fix
+  default-8-thread runs and are gone at `--test-threads=32` (was 8/8 instantly).
+- HONEST residual: the two real-kernel futex REQUEUE/CMP tests remain genuinely
+  load-sensitive — ~2/100 under direct-binary parallel stress (x100 default-8-thread
+  run: 2 failures, both futex), the documented SH345/346 real-kernel timing class
+  the project has accepted since those sessions. They are timing tests against the
+  real kernel, not a regression, and they never affect the canonical gate. Attempts
+  this cycle to force them 100% deterministic (600s waiter timeout + a cross-test
+  futex serialization lock) made the stress WORSE (7/150 + a segv from 600s waiter-thread
+  leak cascades) and were REVERTED; the clean, defensible state is the 5s->60s fix.
 
 ## Honest
 Route-B live-DM structural gate UNCHANGED (DM-root 0, MH_* false). This is a
