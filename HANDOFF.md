@@ -1,6 +1,34 @@
 # Open Sober — Agent Handoff
 
-## SH417 (Sep 26, 2026, hermes-worker): the persistent-tracker host input LOOP — STATUS next-forward #3 — a real host loop keeps ONE PointerTracker across poll iterations so a press's DOWN and its MOVE across frames stay the same pointer (the SH416 one-shot rebuilt the tracker each call and mistracked them); the bounded loop drains the registered ANativeWindow XID N=INPUT_LOOP_ITERS times through the exact SH413/414 bridge into guest nativePassInput, tested inert + measured on the real binary
+## SH417b (Sep 26, 2026, hermes-worker): the boot/input-loop runbook's "known pre-existing nativeInit Route-B lane SIGSEGV" at guestpc=0x1029f3f7c was a MISSING-ENV artifact, not a distinct crash — the promoted host-input LOOP (SH417/418, --v2boot-input-loop) is now a deterministic-clean boot on the real binary (EXIT 124 stable idle, 0 SIGSEGV/SIGABRT)
+Single-agent (cone suppressed). recon-v3 deliverables re-verified green at this exact HEAD first
+(capture_taskv4_frame.sh attempt 1: 24 real task frames `present swap Ok(0x1)`, 194 node pops, 0
+json abort, 0 crash, EXIT 124). Workspace green (arm64jit lib 568/0 incl. sh417/sh418; cargo test
+--workspace EXIT 0). Production code in session.rs/elfjit.rs UNCHANGED (both at/near the 1MiB hook,
+byte-unchanged) — this is a runbook + doc correction + a measured-closure of a misattribution.
+- SH416/417/418 all documented the input/boot runs as terminating in a "known run-variable nativeInit
+  'outside image' Route-B lane at guestpc=0x1029f3f7c" and treated it as pre-existing. SH417b
+  re-measured it on real libroblox.so: the SAME input-loop boot env PLUS the crossing hash-fix gates
+  the full reaching / recon-v3 runbooks already carry (`JIT_ROUTEB_HASHFIX=1 JIT_JSON_ZERO_FIX=1
+  JIT_ROUTEB_SETFIX=1`) yields **deterministic-clean EXIT 124 (stable idle), 0 SIGSEGV/SIGABRT,
+  hashfix fired 103×**, and the input loop still runs all 4 iterations 0 real -> 0 translated -> 0
+  delivered exactly as designed.
+- ROOT CAUSE: 0x1029f3f7c is the SH83/SH91 string-hash-map `blr x8` into a garbage +0x18 hash-fn-2
+  slot (`x8=0x4741495241003635`) — precisely the crash `JIT_ROUTEB_HASHFIX` clears. The input-loop
+  runbook omitted the env, so the --v2boot boot raced into the unguarded map insert and the terminal
+  was MISATTRIBUTED as "a Route-B lane." Fix: capture_sh417_host_input_loop.sh now carries the
+  crossing env (same as capture_taskv4_frame.sh / capture_sh415). The input axis itself was never the
+  faulting path.
+- SCOPE HONESTY: only the promoted sh417 loop is cleansed. The superseded SH416 one-shot poll re-ran
+  with the same env and hit a DIFFERENT run-variable lane (guestpc=0x101fd128c, LSM-family, fault=0x18,
+  hashfix 0 fired) — a separate pre-existing wall, NOT cleansed by this env; capture_sh416_input_poll.sh
+  was reverted unchanged (no false "0 crash" claim).
+- No DM (DM-root 0, MH_GAME_LOADED false) — Route-B live-DM structural gate UNCHANGED. This is an
+  artifact-quality / BUILD-THE-RUNTIME fix + a ~3-cycle misattribution correction, not a DM step.
+- Files: runs/capture_sh417_host_input_loop.sh (+ crossing env) + docs/frontier-sh417-host-input-loop.md
+  (SH417b section) + /home/hermes-worker/runs/STATUS.md.
+
+## SH418 (Sep 26, 2026, hermes-worker): promote the persistent-tracker host input LOOP (SH417) to a first-class driven substrate step — drive_routeb_session_substrate now drives drive_host_input_loop (iimg, ib, tpidr, boot_sp, input_loop_iters()) right after the post-bus G3 content-surface step
 (SH417 + SH418: SH418 promoted the loop to a FIRST-CLASS driven substrate step —
 drive_routeb_session_substrate now drives it right after the post-bus G3 content
 surface, same promotion SH411/412 gave the DM binder/app-start/content; substrate

@@ -54,12 +54,35 @@ frames. Route-B live-DM structural gate UNCHANGED (DM-root [0x106a68818]=0,
 MH_GAME_LOADED false, no make_shared). recon-v3 deliverables re-verified green at
 HEAD. No re-treads.
 
+## SH417b correction (this cycle): the boot/input loop's "known nativeInit Route-B
+## lane SIGSEGV" was a MISSING-ENV artifact, not a distinct crash.
+
+SH416/417/418 all documented the input/boot runs as terminating in a "known
+run-variable nativeInit 'outside image' Route-B lane at guestpc=0x1029f3f7c" and
+treating it as pre-existing. SH417 re-measured it: with the SAME input-loop boot
+env plus the crossing hash-fix gates the full reaching ladder already carries
+(`JIT_ROUTEB_HASHFIX=1 JIT_JSON_ZERO_FIX=1 JIT_ROUTEB_SETFIX=1` — the exact env
+recon-v3/capture_taskv4 and sh415 set), the run is **deterministic-clean: EXIT 124
+(stable idle), 0 SIGSEGV/SIGABRT**; hashfix fires 103×, the input loop still runs
+all 4 iterations 0→0→0 delivered as designed. The 0x1029f3f7c fault is the SH83/SH91
+string-hash-map `blr x8` into a garbage +0x18 hash-fn-2 slot (`x8=0x4741495241003635`)
+— exactly the map crash the hashfix guard clears; the input-loop runbook simply
+omitted the env, so the whole --v2boot boot raced into the unguarded map insert and
+the terminal was MISATTRIBUTED as "a Route-B lane." Fix: capture_sh417_host_input_loop.sh
+now carries the same crossing env as the reaching/recon-v3 runbooks. VERIFIED on real
+libroblox.so (0 crash). The input axis itself was never the faulting path.
+(SH417b scope: ONLY the promoted sh417 loop. The superseded SH416 one-shot poll
+re-ran with the same env and hit a DIFFERENT run-variable lane, guestpc=0x101fd128c
+LSM-family fault=0x18, hashfix 0× — a separate pre-existing wall, not cleansed by
+this env; capture_sh416_input_poll.sh was reverted unchanged.)
+
 ## Files
 
 - crates/arm64jit/src/session.rs (+drive_host_input_loop, +input_loop_iters,
   +sh417, +sh418; one-shot poll doc corrected to point at the loop)
 - crates/arm64jit/examples/elfjit.rs (+--v2boot-input-loop rung; SH-prose condensed)
-- runs/capture_sh417_host_input_loop.sh, docs/frontier-sh417-host-input-loop.md
+- runs/capture_sh417_host_input_loop.sh (SH417b: + crossing env -> deterministic-clean)
+- docs/frontier-sh417-host-input-loop.md
 
 ## Next (standing)
 

@@ -18,6 +18,7 @@ rm -f "$LOG"
 timeout 100 env \
   JIT_DRIVE_LIFECYCLE=1 RENDERINIT_WARMUP_MS=1000 \
   JIT_AINPUT_BRIDGE=1 INPUT_LOOP_ITERS=4 \
+  JIT_ROUTEB_HASHFIX=1 JIT_JSON_ZERO_FIX=1 JIT_ROUTEB_SETFIX=1 \
   SOBER_ANDROID_ROOT=/tmp/sober_sh417_root \
   ./target/debug/examples/elfjit ~/.cache/open-sober/robbox/libroblox.so 0x2173ff4 \
   --jni --startapp 0x258b144 --v2boot --v2boot-input-loop \
