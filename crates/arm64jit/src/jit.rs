@@ -704,6 +704,34 @@ fn routeb_busrecv_holder_guard(state: *mut CpuState, pc: u64) {
     });
 }
 
+/// SH364 (opt-in JIT_ROUTEB_BUSRECV=1): MEASURE whether the messageBus experience-launch
+/// RECEIVE cb is ENTERED at all headlessly, distinct from the DM-holder read at its tail.
+/// SH347 measured the cb's holder read (file 0x2bd7474) NEVER fires; that leaves ambiguous
+/// whether (a) publishRaw never dispatches to the cb (publish-side topic-match failure) or
+/// (b) the cb is entered but its DM-holder is null because [DataModelBindings+16] is a live-DM
+/// holder a static seed cannot populate. This guard fires at the cb BODY ENTRY (file 0x2bd744c,
+/// the `sub sp,#128` prologue the cb's static data is built around) — BEFORE the DM-holder read —
+/// and records x0/x1/x2 so we can tell "cb never entered" (publish-side) from "cb entered, holder
+/// null" (live-DM-side). READ-ONLY (no guest write), fires once per run.
+fn routeb_busrecv_cb_entry_guard(state: *mut CpuState, pc: u64) {
+    if std::env::var("JIT_ROUTEB_BUSRECV").ok().as_deref() != Some("1") {
+        return;
+    }
+    if pc != 0x102bd744c {
+        return;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let s = unsafe { &*state };
+    ONCE.call_once(|| {
+        let c0 = s.x[0]; // this / first arg of the dispatch thunk into the cb body
+        let c1 = s.x[1];
+        let c2 = s.x[2];
+        eprintln!(
+            "[routeb-busrecv-cbentry] SH364 MessageBus receive cb BODY ENTERED @0x102bd744c (x0={c0:#x} x1={c1:#x} x2={c2:#x}) — publish DID dispatch to the experience-launch cb"
+        );
+    });
+}
+
 /// SH347 (opt-in --v2boot-session-pub): drive the messageBus publishRaw receive entry
 /// (guest 0x102334684 Java_com_roblox_universalapp_messagebus_MessageBus_publishRaw) with an
 /// "experience-launch request" event so the engine's cb (file 0x2bd7444/0x2bd76e8) fires and reads
@@ -718,37 +746,71 @@ pub fn drive_messagebus_publish_receive(
     env_ptr: u64,
     thiz: u64,
 ) -> u64 {
-    let topic = crate::jni::new_string_utf_handle(b"experience-launch");
-    let payload = crate::jni::new_string_utf_handle(b"");
+    drive_messagebus_publish_receive_payload(
+        iimg,
+        ib,
+        tpidr,
+        boot_sp,
+        env_ptr,
+        thiz,
+        b"",
+        Some(b"experience-launch"),
+    )
+}
+
+/// SH364 (opt-in --v2boot-session-pub-real): drive the messageBus publishRaw receive entry
+/// (guest 0x102334684) with a REAL structured payload (not empty). SH347 only ever published an
+/// empty payload `b""` — the experience-launch cb may key its dispatch on payload content (an
+/// "experience-launch request" JSON envelope or a topic sibling), so an empty payload could be
+/// why the cb never entered. This drives the same publishRaw with a realistic payload and the
+/// same topic, so the cb-entry guard (0x102bd744c) and the DM-holder guard (0x102bd7474) measure
+/// whether real content changes the dispatch. ABI publishRaw(env, thiz, topic jstring x2, payload
+/// jstring x3). Single jit_run, serialized. Default-inert (opt-in rung).
+pub fn drive_messagebus_publish_receive_payload(
+    iimg: &[u8],
+    ib: u64,
+    tpidr: u64,
+    boot_sp: u64,
+    env_ptr: u64,
+    thiz: u64,
+    payload: &[u8],
+    topic_override: Option<&[u8]>,
+) -> u64 {
+    let topic = crate::jni::new_string_utf_handle(topic_override.unwrap_or(b"experience-launch"));
+    let payload_h = crate::jni::new_string_utf_handle(payload);
     let mut st = CpuState::new();
     st.tpidr = tpidr;
     st.x[31] = boot_sp;
     st.x[0] = env_ptr;
     st.x[1] = thiz;
     st.x[2] = topic;
-    st.x[3] = payload;
+    st.x[3] = payload_h;
+    eprintln!(
+        "[elfjit:v2boot-pub-real] publishRaw payload \"{}\" ({} bytes) topic \"{}\"",
+        String::from_utf8_lossy(payload),
+        payload.len(),
+        String::from_utf8_lossy(topic_override.unwrap_or(b"experience-launch"))
+    );
     match jit_run(iimg, ib, 0x102334684, &mut st as *mut CpuState) {
         Err(e) => {
-            eprintln!("[elfjit:v2boot-pub] MessageBus.publishRaw stopped: {e}");
+            eprintln!("[elfjit:v2boot-pub-real] MessageBus.publishRaw stopped: {e}");
             0
         }
         Ok(r) => {
-            eprintln!("[elfjit:v2boot-pub] MessageBus.publishRaw returned Ok({r:#x})");
+            eprintln!("[elfjit:v2boot-pub-real] MessageBus.publishRaw returned Ok({r:#x})");
             r
         }
     }
 }
 
 /// R1 content-path synthesis (deleg_dbfc8eb2, Route-B): stage a hand-authored ~20-line Luau
-/// CoreScript module that, the INSTANT a live DataModel owns a session, makes the engine
-/// SELF-CONSTRUCT a real GuiObject tree (ScreenGui with a TextLabel under CoreGui) -> R+0x180/0x188
-/// scene nodes with ZERO host layout — the exact Route-B marker. The loader resolves
-/// rbxasset://scripts/CoreScripts/<Name>.lua from the files-dir global (0x10726d600, seeded by
-/// --v2boot-set-filesdir) which fsmap re-roots to SOBER_ANDROID_ROOT/data/user/0/com.roblox.client/
-/// files/... . <Name> is INFERRED (AppShell|CoreScripts; desktop fastflags/name literals are ABSENT
-/// from this Android .so, measured) — this writes BOTH candidate names so whichever the engine first
-/// requests resolves. Also arms the REAL loader gates (content-path synthesis):
-/// flags-loaded 0x10672739d4.bit0, flags-latch 0x106a683e8.bit0, governor union-init guards
+/// CoreScript the engine SELF-CONSTRUCTS a real GuiObject tree from -> R+0x180/0x188 scene nodes
+/// with ZERO host layout. Loader resolves rbxasset://scripts/CoreScripts/<Name>.lua from the
+/// files-dir global (0x10726d600, --v2boot-set-filesdir) re-rooted by fsmap to
+/// SOBER_ANDROID_ROOT/data/user/0/com.roblox.client/files/.... <Name> is INFERRED
+/// (AppShell|CoreScripts; desktop fastflags/literals ABSENT from this Android .so) — write BOTH
+/// names so whichever the engine requests resolves. Also arms the REAL loader gates: flags-loaded
+/// 0x10672739d4.bit0, flags-latch 0x106a683e8.bit0, governor union-init guards
 /// 0x106a63da0/0x106a63d70=0, loader settings slot 0x106ba3350. Default-inert; opt-in --v2boot-r1-stage.
 pub fn stage_r1_core_scripts() -> Vec<String> {
     // The synthetic module: a ScreenGui + TextLabel under CoreGui so the engine's own
@@ -6874,6 +6936,7 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         routeb_lsm_keyfix_guard(state, pc); // SH341-cross (JIT_ROUTEB_LSM_KEYFIX): redirect the LSM pop's write-target away from a poisoned .text key so the pop completes and the full-ladder Route-B route passes the persistence-lane terminal wall
         routeb_appstart_408_guard(state, pc); // SH330: seed [AppStarted+0x408] (runtime heap x19) benign vt[+136] leaf at the 0x25f5050 gate (JIT_ROUTEB_APPSART_408SEED, standalone)
         routeb_busrecv_holder_guard(state, pc); // SH347 (JIT_ROUTEB_BUSRECV): measure [DataModelBindings+16] at the messageBus experience-launch cb (file 0x2bd7474) — receive-side DM holder readback (READ-ONLY, once)
+        routeb_busrecv_cb_entry_guard(state, pc); // SH364 (JIT_ROUTEB_BUSRECV): measure whether the messageBus receive cb BODY (file 0x2bd744c) is ENTERED at all headlessly — distinguishes publish-side topic-match failure from live-DM-holder-null (READ-ONLY, once)
         routeb_cookie_jar_guard(state, pc); // SH175: seed cookie-jar container + gates at worker 0x102203148 (JIT_ROUTEB_COOKIE)
         // SH248d (opt-in JIT_ROUTEB_APPSART_JAR_SEED): seed [0x106ed7a20] cookie-jar string
         // at the nativeAppBridgeAppStart string-assign site 0x1021f4830 (was NULL -> crash).
@@ -7958,6 +8021,47 @@ mod tests {
         routeb_busrecv_holder_guard(&mut s0, 0x102bd7474);
     }
 
+    /// SH364 (JIT_ROUTEB_BUSRECV): the cb-body-entry guard is (1) inert without the env var or at
+    /// a wrong pc, and (2) fires only at the real cb body entry 0x102bd744c, read-only, once per
+    /// run. It distinguishes "publish never dispatches to the cb" (no fire) from "cb entered but
+    /// DM-holder null" (fire at 0x2bd744c, then possibly 0x2bd7474). Pins the real-image boundary
+    /// (file 0x2bd744c = `sub sp,#128` prologue, disasm-verified).
+    #[test]
+    fn busrecv_cb_entry_guard_inert_then_fires() {
+        // (1) inert without env.
+        unsafe { env_test_remove("JIT_ROUTEB_BUSRECV") };
+        let mut s = CpuState::new();
+        s.x[0] = 0x10; // would fire if gated wrongly
+        routeb_busrecv_cb_entry_guard(&mut s, 0x102bd744c);
+
+        // (2) env on but wrong pc -> no fire.
+        unsafe { env_test_set("JIT_ROUTEB_BUSRECV", "1") };
+        routeb_busrecv_cb_entry_guard(&mut s, 0x102bd7600);
+
+        // (3) env on + exact cb body entry 0x102bd744c -> fires, read-only (x0/x1/x2 untouched).
+        s.x[0] = 0x102_a68818;
+        s.x[1] = 0xdeadbeef;
+        s.x[2] = 0x1234;
+        routeb_busrecv_cb_entry_guard(&mut s, 0x102bd744c);
+        assert_eq!(s.x[0], 0x102_a68818, "cb-entry guard is READ-ONLY (x0 untouched)");
+        assert_eq!(s.x[1], 0xdeadbeef, "cb-entry guard is READ-ONLY (x1 untouched)");
+        assert_eq!(s.x[2], 0x1234, "cb-entry guard is READ-ONLY (x2 untouched)");
+
+        // (4) second fire at the same pc is a no-op (once per run).
+        routeb_busrecv_cb_entry_guard(&mut s, 0x102bd744c);
+    }
+
+    /// SH364: the real-payload publish driver builds a jstring handle for a NON-empty payload and
+    /// preserves the empty-payload legacy wrapper behavior (payload b"", topic experience-launch).
+    #[test]
+    fn busrecv_real_payload_driver_handle_shapes() {
+        // new_string_utf_handle returns a non-null guest pointer for arbitrary bytes.
+        let p = crate::jni::new_string_utf_handle(b"{\"requestId\":\"sh364\"}");
+        assert!(p != 0, "real payload jstring handle must be non-null");
+        let empty = crate::jni::new_string_utf_handle(b"");
+        assert!(empty != 0, "empty payload jstring handle must be non-null");
+    }
+
     /// SH360 (JIT_ROUTEB_DOINIT_EMPTYVEC): the do-init app-shell band's 0x20-stride vector
     /// walker gate is default-inert and fires only at the two real BLOCK-ENTRY pcs (measured),
     /// seeding [0x106dcb160]={0,0} (begin==end==NULL) so both populate/teardown loops `b.eq` out.
@@ -8906,6 +9010,10 @@ mod tests {
         // WITHOUT writing any guest state (pure observation — never seeds/mutates), (d) survive
         // a NULL obj (rd() guarded). Use a scratch guest cell for obj so vt walks are real reads.
         let cell: u64 = 0x1063_1129;
+        // Holds the routeb-family test lock: the scratch cell is fixed .bss shared with sibling
+        // routeb tests under parallel load (a concurrent sibling clobbers the 0xdead sentinel ->
+        // false fail 222/57005). Serialize like the SH357 lock convention.
+        let _proc_g = ROUTEB_PROC_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         unsafe {
             assert!(routeb_ensure_writable(cell), "scratch .bss page must be writable");
             // (a) inert without env: no guest write (only observable via a null y).

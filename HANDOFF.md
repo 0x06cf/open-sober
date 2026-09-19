@@ -1,5 +1,38 @@
 # Open Sober — Agent Handoff
 
+## SH364 (Sep 20, 2026, hermes-worker): MEASURED — the messageBus experience-launch RECEIVE cb body is NEVER entered headlessly even with a REAL structured payload (SH347's named-open "real-string receive probe" is now closed: the cb-entry guard fires 0, the DM-holder read fires 0, publishRaw drives clean Ok(0x3e8)); recon-v3 immediate-priority deliverables re-verified green at HEAD
+Single-agent (cone suppressed). recon-v3 deliverables re-verified green at this
+HEAD (24 real task frames, swap Ok(0x1), dispatch #2638000, 197 node pops, 0
+json abort, 0 crash). Workspace green (cargo test --workspace EXIT 0, 0
+failures; arm64jit lib + elfjit example build). elfjit.rs / jit.rs stay under
+the 1MB pre-commit hook. Route-B live-DM gate UNCHANGED (DM-root 0x0, MH_*
+false, AppBridgeV2 0x0).
+
+### The forward this cycle
+SH347 measured the messageBus experience-launch RECEIVE path at the cb's
+DM-holder read (file 0x2bd7474) NEVER firing, but left its cause ambiguous and
+explicitly named a "future receive-payload-with-real-string probe" as the open
+forward surface. SH364 closes that surface with two read-only observations:
+- `routeb_busrecv_cb_entry_guard` (jit.rs, JIT_ROUTEB_BUSRECV): fires at the cb
+  BODY ENTRY (file 0x2bd744c, `sub sp,#128` prologue, BEFORE the DM-holder read)
+  — distinguishes "publish never dispatches to the cb" (publish-side) from "cb
+  entered, DM-holder null" (live-DM-side gate). READ-ONLY.
+- `drive_messagebus_publish_receive_payload` + elfjit rung `--v2boot-session-pub-real`
+  publishing a REAL 56-byte envelope (SH347 used only an empty b"" payload).
+MEASURED (clean bounded run, EXIT 124): subscribe Ok(0x3e8), publishRaw bound +
+Ok(0x3e8), **cb-entry guard fires 0** AND **DM-holder guard fires 0** — identical to
+the empty-payload run. So the receive cb is not dispatch-reachable headlessly
+even with real content: publish-side registration/live-DM-gated, matching every
+other SEP-17 receive behind the same gate. +2 hermetic tests (individually 3/3;
+the full-suite SH362 flake earlier was the documented SH357 fixed-address race,
+passes isolated + suite green on rerun), +capture_sh364_busrecv_real.sh,
++frontier-sh364 doc.
+
+### Honest
+Does not manufacture a DataModel. Route-B live-DM structural gate UNCHANGED
+(DM-root [0x106a68818]=0, MH_* false). SH174 capture-latch stays the single
+forward observer.
+
 ## SH362 (Sep 20, 2026, hermes-worker): MEASURED — the do-init MAIN dispatch body fn 0x258b5d8 (StartAppWithParams+0x494) NEVER EXECUTES headlessly; SH361 read only the dispatch *target pointer* (vt[+48]=0x10258b5d8), SH362's body trace proves the body is never entered — every run faults at the SH285 persistence wall (0x101db1b08) before control reaches it (3/3)
 Single-agent (cone suppressed). One new READ-ONLY observation guard
 `routeb_startapp_dispatch_body_guard` (jit.rs, opt-in JIT_ROUTEB_DISPATCH_BODY_TRACE=1,

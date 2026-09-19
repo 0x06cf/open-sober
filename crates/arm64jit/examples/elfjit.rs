@@ -142,11 +142,11 @@ fn routeb_map_guest_page(guest_addr: u64) -> bool {
 
 // SH60 task-driven frame plane (recon §A): type-4 popped-task vector [0x106829ea8] is .bss glue,
 // host-seeded with a non-recursive thunk -> REAL frame: make-current(vt+16=0x105b3b358) ->
-// frame-fn(0x105b32c00) -> swap(vt+24=0x105b3b408) on recovered ctx. Must NOT re-enter the
-// dispatcher/drain/vector (recurse); RENDERCTX==0 -> no-op.
+// frame-fn(0x105b32c00) -> swap(vt+24=0x105b3b408) on recovered ctx. Never re-enters dispatcher/
+// drain/vector (recurse); RENDERCTX==0 -> no-op.
 
 /// Engine's real 0x48-byte render ctx recovered by --renderthunk (0x105b3a280 returns x0);
-/// 0 = not yet recovered (type-4 dispatch no-ops). Published --renderinit thread.
+/// 0 = not yet recovered (type-4 dispatch no-ops). Published by the --renderinit thread.
 static RENDERCTX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Base leaked fabricated renderer/view/clear objects the frame thunk
@@ -154,32 +154,28 @@ static RENDERCTX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 static TASK_FRAME_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Base fabricated-but-engine-native render-manager R that `--renderscene` drives the engine's REAL
-/// scene renderer 0x105b2ead4 with. Layout mirrors render-manager ctor 0x5b2b0d4 (R+0x160=ctx,
-/// R+0x170=frame-list root/view, R+0x180/0x188=scene head/tail) so that code runs verbatim.
-/// Built once lazily; guest==host so engine code derefs it directly.
+/// scene renderer 0x105b2ead4 with (mirrors ctor 0x5b2b0d4: R+0x160=ctx, R+0x170=frame-list/view,
+/// R+0x180/0x188=scene head/tail). Built lazily; guest==host so engine code derefs it directly.
 static RENDERSCENE_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// SH126-gate: set once the --v2boot ladder's rungs complete.
 
 static LADDER_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// SH128 combined re-drive: when StartApp RETURNS under serialized ladder no guest thread is in
-/// the drain pop-loop, so --deque-node-live nodes are never popped (0 frames). --deque-redrive has
-/// the MAIN thread re-run the drain after the ladder joins; these statics coordinate the parties.
+/// @SH128 combined re-drive coordinators; --deque-redrive re-runs the drain after the ladder joins.
 static REDRIVE_X1: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static REDRIVE_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static REDRIVE_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// Number of scene nodes `render_scene_base` laid out in R (0 = legacy empty
-/// scene). Mirrored later node-count change rebuilds R rather than
-/// reusing the stale empty buffer.
+/// Number of scene nodes `render_scene_base` laid out in R (0 = legacy empty scene).
+/// A later node-count change rebuilds R rather than reusing the stale empty buffer.
 static SCENE_NODES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// SLES-dispatch slots seeded once before the first task frame (SH22-corrected
-/// clear-path names 0-7 + geometry draw slots 9/10). Seeding is idempotent.
+/// clear-path names 0-7 + geometry draw slots 9/10). Idempotent.
 static GLES_SLOTS_SEEDED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// Per-dispatch palette so consecutive task frames are visibly distinct (a
-/// capture proves the frame is task-driven/fresh, not a static buffer).
+/// Per-dispatch palette so consecutive task frames are visibly distinct (proves the
+/// frame is task-driven/fresh, not a static buffer).
 const TASK_FRAME_PALETTE: [[f32; 4]; 5] = [
     [0.40, 0.20, 0.95, 1.0],
     [0.10, 0.70, 0.05, 1.0],
@@ -220,9 +216,8 @@ fn task_frame_base() -> u64 {
     b
 }
 
-/// Seed the 10 engine-GLES dispatch slots (BSS 0x106d3b2f0+8*N) JIT
-/// bridge once, before the first task frame. Same (slot, name) table + resolver
-/// used by --renderframe-seedgles, factored task thunk self-heals.
+/// Seed the 10 engine-GLES dispatch slots (BSS 0x106d3b2f0+8*N) JIT bridge once,
+/// before the first task frame. Same table + resolver as --renderframe-seedgles.
 fn seed_task_frame_gles_slots() {
     if GLES_SLOTS_SEEDED.load(core::sync::atomic::Ordering::Relaxed) {
         return;
@@ -272,13 +267,11 @@ static PENDING_PRESENTS: core::sync::atomic::AtomicU64 = core::sync::atomic::Ato
 /// SH131 combined-run flood bound: after the serialized presenter finishes, [0x106829ea8] is nulled
 /// (boot-idle no-op @ slot==0) and this gate stops --deque-node-live re-injecting foreign nodes —
 /// else PENDING_PRESENTS grows + a released clone worker hits untrapped raise(SIGTRAP)=exit 133.
-/// Combined-capture only.
 static TASKFRAME_HALT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// True in the SH130/129 combined serialized-capture mode (JIT_SERIALIZE_RENDER
-/// + --v2boot + --taskv4-seed frame): the case whose post-frame dispatch flood
-/// must be bounded for a clean exit. Standalone single-plane mode (no serialize)
-/// stays unchanged.
+/// + --v2boot + --taskv4-seed frame): post-frame dispatch flood must be bounded
+/// for a clean exit. Standalone single-plane mode stays unchanged.
 fn combined_frame_capture() -> bool {
     let serialize = std::env::var("JIT_SERIALIZE_RENDER").ok().as_deref() == Some("1")
         && std::env::args().any(|a| a == "--v2boot")
@@ -341,10 +334,8 @@ fn session_live_dm() -> bool {
 }
 
 /// SESSION-GATED type-4 producer (self-drive handoff) at [0x106829ea8] via
-/// `--taskv4-seed session`. GATED (MH_APP_READY && live-DM) -> queue a real present
-/// (as `type4_frame_thunk`), REPLACING the harness seed on a real session; UNGATED
-/// -> inert (bounded log). Latent-but-correct; MH_APP_READY is false on bare-boot
-/// headless until do-init owns a DM. Producer-only, safe on drain thread.
+/// `--taskv4-seed session`. GATED (MH_APP_READY && live-DM) -> queue a real present,
+/// REPLACING the harness seed on a real session; UNGATED -> inert (bounded log).
 extern "C" fn type4_session_gated_thunk(
     a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
 ) -> u64 {
@@ -418,10 +409,9 @@ fn render_scene_base(node_count: u64) -> u64 {
     r
 }
 
-/// Drive the engine's REAL scene renderer (guest 0x105b2ead4) with the
-/// fabricated-but-engine-native R from `render_scene_base`. Binds ctx, lets the engine's frame-desc
-/// ctor+linker build a real 0x98 frame into R+0x170 AND one per 0x28 node (SH63) when node_count>0,
-/// then swaps (1=present). Verifies frames (R+0x170+nodes nonzero, [+140] set, [+144]==1).
+/// Drive the engine's REAL scene renderer (guest 0x105b2ead4) with the fabricated-but-engine-native
+/// R from `render_scene_base`. Binds ctx; engine's frame-desc ctor+linker build a real 0x98 frame
+/// into R+0x170 AND one per 0x28 node (SH63) when node_count>0, then swaps (1=present).
 fn render_engine_scene(ctx: u64, n: u64, node_count: u64) -> u64 {
     if !(ctx >= 0x100000000 && ctx >> 56 == 0) {
         return 0;
@@ -1680,11 +1670,11 @@ fn routeb_patch_keyed_registry_x24_load() {
 
 fn routeb_patch_map_dispatch() {
     // Two dispatch `blr x8` sites in the Roblox string/span hash-map family, each the
-    // optional-hash2 branch of `ldp x1,x8,[x19,#16]; cbz x8;<tail>blr x1`:
-    // FIND/grow 0x1029f4280 (SH87); INSERT 0x1029f3f78 (SH89; 29f3f6c ldp; 29f3f74 cbz;
-    // 29f3f78 blr x8; 29f3f80 blr x1). Forcing `blr x1` at both is behavior-preserving: hash2
-    // is redundant (observed = `br x1` aliasing primary), the hash only picks a bucket probe
-    // (correctness via key-eq comparator at map+0x08), so garbage +0x18 is never branched to.
+    // optional-hash2 branch of `ldp x1,x8,[x19,#16]; cbz x8;<tail>blr x1`: FIND/grow
+    // 0x1029f4280 (SH87); INSERT 0x1029f3f78 (SH89). Forcing `blr x1` at both is
+    // behavior-preserving: hash2 is redundant (observed = `br x1` aliasing primary), the hash
+    // only picks a bucket probe (correctness via key-eq comparator at map+0x08), so garbage
+    // +0x18 is never branched to.
     const FIND_BLR: (u64, u64) = (0x1029f4280, 0x29f4280);
     const INSERT_BLR: (u64, u64) = (0x1029f3f78, 0x29f3f78);
     let want = 0xd63f_0020u32; // blr x1
@@ -7737,6 +7727,19 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                     eprintln!("[elfjit:v2boot-pub] post-publish DM-root[0x106a68818]={dm:#x}");
                     dump("MessageBus.publishRaw");
                 }
+                // SH364 (--v2boot-session-pub-real): RECEIVE probe with a REAL payload (SH347 only published b"")
+                // so the cb-entry guard (0x102bd744c) + DM-holder guard (0x102bd7474) measure whether
+                // real content changes pub->cb dispatch. Single ladder thread (SH55/64).
+                if std::env::args().any(|a| a == "--v2boot-session-pub-real") {
+                    let payload = br#"{"requestId":"sh364","topic":"experience-launch","payload":{}}"#;
+                    let ret = arm64jit::jit::drive_messagebus_publish_receive_payload(
+                        iimg, ib, tpidr, boot_sp, env_ptr, thiz, payload, None,
+                    );
+                    eprintln!("[elfjit:v2boot-pub-real] publishRaw -> {ret:#x}");
+                    let dm = unsafe { *(0x106a68818u64 as *const u64) };
+                    eprintln!("[elfjit:v2boot-pub-real] post-publish DM-root[0x106a68818]={dm:#x}");
+                    dump("MessageBus.publishRaw-real");
+                }
                 // SH131 (disasm 21f7654): seed engine's OWN files-dir global - 24B libc++ std::string
                 // at 0x10726d600 (see frontier-sh131b; long form, cap bit0 clear). Opt-in --v2boot-set-filesdir.
                 if std::env::args().any(|a| a == "--v2boot-set-filesdir") {
@@ -8508,12 +8511,11 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                 }
             });
         }
-        // --deque-node-live <vt-hex>: inject a REAL task node LIVE drainer's deque
-        // (guest_tid 0 under --drain-poll), NOT the parked consumers' (tids 1/2) --deque-node.
-        // SH7's next lever: drain 0x2856e40 pop-loop @0x2856f94 reads head from [[root]]
-        // (x24=ldar[x23]), CAS-pops, dispatches [vt+40]([vt+16],consumer,[node+32]&~1,node,4,0)
-        // when not sentinel && [node+40]!=0 && [vt+40]!=0. Deque root = drainer's x20, STABLE +
-        // host-readable; write node into head-cell gated on head empty/sentinel; verify popped.
+        // --deque-node-live <vt-hex>: inject a REAL task node LIVE drainer's deque (guest_tid 0
+        // under --drain-poll), not the parked consumers' (tids 1/2) --deque-node. Drain 0x2856e40
+        // pop-loop @0x2856f94 reads head from [[root]], CAS-pops, dispatches [vt+40]([vt+16],consumer,
+        // [node+32]&~1,node,4,0) when not sentinel && [node+40]!=0 && [vt+40]!=0. Deque root =
+        // drainer's x20, STABLE + host-readable.
         if let Some(vt) = {
             let args: Vec<String> = std::env::args().collect();
             args.iter()
@@ -9132,13 +9134,11 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
         }
     }
 
-    // JIT_FRAMEWORK_DUMP: StartApp's jit_run below parks the main thread in the
-    // engine main loop and never returns, post-run sampler would never
-    // run. Instead spawn a detached host thread that samples the framework-built
-    // globals (guest==host addressing) every ~500 ms while StartApp initializes
-    // and parks, so we learn whether the render-init context (0x1067d16f0) or
-    // the deque-maintenance forward-edges (0x1068262e8/300/308) get POPULATED
-    // at runtime - i.e. whether driving the real render-init after warm-up runs.
+    // JIT_FRAMEWORK_DUMP: StartApp's jit_run below parks the main thread in the engine
+    // main loop and never returns, so a post-run sampler would never run. Instead spawn a
+    // detached host thread sampling the framework-built globals (guest==host) every ~500 ms
+    // while StartApp initializes + parks, to learn whether the render-init ctx (0x1067d16f0)
+    // or the deque-maintenance forward-edges (0x1068262e8/300/308) get POPULATED at runtime.
     if std::env::var_os("JIT_FRAMEWORK_DUMP").is_some() {
         std::thread::spawn(|| {
             let dw = |a: u64| -> u64 {
@@ -11642,9 +11642,9 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
     // SH175 follow-on (--cookie-ingress): drive pure-native cookie worker 0x102203148
     // (under nativeSetMultipleCookies 0x102202ff8) as a STANDALONE top-level jit_run on main
     // BEFORE StartApp, JIT_ROUTEB_COOKIE=1 seeds jar [0x106ed7a20] + clears boot gates
-    // ([0x106dcfc30]/[0x1072739d4] bit0) - closing the SH129/174 jar-CONSTRUCTION NULL fault at
-    // 0x220331c. ABI 6 args; w4(arg4)&1==1 REQUIRED (arg4=0 early-bails @0x2203b20). Jar
-    // READ-ONLY here. Standalone = first/only top-level jit_run on main (SH55/64-safe).
+    // ([0x106dcfc30]/[0x1072739d4] bit0) — closing the SH129/174 jar-ctor NULL fault at 0x220331c.
+    // ABI 6 args; w4(arg4)&1==1 REQUIRED (arg4=0 early-bails @0x2203b20). JAR READ-ONLY here.
+    // Standalone = first/only top-level jit_run on main (SH55/64-safe).
     if std::env::args().any(|a| a == "--cookie-ingress") {
         const COOKIE_WORKER: u64 = 0x102203148;
         const COOKIE: &[u8] = b".ROBLESECURITY\t0xdeadbeef_0123456789abcdef";
@@ -13070,12 +13070,11 @@ mod sh115_tests {
     }
     #[test]
     fn sh251c_getter_landingpad_cleanup_not_forward_ctor() {
-        // SH251b CORRECTION (SH251c): 0x102b9eca0 is NOT an indirect-only "next-unsynthesized"
-        // ctor. TRUE entry = 0x2b9ec9c (`paciasp`); exec seg has 64,748 `bl 0x2b9ec9c` + ZERO
-        // `bl 0x2b9eca0`. Two callers in PlayerGui getter 0x10201fce0 are EXCEPTION LANDING PADS
-        // (each preceded by a __cxa cleanup bl): NULL-this crash @0x102b9ecbc = unwind teardown
-        // (spawned-thread SIGTRAP), not Route-B construction. Pin true entry + 2 landing pads + bls;
-        // assert bl-imm26 targets 0x2b9ec9c so +4 drift fails loudly.
+        // SH251b CORRECTION (SH251c): 0x102b9eca0 is NOT an indirect-only "next-unsynthesized" ctor.
+        // TRUE entry = 0x2b9ec9c (`paciasp`); exec seg has 64,748 `bl 0x2b9ec9c` + ZERO `bl 0x2b9eca0`.
+        // Two callers in PlayerGui getter 0x10201fce0 are EXCEPTION LANDING PADS (each preceded by a
+        // __cxa cleanup bl): NULL-this crash @0x102b9ecbc = unwind teardown (spawned-thread SIGTRAP),
+        // not Route-B construction. Pin true entry + 2 landing pads; assert bl targets 0x2b9ec9c.
         fn bl_target(pc: usize, img: &[u8]) -> u64 {
             let w = u32::from_le_bytes([img[pc], img[pc + 1], img[pc + 2], img[pc + 3]]);
             assert_eq!(w & 0xfc00_0000, 0x9400_0000, "word at 0x{pc:x} must be a BL");
