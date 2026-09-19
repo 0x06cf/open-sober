@@ -1943,28 +1943,19 @@ fn routeb_ec_arg0_vt_dispatch_obj() -> u64 {
     })
 }
 
-/// SH320 (opt-in JIT_ROUTEB_DONEPATH_MAIN=1): the do-init DONE-path dispatcher 0x2206db8 forks
-/// at `b.ne` @0x2206df0 on main-id [0x106863a68] == pthread_self: TAKEN -> non-main box-build
-/// (SH319 measured); NOT taken -> the MAIN branch binder-dispatch 0x206df4 `ldr x0,[x19,#32]`
-/// -> vt+0x30 -> br x1 @0x206e24 = DM-ctor dispatch entry (SESSION-CTOR, candidate (b)). The
-/// harness can only seed main-id to the ladder thread's pthread_self; but if the done-path runs
-/// on a spawned clone worker (JIT_DRIVE_LIFECYCLE) its pthread_self differs, so only a JIT
-/// block-entry guard at the dispatcher can seed the EXECUTING thread's OWN id. Fires at the
-/// dispatcher block entry 0x2206db8 (a true block entry, unlike the mid-block 0x206df4), seeds
-/// [0x106863a68] = libc::pthread_self() of the current jit thread (the same id the guest's
-/// pthread_self resolves to), so the b.eq is taken -> MAIN branch. Idempotent, env-gated.
-/// SH322 (opt-in JIT_ROUTEB_LIFECYCLE_EARLYRET=1): cross the SH273 lifecycle-notifier
-/// live-object wall that the SH320/321 MAIN-path dispatch now reaches. Fn 0x21f3748
-/// (the SH273 SHARED lifecycle-notify body) reads `ldr x8,[x1]` @0x21f376c then
-/// `ldrb w8,[x8,#80]` @0x21f3770, faulting fault=0x50 because [x1]==[x22]==0 (the
-/// engine-settings controller arg's first word is 0 headlessly). But the next instruction
-/// `tbnz w8,#1,0x21f3870` @0x21f3774 means: IF byte[+80].bit1 is SET, control jumps STRAIGHT
-/// to 0x21f3870 = the epilogue canary-check + ret (a benign no-op) WITHOUT running the
-/// registry-build body that needs the live controller. Firing at the callee block-entry pc
-/// 0x1021f3748 (a real `bl` target), reads x1 (the caller's sp+0x18 pair pointer) and, when
-/// [x1]==0, writes a leaked object with byte[+80] bit1 SET -> the tbnz is taken -> fn 0x21f3748
-/// returns cleanly and nativePostClientSettingsLoadedInitialization3 COMPLETES. Default-inert,
-/// idempotent (seeds only the measured NULL headless state, never corrupts a live ref).
+/// SH320 (opt-in JIT_ROUTEB_DONEPATH_MAIN=1): do-init done-path dispatcher 0x2206db8 forks at
+/// `b.ne` @0x2206df0 on main-id [0x106863a68]==pthread_self: TAKEN -> non-main box-build; NOT ->
+/// MAIN branch binder-dispatch 0x206df4 `ldr x0,[x19,#32]` -> vt+0x30 -> br x1 @0x206e24 = DM-ctor
+/// dispatcher entry (SESSION-CTOR). Only a block-entry guard at the dispatcher (0x2206db8) can seed
+/// the EXECUTING jit thread's own pthread_self (idempotent, env-gated) so the b.eq MAIN branch runs.
+/// SH322 (opt-in JIT_ROUTEB_LIFECYCLE_EARLYRET=1): cross the SH273 lifecycle-notifier wall fn
+/// 0x21f3748 reads `ldr x8,[x1]` @0x21f376c then `ldrb w8,[x8,#80]` @0x21f3770, fault=0x50 when
+/// [x1]==[x22]==0 (engine-settings controller arg's first word 0 headlessly). Next insn `tbnz
+/// w8,#1,0x21f3870` @0x21f3774: if byte[+80].bit1 SET -> jump to 0x21f3870 = epilogue canary+ret
+/// (benign no-op) WITHOUT the registry-build body needing the live controller. Firing at callee
+/// block-entry 0x1021f3748, when [x1]==0 write a leaked obj with byte[+80].bit1 SET -> tbnz taken ->
+/// fn 0x21f3748 returns cleanly and nativePostClientSettingsLoadedInitialization3 COMPLETES.
+/// Default-inert, idempotent (seeds only the measured NULL headless state).
 fn routeb_lifecycle_wall_earlyret_guard(state: *mut CpuState, pc: u64) {
     if std::env::var("JIT_ROUTEB_LIFECYCLE_EARLYRET").ok().as_deref() != Some("1") {
         return;
@@ -3025,31 +3016,16 @@ pub fn routeb_manufactured_dm() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// SH182: host-drive the genuine-DM-vtable app-shell ctor on the manufactured DM
-// The APP-SHELL ctor slot [V+0x30] of the genuine primary DataModel vtable
-// (0x1067162f0) is guest 0x1057d6ef4 — loader-populated, REAL relocated engine
-// code (SH181). SH181's declared "next problem" was whether a manufactured DM
-// (bare zeroed body, genuine vptr) SURVIVES this ctor headlessly. Fresh recon
-// (deleg_661626bb): the ctor reads only TWO things —
-//   (a) stack-canary global file 0x67d16f0 (guest 0x1067d16f0): currently VALUE 1
-//       in a bare boot -> `ldr x8,[x21]` at 0x57d6f10 derefs addr 1 -> SEGV.
-//       Fix: write a stable pointer (to a stable 8-byte word) into it. The ctor
-//       stores it to [x29,#-8] at prologue and re-reads at epilogue, so ANY
-//       stable value auto-passes — it is a standard canary, not a data seed.
-//   (b) DM field +0x38c (`ldrsw x3,[x19,#908]`) = 4 readable bytes (0 fine).
-// Plus an ABI gate on the SECOND argument x1 (not a code-pointer and not
-// derefed as one): `ldr x8,[x1,#8]`. With a ZEROED descriptor (PATH A) the gate
-// takes the clean zero-touch no-op + ret — the SAFE survival proof: the
-// manufactured DM enters and returns through its real app-shell ctor without
-// faulting. (PATH B — feeding a genuine "ServerRestartScheduled" std::string —
-// would run a real init body, but its exact SSO-byte layout vs the equality fn
-// 0x2152f30 reading +0/+8/+16 is not yet decoded; flagged as an empirical
-// follow-up, do NOT lock an unverified byte model here. PATH A is the honest
-// first SH182 deliverable.)
-// This lever drives guest 0x1057d6ef4 with x0=manufactured DM + x1=&zeroed
-// descriptor via the existing NESTED run_guest_callback (same-thread nested is
-// the sanctioned type4_frame pattern; this ctor is pure .text, no GLSL compile).
-// default-inert; env JIT_ROUTEB_DM_CTOR_DRIVER=1. +1 hermetic test.
+// SH182: host-drive the genuine-DM-vtable app-shell ctor on the manufactured DM.
+// App-shell ctor slot [V+0x30] of genuine DM primary vtable (0x1067162f0) = guest
+// 0x1057d6ef4 (real relocated engine code). Ctor reads only: (a) stack-canary
+// global 0x1067d16f0 (write a stable ptr -> any stable value auto-passes epilogue);
+// (b) DM +0x38c `ldrsw x3,[x19,#908]` (4 readable bytes, 0 fine); (c) ABI gate on x1
+// `ldr x8,[x1,#8]` (zeroed descriptor PATH A -> clean zero-touch no-op+ret = safe
+// survival proof). PATH B (SSO "ServerRestartScheduled") not locked (SSO/eql fn
+// 0x2152f30 byte model unverified) — do NOT lock it. Drive 0x1057d6ef4 with
+// x0=manufactured DM + x1=&zeroed descriptor via nested run_guest_callback (type4
+// pattern). default-inert; env JIT_ROUTEB_DM_CTOR_DRIVER=1. +1 hermetic.
 // ---------------------------------------------------------------------------
 /// Build the x1 descriptor for the app-shell ctor. `full` selects the PATH B
 /// descriptor: [descriptor+8] = pointer to a SHORT-form (SSO) libc++ std::string
@@ -7241,18 +7217,13 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
                     // cleared purely by the non-image +0x18 repair above (no force-empty).
                     // SH91: scrub PHANTOM IMAGE-RANGE BUCKET SLOTS at every INSERT entry.
                     // The map header/array are seeded (SH84/90) and valid; but after thousands
-                    // of inserts into the never-grown 1024-slot map a single bucket slot can
-                    // hold an IMAGE address (e.g. 0x1029b37ec, a .text thunk the descriptor-
-                    // iteration wrote into a slot) instead of a managed-heap node ptr. The
-                    // chain-walk `ldr x23,[x22]` (head, file 0x29f3fb4) picks it up and
-                    // `ldr x8,[x23,#16]` faults on unmapped image+16 (guestpc 0x1029f3f7c).
-                    // Managed-heap node pointers / host metadata are NEVER in the guest image
-                    // range [base, base+len), so any image-range 64-bit slot value is a
-                    // phantom head link -> NULL it (chain sees empty -> alloc new node).
-                    // ONLY scrub a bucket array WE OWN (a leaked host array registered in
-                    // TRUSTED_BUCKETS) — a foreign/unseeded map's +0x00 can be an invalid
-                    // host address and dereferencing it panics (jit.rs:2467). Never touch a
-                    // valid node pointer or the map header; honors SH84/86b.
+                    // of inserts into the never-grown 1024-slot map a bucket slot can hold an IMAGE
+                    // address (e.g. 0x1029b37ec) instead of a managed-heap node ptr; the chain-walk
+                    // `ldr x23,[x22]` (head, file 0x29f3fb4) picks it up and `ldr x8,[x23,#16]`
+                    // faults on unmapped image+16 (guestpc 0x1029f3f7c). Image-range slots are never
+                    // managed-heap ptrs => NULL them (chain sees empty -> alloc new node). Only scrub
+                    // an array WE OWN (in TRUSTED_BUCKETS); a foreign map's +0x00 may be an invalid
+                    // host addr (deref panics jit.rs:2467). Never touch a valid node ptr or header.
                     if pc == 0x1029f3e70 {
                         // SH91+SH96: the INSERT chain-walk (0x29f3fb4 head ldr, 0x29f3fe4
                         // [x23+16]) faults when the probe's slot ADDRESS overflows the owned
@@ -17456,21 +17427,11 @@ mod fp16_and_fabd_fccmp_exec {
         // recon (docs/recon-framework-boot-order.md) claimed the vector is
         // installed IN-IMAGE by TaskScheduler/V2-init code that SH46's scan just
         // "never reached" (a plausible-sounding reframe: guest 0x106829ea8 == the
-        // .bss array start 0x6829e80 + 0x28, so `adrp 6829000; add xN,xN,#0xe80;
-        // str [xN,#0x28]` would escape a `#3752`-literal scan). Disassembling
-        // every `adrp xN,6829000` site in the real binary disproves it:
-        //   - 0x2953e30: x19<-0x6829e80, then `str xzr,[x19]` — clears the bss
-        //     array's FIRST qword (0x6829e80), NOT [x19+0x28]=the vector.
-        //   - 0x295427c / 0x29542ec: operate on 0x6829e88 (+0x8) as an atomic
-        //     counter (ldxr/stxr, stlr) — not the vector.
-        //   - Every other adrp-6829000 `add` targets #0xba8/#0xe80/#0xe88/#0xf00;
-        //     none reaches #0xea8. All `add #0xea8` sites in the image are
-        //     struct-relative on dynamic bases (x0/x1/x2/x19/sp), never a
-        //     static-6829000-derived register.
-        // So there is no in-image literal OR computed store to the vector; if the
-        // V2 ladder installs it at all it is via cross-module glue (another loaded
-        // lib) or a host-side seed — both out of scope of an in-binary scan.
-        // See docs/frontier-sh52-media-keys-data.md §"frontier".
+        //   so `adrp 6829000; str [xN,#0x28]` would escape a literal scan — disasm disproves:
+        //   0x2953e30 clears bss first qword (0x6829e80), 0x295427c/2ec use +0x8 atomic counter;
+        //   other adrp-6829000 adds target #0xba8/#0xe80/#0xe88/#0xf00, none #0xea8. No in-image
+        //   store reaches the vector => installed only by cross-module glue or a host seed (out of
+        //   an in-binary scan). See docs/frontier-sh52-media-keys-data.md.
         const DISPATCH_ADRP_PAGE: u64 = 0x6829000; // file vaddr of `adrp x8, 6829000`
         const DISPATCH_OFF: u64 = 3752; // `ldr x3,[x8,#3752]` -> file 0x6829ea8
         const VECTOR_FILE: u64 = DISPATCH_ADRP_PAGE + DISPATCH_OFF;
@@ -17779,6 +17740,45 @@ mod fp16_and_fabd_fccmp_exec {
             );
         } else {
             eprintln!("sh399 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
+    fn sh401_doinit_governor_reach_chain_pinned() {
+        // SH401: the ordered session substrate (SH400) self-constructs the AppBridgeV2 singleton to
+        // its genuine relocated vt (0x1063a3410), making the do-init `blr [vt+0x18]` dispatch into the
+        // REAL governor 0x102e9fa84 for the first time (region-watch: governor + its make-call
+        // StartAppWithParams 0x258c6e4 fire; DMCONT 0x102bd1d68 not yet reached; 2/2, 0 crash). Byte-pin:
+        //   do-init 0x1023eff4c -> `blr [x19]+[+0x18]` @0x23effbc -> gov 0x102e9fa84 (a9ba7bfd)
+        //   -> gov dispatch `blr x9` @0x2e9fb54 -> `bl 258c6e4` StartAppWithParams (a9bc7bfd).
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let word_at = |vaddr: u64| -> u32 {
+                let off = (vaddr & 0xffff_ffff) as usize;
+                let b = &img[off..off + 4];
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            };
+            // do-init worker prologue (sub sp,#0x180 = d10603ff)
+            assert_eq!(word_at(0x1023eff4c), 0xd106_03ff, "sh401 do-init worker prologue");
+            // the AppBridgeV2 dispatch `blr x8` @0x23effbc (d63f0100), arg x0=AppBridgeV2.
+            assert_eq!(word_at(0x1023effbc), 0xd63f_0100, "sh401 do-init blr [vt+0x18]");
+            // governor entry: frame `stp x29,x30,[sp,#-96]!` (a9ba7bfd).
+            assert_eq!(word_at(0x102e9fa84), 0xa9ba_7bfd, "sh401 governor frame stp");
+            // governor's MODERN dispatch `blr x9` @0x2e9fb54 (d63f0120) feeding impl[+0x408].
+            assert_eq!(word_at(0x102e9fb54), 0xd63f_0120, "sh401 governor dispatch blr");
+            // governor make-call `bl 258c6e4` @0x2e9fb68 (97dbb2df) -> StartAppWithParams.
+            assert_eq!(word_at(0x102e9fb68), 0x97db_b2df, "sh401 governor bl StartAppWithParams");
+            // StartAppWithParams entry: frame `stp x29,x30,[sp,#-64]!` (a9bc7bfd).
+            assert_eq!(word_at(0x10258c6e4), 0xa9bc_7bfd, "sh401 StartAppWithParams frame stp");
+            // the AppBridgeV2 singleton cell the do-init's GetOrCreate populates (host probe read).
+            // [0x106a705e8] readback == genuine vt 0x1063a3410 (MEASURED, not a static word pin).
+            eprintln!(
+                "[abi] sh401 do-init->governor->StartAppWithParams reach chain pinned on libroblox.so \
+                 (do-init 0x1023eff4c blr[vt+0x18]@0x23effbc -> gov 0x102e9fa84 -> bl 0x258c6e4)"
+            );
+        } else {
+            eprintln!("sh401 real-image guard: no real libroblox.so, skipping anchors");
         }
     }
 

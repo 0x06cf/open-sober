@@ -1,5 +1,33 @@
 # Open Sober — Agent Handoff
 
+## SH401 (Sep 19, 2026, hermes-worker): MEASURED the do-init → governor reach through the GENUINE AppBridgeV2 singleton — the frontier's named next gate after SH400, now crossed headlessly: the ordered session drive executes the real governor 0x102e9fa84 and its make-call into StartAppWithParams
+Single-agent (cone suppressed). SH400 measured that StartLuaAppDM driven in the ordered
+`ROUTEB_SESSION_SUBSTRATE` self-constructs the AppBridgeV2 singleton [0x106a705e8] to its genuine
+relocated vt 0x1063a3410; its frontier doc named the next gate explicitly ("drive DEEPER past the
+AppBridgeV2 singleton — the governor vt[+0x18]=0x102e9fa84 the singleton makes reachable"). SH401
+executes that drive and MEASURES the reach on the real libroblox.so with region-watch over the
+do-init worker / governor body / StartAppWithParams / DMCONT, on the SAME env as SH400
+(furthest-advancing ladder + --v2boot-session-drive ordered substrate).
+- MEASURED (2/2 reproducible, EXIT 124 stable, 0 crash): the ordered session drive now executes
+  do-init worker 0x1023eff4c -> `blr [vt+0x18]` @0x23effbc -> **real governor 0x102e9fa84**
+  (frame `stp` a9ba7bfd, MODERN router after SH159c patch) -> governor MODERN-dispatch body
+  0x102e9fb58 -> `bl 0x258c6e4` **StartAppWithParams** (frame `stp` a9bc7bfd, body 0x258c7b4
+  past the allocation) — the governor and StartAppWithParams were BOTH "0 hits" headlessly
+  before (SH378/379: "governor/app-shell ctor 0 hits"). The genuine AppBridgeV2 vt makes the
+  do-init blur land on the real governor entry.
+- NEXT standing gate: **DMCONT 0x102bd1d68 (engine-init continuation) still NOT reached**
+  (0 region hits) — one step past StartAppWithParams's entry.
+- New real-image hermetic `sh401_doinit_governor_reach_chain_pinned` (arm64jit lib 449->450)
+  byte-pins the reach chain: do-init worker prologue d10603ff, blr[vt+0x18] d63f0100 @0x23effbc,
+  governor frame a9ba7bfd @0x102e9fa84, gov dispatch blr d63f0120 @0x2e9fb54, gov make-call
+  `bl 258c6e4` 97dbb2df @0x2e9fb68, StartAppWithParams frame a9bc7bfd.
+- Capture `runs/capture_sh401_governor_reach.sh` + `docs/frontier-sh401-governor-reach.md`.
+- Honest: does NOT manufacture a DM (DM-root [0x106a68818]=0, MH_* false, AppBridgeV2 genuine
+  vt unchanged from SH400). A MEASURE (region-recorded reach) + hermetic pin, confirming the
+  SESSION-CTOR substrate now exercises real engine session code deeper than ever. Workspace green
+  (cargo test --workspace EXIT 0, 630 passed/0 failed; arm64jit lib 450). elfjit.rs/session.rs
+  untouched; jit.rs off-hook (+new hermetic, size 1,048,517 B < 1MiB hook).
+
 ## SH400 (Sep 19, 2026, hermes-worker): the ordered session-substrate DRIVER — the missing executable half of SH399's BUILD-THE-RUNTIME substrate, now lands real production code after 9 probe-only cycles (SH390-398) and MEASURES that driving the ordered 16-atom substrate self-constructs the AppBridgeV2 singleton to its genuine vt
 Single-agent (cone suppressed). PRODUCTION CODE (not a probe): new small module `session.rs`
 (+ `pub mod session` in lib.rs) — `routeb_session_substrate_drive()`, `substrate_args()` per-atom
