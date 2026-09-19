@@ -7346,4 +7346,224 @@ mod tests {
         crate::translate::host_return_leak_watch(0x7f0000000000, 0x7fd16c014bc0, 0);
         crate::translate::host_return_leak_watch(0, 0, 0);
     }
+
+    // SH427: hermetic coverage of the arm64->x86 translator CORE (`translate`).
+    // decode.rs pins decode (insn word -> Inst, 76 tests) and jit.rs pins
+    // runtime behavior (295 tests), but the byte emission BETWEEN them — the
+    // `translate(Inst -> CodeBuf)` mapping every translated block flows through —
+    // had ZERO direct hermetics (only the 3 instrument-watch tests above). SH427
+    // byte-pins the exact emitted x86 for the load-bearing, historically-buggy
+    // instruction families, and asserts the semantic discriminators that the
+    // qemu-verified comments in translate() spell out. Pure #[cfg(test)]: no
+    // production path / guest byte / JIT-hook-default changed (translator core
+    // untouched). Deterministic: synthetic Inst values, no real binary/image, no
+    // env. RBX = CpuState base; guest reg g lives at [RBX+g*8] (slot g = 8g);
+    // SP slot = 31*8 = 248 = 0xf8.
+    fn tr_bytes(inst: Inst) -> Vec<u8> {
+        let mut c = crate::x86::CodeBuf::new();
+        let mut fx = Vec::new();
+        translate(&mut c, 0x1000, inst, &mut fx).expect("translate must succeed");
+        c.as_slice().to_vec()
+    }
+
+    // movz x0,#0x1234, 64-bit: `mov r32-imm` shortcut (mov_eax_imm32 into a
+    // 64-bit dest) then store to [RBX+0]. The 64-bit form may use the imm32
+    // short-cut because movz zero-extends — pin that choice and the store.
+    #[test]
+    fn sh427_movz_64_imm32_shortcut_stores_slot0() {
+        let b = tr_bytes(Inst::MoveWide { rd: 0, imm16: 0x1234, hw: 0, opc: 0, sf: true });
+        assert_eq!(b, vec![
+            0x48, 0xc7, 0xc0, 0x34, 0x12, 0x00, 0x00, // mov rax, 0x1234
+            0x48, 0x89, 0x03, // mov [rbx], rax (slot0)
+        ]);
+    }
+
+    // movn w0,#2 (32-bit, opc=2): NOT of the immediate, then TRUNCATED to 32 bits
+    // (W-dest zero-extends). The qemu-verified comment: `movn w0,#2` must be
+    // 0x00000000fffffffd, NOT 0xfffffffffffffffd — the imm64 path would
+    // sign-extend and leave the upper 32 set. Pin that the emitted constant is
+    // 0x00000000fffffffd (upper half zero) and the store lands in slot0.
+    #[test]
+    fn sh427_movn_32_truncates_to_zero_extended() {
+        let b = tr_bytes(Inst::MoveWide { rd: 0, imm16: 2, hw: 0, opc: 2, sf: false });
+        assert_eq!(b, vec![
+            0x48, 0xb8, 0xfd, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, // mov rax, 0x00000000fffffffd
+            0x48, 0x89, 0x03, // mov [rbx], rax
+        ]);
+    }
+
+    // movk x0,#2,lsl#16, 64-bit, over a prior movz x0,#0x8bb1 (so x0==0x28bb1
+    // after). movk is read-modify-write — OR imm16<<16 into bits[16,32),
+    // PRESERVING the 0x8bb1 low half. The qemu-verified regression: treating
+    // movk as a full replace corrupted the constant (0x8bb1 then 0x2 lsl16 came
+    // out 0x20000). Pin the read-AND-OR sequence: load [rbx], and with the
+    // clear mask 0xffffffffffff0000, or with 0x20000, store.
+    #[test]
+    fn sh427_movk_read_modify_write_preserves_low_half() {
+        let b = tr_bytes(Inst::MoveWide { rd: 0, imm16: 2, hw: 1, opc: 1, sf: true });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x03, // mov rax, [rbx]
+            0x48, 0xb9, 0xff, 0xff, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, // mov rcx, 0xffffffffffff0000 (clear mask)
+            0x48, 0x21, 0xc8, // and rax, rcx
+            0x48, 0xb9, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rcx, 0x20000
+            0x48, 0x09, 0xc8, // or rax, rcx
+            0x48, 0x89, 0x03, // mov [rbx], rax
+        ]);
+    }
+
+    // sub sp,sp,#0x20 (64-bit, rd==31=SP): the ADD/SUB immediate form treats
+    // rd==31 as SP (unlike logical ops where it's discarded as XZR). Every fn
+    // prologue does this. Pin: load [RBX+0xf8] (SP slot), sub 0x20, store back
+    // to [RBX+0xf8].
+    #[test]
+    fn sh427_sub_imm_sp_writeback_uses_sp_slot() {
+        let b = tr_bytes(Inst::AddSubImm { rd: 31, rn: 31, imm12: 0x20, shift12: false, sub: true, sf: true, s: false });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x83, 0xf8, 0x00, 0x00, 0x00, // mov rax, [rbx+0xf8] (SP)
+            0x48, 0x81, 0xe8, 0x20, 0x00, 0x00, 0x00, // sub rax, 0x20
+            0x48, 0x89, 0x83, 0xf8, 0x00, 0x00, 0x00, // mov [rbx+0xf8], rax
+        ]);
+    }
+
+    // cmp wzr,#0x10 (32-bit, s==1, rd==31): rn==31 must be read as XZR (zero),
+    // NOT SP — and the flag-setting form must NOT clobber the SP writeback. The
+    // emitted sequence: mov rax,0 (XZR), zext to 32 via shl/shr 32, sub 0x10,
+    // then store_nzcv (pushfq + nzcv-packing into [CpuState+0x108], the 4-bit C
+    // at offset 0x108+0 = nzcv[0]: XXX-C packing 1f/1e/0b/06/07/0d/1c/1d).
+    // Assert: starts with `mov rax,0` (not a [rbx+0xf8] SP read) and ends with
+    // the store to [rbx+0x8] — slot rd but the write is SKIPPED in the s==1 case
+    // (comparison discards). So no slot write; the tail is the nzcv pack.
+    #[test]
+    fn sh427_cmp_wzr_reads_xzr_zero_and_skips_writeback() {
+        let b = tr_bytes(Inst::AddSubImm { rd: 31, rn: 31, imm12: 0x10, shift12: false, sub: true, sf: false, s: true });
+        // Begin: mov rax, 0 (XZR, NOT a [rbx+0xf8] SP load)
+        assert_eq!(&b[0..10], &[0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        // 32-bit zext: shl rax,32 ; shr rax,32
+        assert_eq!(&b[10..14], &[0x48, 0xc1, 0xe0, 0x20]);
+        assert_eq!(&b[14..18], &[0x48, 0xc1, 0xe8, 0x20]);
+        // sub rax,0x10 (imm32, 6 bytes)
+        assert_eq!(&b[18..24], &[0x81, 0xe8, 0x10, 0x00, 0x00, 0x00]);
+        // No `mov [rbx+0xf8], rax` writeback anywhere (comparison discards) —
+        // the nzcv pack follows. The whole buffer must NOT contain a store to
+        // the SP slot. The nzcv tail writes to [rbx+0x108]-ish (nzcv), not SP.
+        assert!(!b.windows(7).any(|w| w == [0x48, 0x89, 0x83, 0xf8, 0x00, 0x00, 0x00]),
+            "cmp must not write back to the SP slot");
+        // nzcv pack ends with the C-bit store `89 93 08 01 00 00` (mov
+        // [rbx+0x108],edx) then restores the caller's regs (5a 59 58 = pop
+        // rdx/rcx/rax). Pin the C-flags store wraps the tail (a real write to
+        // the flags slot, distinct from the forbidden SP-writeback).
+        assert_eq!(&b[b.len() - 9..b.len() - 3], &[0x89, 0x93, 0x08, 0x01, 0x00, 0x00],
+            "nzcv pack stores C to [rbx+0x108]");
+        assert_eq!(&b[b.len() - 3..], &[0x5a, 0x59, 0x58], "caller regs restored");
+    }
+
+    // neg x6,x6 = sub x6,xzr,x6 (bit21=0, shifted-register form): rn==31 is XZR
+    // (zero), NOT SP — a `neg` must never touch the SP slot. Pin: mov rax,0
+    // (XZR), load rm(6) into rcx, sub, store to slot6.
+    #[test]
+    fn sh427_neg_shifted_form_reads_xzr_zero() {
+        let b = tr_bytes(Inst::AddSubReg { rd: 6, rn: 31, rm: 6, sub: true, sf: true, s: false, shift: ShiftKind::Lsl, sh_amt: 0, sp_operand: false });
+        assert_eq!(b, vec![
+            0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rax, 0 (XZR)
+            0x48, 0x8b, 0x4b, 0x30, // mov rcx, [rbx+0x30] (slot6)
+            0x48, 0x29, 0xc8, // sub rax, rcx
+            0x48, 0x89, 0x43, 0x30, // mov [rbx+0x30], rax (slot6)
+        ]);
+    }
+
+    // sub sp,sp,x1 (bit21=1, extended-register form): rn==31 AND rd==31 are SP.
+    // Pin: load [rbx+0xf8] (SP), load rm(1) from slot8 ([rbx+0x8]) into rcx,
+    // sub, write back to [rbx+0xf8] (SP).
+    #[test]
+    fn sh427_sub_sp_sp_x1_extended_form_reads_slots() {
+        let b = tr_bytes(Inst::AddSubReg { rd: 31, rn: 31, rm: 1, sub: true, sf: true, s: false, shift: ShiftKind::Lsl, sh_amt: 0, sp_operand: true });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x83, 0xf8, 0x00, 0x00, 0x00, // mov rax, [rbx+0xf8] (SP rn)
+            0x48, 0x8b, 0x4b, 0x08, // mov rcx, [rbx+0x08] (rm=1)
+            0x48, 0x29, 0xc8, // sub rax, rcx
+            0x48, 0x89, 0x83, 0xf8, 0x00, 0x00, 0x00, // mov [rbx+0xf8], rax (SP rd)
+        ]);
+    }
+
+    // adds w0,w1,w2 (32-bit flag-setting add, bit21=0, S=1): 32-bit operand zext,
+    // add, then store_nzcv with the cmc (carry-borrow convention) inserted for
+    // the ADDS case. Pin: it begins with the two register loads, performs the
+    // 32-bit zext (shl/shr 32) on each, a 32-bit add (01 c8), a cmc (f5), the
+    // nzcv pack, and finishes with a zero-extended 32-bit store to slot0.
+    #[test]
+    fn sh427_adds_32_flag_setting_cmc_and_nzcv() {
+        let b = tr_bytes(Inst::AddSubReg { rd: 0, rn: 1, rm: 2, sub: false, sf: false, s: true, shift: ShiftKind::Lsl, sh_amt: 0, sp_operand: false });
+        // loads: mov rax,[rbx+0x08] (rn1) ; mov rcx,[rbx+0x10] (rm2)
+        assert_eq!(&b[0..8], &[0x48, 0x8b, 0x43, 0x08, 0x48, 0x8b, 0x4b, 0x10]);
+        // 32-bit zext rax: shl/shr 32
+        assert_eq!(&b[8..12], &[0x48, 0xc1, 0xe0, 0x20]);
+        assert_eq!(&b[12..16], &[0x48, 0xc1, 0xe8, 0x20]);
+        // 32-bit zext rcx
+        assert_eq!(&b[16..20], &[0x48, 0xc1, 0xe1, 0x20]);
+        assert_eq!(&b[20..24], &[0x48, 0xc1, 0xe9, 0x20]);
+        // 32-bit add: add eax,ecx (01 c8)
+        assert_eq!(&b[24..26], &[0x01, 0xc8]);
+        // cmc (the ADDS non-subtract borrow-convention carry complement)
+        assert_eq!(&b[26], &0xf5);
+        // finishes with a zero-extended store: after the nzcv pack + register
+        // pop (5a 59 58), the write path does shl/shr 32 then `mov [rbx],rax`.
+        assert_eq!(&b[b.len() - 11..], &[0x48, 0xc1, 0xe0, 0x20, 0x48, 0xc1, 0xe8, 0x20, 0x48, 0x89, 0x03]);
+    }
+
+    // adc x0,x1,x2 (64-bit, non-S): load rn/rm, load stored C into EFLAGS, then
+    // cmc + native adc (since TRUE_C = !stored_C in the borrow convention). Pin
+    // the tail: cmc (f5) then adc (48 11 c8) then store slot0.
+    #[test]
+    fn sh427_adc_adds_true_carry_via_cmc_and_adc() {
+        let b = tr_bytes(Inst::AddCarry { rd: 0, rn: 1, rm: 2, sf: true, s: false, sub: false });
+        // ends: ... cmc(f5) adc rax,rcx(48 11 c8) store
+        assert_eq!(&b[b.len() - 4 - 3..b.len() - 3], &[0xf5, 0x48, 0x11, 0xc8]);
+        assert_eq!(&b[b.len() - 3], &0x48); // store prefix
+    }
+
+    // sbc x0,x1,x2 (64-bit, non-S): SBB subtracts C_s = (1-TRUE_C), so native
+    // sbb directly (no cmc). Pin: tail is `sbb rax,rcx` (48 19 c8) then store.
+    #[test]
+    fn sh427_sbc_sbb_direct_borrow() {
+        let b = tr_bytes(Inst::AddCarry { rd: 0, rn: 1, rm: 2, sf: true, s: false, sub: true });
+        assert_eq!(&b[b.len() - 3 - 3..b.len() - 3], &[0x48, 0x19, 0xc8]); // sbb rax,rcx
+        assert_eq!(&b[b.len() - 3], &0x48); // store prefix
+    }
+
+    // bic x0,x1,x2 (logical NOT AND, op=4, 64-bit): not rm then and. Pin the
+    // full sequence: load rn, load rm, not rcx (48 f7 d1), and, store.
+    #[test]
+    fn sh427_bic_not_then_and() {
+        let b = tr_bytes(Inst::LogicReg { rd: 0, rn: 1, rm: 2, op: 4, s: false, sf: true, shift: ShiftKind::Lsl, sh_amt: 0 });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x43, 0x08, // mov rax, [rbx+0x08] (rn1)
+            0x48, 0x8b, 0x4b, 0x10, // mov rcx, [rbx+0x10] (rm2)
+            0x48, 0xf7, 0xd1, // not rcx
+            0x48, 0x21, 0xc8, // and rax, rcx
+            0x48, 0x89, 0x03, // mov [rbx], rax
+        ]);
+    }
+
+    // orr x0,xzr,x1 (64-bit, `mov` alias): rn==31 (XZR) must load as zero, NOT
+    // SP. Pin: mov rax,0 then or with rm(1) then store.
+    #[test]
+    fn sh427_orr_xzr_loads_zero_not_sp() {
+        let b = tr_bytes(Inst::LogicReg { rd: 0, rn: 31, rm: 1, op: 1, s: false, sf: true, shift: ShiftKind::Lsl, sh_amt: 0 });
+        assert_eq!(b, vec![
+            0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rax, 0 (XZR)
+            0x48, 0x8b, 0x4b, 0x08, // mov rcx, [rbx+0x08] (rm1)
+            0x48, 0x09, 0xc8, // or rax, rcx
+            0x48, 0x89, 0x03, // mov [rbx], rax
+        ]);
+    }
+
+    // BCond (b.eq rel): the discriminator must not clobber a live C — the
+    // sequence loads stored NZCV into EFLAGS (pushfq/popfq around the nzcv
+    // unpack) then emits a je (0f 84 disp32). Pin: the buffer ends with
+    // `0f 84 00 00 00 00` (je rel32, fixup placeholder zeroed by patch).
+    #[test]
+    fn sh427_bcond_loads_nzcv_and_emits_je() {
+        let b = tr_bytes(Inst::BCond { cond: 0, imm: 8 });
+        assert_eq!(&b[b.len() - 6..], &[0x0f, 0x84, 0x00, 0x00, 0x00, 0x00], "je rel32");
+    }
 }
