@@ -8292,4 +8292,138 @@ mod tests {
         assert!(b.windows(4).any(|w| w == [0xf3, 0x0f, 0x58, 0xc1]), "addss xmm0,xmm1 accumulate");
         assert!(!b.windows(4).any(|w| w == [0xf3, 0x0f, 0x59, 0xc8]), "element-form must NOT scale by full Vm lane");
     }
+
+// SH434: hermetic coverage of the SIMD shift-and-accumulate codegen families
+    // (translate.rs SimdShl, SimdShr, SimdShrAcc) — the load-bearing integer
+    // shift/rounding math every vertex-index / packed-color / image-lane path
+    // leans on. These had no direct byte tests. SH434 pins the discriminators
+    // a byte error silently corrupts: (1) the shl-vs-shr opcode byte (shl C1
+    // /4 E0  vs  unsigned shr C1 /5 E8  vs  signed arithmetic shr C1 /7 F8 —
+    // a shift-direction flub moves every lane the wrong way); (2) the
+    // SIGN-extend-before-arithmetic-shift requirement (sshr esize=4 loads
+    // movsxd 48 63 then sar F8; ushr loads zero-extend movzx and shr E8 — a
+    // zero-extended negative element shifts positive and flips the sign bit);
+    // (3) the shift>=esize-bits guard (logical all-zeros via xor 48 31 C0 vs
+    // arithmetic all-ones sign-fill via sar,63 48 C1 F8 3F — a bare x86 imm
+    // would clamp instead, silently wrong for large shifts); (4) the
+    // SimdShrAcc accumulate ordering (Vd read AFTER the shift, added via
+    // add rcx,rax 48 01 C1 — never before, and the dst is re-stored, so usra/
+    // ssra accumulate rather than overwrite). Exact-byte window + full-buffer
+    // asserts (multi-lane); synthetic Inst -> translate() (tr_bytes),
+    // deterministic, no image/env. [RBX]=CpuState; vector slot v[t] =
+    // VECTOR_BASE(0x110) + t*16. (STATUS next-forward #5: the remaining SIMD
+    // surface — distinct from SH432's SminMax/SimdSatAdd and SH433's Fmla.)
+
+    // SimdShl esize=8, shift=1 (shl x0,x1,#1 / shl v0.2d): 2 lanes, each
+    // `mov_load64 [rn]` -> `shl rax,1` (48 C1 E0 01) -> `mov_store64 [rd]`.
+    // Full-buffer pin of the 2-lane body: the shl opcode byte C1/E0/01 and
+    // the per-lane Vn 0x120/0x128 -> Vd 0x110/0x118 offset walk.
+    #[test]
+    fn sh434_shl_64_two_lane_load_shift_store() {
+        let b = tr_bytes(Inst::SimdShl { rd: 0, rn: 1, esize: 8, shift: 1 });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x83, 0x20, 0x01, 0x00, 0x00, // mov rax,[rbx+0x120]  Vn[0]
+            0x48, 0xc1, 0xe0, 0x01,                   // shl rax,1
+            0x48, 0x89, 0x83, 0x10, 0x01, 0x00, 0x00, // mov [rbx+0x110],rax  Vd[0]
+            0x48, 0x8b, 0x83, 0x28, 0x01, 0x00, 0x00, // mov rax,[rbx+0x128]  Vn[1]
+            0x48, 0xc1, 0xe0, 0x01,                   // shl rax,1
+            0x48, 0x89, 0x83, 0x18, 0x01, 0x00, 0x00, // mov [rbx+0x118],rax  Vd[1]
+        ]);
+        assert!(!b.windows(4).any(|w| w == [0x48, 0xc1, 0xe8, 0x01]), "shl must NOT emit shr");
+        assert!(!b.windows(4).any(|w| w == [0x48, 0xc1, 0xf8, 0x01]), "shl must NOT emit sar");
+    }
+
+    // SimdShr signed (sshr) esize=8: each 64-bit lane `mov_load64` ->
+    // `sar rax,shift` (48 C1 F8 02, arithmetic) -> store. Full-buffer pin of
+    // the 2-lane body: the F8 (sar) opcode byte is the signed-vs-unsigned
+    // discriminator (ushr uses E8).
+    #[test]
+    fn sh434_sshr_64_signed_arithmetic_shift() {
+        let b = tr_bytes(Inst::SimdShr { rd: 0, rn: 1, esize: 8, shift: 2, unsigned: false });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x83, 0x20, 0x01, 0x00, 0x00, // mov rax,[rbx+0x120]  Vn[0]
+            0x48, 0xc1, 0xf8, 0x02,                   // sar rax,2  (arithmetic)
+            0x48, 0x89, 0x83, 0x10, 0x01, 0x00, 0x00, // mov [rbx+0x110],rax  Vd[0]
+            0x48, 0x8b, 0x83, 0x28, 0x01, 0x00, 0x00, // mov rax,[rbx+0x128]  Vn[1]
+            0x48, 0xc1, 0xf8, 0x02,                   // sar rax,2
+            0x48, 0x89, 0x83, 0x18, 0x01, 0x00, 0x00, // mov [rbx+0x118],rax  Vd[1]
+        ]);
+        assert!(!b.windows(4).any(|w| w == [0x48, 0xc1, 0xe8, 0x02]), "sshr must NOT emit logical shr");
+    }
+
+    // SimdShr unsigned (ushr) esize=8: `mov_load64` -> `shr rax,2` (48 C1 E8
+    // 02, logical) -> store. The E8 (shr) vs F8 (sar) opcode byte is the
+    // signed-vs-unsigned discriminator.
+    #[test]
+    fn sh434_ushr_64_unsigned_logical_shift() {
+        let b = tr_bytes(Inst::SimdShr { rd: 0, rn: 1, esize: 8, shift: 2, unsigned: true });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x83, 0x20, 0x01, 0x00, 0x00, // mov rax,[rbx+0x120]
+            0x48, 0xc1, 0xe8, 0x02,                   // shr rax,2  (logical)
+            0x48, 0x89, 0x83, 0x10, 0x01, 0x00, 0x00, // mov [rbx+0x110],rax
+            0x48, 0x8b, 0x83, 0x28, 0x01, 0x00, 0x00, // mov rax,[rbx+0x128]
+            0x48, 0xc1, 0xe8, 0x02,                   // shr rax,2
+            0x48, 0x89, 0x83, 0x18, 0x01, 0x00, 0x00, // mov [rbx+0x118],rax
+        ]);
+        assert!(!b.windows(4).any(|w| w == [0x48, 0xc1, 0xf8, 0x02]), "ushr must NOT emit arithmetic sar");
+    }
+
+    // SimdShr esize=4 signed (sshr) MUST sign-extend the 32-bit element to 64
+    // BEFORE the arithmetic shift (movsxd rax,eax = 48 63 C0 then sar) so a
+    // negative element polls its sign into the high bits; the unsigned form
+    // must NOT (movzx load, shr E8, no movsxd). A zero-extended negative
+    // element under an arithmetic shift becomes positive -> sign-bit flub.
+    #[test]
+    fn sh434_shr_signed_movsxd_before_sar_unsigned_never() {
+        let s = tr_bytes(Inst::SimdShr { rd: 0, rn: 1, esize: 4, shift: 1, unsigned: false });
+        assert!(s.windows(3).any(|w| w == [0x48, 0x63, 0xc0]), "sshr .4s/2s must movsxd the element before sar");
+        assert!(s.windows(4).any(|w| w == [0x48, 0xc1, 0xf8, 0x01]), "sshr element uses arithmetic sar");
+        let u = tr_bytes(Inst::SimdShr { rd: 0, rn: 1, esize: 4, shift: 1, unsigned: true });
+        assert!(!u.windows(3).any(|w| w == [0x48, 0x63, 0xc0]), "ushr must NOT sign-extend (zero-extend then logical shr)");
+        assert!(u.windows(4).any(|w| w == [0x48, 0xc1, 0xe8, 0x01]), "ushr uses logical shr");
+        assert!(!u.windows(4).any(|w| w == [0x48, 0xc1, 0xf8, 0x01]), "ushr must NOT use sar");
+    }
+
+    // SimdShr shift>=esize-bits guard: esize=1 (byte), shift=8 >= 8 bits.
+    // x86 imm shifts clamp to the 64-bit width (shift amounts 64-255 are
+    // masked), so a large guest shift that empties the element must be
+    // synthesized: unsigned UNSIGNED all-zeros (xor rax,rax = 48 31 C0),
+    // signed all-ones sign-fill (sar rax,63 = 48 C1 F8 3F). The guard is the
+    // discriminator between the two.
+    #[test]
+    fn sh434_shr_oversize_guard_unsigned_zero_signed_signfill() {
+        let u = tr_bytes(Inst::SimdShr { rd: 0, rn: 1, esize: 1, shift: 8, unsigned: true });
+        assert!(u.windows(3).any(|w| w == [0x48, 0x31, 0xc0]), "ushr overflowed element must xor to 0");
+        assert!(!u.windows(4).any(|w| w == [0x48, 0xc1, 0xf8, 0x3f]), "unsigned must NOT sign-fill");
+        let s = tr_bytes(Inst::SimdShr { rd: 0, rn: 1, esize: 1, shift: 8, unsigned: false });
+        assert!(s.windows(4).any(|w| w == [0x48, 0xc1, 0xf8, 0x3f]), "sshr overflowed element must sign-fill all-ones (sar,63)");
+        assert!(!s.windows(3).any(|w| w == [0x48, 0x31, 0xc0]), "signed must NOT zero the overflowed element");
+        // both preserve the 8-bit element sign/zero extension before the guard
+        assert!(u.windows(3).any(|w| w == [0x0f, 0xb6, 0x83]), "ushr .8b zero-extends byte lane (movzx)");
+        assert!(s.windows(4).any(|w| w == [0x48, 0x0f, 0xbe, 0x83]), "sshr .8b sign-extends byte lane (movsx)");
+    }
+
+    // SimdShrAcc (usra here, unsigned esize=8 shift=1): Vd_i += Vn_i >> imm.
+    // Full-buffer pin of lane 0: load Vn -> logical shr -> load the Vd
+    // accumulator into RCX AFTER the shift -> add rcx,rax (48 01 C1) ->
+    // re-store to Vd. The accumulate ordering (read-before-add, add after
+    // shift) is the usra/ssra-vs-plain-shift discriminator.
+    #[test]
+    fn sh434_simdshracc_accumulates_after_shift() {
+        let b = tr_bytes(Inst::SimdShrAcc { rd: 0, rn: 1, esize: 8, shift: 1, unsigned: true });
+        // lane 0 only: load Vn[0] @0x120 -> shr 1 -> load Vd[0] @0x110 into RCX
+        // -> add rcx,rax -> store [rbx+0x110]
+        let want_head = [
+            0x48, 0x8b, 0x83, 0x20, 0x01, 0x00, 0x00, // mov rax,[rbx+0x120]  Vn[0]
+            0x48, 0xc1, 0xe8, 0x01,                   // shr rax,1  (shifted source)
+            0x48, 0x8b, 0x8b, 0x10, 0x01, 0x00, 0x00, // mov rcx,[rbx+0x110]  Vd[0] accumulator
+            0x48, 0x01, 0xc1,                         // add rcx,rax  (accumulate)
+            0x48, 0x89, 0x8b, 0x10, 0x01, 0x00, 0x00, // mov [rbx+0x110],rcx  (re-store Vd[0])
+        ];
+        assert_eq!(&b[0..want_head.len()], &want_head[..]);
+        // the accumulate add must come after the shift of Vn (never before)
+        let shr = b.windows(4).position(|w| w == [0x48, 0xc1, 0xe8, 0x01]).unwrap();
+        let add = b.windows(3).position(|w| w == [0x48, 0x01, 0xc1]).unwrap();
+        assert!(shr < add, "shift must happen before the accumulate add");
+    }
 }
