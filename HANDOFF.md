@@ -1,5 +1,30 @@
 # Open Sober — Agent Handoff
 
+## SH390 (Sep 20, 2026, hermes-worker): byte-anchor the SH345 render-plane flake's exact fault leaf (memcpy16 into guest .text 0x102859fd0) — a real determinism fix target for the HARD-GATE reproducible artifact, replacing the retry-hide coin-flip
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified
+green LIVE at this exact HEAD (capture_taskv4_frame.sh attempt 1 = 24 real task-driven
+frames `present swap Ok(0x1)`, 197 node pops, 0 json abort, 0 crash; capture_sh304 =
+session-gated producer correctly INERT 0 GATED / 0 fabricated frames); workspace green
+(cargo test --workspace EXIT 0, 25 test binaries, 444 arm64jit lib tests). All named
+Route-B cones remain measured-closed (incl. the SH384 manufactured-manager wiring
+target = SH385-closed LSM re-tread, NOT re-driven). SH390 takes the ONE genuinely-open
+in-scope defect: the SH345 ~1/25 SIGSEGV in the primary frame deliverable was recorded
+in prose only ("store into guest .text 0x102859fd0") and mitigated by capture-script
+RETRY, not root-cause. New real-image hermetic `sh390_render_plane_memcpy16_fault_leaf_pinned`
+(arm64jit lib 443->444) byte-pins the exact fault leaf: 0x102859fd0 = a memcpy16 guard
+(`cmp x0,x1; b.ne; cbz x1; cbz x0; ldr q0,[x1]; str q0,[x0]; ret`), crash store @file
+0x2859fe4 — the copy dest computes to a PROT_EXEC guest .text addr from the
+activity-lifecycle divergence arm (drain/presenter quirk), the same run-variable
+live-object class SH346/353. This turns the retry-hidden coin-flip into a pinned,
+guardable leaf (ret-to-leaf or zero-x1 in the drain-entry window = a real determinism
+fix, deliberately not implemented this cycle — needs a live JIT_REGION_WATCH first to
+avoid masking a real walker copy). NO production path / JIT hook default / guest byte
+touched (pure pin, adds coverage). Do-not-re-tread unchanged (setDataModelToCurrent
+SH388, LSM skips, EC reader-gate, 0x258b5d8/SetInitParams, window-attach real, ALooper,
+governor full-ladder, -9 string, map-header repair, once-lambda store, SH267 node-cell).
+Route-B live-DM gate UNCHANGED (DM-root [0x106a68818]=0, MH_* false, AppBridgeV2 0).
+SH174 capture-latch stays the single forward observer.
+
 ## SH389 (Sep 20, 2026, hermes-worker): correct a false doc claim in the recon-v3 §A session-gated producer's live-DM gate + re-verify all recon-v3 deliverables + the SH388 wall green at this exact HEAD
 Single-agent (cone suppressed). Recon-v3 immediate-priority deliverables re-verified green at this HEAD
 (no regression): capture_taskv4_frame.sh attempt 1 = 24 real task-driven frames `present swap Ok(0x1)`,

@@ -9850,6 +9850,47 @@ mod tests {
     }
 
     #[test]
+    fn sh390_render_plane_memcpy16_fault_leaf_pinned() {
+        // SH390 (real-image): byte-anchor the SH345 render-plane flake's exact fault leaf so
+        // the ~1/25 run-variable SIGSEGV in capture_taskv4_frame.sh is no longer a fuzzy
+        // prose record ("store into guest .text 0x102859fd0 from a non-guest thread") but a
+        // pinned, replayable classification. Disasm: guest 0x102859fd0 (file 0x2859fd0) is a
+        // small memcpy16 guard leaf — `cmp x0,x1; b.ne out; cbz x1; cbz x0; ldr q0,[x1];
+        // str q0,[x0]; ret`. The `str q0,[x0]` @0x2859fe4 is the crash store: when the drain
+        // quirks into the activity-lifecycle divergence arm, x0 is an uninitialized pointer
+        // that computes to a guest .text address (prot EXEC), so the copy faults. Anchoring the
+        // leaf lets a future targeted guard either (a) verify the copy lands off-code before the
+        // store, or (b) RET the leaf in the narrow drain-entry window — a fix, not a retry-hide,
+        // for the artifact the HARD GATE (reproducible capture) depends on. Index by FILE OFFSET.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let word_at = |vaddr: u64| -> u32 {
+                let off = vaddr as usize;
+                let b = &img[off..off + 4];
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            };
+            // memcpy16 guard leaf at the SH345 crash site.
+            assert_eq!(word_at(0x2859fd0), 0xeb01001f, "sh390 leaf cmp x0,x1");
+            assert_eq!(word_at(0x2859fd4), 0x54000160, "sh390 leaf b.ne out");
+            assert_eq!(word_at(0x2859fd8), 0xb40000a1, "sh390 leaf cbz x1");
+            assert_eq!(word_at(0x2859fdc), 0xb4000140, "sh390 leaf cbz x0");
+            assert_eq!(word_at(0x2859fe0), 0x3dc00020, "sh390 leaf ldr q0,[x1]");
+            assert_eq!(word_at(0x2859fe4), 0x3d800000, "sh390 leaf str q0,[x0] (THE SH345 fault store into .text)");
+            assert_eq!(word_at(0x2859fe8), 0xd65f03c0, "sh390 leaf ret");
+            for (g, name) in [
+                (0x2859fd0u64, "leaf-entry"),
+                (0x2859fe4u64, "crash-store"),
+            ] {
+                assert!(g & 3 == 0, "sh390 {name} {g:#x} 4-aligned");
+            }
+            eprintln!("sh390 render-plane memcpy16 fault leaf pinned (0x102859fd0 cmp/ldr q0,[x1]/str q0,[x0]/ret; crash store @0x2859fe4) — SH345 flake is byte-anchored for a targeted fix");
+        } else {
+            eprintln!("sh390 real-image guard: no real libroblox.so, skipping render-plane fault-leaf pins");
+        }
+    }
+
+    #[test]
     fn sh385_lsm_reader_value_slot_and_poolmove_base_pinned() {
         // SH385 (real-image): byte-anchor the FULL SH285 reader/pool-move mechanism that the
         // persistence-lane terminal (guestpc=0x101db1b08) faults on, refining SH285's "reader/pop
