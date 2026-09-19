@@ -7566,4 +7566,131 @@ mod tests {
         let b = tr_bytes(Inst::BCond { cond: 0, imm: 8 });
         assert_eq!(&b[b.len() - 6..], &[0x0f, 0x84, 0x00, 0x00, 0x00, 0x00], "je rel32");
     }
+
+    // SH428: hermetic coverage of the load/store codegen families (LdStrImm —
+    // the single most load-bearing translation: every guest memory access).
+    // decode.rs pins the decode, jit.rs pins runtime, but the exact bytes for
+    // the load/store emission were untested. These pin the critical semantic
+    // discriminators: the XZR-source store (`str xzr,[..]` reads zero, never
+    // the SP-slot), zero- vs sign-extending loads, the scaled-offset form, and
+    // the LEAGUES-of-use `cmn` carry-borrow flag pack.
+    //
+    // Byte-map (x86): [RBX] = CpuState base, slot g = [RBX+g*8], g=1 -> 0x08.
+
+    // ldr x0,[x1] (64-bit, scaled-offset 0): load [x1] into RAX, store slot0.
+    #[test]
+    fn sh428_ldr_64_scaled_offset_zero() {
+        let b = tr_bytes(Inst::LdStrImm { rt: 0, rn: 1, imm: 0, size: 8, ld: true, sext: false });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x53, 0x08, // mov rdx, [rbx+0x08]  (x1 = addr)
+            0x48, 0x8b, 0x02, // mov rax, [rdx]  (load [x1])
+            0x48, 0x89, 0x03, // mov [rbx], rax  (store x0)
+        ]);
+    }
+
+    // str x0,[x1] (64-bit): addr in rdx, load source slot0, store [rdx].
+    #[test]
+    fn sh428_str_64_reads_source_slot() {
+        let b = tr_bytes(Inst::LdStrImm { rt: 0, rn: 1, imm: 0, size: 8, ld: false, sext: false });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x53, 0x08, // mov rdx, [rbx+0x08]  (x1 = addr)
+            0x48, 0x8b, 0x03, // mov rax, [rbx]  (x0 source)
+            0x48, 0x89, 0x02, // mov [rdx], rax  (store)
+        ]);
+    }
+
+    // str xzr,[x1] (64-bit): source register x31 = XZR = ZERO, must NOT read the
+    // SP slot. Pin: `mov rax,0` (not a [rbx+0xf8] load), then store [rdx].
+    #[test]
+    fn sh428_str_xzr_stores_zero_not_sp() {
+        let b = tr_bytes(Inst::LdStrImm { rt: 31, rn: 1, imm: 0, size: 8, ld: false, sext: false });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x53, 0x08, // mov rdx, [rbx+0x08]  (addr)
+            0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rax, 0 (XZR)
+            0x48, 0x89, 0x02, // mov [rdx], rax
+        ]);
+    }
+
+    // str xzr,[x1] (32-bit): same XZR-zero source but the 32-bit store (89 02).
+    #[test]
+    fn sh428_str_xzr_32_stores_zero_not_sp_w32() {
+        let b = tr_bytes(Inst::LdStrImm { rt: 31, rn: 1, imm: 0, size: 4, ld: false, sext: false });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x53, 0x08, // mov rdx, [rbx+0x08]
+            0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rax, 0 (XZR)
+            0x89, 0x02, // mov [rdx], eax (32-bit store)
+        ]);
+    }
+
+    // ldr w0,[x1] (32-bit, non-sext): mov_load32 zero-extends into RAX, then
+    // stg_if_writable stores the full 64-bit RAX to slot0.
+    #[test]
+    fn sh428_ldr_32_zero_extends() {
+        let b = tr_bytes(Inst::LdStrImm { rt: 0, rn: 1, imm: 0, size: 4, ld: true, sext: false });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x53, 0x08, // mov rdx, [rbx+0x08]
+            0x8b, 0x02, // mov eax, [rdx]  (w zero-extends to 64-bit RAX)
+            0x48, 0x89, 0x03, // mov [rbx], rax (full 64-bit zero-extended store)
+        ]);
+    }
+
+    // ldrsb x0,[x1,#1] (byte sign-extend, scaled offset 1): lea addr, movzx
+    // byte, then shl/sar 56 (8->64 sign-extend), store slot0.
+    #[test]
+    fn sh428_ldrsb_scaled_offset_sign_extends() {
+        let b = tr_bytes(Inst::LdStrImm { rt: 0, rn: 1, imm: 1, size: 1, ld: true, sext: true });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x53, 0x08, // mov rdx, [rbx+0x08]  (addr)
+            0x48, 0x8d, 0x52, 0x01, // lea rdx, [rdx+1]  (scaled offset 1*1)
+            0x0f, 0xb6, 0x02, // movzx eax, byte [rdx]
+            0x48, 0xc1, 0xe0, 0x38, // shl rax, 56
+            0x48, 0xc1, 0xf8, 0x38, // sar rax, 56  (sign-extend byte -> 64)
+            0x48, 0x89, 0x03, // mov [rbx], rax
+        ]);
+    }
+
+    // ldrsw x0,[x1,#4] (word sign-extend, scaled offset 1 -> 4 bytes): lea,
+    // mov_load32, movsxd (48 63 c0) 32->64, store.
+    #[test]
+    fn sh428_ldrsw_scaled_offset_sign_extends_word() {
+        let b = tr_bytes(Inst::LdStrImm { rt: 0, rn: 1, imm: 1, size: 4, ld: true, sext: true });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x53, 0x08, // mov rdx, [rbx+0x08]
+            0x48, 0x8d, 0x52, 0x04, // lea rdx, [rdx+4]  (scaled offset 1*4)
+            0x8b, 0x02, // mov eax, [rdx]
+            0x48, 0x63, 0xc0, // movsxd rax, eax  (32->64 sign)
+            0x48, 0x89, 0x03, // mov [rbx], rax
+        ]);
+    }
+
+    // ldr x0,[x1,#16] (64-bit, scaled offset 2 -> 16 bytes): lea then load.
+    #[test]
+    fn sh428_ldr_64_scaled_offset_16() {
+        let b = tr_bytes(Inst::LdStrImm { rt: 0, rn: 1, imm: 2, size: 8, ld: true, sext: false });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x53, 0x08, // mov rdx, [rbx+0x08]
+            0x48, 0x8d, 0x52, 0x10, // lea rdx, [rdx+16]  (scaled offset 2*8)
+            0x48, 0x8b, 0x02, // mov rax, [rdx]
+            0x48, 0x89, 0x03, // mov [rbx], rax
+        ]);
+    }
+
+    // cmn x0,#0x10000 (64-bit, non-sub shift:12, S=1): the qemu-verified case
+    // `x > 0xffffffffffff0000` compiles to `cmn x,#0x10000; b.ls` — the ADD
+    // carries (ARM C=1, ls=false) so stored C must be !carry. Pin: load x0,
+    // add 0x10000 (81 c0 00 00 00 01), cmc (f5), then the nzcv pack ending with
+    // the C-store `89 93 08 01 00 00` + caller-reg restores.
+    #[test]
+    fn sh428_cmn_shifted_carry_borrow_pack() {
+        let b = tr_bytes(Inst::AddSubImm { rd: 31, rn: 0, imm12: 0x1000, shift12: true, sub: false, sf: true, s: true });
+        // load x0 (slot0): mov rax, [rbx]
+        assert_eq!(&b[0..3], &[0x48, 0x8b, 0x03]);
+        // add rax, imm32 (imm12 0x1000 << 12 = 0x01000000): 48 81 c0 + LE imm32
+        assert_eq!(&b[3..10], &[0x48, 0x81, 0xc0, 0x00, 0x00, 0x00, 0x01]);
+        // cmc (the ADDS carry-borrow complement)
+        assert_eq!(&b[10], &0xf5);
+        // nzcv pack: pushfq (9c) ... ends with C-store `89 93 08 01 00 00`
+        assert_eq!(&b[b.len() - 9..b.len() - 3], &[0x89, 0x93, 0x08, 0x01, 0x00, 0x00]);
+        assert_eq!(&b[b.len() - 3..], &[0x5a, 0x59, 0x58], "caller regs restored");
+    }
 }
