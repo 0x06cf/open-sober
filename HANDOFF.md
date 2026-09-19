@@ -1,5 +1,39 @@
 # Open Sober — Agent Handoff
 
+## SH423 (Sep 19, 2026, hermes-worker): the durable persistence contract (objective 2b "remembers sign-in") proven at the fsmap layer — a REMAPPED guest datastore path lands as a REAL on-disk host file, survives the in-memory override being cleared (simulated restart), and is readable back through a fresh independent remap; plus the 5-root longest-prefix precedence + pass-through rules pinned. fsmap.rs had ZERO tests of its own logic (only jit.rs harnessed it for R1 staging); SH423 delivers the module's own hermetic pair
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+re-verified green at this exact HEAD first (capture_taskv4_frame.sh attempt 1:
+24 real task-driven frames `present swap Ok(0x1)`, 197 node pops, 0 json abort,
+0 crash). Workspace green (cargo test --workspace EXIT 0; arm64jit lib 482/0
+incl. 2 new sh423 hermetics; cargo build --example elfjit OK, 0 errors).
+Production code ONLY in fsmap.rs (off the 1MiB hooks, pure host-side remap —
+no guest byte / JIT hook default touched); jit.rs/elfjit.rs byte-unchanged.
+- fsmap.rs `#[cfg(test)] mod tests`: `FSMAP_ROOT_LOCK` (serializes the two
+  tests against the process-global override cell; a first-run parallel race
+  where they clobbered each other's override was real and is fixed) +
+  `sh423_durable_datastore_write_survives_remap_restart` (remap
+  `/data/user/0/com.roblox.client/databases/rbx-session.db` -> preserve guest
+  dirs + stay under root; `ensure_parents` scaffolds the deep chain so an
+  O_CREAT never ENOENTs; forfeits the value to real disk; clears override to
+  None = simulated restart; re-arms same root; fresh `remap_path`; reads the
+  EXACT bytes back) + `sh423_remap_precedence_and_passthrough` (longest-prefix
+  `/storage/emulated` before `/storage`; `/proc`/`/system` + relative + null
+  pass through; fully-inactive state where even `/data` passes through).
+- MEASURED: 2/2 hermetics pass, stable 3/3; full workspace 0 failed. BEFORE the
+  lock, parallel-run intermittently failed under development (both tests mutated
+  the shared override) — the lock makes each own the flag, deterministic green.
+- Honest: NOT a DM (SH415 do-init probe under the complete substrate re-confirms
+  DM-root [0x106a68818]=0x0, once-guard bit0=1, once-lambda let to run, MH_*
+  latch true, AppBridgeV2 genuine vt 0x1063a3410 -> LIVE DM=false — Route-B
+  live-DM structural gate UNCHANGED). This is BUILD-THE-RUNTIME COVERAGE
+  completion: the "remembers sign-in" persistence contract is now pinned
+  end-to-end headlessly (remap -> real file -> survive restart -> read-back),
+  a genuine gap (fsmap.rs had zero self-tests; jit.rs only used it for R1
+  staging). No re-treads (not an LSM/DM/store-watch seam; distinct from sh351/
+  sh354 R1-staging tests).
+- Files: docs/frontier-sh423-fsmap-durable-persistence.md +
+  crates/arm64jit/src/fsmap.rs. Commit (pending).
+
 ## SH422 (Sep 19, 2026, hermes-worker): a reusable guest frame-pointer chain WALKER + one-shot default-inert guard (JIT_ROUTEB_LSM_BT=1) at the persistence-lane POOL-POP entry 0x101d9a5a0 NAMES the caller chain that drains do-init into the standing SH285/SH341 LSM lane — the loop only ever logged the terminal guestpc, never the call path INTO the lane (the MIGRATION-directive hunt's missing first datum)
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 re-verified green at this exact HEAD first (capture_taskv4_frame.sh attempt 1:

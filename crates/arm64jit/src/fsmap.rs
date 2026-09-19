@@ -166,3 +166,123 @@ pub fn ensure_parents(path: Option<&RemappedPath>, create: bool) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serialize fsmap-root tests: each mutates the process-global override
+    /// cell (`set_root_for_tests` / `override_root`), so parallel runs would
+    /// clobber each other mid-test (mirrors jit.rs's FS_ROOT_LOCK).
+    static FSMAP_ROOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// SH423: the durable persistence contract (objective 2b "remembers
+    /// sign-in") is proven at the fsmap layer: a guest datastore path under a
+    /// mapped Android root resolves to a REAL host file on disk, and a value
+    /// written there survives a simulated restart (override cleared) and is
+    /// readable back through a fresh, independent remap. This is the actual
+    /// persistence hook the real client's session/cookie store lands on; it was
+    /// exercised nowhere (jit.rs only harnesses fsmap for R1 CoreScript staging).
+    #[test]
+    fn sh423_durable_datastore_write_survives_remap_restart() {
+        let _g = FSMAP_ROOT_LOCK.lock().unwrap();
+        // A persistent HOST root that must outlive the writes (real disk dir).
+        let root = std::env::temp_dir().join(format!("os-fsmap-durable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        set_root_for_tests(root.clone());
+
+        // The guest path the real client would open to persist its session
+        // datastore (contacts fsmap's longest-prefix /data root).
+        let guest = b"/data/user/0/com.roblox.client/databases/rbx-session.db\0";
+        let rbp = remap_path(guest.as_ptr() as *const libc::c_char)
+            .unwrap_or_else(|| panic!("guest datastore path must remap"));
+
+        // Proving parent scaffolding: the deep /data/user/0/... chain must be
+        // created so an O_CREAT-style open never ENOENTs (SH-fsmap contract).
+        ensure_parents(Some(&rbp), true);
+        let host = rbp.host_path().to_path_buf();
+        assert!(
+            host.starts_with(&root),
+            "host path must stay under the configured root: {host:?}"
+        );
+        assert!(
+            host.ends_with("data/user/0/com.roblox.client/databases/rbx-session.db"),
+            "mapped path must preserve the guest dirs: {host:?}"
+        );
+
+        // Write the persisted value as the engine would (a real file on disk).
+        const VALUE: &[u8] = b"open-sober|remembered-session|0x06cf";
+        std::fs::write(&host, VALUE).unwrap();
+        // The write must be ON DISK (present even with the in-memory override gone).
+        assert!(
+            std::fs::metadata(&host).is_ok() && std::fs::metadata(&host).unwrap().len() == VALUE.len() as u64,
+            "persisted value must land as a real host file on disk"
+        );
+
+        // Simulate a RESTART: the runtime is a fresh process that re-derives
+        // its root from env, so the in-memory override is entirely cleared
+        // (back to None). The value must survive purely because it is a real
+        // file already on disk under the root.
+        *override_root().lock().unwrap() = None;
+        // Re-arm the SAME on-disk root via a fresh override (fresh boot's root).
+        set_root_for_tests(root.clone());
+
+        // A FRESH, independent remap resolves the host file again and reads the
+        // exact value back — the "remembers sign-in" round-trip.
+        let rbp2 = remap_path(guest.as_ptr() as *const libc::c_char)
+            .unwrap_or_else(|| panic!("re-remap of guest datastore path must resolve"));
+        let read_back = std::fs::read(rbp2.host_path())
+            .unwrap_or_else(|e| panic!("value must survive restart + re-remap: {e} path={:?}", rbp2.host_path()));
+        assert_eq!(
+            read_back, VALUE,
+            "durable round-trip: written value must read back after simulated restart"
+        );
+
+        set_root_for_tests(PathBuf::new()); // clear override for later tests
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// SH423: the 5-root longest-prefix remap precedence — `/storage/emulated`
+    /// must be handled before the shorter `/storage`, and only ABSOLUTE paths
+    /// under a mapped writable root are rewritten; relative paths, nulls, and
+    /// unmapped absolute roots (`/proc`, `/system`) pass through unchanged.
+    #[test]
+    fn sh423_remap_precedence_and_passthrough() {
+        let _g = FSMAP_ROOT_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!("os-fsmap-prec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        set_root_for_tests(root.clone());
+
+        // Longest-prefix: /storage/emulated before /storage.
+        let ge = b"/storage/emulated/0/Android/data/com.roblox.client\0";
+        let re = remap_path(ge.as_ptr() as *const libc::c_char).unwrap();
+        assert!(re.host_path().starts_with(&root.join("storage/emulated")),
+            "/storage/emulated must map under storage/emulated: {:?}", re.host_path());
+        // Plain /storage (shorter prefix) is still a distinct dir.
+        let gs = b"/storage/foo\0";
+        let rs = remap_path(gs.as_ptr() as *const libc::c_char).unwrap();
+        assert!(rs.host_path().starts_with(&root.join("storage/foo")));
+
+        // Unmapped absolute roots pass through.
+        let gp = b"/proc/self/maps\0";
+        assert!(remap_path(gp.as_ptr() as *const libc::c_char).is_none(),
+            "/proc is not a writable Android root");
+        let gsys = b"/system/build.prop\0";
+        assert!(remap_path(gsys.as_ptr() as *const libc::c_char).is_none());
+
+        // Relative + null pass through.
+        assert!(remap_path(b"relative/path\0".as_ptr() as *const libc::c_char).is_none());
+        assert!(remap_path(std::ptr::null::<libc::c_char>()).is_none());
+
+        // No root configured -> inactive entirely (override cleared to None,
+        // env unset in the harness -> active_root() is None).
+        *override_root().lock().unwrap() = None;
+        let gd = b"/data/foo\0";
+        assert!(remap_path(gd.as_ptr() as *const libc::c_char).is_none(),
+            "with no root, even /data passes through unchanged");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
