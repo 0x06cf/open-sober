@@ -7190,6 +7190,12 @@ Inst::SimdMovEl { rd, rn, esize, index, signed, is_x } => {
 mod tests {
     use super::*;
 
+    // The two store-watch hermetics flip the module-global CANARY_STORE_WATCH
+    // static, so they must be serialized or they race in parallel-test runs
+    // (one test's ON clobbers the other's OFF phase). Serialize via a static
+    // mutex so each test owns the flag exclusively regardless of scheduling.
+    static CANARY_WATCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     // SH106-NEXT hermetic: the store-watch is DEFAULT-INERT — with the atomic
     // flag OFF the pure emit helper adds zero bytes to a store's block (the
     // product path stays byte-identical), and the host fn returns 0 (observes
@@ -7198,6 +7204,7 @@ mod tests {
     #[test]
     fn canary_store_watch_emit_is_inert_off_and_emits_on() {
         use std::sync::atomic::Ordering;
+        let _guard = CANARY_WATCH_TEST_LOCK.lock().unwrap();
         // Make sure the lazy env sync can't fight the test override.
         set_canary_store_watch_test(false);
         let _ = canary_store_watch_enabled(); // run the env sync (default off here)
@@ -7228,6 +7235,7 @@ mod tests {
     #[test]
     fn canary_store_watch_never_removes_the_store() {
         use std::sync::atomic::Ordering;
+        let _guard = CANARY_WATCH_TEST_LOCK.lock().unwrap();
         CANARY_STORE_WATCH.store(true, Ordering::Relaxed);
         set_canary_store_watch_test(true);
         let mut buf = crate::x86::CodeBuf::new();
