@@ -1,5 +1,41 @@
 # Open Sober — Agent Handoff
 
+## SH465 (Sep 20, 2026, hermes-worker): make the session-substrate completion metric outcome-aware — the runtime now reports true session-boot health (14/16 completed), not a return-value filter (11/16)
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified
+green at this HEAD first (capture_taskv4_frame.sh: 24 real task-driven frames `present
+swap Ok(0x1)`, 196 node pops, 0 json abort, 0 crash, EXIT 0; sh415 do-init capture
+re-confirms the Route-B baseline: once-guard seeded, DM-root [0x106a68818]=0x0 -> LIVE
+DM = false, unchanged). Workspace green (cargo test --workspace EXIT 0; arm64jit lib
+675->676 incl. 1 new sh465 test; cargo build --workspace + --example elfjit OK).
+Production code only in session.rs (off the 1MiB hooks; jit.rs/elfjit.rs untouched).
+- **The observability defect fixed:** the SH400 substrate reported
+  `substrate complete: N/16 atoms returned non-zero Ok`. On the real binary that read
+  **11/16**, yet **14/16 atoms genuinely completed jit_run and returned** — because the
+  metric only counted non-zero returns, so three VOID JNI natives
+  (initAppShellReporter / setActive / nativeActivity_onEngineSettingsReceived, all
+  legitimate `Ok(0x0)`) were counted as failures. The 11/16 number understated a
+  healthy session boot and hid that only the two documented pre-existing nativeInit
+  "outside image" atoms (nativeInitializeNativeFlags 0x10232048c, V2InitWithParams
+  0x102365c54) truly fault.
+- `session.rs`: new `DriveOutcome` enum (Stopped vs Completed(u64), with
+  `.completed()` as the health bit); `drive_atom` now returns `DriveOutcome` (internal
+  only); the substrate tracks BOTH `completed` (true health) and `nonzero` (legacy
+  sub-count) and now summaries `completed/total completed jit_run (nonzero non-zero
+  return); stopped/total stopped` — so a real run reads 14/16 complete (11 non-zero),
+  2/16 stopped instead of hiding the void completions.
+- New hermetic `sh465_substrate_completion_is_outcome_aware`: pins Completed(0) counts
+  as a completion (void JNI natives ARE completions), only Stopped is not counted, and
+  the real 16-atom shape (2 documented nativeInit Stopped + 11 non-zero + 3 void
+  Completed) reads 14/11. Pure enum semantics, no jit_run, deterministic.
+- Honest: NOT a DM / NOT a live-DM step (Route-B gate UNCHANGED). This is a
+  runtime-observability correctness fix — the runtime's own health number must be
+  correct so verdicts derived from it are sound (the "measured verdict, not guess"
+  discipline). No guest byte, no env, no ladder-path change. Not a re-tread: prior
+  cycles recorded the 11/16 baseline but never fixed the Completed(0) vs Stopped
+  conflation. No re-treads.
+- Files: docs/frontier-sh465-session-outcome-metric.md + crates/arm64jit/src/session.rs
+  (DriveOutcome + drive_atom + substrate summary + test). Commit (SH465).
+
 ## SH464 (Sep 20, 2026, hermes-worker): promote the FMOD/AAudio AUDIO axis to a first-class driven substrate step (the SH418 input-twin) — real PCM -> real WAV sink
 Single-agent (cone suppressed). The SEP-18 "audio/input — each landed + green +
 committed" deliverable list is now CLOSED on the audio side: input was promoted

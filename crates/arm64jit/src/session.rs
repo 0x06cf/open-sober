@@ -107,9 +107,34 @@ pub fn substrate_args(name: &str, h: &SessionHandles) -> [u64; 8] {
     a
 }
 
+/// Outcome of driving one substrate atom. Distinguishes a TRUE completion of
+/// `jit_run` (the guest function returned, even with a legitimately-0 return
+/// value — e.g. the void JNI natives initAppShellReporter / setActive /
+/// nativeActivity_onEngineSettingsReceived all return Ok(0x0)) from a
+/// `jit_run` Err/stop (unresolvable pc / outside-image). The OLD metric only
+/// counted `r != 0` as success, which understated a healthy session boot
+/// (14/16 atoms complete) as 11/16 and hid that only the two documented
+/// pre-existing nativeInit "outside image" atoms truly fault.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DriveOutcome {
+    /// `jit_run` returned Err (run stopped before the guest function returned).
+    Stopped,
+    /// The guest function completed; carries its w0 return value (0 is valid).
+    Completed(u64),
+}
+
+/// Whether the atom completed (vs. stopped). The true session-boot health bit:
+/// a `Completed` atom ran its JIT body to return, regardless of its value.
+impl DriveOutcome {
+    pub fn completed(&self) -> bool {
+        matches!(self, DriveOutcome::Completed(_))
+    }
+}
+
 /// Drive one substrate atom through `jit_run` and report its Ok/Err + post-atom
-/// session observables. Returns the atom's Ok-return value (0 on Err or stop).
-/// Single serialized jit_run (SH55/64): caller must not nest concurrent drives.
+/// session observables. Returns the atom's completion outcome (not merely
+/// whether its return value was non-zero). Single serialized jit_run (SH55/64):
+/// caller must not nest concurrent drives.
 pub fn drive_atom(
     iimg: &[u8],
     ib: u64,
@@ -118,19 +143,19 @@ pub fn drive_atom(
     args: &[u64; 8],
     tpidr: u64,
     boot_sp: u64,
-) -> u64 {
+) -> DriveOutcome {
     let mut s = CpuState::new();
     s.tpidr = tpidr;
     s.x[31] = boot_sp;
     s.x[..8].copy_from_slice(args);
-    let r = match jit_run(iimg, ib, guest, &mut s as *mut CpuState) {
+    let oc = match jit_run(iimg, ib, guest, &mut s as *mut CpuState) {
         Err(e) => {
             eprintln!("[session-drive] {name}: stopped: {e}");
-            0
+            DriveOutcome::Stopped
         }
         Ok(r) => {
             eprintln!("[session-drive] {name}: returned Ok({r:#x})");
-            r
+            DriveOutcome::Completed(r)
         }
     };
     let nf = crate::jni::nativehelper_flags_loaded();
@@ -145,16 +170,20 @@ pub fn drive_atom(
     eprintln!(
         "[session-drive] {name} post: MH_FLAGS_LOADED={nf} MH_ENGINE_INITIALIZED={ni} MH_APP_READY={ar} MH_GAME_LOADED={gl} AppBridgeV2[0x106a705e8]=0x{abv:x}"
     );
-    r
+    oc
 }
 
 /// Drive the FULL ordered ROUTEB_SESSION_SUBSTRATE (16 atoms) on the single
-/// ladder thread. Returns the number of atoms that returned Ok(v!=0-stopped).
+/// ladder thread. Returns the number of atoms that COMPLETED `jit_run`
+/// (returned Ok; includes the void-JNI atoms returning 0 — the true
+/// session-boot health bit). A `Stopped` atom (jit_run Err, e.g. the two
+/// documented pre-existing nativeInit "outside image" atoms) is NOT counted.
 /// This is the runtime the elfjit `--v2boot-session-drive` rung invokes.
 pub fn drive_routeb_session_substrate(iimg: &[u8], ib: u64, tpidr: u64, boot_sp: u64) -> usize {
     let h = SessionHandles::build();
     let total = ROUTEB_SESSION_SUBSTRATE.len();
-    let mut ok = 0usize;
+    let mut completed = 0usize;
+    let mut nonzero = 0usize;
     eprintln!(
         "[session-drive] driving ordered session substrate ({} atoms; env=0x{:x} thiz=0x{:x})",
         total, h.env, h.thiz
@@ -177,8 +206,13 @@ pub fn drive_routeb_session_substrate(iimg: &[u8], ib: u64, tpidr: u64, boot_sp:
             atom.guest
         );
         let r = drive_atom(iimg, ib, atom.name, atom.guest, &args, tpidr, boot_sp);
-        if r != 0 {
-            ok += 1;
+        if r.completed() {
+            completed += 1;
+            if let DriveOutcome::Completed(v) = r {
+                if v != 0 {
+                    nonzero += 1;
+                }
+            }
         }
         // SH415: the EXECUTE-DO-INIT-GATES live-DM completion markers are the
         // runtime's single source of truth for whether the do-init world-build
@@ -262,8 +296,12 @@ pub fn drive_routeb_session_substrate(iimg: &[u8], ib: u64, tpidr: u64, boot_sp:
             drive_fmod_audio_drain(iimg, ib, tpidr, boot_sp, audio_drain_iters());
         }
     }
-    eprintln!("[session-drive] substrate complete: {ok}/{total} atoms returned non-zero Ok");
-    ok
+    eprintln!(
+        "[session-drive] substrate complete: {completed}/{total} atoms completed jit_run ({nonzero} non-zero return); {}/{} stopped",
+        total - completed,
+        total
+    );
+    completed
 }
 
 /// AUDIO_DRAIN_ITERS (default 8) for the SH464 FMOD/AAudio substrate step —
@@ -1131,6 +1169,57 @@ mod tests {
         let args_surf = substrate_args("V2UpdateSurfaceAppWithPlatformParams", &h);
         assert_ne!(args_surf[2], 0, "surface token absent");
         let _ = current_guest_tp(); // linker sanity: helper resolved
+    }
+
+    /// SH465: the substrate completion metric is OUTCOME-aware. The OLD metric
+    /// counted only `r != 0` as success, which understated a healthy session
+    /// boot: the void JNI natives (initAppShellReporter / setActive /
+    /// nativeActivity_onEngineSettingsReceived) complete jit_run with a
+    /// legitimate Ok(0x0) and were counted as failures, while only the two
+    /// documented pre-existing nativeInit "outside image" atoms truly stop.
+    /// This pins that Completed(0) counts as completed (the health bit) and
+    /// only a Stopped atom is not counted — pure enum semantics, no jit_run.
+    #[test]
+    fn sh465_substrate_completion_is_outcome_aware() {
+        // (1) A completed atom with a 0 return (void JNI native) IS a completion.
+        assert!(DriveOutcome::Completed(0).completed());
+        // (2) A completed atom with a non-zero return is also a completion
+        //     (covered; both Completed variants report true).
+        assert!(DriveOutcome::Completed(0x3e8).completed());
+        // (3) ONLY a Stopped atom is not a completion.
+        assert!(!DriveOutcome::Stopped.completed());
+        // (4) Stopped != Completed(0): the whole point of the fix — the old
+        //     metric conflated them (both were `0`); a run where 14 atoms
+        //     completed (incl. void 0-returns) and 2 stopped must read 14, not
+        //     11, so the driver reports the true session-boot health.
+        let outcomes = [
+            DriveOutcome::Completed(0x3e8), // nativeGameGlobalInit
+            DriveOutcome::Stopped,          // nativeInit "outside image"
+            DriveOutcome::Completed(0x3e8), // setTaskSchedulerBackgroundMode
+            DriveOutcome::Stopped,          // V2InitWithParams "outside image"
+            DriveOutcome::Completed(0x3e8),
+            DriveOutcome::Completed(0x3e8),
+            DriveOutcome::Completed(0x3e8),
+            DriveOutcome::Completed(0), // initAppShellReporter (void) — a completion
+            DriveOutcome::Completed(0), // setActive (void) — a completion
+            DriveOutcome::Completed(0x3e8),
+            DriveOutcome::Completed(0x3e8),
+            DriveOutcome::Completed(0x3e8),
+            DriveOutcome::Completed(0), // onEngineSettingsReceived (void) — a completion
+            DriveOutcome::Completed(0x3e8),
+            DriveOutcome::Completed(0x3e8),
+            DriveOutcome::Completed(0x3e8),
+        ];
+        let completed = outcomes.iter().filter(|o| o.completed()).count();
+        let nonzero = outcomes
+            .iter()
+            .filter(|o| matches!(o, DriveOutcome::Completed(v) if *v != 0))
+            .count();
+        // 14 of 16 atoms completed jit_run (the two Stopped are the documented
+        // pre-existing nativeInit "outside image" lane); 11 returned non-zero.
+        assert_eq!(completed, 14, "void JNI Completes(0) must count as completed");
+        assert_eq!(nonzero, 11, "non-zero sub-count preserved for compatibility");
+        assert_eq!(outcomes.len(), 16, "substrate stays at 16 atoms");
     }
 
     /// SEP-18 host-driven lifecycle milestone sequence: drive_nativehelper_lifecycle
