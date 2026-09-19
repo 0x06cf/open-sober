@@ -1,5 +1,27 @@
 # Open Sober — Agent Handoff
 
+## SH378 (Sep 20, 2026, hermes-worker): SH174 DM-allocation capture latch (CAPTURE-ONLY, no DELEGATE) is byte-silent on the furthest-advancing env (SH377 crossing+GOVFLAG+PRELOAD+PACK_SKIP; SendAppEventOnAppReady returns Ok) — 0 validated make_shared<DataModel>, terminal drains into the closed LSM pool-pop lane 0x101d9a528; the single forward hook still does not fire at the farthest reach (map-completion on a never-run intersection)
+Single-agent (cone suppressed). One new probe runs/capture_sh378_dmcap_advancing.sh (SH377
+advancing env + JIT_DM_ALLOC_CAPTURE=1, capture-ONLY safe latch without the disruptive DELEGATE
+that SH344's record left unread cleanly) + docs/frontier-sh378-dmcap-advancing.md. No production
+path edited (all existing default-inert guards). Workspace green (cargo test --workspace EXIT 0,
+arm64jit 436/0).
+
+- SH344 ran the SH174 capture with JIT_DM_ALLOC_CAPTURE_DELEGATE=1; that host-side delegation
+  dispatch disrupted the deep full ladder (std::bad_function_call EXIT 139) BEFORE a clean readback,
+  so the single SH174 forward hook's firing-state on the furthest-forward write was never cleanly
+  measured. This cycle closes that gap.
+- Capture-only latch (no delegate) on the advancing env: `SendAppEventOnAppReady returned Ok` (the
+  farthest the send-appevent path has gone IS reached); `grep -c "[validated]"` = 0 AND the trail
+  never even installs (no `routed ... capture trail` / `FIRST call#` allocation lines — the only
+  `bytes=` hit is the SH339 w19 jstring readback, not an allocation). => OP_NEW_WRAPPER is never
+  entered installably and no validated in-image-vtable DataModel allocates on this env either.
+- Terminal: `guestpc=0x101d9a528 fault=0x0` (EXIT 134), the LSM pool-pop write site — the SAME
+  measured-closed SH350/SH341 persistence family. Governor/app-shell ctor/Lua still 0 hits.
+- Route-B live-DM structural gate UNCHANGED (DM-root [0x106a68818]=0, MH_FLAGS_LOADED/APP_READY
+  false, AppBridgeV2[0x106a705e8]=0x0). No DataModel manufactured; SH174 capture-latch stays the
+  single forward observer. Do NOT re-drive LSM skips (SH349/350/358/373/375/377/378 stand).
+
 ## SH377 (Sep 20, 2026, hermes-worker): the corrected combined env + SH350 pack-skip advances SendAppEventOnAppReady to RETURN and lands in the known run-variable live-object family (0x10284cf5c) — confirming the pack-helper closure holds as the next wall on the corrected terminal sequence
 Single-agent (cone suppressed). One probe runs/capture_sh377_packskip_combined.sh (crossing-env +
 GOVFLAG + PRELOAD_VALUECELL + LSM_PACK_SKIP, the never-run intersection) + live capture (gitignored).

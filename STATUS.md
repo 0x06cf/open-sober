@@ -1,56 +1,44 @@
 # Open-Sober run status (hermes-worker)
 
-Updated 2026-09-20, this cycle: SH371 = MEASURED forward — the DM-creator continuation
-continueAfterFlagsLoaded_ (0x102bd1d68) now EXECUTES DEEP headlessly (25+ block-entry pcs
-through its app-name guard) with the full Route-B env, overturning the SH226/228 "never
-fires" map; the engine-init dispatcher body is hermetic-proven STRAIGHT-LINE (diverge can
-only be a leaf return / host-landing, no benign body branch). recon-v3 immediate-priority
-deliverables independently re-verified green. Route-B live-DM structural gate UNCHANGED
-(DM-root 0, MH_* false).
+Updated 2026-09-20, this cycle: SH378 = clean readback of the single SH174 DM-allocation forward hook on the
+furthest-advancing env (SH377 crossing+GOVFLAG+PRELOAD+PACK_SKIP, SendAppEventOnAppReady returns Ok). Capture-ONLY
+latch (no DELEGATE — closes SH344's unread record) shows 0 validated make_shared<DataModel> AND the trail never even
+installs (OP_NEW_WRAPPER not hit installably); terminal = the closed LSM pool-pop lane 0x101d9a528. The forward hook
+does not fire at the farthest reach. Route-B live-DM structural gate UNCHANGED (DM-root 0, MH_* false).
 
 ## Current state
 
-- `dev` HEAD (local): SH371 (jit.rs sh371 hermetic + continuation-executes measurement).
-- Workspace green (cargo test --workspace EXIT 0; elfjit 159/0, arm64jit lib 433/0).
-- recon-v3 immediate-priority deliverables CONFIRMED green this cycle (capture_taskv4_frame.sh
-  attempt 1: 24 real task-driven frames swap Ok(0x1), 197 node pops, 0 json abort, 0 crash;
-  JIT_JSON_ZERO_FIX len-clamp at 0x102355d40 present).
-- Route-B live-DM structural gate UNCHANGED: DM-root [0x106a68818]=0x0, MH_* all false.
+- `dev` HEAD (local): SH378 (probe + frontier doc + ledger; capture_sh378_dmcap_advancing.sh; capture log at
+  /home/hermes-worker/runs/sh378-dmcap-advancing.txt, outside repo).
+- Workspace green (cargo test --workspace EXIT 0, 436 passed/0 failed in arm64jit lib). elfjit.rs under 1MiB hook.
+- recon-v3 deliverables CONFIRMED green this cycle (capture_taskv4_frame.sh attempt 1: 24 real task-driven frames,
+  swap Ok(0x1), 197 node pops, 0 json abort, 0 crash; JIT_JSON_ZERO_FIX present).
+- Route-B live-DM structural gate UNCHANGED: DM-root [0x106a68818]=0, MH_* all false.
 
 ## What advanced this cycle
 
-- **SH371 (measured forward, map-correction)**: region-watching the engine-init dispatcher +
-  continueAfterFlagsLoaded_ with the full Route-B seed env (capture_sh344's DMCONT +
-  DM_CONT_M48_SEED + CONT_APPNAME_SEED) shows continueAfterFlagsLoaded_ (0x102bd1d68) now
-  FIRES and runs deep (0x102bd1d68 .. 0x102bd1f64 app-name guard, SH245/SH248c-seeded) —
-  previously recorded as "never entered" (SH226/SH228). It then terminals at the standing
-  SH285 persistence-lane wall (guestpc=0x101db1b08), one fencepost before the F+0x18
-  controller floor the routeb_dm_manager_cont comment predicts.
-- New real-image hermetic `sh371_engineinit_dispatcher_body_straightline_to_sub` (jit.rs):
-  scans the dispatcher body [0x2bd8ce8,0x2bd8d64) + sub_2bd8dac body [0x2bd8dac,0x2bd8e28)
-  for any control-flow word, rejecting all but the 4 known sites (bl getter, blr vt+0xf8,
-  blr vt+0x108, bl sub) + sub's blr vt+0x1f0 — both bodies STRAIGHT-LINE, so SH228's
-  "diverge at a leaf" narrows to "a leaf's return never lands back in-image (host landing)".
-- Probe runs/capture_sh371_dispatcher_body.sh + docs/frontier-sh371-....md added.
+- **SH378**: clean readback of the single SH174 forward hook at the farthest reach. SH344's capture used DELEGATE=1
+  (disruptive, died bad_function_call before a clean readback). This cycle runs CAPTURE-ONLY on the SH377 advancing
+  env: `SendAppEventOnAppReady returned Ok(0x107273d50)` (the farthest send-appevent reach IS achieved) but the trail
+  never installs and `[validated]` = 0 — no make_shared<DataModel> allocates even at the furthest-forward write.
+  Terminal drains to 0x101d9a528 (closed LSM pool-pop family). Confirms the Route-B live-DM wall independent of the
+  SH344 delegation artifact.
+- Maps-completion: the SH377 terminal 0x10284cf5c (a create-once flag setter) was caller-attributed this cycle — all
+  its callers pass FIXED bss globals (adrp 6dd4000/7273000/683c000...), never NULL, so the x0=0 fault is a
+  run-variable create-once fence in the persistence family, not a seedable global. Re-affirms the LSM-family closure.
 
 ## Honest status
 
-- Route-B live-DM structural gate UNCHANGED. Do-init still never owns a live DataModel
-  (DM-root 0, MH_* false). SH174 capture-latch stays the single forward observer.
-- SH371 corrects the map (the continuation is env-reachable deep, not "never entered") but
-  the continuation dives into the measured-closed SH285 persistence lane. It does NOT
-  manufacture a DataModel.
+- Route-B live-DM structural gate UNCHANGED; SH174 capture-latch stays the single forward observer. Even at the
+  farthest SendAppEventOnAppReady-return reach, no DM allocates and control drains into the closed persistence lane.
+  Both recon-v3 deliverables re-verified green at HEAD this cycle.
 
 ## Next-forward candidates
 
-1. (PRIMARY, standing) The SESSION half remains THE wall: do-init must own a live DM (SH184/185
-   four-stacked closure). The two measured dead-ends from the now-reached continuation are the
-   SH285 live-object wall and the F+0x18 controller floor behind it — both measured-closed
-   (SH349/350; do NOT re-drive LSM sub-call skips).
-2. R1 content half is staged + armed + serviceable (SH351/352/354); fires the moment a live DM
-   drives the loader. Window-attach completion 0x22985c0 funnels into the same settings-state/LSM
-   lane (SH369) — not a DM route.
-3. Do NOT re-arm the window-attach once-guard (SH367); do NOT re-enter the ALooper glue loop
-   (SH365); bounded process_cmd is the guarded entry (SH366/SH368); do NOT re-drive LSM
-   sub-call skips (SH349/350/358); do NOT seed [0x106a64da0] (SH362); do NOT re-attack EC
-   reader-gate (SH356); do NOT seed [0x107275550] (SH359).
+1. (PRIMARY, standing) SESSION half remains THE wall: do-init must own a live DM (SH184/185). The governor+preload
+   walls are SH269/SH307-armed and pass; the residual is the SH350 pack-lane (measured-closed — do NOT re-drive
+   LSM sub-call skips, SH349/350/358/373/375/377/378 stand).
+2. R1 content half staged+armed+serviceable (SH351/352/354); fires the moment a live DM drives the loader.
+3. Do NOT re-drive LSM skips; do NOT re-attack the EC reader-gate (SH356/374); do NOT re-attack 0x258b5d8/SetInitParams
+   (SH362/375); do NOT re-arm window-attach once-guard (SH367); do NOT re-enter ALooper loop (SH365); do NOT re-arm
+   JIT_DM_ALLOC_CAPTURE_DELEGATE (SH344/378).
