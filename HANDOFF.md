@@ -1,5 +1,40 @@
 # Open Sober — Agent Handoff
 
+## SH466 (Sep 20, 2026, hermes-worker): promote the SESSION PRODUCER HANDOFF gate core into the tested library — the recon-v3 §A END-STATE / SEP-17 self-drive decision logic is now a hermetic-pinned library contract, not example-only glue
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified
+green at this HEAD first (capture_taskv4_frame.sh attempt 1: 24 real task-driven
+frames `present swap Ok(0x1)`, dispatch #2264000, 195 node pops, 0 json abort,
+0 crash, EXIT 0). Workspace green (cargo test --workspace EXIT 0; arm64jit lib
+677/0 incl. 1 new sh466 hermetic; cargo build --workspace + --example elfjit OK).
+Production code in session.rs + elfjit example wrapper (elfjit.rs DROPPED 1,048,392
+-> 1,048,152 B, stays under the 1MiB hook).
+- **The gap closed:** the recon-v3 §A END-STATE / SEP-17 "SESSION PRODUCER HANDOFF"
+  gate — the logic that lets type-4 self-drive emit REAL task frames only once a
+  REAL session owns a live DataModel — was load-bearing runtime logic that lived
+  ONLY in the untested elfjit example, pinned ONLY under `cargo test --example
+  elfjit`. It never ran in the workspace suite (the project's actual regression
+  gate), so a drift in either direction slipped through. SH466 promotes the two
+  PURE pieces into the library.
+- `session.rs`: new `pub session_producer_gate(mh_app_ready, live_dm)` (recon §B /
+  SH303 gate: GATED only when app-ready AND live-DM) + `pub live_dm_cell_value_ok(v)`
+  (accepts only coherent guest-visible pointers >= 2^32, clear top byte, non-zero —
+  so it REJECTS the SH381 do-init once-lambda "Execute" sentinel 0x400000b, the
+  exact case where a naive producer mistakes the once-slot for a live DM). Pure,
+  deterministic, no env, no guest bytes.
+- elfjit.rs: local copies are now thin wrappers over the library fns (single source
+  of truth); the SH304 example tests still pass.
+- New hermetic `sh466_session_producer_handoff_gate_and_sentinel_rejection` pins the
+  2x2 gate truth table + sentinel/zero/2^32-boundary/top-byte rejection surface.
+- Honest: NOT a DM / NOT a live-DM step (Route-B live-DM gate UNCHANGED; DM-root
+  [0x106a68818]=0, structural at the write site per SH462/463). BUILD-THE-RUNTIME
+  coverage completion; the gated producer stays latent-but-correct, firing the
+  instant a real session advances (MH_APP_READY AND a live DM) — these library fns
+  are exactly what the toolchain uses to classify that moment. No re-treads, not a
+  render-plane visual.
+- Files: docs/frontier-sh466-session-producer-handoff-gate.md + crates/arm64jit/src/
+  session.rs (2 pub fns + hermetic) + crates/arm64jit/examples/elfjit.rs (wrappers).
+  Commit 5556211 (SH466).
+
 ## SH465 (Sep 20, 2026, hermes-worker): make the session-substrate completion metric outcome-aware — the runtime now reports true session-boot health (14/16 completed), not a return-value filter (11/16)
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified
 green at this HEAD first (capture_taskv4_frame.sh: 24 real task-driven frames `present
