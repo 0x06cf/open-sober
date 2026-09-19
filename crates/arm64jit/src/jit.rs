@@ -3567,6 +3567,20 @@ fn page_is_writable(addr: u64) -> bool {
 /// file-backed .data page, like the NativeDataModelManager singleton holder) -> mprotect RW
 /// (private file mapping COWs safely). Returns true when writable afterwards.
 pub fn routeb_ensure_writable(addr: u64) -> bool {
+    // SH357: serialize the whole map/mprotect + /proc/self/maps probe under ONE
+    // process-global lock. The routeb guards run on a single jit_run thread in
+    // production (zero contention), but the parallel test harness drives many
+    // routeb test families concurrently on overlapping fixed guest pages (e.g.
+    // 0x1067333000 is shared by the doinit-next3, SH156-ctor and manager suites,
+    // each under a DIFFERENT family lock). Unlocked, thread A's MAP_FIXED remap
+    // of a page races thread B still writing/reading it (UB -> the intermittent
+    // SIGSEGV), and a concurrent sibling's mmap/probe can make this return false
+    // transiently, panicking its caller mid-family-lock and POISONING that lock
+    // for every sibling test (PoisonError cascade). Serializing the page-op makes
+    // routeb_ensure_writable atomic and its result stable regardless of which
+    // family lock the caller holds.
+    static PAGE_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = PAGE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     if page_is_writable(addr) {
         return true;
     }
@@ -7695,6 +7709,27 @@ pub fn compile_image_bounded(
 }
 
 #[cfg(test)]
+/// SH357: `std::env::set_var`/`remove_var` are NOT thread-safe (unsafe in edition 2024;
+/// libc setenv/putenv mutate the process-global environ concurrently => UB, intermittent
+/// SIGSEGV and PoisonError under the 8-core parallel test harness). Every routeb/functional
+/// guard test toggles process env, so ALL test env mutations must serialize on ONE shared
+/// lock (this is exactly the FS_ROOT_LOCK precedent for shared test-root state). Process-env
+/// reads (std::env::var in the guards) are safe as long as no writer is mid-mutation; with
+/// set/remove serialized, each test's set-then-guard relies on its own linear ordering.
+/// Defined at `jit` module scope (not inside `mod tests`) so every nested/sibling test module
+/// (`mod tests`, routeb_lsm_keyfix_guard_tests, isa_regress_tests, ...) sees them via
+/// `use super::*`. Production code never calls these (single jit_run thread).
+pub(crate) fn env_test_set(key: &str, val: &str) {
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+    let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    unsafe { std::env::set_var(key, val) };
+}
+pub(crate) fn env_test_remove(key: &str) {
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+    let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    unsafe { std::env::remove_var(key) };
+}
+
 mod tests {
     use super::*;
 
@@ -7705,32 +7740,25 @@ mod tests {
     /// mid-mutation by sh169 and fail at a run-variable assert line (observed 550/0 ->
     /// 371/1 flake at jit.rs:5068/5085). Serializing the two shared-state tests makes the
     /// suite deterministic; production (single jit_run thread per run) is untouched.
-    static DM_CAPTURE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// SH190/SH189c: both tests mutate the JIT_ROUTEB_DM_INSTANCE process env (and sh190 reads
-    /// the ROUTEB_DM_CTOR_OBJ global), so they must serialize like the SH179 DM-capture pair —
-    /// otherwise the parallel harness makes sh190's "env-off must be inert" premies run-variable.
-    static DM_INSTANCE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// SH248c: the continuation-manager M is recorded in the shared CONT_MANAGED_M static,
-    /// written by routeb_dm_manager_cont (the sh165fwd test) and read/written by my
-    /// sh248c_appname_seed_guard test. Serialize the two so a parallel sh165fwd run cannot
-    /// overwrite the slot my test pointed the guard at.
-    static CONT_MGR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// sh164/sh243/sh165: all three mutate the JIT_ROUTEB_DMFORCE process env AND the
-    /// shared guest-mapped page at 0x102727550 (sh243 also 0x107275550). Without a lock
-    /// the parallel harness makes sh165's `!any_page_mapped(HOLDER)` precondition race —
-    /// a concurrent sh243/sh165 already mapping that page makes the assert fail, and the
-    /// env set/remove interleave makes "env-off inert" run-variable. Same pattern as
-    /// DM_INSTANCE_TEST_LOCK/CONT_MGR_TEST_LOCK for shared fixed-.bss pages + env.
-    static DM_MANAGER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ///
+    /// SH357: consolidated the four separate family locks (DM_CAPTURE / DM_INSTANCE /
+    /// CONT_MGR / DM_MANAGER) into ONE shared process-state lock. Each family mutates
+    /// process-global state the others also touch — the SAME fixed guest-.bss pages
+    /// (e.g. 0x1067333000 is shared by the doinit-next3, SH156-ctor and manager suites)
+    /// and the SAME process env (JIT_ROUTEB_DMFORCE is set/removed by sh164, sh165 AND
+    /// sh243 under three different families). Separate per-family locks let two families
+    /// run concurrently on one process-global page/env -> a precondition assert sees
+    /// another family's page already mapped, or env state mid-toggle (observed sh165
+    /// "precondition: holder page genuinely absent" failing, and sh167 env race). A
+    /// single lock makes every family's page/env mutation atomic against every other;
+    /// production is untouched (single jit_run thread).
+    static ROUTEB_PROC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// SH347 (JIT_ROUTEB_BUSRECV): the receive-side probe guard is read-only and gated on the
     /// process env var. Give it a fresh env per test so a parallel run can't leak env state.
     #[test]
     fn busrecv_guard_inert_without_env() {
-        unsafe { std::env::remove_var("JIT_ROUTEB_BUSRECV") };
+        unsafe { env_test_remove("JIT_ROUTEB_BUSRECV") };
         // Wrong pc AND env-off -> must return without touching anything.
         let mut s = CpuState::new();
         s.x[0] = 1;
@@ -7740,7 +7768,7 @@ mod tests {
 
     #[test]
     fn busrecv_guard_fires_at_cb_reads_holder() {
-        unsafe { std::env::set_var("JIT_ROUTEB_BUSRECV", "1") };
+        unsafe { env_test_set("JIT_ROUTEB_BUSRECV", "1") };
         // Arrange a readable backing buffer: x0 -> [u64 @ +16] = in-image sentinel.
         let mem = Box::leak(vec![0u32; 0x20].into_boxed_slice());
         let base = mem.as_ptr() as u64;
@@ -7865,7 +7893,7 @@ mod tests {
         //
         // (a) Env unset (default): invocation is a no-op — read of the unset slot is
         // skipped because routeb_tail_dispatch_capture returns before touching memory.
-        unsafe { std::env::remove_var("JIT_ROUTEB_DMTRACE") };
+        unsafe { env_test_remove("JIT_ROUTEB_DMTRACE") };
         let buf = Box::leak(vec![0x0u8; 0x30usize].into_boxed_slice()).as_mut_ptr() as u64;
         let mut st = CpuState::new();
         st.x[19] = buf;
@@ -7878,7 +7906,7 @@ mod tests {
         // vt, and vt[+0x30] and flags the DM-creator family. We can't capture eprintln
         // here; we at least prove it neither faults nor writes guest memory, and that a
         // NON-matching pc (outside the tail window) does nothing.
-        unsafe { std::env::set_var("JIT_ROUTEB_DMTRACE", "1") };
+        unsafe { env_test_set("JIT_ROUTEB_DMTRACE", "1") };
         // A full vt chain pointing at a DM-family target (0x102bd1a38 getFlagsFromEngine_).
         let shell_vt = Box::leak(vec![0x11u8; 0x40usize].into_boxed_slice()).as_mut_ptr() as u64;
         unsafe { std::ptr::write_unaligned((shell_vt + 0x30) as *mut u64, 0x102bd1a38) };
@@ -7896,7 +7924,7 @@ mod tests {
         // impl==0 with env set -> no deref, no crash.
         st.x[19] = 0;
         routeb_tail_dispatch_capture(&mut st as *mut CpuState, 0x102e9fcc4);
-        unsafe { std::env::remove_var("JIT_ROUTEB_DMTRACE") };
+        unsafe { env_test_remove("JIT_ROUTEB_DMTRACE") };
     }
 
     #[test]
@@ -7968,7 +7996,7 @@ mod tests {
             "SETWORLDBUILD env off must not write the world-build gate byte"
         );
         // (b) env on + gate pc -> writes 1.
-        unsafe { std::env::set_var("JIT_ROUTEB_SETWORLDBUILD", "1") };
+        unsafe { env_test_set("JIT_ROUTEB_SETWORLDBUILD", "1") };
         routeb_worldbuild_gate_seed(&mut CpuState::new() as *mut CpuState, 0x102368100);
         assert_eq!(
             unsafe { std::ptr::read_unaligned(cell) },
@@ -7992,7 +8020,7 @@ mod tests {
             0x5a,
             "a live nonzero world-build gate byte must be preserved"
         );
-        unsafe { std::env::remove_var("JIT_ROUTEB_SETWORLDBUILD") };
+        unsafe { env_test_remove("JIT_ROUTEB_SETWORLDBUILD") };
     }
 
     #[test]
@@ -8005,9 +8033,9 @@ mod tests {
         // [shell+0x40]->[+0x18]->[+0x10] + [shell+0x18] all resolve without fault. Prove
         // the shell layout so a real run that enters fnB derefs cleanly.
         // Shares JIT_ROUTEB_DMFORCE env + holder page 0x102727550 with sh165/sh243 — serialize.
-        let _g = DM_MANAGER_TEST_LOCK.lock().unwrap();
+        let _g = ROUTEB_PROC_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // (a) env unset -> no mutation.
-        unsafe { std::env::remove_var("JIT_ROUTEB_DMFORCE") };
+        unsafe { env_test_remove("JIT_ROUTEB_DMFORCE") };
         let impl_buf = Box::leak(vec![0xAAu8; 0x500usize].into_boxed_slice()).as_mut_ptr() as u64;
         let mut st = CpuState::new();
         st.x[19] = impl_buf;
@@ -8018,7 +8046,7 @@ mod tests {
             "DMFORCE must not touch impl[+0x408] when the env is off"
         );
         // (b) env set -> substitutes the shell.
-        unsafe { std::env::set_var("JIT_ROUTEB_DMFORCE", "1") };
+        unsafe { env_test_set("JIT_ROUTEB_DMFORCE", "1") };
         routeb_dm_force_guard(&mut st as *mut CpuState, 0x102e9fcc4);
         let shell = unsafe { std::ptr::read_unaligned((impl_buf + 0x408) as *const u64) };
         assert_ne!(shell, 0xAAAAAAAAAAAAAAAA, "shell must replace the impl slot");
@@ -8049,7 +8077,7 @@ mod tests {
         // impl==0 -> no crash with env set.
         st.x[19] = 0;
         routeb_dm_force_guard(&mut st as *mut CpuState, 0x102e9fcc4);
-        unsafe { std::env::remove_var("JIT_ROUTEB_DMFORCE") };
+        unsafe { env_test_remove("JIT_ROUTEB_DMFORCE") };
     }
 
     #[test]
@@ -8065,11 +8093,11 @@ mod tests {
         const OLD: u64 = 0x102727550;
         const GCELL: u64 = 0x107275550; // getter's true read cell (SH243)
         // Shares JIT_ROUTEB_DMFORCE env + OLD page with sh164/sh165 — serialize.
-        let _g = DM_MANAGER_TEST_LOCK.lock().unwrap();
+        let _g = ROUTEB_PROC_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // env off -> neither touched. Guard is inert without DMFORCE.
-        unsafe { std::env::remove_var("JIT_ROUTEB_DMFORCE") };
+        unsafe { env_test_remove("JIT_ROUTEB_DMFORCE") };
         // env on + fnB region -> both cells seeded to the SAME manager M.
-        unsafe { std::env::set_var("JIT_ROUTEB_DMFORCE", "1") };
+        unsafe { env_test_set("JIT_ROUTEB_DMFORCE", "1") };
         let mut st = CpuState::new();
         st.x[19] = 0x2222;
         // Pre-map both cells so reads are safe regardless of page provenance.
@@ -8099,7 +8127,7 @@ mod tests {
                 "SH243: getter true cell untouched outside the fnB region"
             );
         }
-        unsafe { std::env::remove_var("JIT_ROUTEB_DMFORCE") };
+        unsafe { env_test_remove("JIT_ROUTEB_DMFORCE") };
     }
 
     #[test]
@@ -8114,7 +8142,7 @@ mod tests {
         // routeb_manager_mgr30_leaf selects by JIT_ROUTEB_DM_MGR_MINUS2; both verbs keep the
         // +0x30 out-field write identical. Regression guard: default = 0 (baseline benign),
         // env-on = -2 (forward lever), both == write to a1.
-        unsafe { std::env::remove_var("JIT_ROUTEB_DM_MGR_MINUS2") };
+        unsafe { env_test_remove("JIT_ROUTEB_DM_MGR_MINUS2") };
         let default_leaf = routeb_manager_mgr30_leaf();
         // Call both host verbs and assert the write + the return word.
         let slot = Box::leak(vec![0u8; 8].into_boxed_slice()).as_mut_ptr() as u64;
@@ -8142,9 +8170,9 @@ mod tests {
         // env-off -> default verb; env-on -> minus2 verb. Both OnceLock the registered
         // host-call address; the env lever's behavioral effect is the return word, which
         // the two verbs above pin (0 vs 0xFFFFFFFE). Bound: both leaf addresses registered.
-        unsafe { std::env::set_var("JIT_ROUTEB_DM_MGR_MINUS2", "1") };
+        unsafe { env_test_set("JIT_ROUTEB_DM_MGR_MINUS2", "1") };
         let minus2_leaf = routeb_manager_mgr30_leaf();
-        unsafe { std::env::remove_var("JIT_ROUTEB_DM_MGR_MINUS2") };
+        unsafe { env_test_remove("JIT_ROUTEB_DM_MGR_MINUS2") };
         // Either selection path produces a registered host-call address; the env lever's
         // effect is verified through the two verbs' return words above (the definitive
         // behavioral distinction the getter branch senses). Bound: both must be != 0.
@@ -8202,10 +8230,10 @@ mod tests {
         // skips the NULL-store fault). CONT_MANAGED_M must record the manager address.
         // The shared CONT_MANAGED_M static is also written by routeb_dm_manager_cont (the
         // sh165fwd test) — hold the test lock so a parallel run cannot overwrite `slot`.
-        let _mgr_guard = CONT_MGR_TEST_LOCK.lock().unwrap();
+        let _mgr_guard = ROUTEB_PROC_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         unsafe {
             // (a) env unset AND pc in-range -> inert (no seed).
-            std::env::remove_var("JIT_ROUTEB_CONT_APPNAME_SEED");
+            env_test_remove("JIT_ROUTEB_CONT_APPNAME_SEED");
             let slot = Box::leak(vec![0u8; 0x60].into_boxed_slice()).as_mut_ptr() as u64;
             unsafe { std::ptr::write_unaligned((slot + 0x50) as *mut u64, 0) };
             store_cont_managed_m(slot);
@@ -8218,7 +8246,7 @@ mod tests {
             );
 
             // (b) env set but WRONG pc -> inert.
-            std::env::set_var("JIT_ROUTEB_CONT_APPNAME_SEED", "1");
+            env_test_set("JIT_ROUTEB_CONT_APPNAME_SEED", "1");
             routeb_cont_appname_seed_guard(std::ptr::null_mut(), 0x102bd2014);
             assert_eq!(
                 unsafe { std::ptr::read_unaligned((slot + 0x50) as *const u64) },
@@ -8233,7 +8261,7 @@ mod tests {
                 5,
                 "guard must re-seed M+0x50 = size 5 so the continuation's cbnz skips the NULL-store"
             );
-            std::env::remove_var("JIT_ROUTEB_CONT_APPNAME_SEED");
+            env_test_remove("JIT_ROUTEB_CONT_APPNAME_SEED");
         }
     }
 
@@ -8246,7 +8274,7 @@ mod tests {
         // (d) be idempotent (no clobber of an already-seeded slot).
         // Serialized with CONT_MGR_TEST_LOCK: shares the fixed-.bss cookie-jar cell
         // [0x106ed7a20] + process-global env with sh175/ADAPTER/ONCE.
-        let _mgr_guard = CONT_MGR_TEST_LOCK.lock().unwrap();
+        let _mgr_guard = ROUTEB_PROC_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let empty = routeb_empty_sso_string();
         assert_ne!(empty, 0, "empty SSO string helper must return a leaked non-NULL buffer");
         unsafe {
@@ -8267,14 +8295,14 @@ mod tests {
             assert!(routeb_ensure_writable(B));
         }
         // (a) env unset, pc in-range -> inert.
-        unsafe { std::env::remove_var("JIT_ROUTEB_APPSART_JAR_SEED") };
+        unsafe { env_test_remove("JIT_ROUTEB_APPSART_JAR_SEED") };
         unsafe { std::ptr::write_unaligned(A as *mut u64, 0) };
         unsafe { std::ptr::write_unaligned(B as *mut u64, 0) };
         routeb_appstart_jar_seed_guard(std::ptr::null_mut(), 0x1021f4830);
         assert_eq!(unsafe { std::ptr::read_unaligned(A as *const u64) }, 0, "env-gated: no seed without the env var");
 
         // (b) env set, wrong pc -> inert.
-        unsafe { std::env::set_var("JIT_ROUTEB_APPSART_JAR_SEED", "1") };
+        unsafe { env_test_set("JIT_ROUTEB_APPSART_JAR_SEED", "1") };
         routeb_appstart_jar_seed_guard(std::ptr::null_mut(), 0x1021f4000);
         assert_eq!(unsafe { std::ptr::read_unaligned(A as *const u64) }, 0, "pc-gated: must fire only in the appstart fn range");
 
@@ -8294,7 +8322,7 @@ mod tests {
             0xDECAFBAD,
             "idempotent: a non-NULL slot must be left untouched"
         );
-        unsafe { std::env::remove_var("JIT_ROUTEB_APPSART_JAR_SEED") };
+        unsafe { env_test_remove("JIT_ROUTEB_APPSART_JAR_SEED") };
         unsafe { std::ptr::write_unaligned(A as *mut u64, 0) };
         unsafe { std::ptr::write_unaligned(B as *mut u64, 0) };
     }
@@ -8303,7 +8331,7 @@ mod tests {
     fn sh248e_appstart_once_guard_is_env_pc_gated_and_seeds_minus_one() {
         // SH248e: ... Serialized with CONT_MGR_TEST_LOCK so the parallel test batch does
         // not re-zero the shared fixed .bss once-cell between this test's asserts.
-        let _mgr_guard = CONT_MGR_TEST_LOCK.lock().unwrap();
+        let _mgr_guard = ROUTEB_PROC_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         const ONCE_CELL: u64 = 0x106b0bdf0;
         unsafe {
             assert!(
@@ -8311,7 +8339,7 @@ mod tests {
                 "once-cell pointer page must be made writable (fixed .bss in a unit test)"
             );
             // (a) env unset, pc in-range -> inert.
-            std::env::remove_var("JIT_ROUTEB_APPSART_ONCE_SEED");
+            env_test_remove("JIT_ROUTEB_APPSART_ONCE_SEED");
             std::ptr::write_unaligned(ONCE_CELL as *mut u64, 0);
             routeb_appstart_once_seed_guard(std::ptr::null_mut(), 0x102339208);
             assert_eq!(
@@ -8321,7 +8349,7 @@ mod tests {
             );
 
             // (b) env set, wrong pc -> inert.
-            std::env::set_var("JIT_ROUTEB_APPSART_ONCE_SEED", "1");
+            env_test_set("JIT_ROUTEB_APPSART_ONCE_SEED", "1");
             routeb_appstart_once_seed_guard(std::ptr::null_mut(), 0x102339000);
             assert_eq!(
                 std::ptr::read_unaligned(ONCE_CELL as *const u64),
@@ -8348,7 +8376,7 @@ mod tests {
                 0x1234,
                 "idempotent: a non-NULL slot must be left untouched"
             );
-            std::env::remove_var("JIT_ROUTEB_APPSART_ONCE_SEED");
+            env_test_remove("JIT_ROUTEB_APPSART_ONCE_SEED");
             std::ptr::write_unaligned(ONCE_CELL as *mut u64, 0);
         }
     }
@@ -8356,7 +8384,7 @@ mod tests {
     #[test]
     fn sh248f_appstart_adapter_guard_is_env_pc_gated_and_seeds_leaf_object() {
         // SH248f: ... Serialized with CONT_MGR_TEST_LOCK (shared fixed .bss cell page).
-        let _mgr_guard = CONT_MGR_TEST_LOCK.lock().unwrap();
+        let _mgr_guard = ROUTEB_PROC_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         const ADAPTER_GLOBAL: u64 = 0x106b0bde0;
         unsafe {
             assert!(
@@ -8364,7 +8392,7 @@ mod tests {
                 "adapter page must be writable (fixed .bss in a unit test)"
             );
             // (a) env unset, pc in-range -> inert.
-            std::env::remove_var("JIT_ROUTEB_APPSART_ADAPTER_SEED");
+            env_test_remove("JIT_ROUTEB_APPSART_ADAPTER_SEED");
             std::ptr::write_unaligned(ADAPTER_GLOBAL as *mut u64, 0);
             routeb_appstart_adapter_seed_guard(std::ptr::null_mut(), 0x102339020);
             assert_eq!(
@@ -8374,7 +8402,7 @@ mod tests {
             );
 
             // (b) env set, wrong pc -> inert.
-            std::env::set_var("JIT_ROUTEB_APPSART_ADAPTER_SEED", "1");
+            env_test_set("JIT_ROUTEB_APPSART_ADAPTER_SEED", "1");
             routeb_appstart_adapter_seed_guard(std::ptr::null_mut(), 0x102339000);
             assert_eq!(
                 std::ptr::read_unaligned(ADAPTER_GLOBAL as *const u64),
@@ -8399,7 +8427,7 @@ mod tests {
                 0x1234,
                 "idempotent: a non-NULL slot must be left untouched"
             );
-            std::env::remove_var("JIT_ROUTEB_APPSART_ADAPTER_SEED");
+            env_test_remove("JIT_ROUTEB_APPSART_ADAPTER_SEED");
             std::ptr::write_unaligned(ADAPTER_GLOBAL as *mut u64, 0);
         }
     }
@@ -8413,11 +8441,11 @@ mod tests {
             let mut state = CpuState::new();
             state.x[1] = 0;
             // (a) env unset -> inert (x[1] stays 0).
-            std::env::remove_var("JIT_ROUTEB_EC_ARG1");
+            env_test_remove("JIT_ROUTEB_EC_ARG1");
             routeb_ec_world_arg1_guard(&mut state as *mut CpuState, 0x102e24598);
             assert_eq!(state.x[1], 0, "env-gated: inert without JIT_ROUTEB_EC_ARG1");
             // (b) env set, wrong pc -> inert.
-            std::env::set_var("JIT_ROUTEB_EC_ARG1", "1");
+            env_test_set("JIT_ROUTEB_EC_ARG1", "1");
             state.x[1] = 0;
             routeb_ec_world_arg1_guard(&mut state as *mut CpuState, 0x102e24590);
             assert_eq!(state.x[1], 0, "pc-gated: must fire only at EC-world entry 0x102e24598");
@@ -8435,7 +8463,7 @@ mod tests {
             state.x[1] = 0x1234;
             routeb_ec_world_arg1_guard(&mut state as *mut CpuState, 0x102e24598);
             assert_eq!(state.x[1], 0x1234, "idempotent: non-NULL x[1] left untouched");
-            std::env::remove_var("JIT_ROUTEB_EC_ARG1");
+            env_test_remove("JIT_ROUTEB_EC_ARG1");
         }
     }
 
@@ -8453,12 +8481,12 @@ mod tests {
             // zero the target slot first
             std::ptr::write_unaligned((state.x[0] + 0x30) as *mut u64, 0);
             // (a) env unset -> inert (slot stays 0).
-            std::env::remove_var("JIT_ROUTEB_EC_ARG0VT");
+            env_test_remove("JIT_ROUTEB_EC_ARG0VT");
             routeb_ec_world_arg0_vt_guard(&mut state as *mut CpuState, 0x102e24598);
             assert_eq!(std::ptr::read_unaligned((state.x[0] + 0x30) as *const u64), 0,
                 "env-gated: inert without JIT_ROUTEB_EC_ARG0VT");
             // (b) env set, wrong pc -> inert.
-            std::env::set_var("JIT_ROUTEB_EC_ARG0VT", "1");
+            env_test_set("JIT_ROUTEB_EC_ARG0VT", "1");
             routeb_ec_world_arg0_vt_guard(&mut state as *mut CpuState, 0x102e24590);
             assert_eq!(std::ptr::read_unaligned((state.x[0] + 0x30) as *const u64), 0,
                 "pc-gated: must fire only at EC-world entry 0x102e24598");
@@ -8480,7 +8508,7 @@ mod tests {
             routeb_ec_world_arg0_vt_guard(&mut state as *mut CpuState, 0x102e24598);
             assert_eq!(std::ptr::read_unaligned((state.x[0] + 0x30) as *const u64), 0x1234,
                 "idempotent: non-empty slot left untouched");
-            std::env::remove_var("JIT_ROUTEB_EC_ARG0VT");
+            env_test_remove("JIT_ROUTEB_EC_ARG0VT");
         }
     }
 
@@ -8493,7 +8521,7 @@ mod tests {
         let cell: u64 = 0x106d31e28;
         unsafe {
             assert!(routeb_ensure_writable(cell), "realsession .bss page must be writable");
-            std::env::remove_var("JIT_ROUTEB_EC_REALSESSION");
+            env_test_remove("JIT_ROUTEB_EC_REALSESSION");
             std::ptr::write_unaligned(cell as *mut u8, 0);
             routeb_ec_world_realsession_guard(std::ptr::null_mut(), 0x102e24598);
             assert_eq!(
@@ -8502,7 +8530,7 @@ mod tests {
                 "env-gated: inert without JIT_ROUTEB_EC_REALSESSION"
             );
             // (b) env set, wrong pc -> inert.
-            std::env::set_var("JIT_ROUTEB_EC_REALSESSION", "1");
+            env_test_set("JIT_ROUTEB_EC_REALSESSION", "1");
             std::ptr::write_unaligned(cell as *mut u8, 0);
             routeb_ec_world_realsession_guard(std::ptr::null_mut(), 0x102e24590);
             assert_eq!(
@@ -8526,7 +8554,7 @@ mod tests {
                 2,
                 "idempotent: non-zero flag left untouched"
             );
-            std::env::remove_var("JIT_ROUTEB_EC_REALSESSION");
+            env_test_remove("JIT_ROUTEB_EC_REALSESSION");
             std::ptr::write_unaligned(cell as *mut u8, 0);
         }
     }
@@ -8545,13 +8573,13 @@ mod tests {
             assert!(routeb_ensure_writable(cell), "main-id .bss page must be writable");
             let me = libc::pthread_self() as u64;
             // (a) inert without env.
-            std::env::remove_var("JIT_ROUTEB_DONEPATH_MAIN");
+            env_test_remove("JIT_ROUTEB_DONEPATH_MAIN");
             std::ptr::write_unaligned(cell as *mut u64, 0);
             routeb_donepath_main_branch_guard(std::ptr::null_mut(), 0x102206db8);
             assert_eq!(std::ptr::read_unaligned(cell as *const u64), 0,
                 "env-gated: inert without JIT_ROUTEB_DONEPATH_MAIN");
             // (b) env set, wrong pc -> inert.
-            std::env::set_var("JIT_ROUTEB_DONEPATH_MAIN", "1");
+            env_test_set("JIT_ROUTEB_DONEPATH_MAIN", "1");
             std::ptr::write_unaligned(cell as *mut u64, 0);
             routeb_donepath_main_branch_guard(std::ptr::null_mut(), 0x102206d90);
             assert_eq!(std::ptr::read_unaligned(cell as *const u64), 0,
@@ -8571,7 +8599,7 @@ mod tests {
             routeb_donepath_main_branch_guard(std::ptr::null_mut(), 0x102206db8);
             assert_eq!(std::ptr::read_unaligned(cell as *const u64), me,
                 "mismatched cell rewritten to executing thread (b.eq now taken)");
-            std::env::remove_var("JIT_ROUTEB_DONEPATH_MAIN");
+            env_test_remove("JIT_ROUTEB_DONEPATH_MAIN");
             std::ptr::write_unaligned(cell as *mut u64, 0);
         }
     }
@@ -8587,7 +8615,7 @@ mod tests {
         // pair-pointer [x1] alone.
         unsafe {
             // (a) inert without env.
-            std::env::remove_var("JIT_ROUTEB_LIFECYCLE_EARLYRET");
+            env_test_remove("JIT_ROUTEB_LIFECYCLE_EARLYRET");
             let obj = routeb_lifecycle_earlyret_obj();
             // Use a scratch cell to hold a fake pair pointer.
             let pair_slot: u64 = 0x1063_1110;
@@ -8600,7 +8628,7 @@ mod tests {
                 "env-gated: inert without JIT_ROUTEB_LIFECYCLE_EARLYRET");
 
             // (b) env set, wrong pc -> inert.
-            std::env::set_var("JIT_ROUTEB_LIFECYCLE_EARLYRET", "1");
+            env_test_set("JIT_ROUTEB_LIFECYCLE_EARLYRET", "1");
             std::ptr::write_unaligned(pair_slot as *mut u64, 0);
             routeb_lifecycle_wall_earlyret_guard(&mut st, 0x102206db8);
             assert_eq!(std::ptr::read_unaligned(pair_slot as *const u64), 0,
@@ -8635,7 +8663,7 @@ mod tests {
             assert_ne!(std::ptr::read_unaligned(pair_slot as *const u64), 0,
                 "[x1] pair seeded at second lifecycle-notify copy 0x1021f4538");
 
-            std::env::remove_var("JIT_ROUTEB_LIFECYCLE_EARLYRET");
+            env_test_remove("JIT_ROUTEB_LIFECYCLE_EARLYRET");
             std::ptr::write_unaligned(pair_slot as *mut u64, 0);
         }
     }
@@ -8651,7 +8679,7 @@ mod tests {
         const CELL_A: u64 = 0x106ed7a18;
         const CELL_B: u64 = 0x106ed7a28;
         unsafe {
-            std::env::remove_var("JIT_ROUTEB_SETTINGS_SSO_SEED");
+            env_test_remove("JIT_ROUTEB_SETTINGS_SSO_SEED");
             assert!(routeb_ensure_writable(CELL_A), "settings .bss page must be writable");
             std::ptr::write_unaligned(CELL_A as *mut u64, 0);
             std::ptr::write_unaligned(CELL_B as *mut u64, 0);
@@ -8659,7 +8687,7 @@ mod tests {
             routeb_settings_sso_seed_guard(std::ptr::null_mut(), 0x1021f5078);
             assert_eq!(std::ptr::read_unaligned(CELL_A as *const u64), 0, "inert without env");
             // (b) env set, wrong pc -> inert.
-            std::env::set_var("JIT_ROUTEB_SETTINGS_SSO_SEED", "1");
+            env_test_set("JIT_ROUTEB_SETTINGS_SSO_SEED", "1");
             routeb_settings_sso_seed_guard(std::ptr::null_mut(), 0x1021f3748);
             assert_eq!(std::ptr::read_unaligned(CELL_A as *const u64), 0, "wrong pc");
             // (c) CELL_A at pc 0x1021f5078 -> seed empty SSO.
@@ -8679,7 +8707,7 @@ mod tests {
             routeb_settings_sso_seed_guard(std::ptr::null_mut(), 0x1025f36ac);
             assert_eq!(std::ptr::read_unaligned(CELL_A as *const u64), 0xdeadbeef, "CELL_A untouched");
             assert_eq!(std::ptr::read_unaligned(CELL_B as *const u64), 0xdeadbeef, "CELL_B untouched");
-            std::env::remove_var("JIT_ROUTEB_SETTINGS_SSO_SEED");
+            env_test_remove("JIT_ROUTEB_SETTINGS_SSO_SEED");
             std::ptr::write_unaligned(CELL_A as *mut u64, 0);
             std::ptr::write_unaligned(CELL_B as *mut u64, 0);
         }
@@ -8792,13 +8820,13 @@ mod tests {
         let entry_sp = unsafe { st.x[31] };
         let slot = entry_sp + 8;
         unsafe {
-            std::env::remove_var("JIT_ROUTEB_EC_READERGATE");
+            env_test_remove("JIT_ROUTEB_EC_READERGATE");
             std::ptr::write_unaligned(slot as *mut u64, 0x1234_5678_9abc_def0u64);
             routeb_ec_world_reader_gate_guard(&mut st as *mut CpuState, 0x102e24598);
             assert_eq!(std::ptr::read_unaligned(slot as *const u64), 0x1234_5678_9abc_def0u64,
                 "env-gated: inert without JIT_ROUTEB_EC_READERGATE");
             // (b) env set, wrong pc -> inert.
-            std::env::set_var("JIT_ROUTEB_EC_READERGATE", "1");
+            env_test_set("JIT_ROUTEB_EC_READERGATE", "1");
             std::ptr::write_unaligned(slot as *mut u64, 0x1234_5678_9abc_def0u64);
             routeb_ec_world_reader_gate_guard(&mut st as *mut CpuState, 0x102e24590);
             assert_eq!(std::ptr::read_unaligned(slot as *const u64), 0x1234_5678_9abc_def0u64,
@@ -8819,7 +8847,7 @@ mod tests {
             routeb_ec_world_reader_gate_guard(&mut st as *mut CpuState, 0x102e24598);
             assert_eq!(std::ptr::read_unaligned(slot2 as *const u64), 0,
                 "NULL slot left NULL (would SIGSEGV [0+32] if seeded)");
-            std::env::remove_var("JIT_ROUTEB_EC_READERGATE");
+            env_test_remove("JIT_ROUTEB_EC_READERGATE");
         }
         // Real-image guard (as sh301 family): pin the reader-gate mechanism at
         // [0x2e24598,0x2e24840) so a drifted real binary fails loudly. These bytes
@@ -8860,13 +8888,13 @@ mod tests {
         unsafe { st.x[29] = frame.as_ptr() as u64; }
         let slot = unsafe { st.x[29] } + 104;
         unsafe {
-            std::env::remove_var("JIT_ROUTEB_EC_READERGATE_FRAME");
+            env_test_remove("JIT_ROUTEB_EC_READERGATE_FRAME");
             std::ptr::write_unaligned(slot as *mut u64, 0x1234_5678_9abc_def0u64);
             routeb_ec_world_reader_gate_frame_guard(&mut st as *mut CpuState, 0x102e24694);
             assert_eq!(std::ptr::read_unaligned(slot as *const u64), 0x1234_5678_9abc_def0u64,
                 "env-gated: inert without JIT_ROUTEB_EC_READERGATE_FRAME");
             // (b) env set, wrong pc (block-entry 0x102e24598 / unrelated) -> inert.
-            std::env::set_var("JIT_ROUTEB_EC_READERGATE_FRAME", "1");
+            env_test_set("JIT_ROUTEB_EC_READERGATE_FRAME", "1");
             std::ptr::write_unaligned(slot as *mut u64, 0x1234_5678_9abc_def0u64);
             routeb_ec_world_reader_gate_frame_guard(&mut st as *mut CpuState, 0x102e24598);
             assert_eq!(std::ptr::read_unaligned(slot as *const u64), 0x1234_5678_9abc_def0u64,
@@ -8888,7 +8916,7 @@ mod tests {
             routeb_ec_world_reader_gate_frame_guard(&mut st as *mut CpuState, 0x102e246b0);
             assert_ne!(std::ptr::read_unaligned(slot2 as *const u64), 0,
                 "NULL slot seeded with a coherent fabricated object (avoids [0+32] SIGSEGV)");
-            std::env::remove_var("JIT_ROUTEB_EC_READERGATE_FRAME");
+            env_test_remove("JIT_ROUTEB_EC_READERGATE_FRAME");
         }
     }
 
@@ -8902,7 +8930,7 @@ mod tests {
         // loop 0x22085c4 consumes it), and (d) be idempotent (no clobber of a
         // non-empty vector). Serialized with CONT_MGR_TEST_LOCK (shares the
         // fixed-.bss source-vector page).
-        let _mgr_guard = CONT_MGR_TEST_LOCK.lock().unwrap();
+        let _mgr_guard = ROUTEB_PROC_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         const SRC_VEC: u64 = 0x106dca0ea8;
         const SRC_VEC2: u64 = 0x106dca0e08;
         const SRC_MAP: u64 = 0x106dca0e90;
@@ -8923,7 +8951,7 @@ mod tests {
         }
         unsafe {
             // (a) env unset, pc in-range -> inert.
-            std::env::remove_var("JIT_ROUTEB_SOURCE_SEED");
+            env_test_remove("JIT_ROUTEB_SOURCE_SEED");
             zero_slots(slots);
             routeb_source_vector_seed_guard(std::ptr::null_mut(), 0x102206404);
             assert_eq!(
@@ -8933,7 +8961,7 @@ mod tests {
             );
 
             // (b) env set, wrong pc -> inert.
-            std::env::set_var("JIT_ROUTEB_SOURCE_SEED", "1");
+            env_test_set("JIT_ROUTEB_SOURCE_SEED", "1");
             routeb_source_vector_seed_guard(std::ptr::null_mut(), 0x10220881c);
             assert_eq!(
                 std::ptr::read_unaligned(SRC_VEC as *const u64),
@@ -8979,7 +9007,7 @@ mod tests {
                 "idempotent: a non-empty source vector must be left untouched"
             );
 
-            std::env::remove_var("JIT_ROUTEB_SOURCE_SEED");
+            env_test_remove("JIT_ROUTEB_SOURCE_SEED");
             zero_slots(slots);
         }
     }
@@ -8993,7 +9021,7 @@ mod tests {
         // 0x20 zeroed buffer, telemetry once-cell [0x106dcd380] -> -1, map-page
         // [0x10673336d8].bit0 -> 1 — and (d) be idempotent. Serialized on the shared
         // fixed-.bss TEST_LOCK (telem page shared with SH156-style ctor globals).
-        let _g = CONT_MGR_TEST_LOCK.lock().unwrap();
+        let _g = ROUTEB_PROC_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         const TI: u64 = 0x1067333aa0;
         const TEL: u64 = 0x106dcd380;
         const MAP: u64 = 0x10673336d8;
@@ -9004,7 +9032,7 @@ mod tests {
         }
         unsafe {
             // (a) env unset, in-range pc -> inert.
-            std::env::remove_var("JIT_ROUTEB_DOINIT_NEXT3");
+            env_test_remove("JIT_ROUTEB_DOINIT_NEXT3");
             std::ptr::write_unaligned(TI as *mut u64, 0);
             std::ptr::write_unaligned(TEL as *mut u64, 0);
             std::ptr::write_unaligned(MAP as *mut u8, 0);
@@ -9013,7 +9041,7 @@ mod tests {
             assert_eq!(std::ptr::read_unaligned(TEL as *const u64), 0, "env-gated: telemetry untouched");
 
             // (b) env set, wrong pc -> inert.
-            std::env::set_var("JIT_ROUTEB_DOINIT_NEXT3", "1");
+            env_test_set("JIT_ROUTEB_DOINIT_NEXT3", "1");
             routeb_doinit_next3_seed_guard(std::ptr::null_mut(), 0x102213000);
             assert_eq!(std::ptr::read_unaligned(TI as *const u64), 0, "pc-gated: must not fire outside band");
 
@@ -9030,7 +9058,7 @@ mod tests {
             routeb_doinit_next3_seed_guard(std::ptr::null_mut(), 0x102206f00);
             assert_eq!(std::ptr::read_unaligned(TI as *const u64), ti_keep, "idempotent: thread-init not re-seeded");
 
-            std::env::remove_var("JIT_ROUTEB_DOINIT_NEXT3");
+            env_test_remove("JIT_ROUTEB_DOINIT_NEXT3");
             std::ptr::write_unaligned(TI as *mut u64, 0);
             std::ptr::write_unaligned(MAP as *mut u8, 0);
         }
@@ -9046,17 +9074,24 @@ mod tests {
         // engine-init at +0x30 (that would recurse into 0x102bd8ce8 forever).
         //
         // (a) env unset -> holder untouched. Shares env + holder page with sh164/sh243 — serialize.
-        let _g = DM_MANAGER_TEST_LOCK.lock().unwrap();
-        unsafe { std::env::remove_var("JIT_ROUTEB_DMFORCE") };
+        let _g = ROUTEB_PROC_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe { env_test_remove("JIT_ROUTEB_DMFORCE") };
         const HOLDER: u64 = 0x102727550;
         // The holder is a fixed .bss global NOT loaded by any unit-test process
         // (the libroblox image is never mapped here), so its page is genuinely
-        // unmapped — this exercises routeb_map_guest_page (the SH156 pattern:
-        // map anon RW into the fully-absent page, never clobber file-backed).
-        assert!(!any_page_mapped(HOLDER), "precondition: holder page genuinely absent in a unit test");
+        // unmapped on a fresh process — this exercises routeb_map_guest_page (the
+        // SH156 pattern: map anon RW into the fully-absent page, never clobber
+        // file-backed). The page starts UNMAPPED only if this test runs first among
+        // the serialized holder-page siblings (sh243 maps the SAME 0x102727550 page
+        // and leaves it mapped for the process lifetime). So a "page must be absent"
+        // assert is order-dependent in a shared test process — not part of the contract
+        // under test. Keep the behavioral assertions (routeb_map_guest_page makes it
+        // mapped+readable, idempotent second map, writable, and the guard's env/pc
+        // gating) which hold in BOTH orders; drop only the private-order precondition.
+        let _was_absent = !any_page_mapped(HOLDER);
         assert!(
             routeb_map_guest_page(HOLDER),
-            "routeb_map_guest_page must map a genuinely-unmapped page anon RW"
+            "routeb_map_guest_page must make the page mapped+readable (absent or pre-mapped by a sibling -> idempotent no-op)"
         );
         assert!(
             page_is_mapped(HOLDER),
@@ -9086,7 +9121,7 @@ mod tests {
         );
         // (b/d) env set + a NON-fnB pc (the governor tail, where the shell is dispatched)
         // must NOT write (the manager seed is scoped to the engine-init region).
-        unsafe { std::env::set_var("JIT_ROUTEB_DMFORCE", "1") };
+        unsafe { env_test_set("JIT_ROUTEB_DMFORCE", "1") };
         routeb_dm_manager_guard(&mut st as *mut CpuState, 0x102e9fcc4);
         assert_eq!(
             unsafe { std::ptr::read_unaligned(HOLDER as *const u64) },
@@ -9112,7 +9147,7 @@ mod tests {
         let m2 = unsafe { std::ptr::read_unaligned(HOLDER as *const u64) };
         routeb_dm_manager_guard(&mut st as *mut CpuState, 0x102bd1b98);
         assert_eq!(unsafe { std::ptr::read_unaligned(HOLDER as *const u64) }, m2, "idempotent");
-        unsafe { std::env::remove_var("JIT_ROUTEB_DMFORCE") };
+        unsafe { env_test_remove("JIT_ROUTEB_DMFORCE") };
     }
 
     #[test]
@@ -9125,7 +9160,7 @@ mod tests {
         // (c) leave the DEFAULT all-leaf routeb_dm_manager_fabricated (M=0x20, +0x1f0=leaf)
         // unchanged so SH165-fwd's verified benign-complete is preserved.
         // Serialize against the sh248c test (shared CONT_MANAGED_M static).
-        let _mgr_guard = CONT_MGR_TEST_LOCK.lock().unwrap();
+        let _mgr_guard = ROUTEB_PROC_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let m_cont = routeb_dm_manager_cont();
         let vt = unsafe { std::ptr::read_unaligned(m_cont as *const u64) };
         // +0x1f0 routed to the REAL continuation (NOT a leaf / NOT 0).
@@ -9179,7 +9214,7 @@ mod tests {
             "manufacture guard must not touch the holder when env is off"
         );
         // (b) env on + a NON-StartLuaAppDM pc -> must NOT fire.
-        unsafe { std::env::set_var("JIT_ROUTEB_DM_MANUFACTURE", "1") };
+        unsafe { env_test_set("JIT_ROUTEB_DM_MANUFACTURE", "1") };
         routeb_dm_manufacture_guard(&mut st as *mut CpuState, 0x102e9fcc4);
         assert_eq!(
             unsafe { std::ptr::read_unaligned(CUR_DM_HOLDER as *const u64) },
@@ -9210,7 +9245,7 @@ mod tests {
             dm,
             "idempotent: second StartLuaAppDM call leaves the same DM"
         );
-        unsafe { std::env::remove_var("JIT_ROUTEB_DM_MANUFACTURE") };
+        unsafe { env_test_remove("JIT_ROUTEB_DM_MANUFACTURE") };
     }
 
     #[test]
@@ -9286,14 +9321,14 @@ mod tests {
         // image), so assert via timing: a fired guard on this pc would attempt
         // routeb_ensure_writable + a failed callback; a region-gated return is
         // instant. (routeb_ensure_writable on an unmapped addr is safe/no-op.)
-        unsafe { std::env::set_var("JIT_ROUTEB_DM_CTOR_DRIVER", "1") };
+        unsafe { env_test_set("JIT_ROUTEB_DM_CTOR_DRIVER", "1") };
         let t0 = std::time::Instant::now();
         routeb_dm_ctor_driver_guard(&mut st as *mut CpuState, 0x102e9fcc4);
         assert!(
             t0.elapsed().as_millis() < 50,
             "env-on + wrong pc must region-gate and return immediately"
         );
-        unsafe { std::env::remove_var("JIT_ROUTEB_DM_CTOR_DRIVER") };
+        unsafe { env_test_remove("JIT_ROUTEB_DM_CTOR_DRIVER") };
     }
 
     #[test]
@@ -9308,7 +9343,7 @@ mod tests {
         // (a) env off -> no-op.
         routeb_dm_real_ctor_drive_guard(&mut st as *mut CpuState, 0x1023efe2c);
         // (b) env on + non-StartLuaAppDM pc -> no-op.
-        unsafe { std::env::set_var("JIT_ROUTEB_DM_REALCTOR", "1") };
+        unsafe { env_test_set("JIT_ROUTEB_DM_REALCTOR", "1") };
         let t0 = std::time::Instant::now();
         routeb_dm_real_ctor_drive_guard(&mut st as *mut CpuState, 0x102e9fcc4);
         assert!(
@@ -9319,7 +9354,7 @@ mod tests {
         //     owned: run_guest_callback needs a real loaded image with guest TLS, never invoked
         //     here in the hermetic context).
         routeb_dm_real_ctor_drive_guard(&mut st as *mut CpuState, 0x1023efe2c);
-        unsafe { std::env::remove_var("JIT_ROUTEB_DM_REALCTOR") };
+        unsafe { env_test_remove("JIT_ROUTEB_DM_REALCTOR") };
     }
 
     #[test]
@@ -9336,10 +9371,10 @@ mod tests {
         routeb_dm_real_ctor_drive_guard(&mut st as *mut CpuState, 0x1023efe2c);
         // (b) FULL set but base JIT_ROUTEB_DM_REALCTOR unset -> inert (guard early-outs on the
         //     base env before reading FULL).
-        unsafe { std::env::set_var("JIT_ROUTEB_DM_REALCTOR_FULL", "1") };
+        unsafe { env_test_set("JIT_ROUTEB_DM_REALCTOR_FULL", "1") };
         routeb_dm_real_ctor_drive_guard(&mut st as *mut CpuState, 0x1023efe2c);
         // (c) base + FULL set, wrong pc -> region-gates and returns immediately.
-        unsafe { std::env::set_var("JIT_ROUTEB_DM_REALCTOR", "1") };
+        unsafe { env_test_set("JIT_ROUTEB_DM_REALCTOR", "1") };
         let t0 = std::time::Instant::now();
         routeb_dm_real_ctor_drive_guard(&mut st as *mut CpuState, 0x102e9fcc4);
         assert!(
@@ -9349,8 +9384,8 @@ mod tests {
         // (d) base + FULL set, correct entry pc -> returns without error (the drive stays
         //     harness-owned; never run_guest_callback'd in hermetic context).
         routeb_dm_real_ctor_drive_guard(&mut st as *mut CpuState, 0x1023efe2c);
-        unsafe { std::env::remove_var("JIT_ROUTEB_DM_REALCTOR_FULL") };
-        unsafe { std::env::remove_var("JIT_ROUTEB_DM_REALCTOR") };
+        unsafe { env_test_remove("JIT_ROUTEB_DM_REALCTOR_FULL") };
+        unsafe { env_test_remove("JIT_ROUTEB_DM_REALCTOR") };
     }
 
     #[test]
@@ -9364,7 +9399,7 @@ mod tests {
         // (a) env off -> no-op (includes the once-init region).
         routeb_dm_service_seed_guard(&mut st as *mut CpuState, 0x1023efe2c);
         // (b) env on + non-StartLuaAppDM pc -> no-op (region gate).
-        unsafe { std::env::set_var("JIT_ROUTEB_DM_SERVICES", "1") };
+        unsafe { env_test_set("JIT_ROUTEB_DM_SERVICES", "1") };
         let t0 = std::time::Instant::now();
         routeb_dm_service_seed_guard(&mut st as *mut CpuState, 0x102e9fcc4);
         assert!(
@@ -9375,7 +9410,7 @@ mod tests {
         //     are harness-owned; run_guest_callback needs a real loaded guest image, never run
         //     in a hermetic test).
         routeb_dm_service_seed_guard(&mut st as *mut CpuState, 0x1023efe2c);
-        unsafe { std::env::remove_var("JIT_ROUTEB_DM_SERVICES") };
+        unsafe { env_test_remove("JIT_ROUTEB_DM_SERVICES") };
     }
 
     #[test]
@@ -9384,7 +9419,7 @@ mod tests {
         // fire at the PlayerGui ctor-entry pc 0x10255d1dc, and (c) only store a NON-trivial object
         // (never 0/0x1) into the global. It is the observation primitive that closed SH189c's
         // "allocated but unobserved" residual (the pair-consumer ret/out walk was a red herring).
-        let _l = DM_INSTANCE_TEST_LOCK.lock().unwrap();
+        let _l = ROUTEB_PROC_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut st = CpuState::new();
         ROUTEB_DM_CTOR_OBJ.store(0, std::sync::atomic::Ordering::Relaxed);
         // env off -> inert, no store.
@@ -9396,7 +9431,7 @@ mod tests {
             "env-off must be inert"
         );
         // env on + wrong pc -> region-gated, no store.
-        unsafe { std::env::set_var("JIT_ROUTEB_DM_INSTANCE", "1") };
+        unsafe { env_test_set("JIT_ROUTEB_DM_INSTANCE", "1") };
         routeb_dm_instance_ctor_capture(&mut st as *mut CpuState, 0x102e9fcc4);
         assert_eq!(
             ROUTEB_DM_CTOR_OBJ.load(std::sync::atomic::Ordering::Relaxed),
@@ -9420,7 +9455,7 @@ mod tests {
             "trivial x0 must not clobber the stored object"
         );
         ROUTEB_DM_CTOR_OBJ.store(0, std::sync::atomic::Ordering::Relaxed);
-        unsafe { std::env::remove_var("JIT_ROUTEB_DM_INSTANCE") };
+        unsafe { env_test_remove("JIT_ROUTEB_DM_INSTANCE") };
     }
 
     #[test]
@@ -9431,7 +9466,7 @@ mod tests {
         // __data_=real buffer at obj+0x70}; [obj+0x40,0x60) and [obj+0x78,0xa8) -> EMPTY SSO. Must be
         // local to the seeded object, env-gated (NOP env on), and pc-gated (only PGI_CTOR_ENTRY),
         // leaving the capture atomics untouched.
-        let _l = DM_INSTANCE_TEST_LOCK.lock().unwrap();
+        let _l = ROUTEB_PROC_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut st = CpuState::new();
         // Allocate a fresh isolated object so the zeroing deals only with our own bytes.
         let obj = Box::leak(vec![0xabu8; 0x200].into_boxed_slice()).as_mut_ptr() as u64;
@@ -9448,8 +9483,8 @@ mod tests {
             "env-off must not seed"
         );
         // env ON + wrong pc (a non-ctor pc, e.g. the governor tail) -> no seed.
-        unsafe { std::env::set_var("JIT_ROUTEB_DM_INSTANCE", "1") };
-        unsafe { std::env::set_var("JIT_ROUTEB_DM_INSTANCE_NOP", "1") };
+        unsafe { env_test_set("JIT_ROUTEB_DM_INSTANCE", "1") };
+        unsafe { env_test_set("JIT_ROUTEB_DM_INSTANCE_NOP", "1") };
         routeb_dm_instance_ctor_capture(&mut st as *mut CpuState, 0x102e9fcc4);
         assert_eq!(
             unsafe { std::ptr::read_volatile((obj + 0x60) as *const u64) },
@@ -9495,8 +9530,8 @@ mod tests {
             "capture obj atomic must be set"
         );
         ROUTEB_DM_CTOR_OBJ.store(0, std::sync::atomic::Ordering::Relaxed);
-        unsafe { std::env::remove_var("JIT_ROUTEB_DM_INSTANCE_NOP") };
-        unsafe { std::env::remove_var("JIT_ROUTEB_DM_INSTANCE") };
+        unsafe { env_test_remove("JIT_ROUTEB_DM_INSTANCE_NOP") };
+        unsafe { env_test_remove("JIT_ROUTEB_DM_INSTANCE") };
     }
 
     #[test]
@@ -9506,10 +9541,10 @@ mod tests {
         // headlessly once the current-DM global 0x107333948 is planted. Guard must be
         // default-inert (env off), env-gated (JIT_ROUTEB_DM_INSTANCE), region-scoped to
         // StartLuaAppDM entry. Guest drive (run_guest_callback_x8) is harness-owned.
-        let _l = DM_INSTANCE_TEST_LOCK.lock().unwrap();
+        let _l = ROUTEB_PROC_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut st = CpuState::new();
         routeb_dm_instance_guard(&mut st as *mut CpuState, 0x1023efe2c);
-        unsafe { std::env::set_var("JIT_ROUTEB_DM_INSTANCE", "1") };
+        unsafe { env_test_set("JIT_ROUTEB_DM_INSTANCE", "1") };
         let t0 = std::time::Instant::now();
         routeb_dm_instance_guard(&mut st as *mut CpuState, 0x102e9fcc4);
         assert!(
@@ -9517,7 +9552,7 @@ mod tests {
             "env-on + wrong pc must region-gate and return immediately"
         );
         routeb_dm_instance_guard(&mut st as *mut CpuState, 0x1023efe2c);
-        unsafe { std::env::remove_var("JIT_ROUTEB_DM_INSTANCE") };
+        unsafe { env_test_remove("JIT_ROUTEB_DM_INSTANCE") };
     }
 
     #[test]
@@ -9528,7 +9563,7 @@ mod tests {
         // (d) not fault when driving toward the walker in a hermetic context (no guest image
         // -> the holder/name pages are unmapped -> safe early-return). The actual node-link +
         // walker drive live on the harness's real run (run_guest_callback needs a live engine).
-        let _l = DM_INSTANCE_TEST_LOCK.lock().unwrap();
+        let _l = ROUTEB_PROC_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut st = CpuState::new();
         let inst = Box::leak(vec![0x0u8; 0x100].into_boxed_slice()).as_mut_ptr() as u64;
         unsafe { std::ptr::write_unaligned(inst as *mut u64, 0x106648950) }; // PlayerGui vptr
@@ -9538,7 +9573,7 @@ mod tests {
         routeb_dm_service_resolve_guard(&mut st as *mut CpuState, 0x1023efe2c);
 
         // (b) env on + wrong pc -> region-gated, returns immediately.
-        unsafe { std::env::set_var("JIT_ROUTEB_DM_SERVICE_NODE", "1") };
+        unsafe { env_test_set("JIT_ROUTEB_DM_SERVICE_NODE", "1") };
         let t0 = std::time::Instant::now();
         routeb_dm_service_resolve_guard(&mut st as *mut CpuState, 0x102e9fcc4);
         assert!(
@@ -9552,7 +9587,7 @@ mod tests {
         ROUTEB_DM_CTOR_OBJ.store(inst, std::sync::atomic::Ordering::Relaxed);
         routeb_dm_service_resolve_guard(&mut st as *mut CpuState, 0x1023efe2c);
 
-        unsafe { std::env::remove_var("JIT_ROUTEB_DM_SERVICE_NODE") };
+        unsafe { env_test_remove("JIT_ROUTEB_DM_SERVICE_NODE") };
         ROUTEB_DM_CTOR_OBJ.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -9626,8 +9661,8 @@ mod tests {
         // clear both boot-latch gate bits. Idempotent; env-off and wrong-pc inert.
         // Serialized with CONT_MGR_TEST_LOCK: this test and sh248d/ADAPTER/ONCE all write
         // the shared fixed-.bss cookie-jar/adapter cells + process-global env vars.
-        let _mgr_guard = CONT_MGR_TEST_LOCK.lock().unwrap();
-        unsafe { std::env::remove_var("JIT_ROUTEB_COOKIE") };
+        let _mgr_guard = ROUTEB_PROC_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe { env_test_remove("JIT_ROUTEB_COOKIE") };
         const JAR: u64 = 0x106ed7a20;
         const GATE_FLAGS: u64 = 0x1072739d4;
         const GATE_JAR: u64 = 0x106dcfc30;
@@ -9645,7 +9680,7 @@ mod tests {
             "cookie-jar guard must be inert when JIT_ROUTEB_COOKIE is unset"
         );
         // (b) env set but WRONG pc -> still inert.
-        unsafe { std::env::set_var("JIT_ROUTEB_COOKIE", "1") };
+        unsafe { env_test_set("JIT_ROUTEB_COOKIE", "1") };
         unsafe { std::ptr::write_unaligned(JAR as *mut u64, 0) };
         routeb_cookie_jar_guard(&mut st as *mut CpuState, 0x102203144);
         assert_eq!(
@@ -9670,7 +9705,7 @@ mod tests {
         );
         // Sanity: the seeded SSO is a valid empty string (size 0 at +8 on libc++ SSO).
         assert_eq!(unsafe { std::ptr::read_unaligned((sso + 8) as *const u64) }, 0, "empty SSO size==0");
-        unsafe { std::env::remove_var("JIT_ROUTEB_COOKIE") };
+        unsafe { env_test_remove("JIT_ROUTEB_COOKIE") };
     }
 
     #[test]
@@ -9707,14 +9742,14 @@ mod tests {
     #[test]
     fn sh167_dm_alloc_capture_is_env_gated_and_never_clobbers_live_hook() {
         // SH179: serialize against sh169 (shared PREV_DM_ALLOC_HOOK static + process env).
-        let _dm_capture_lock = DM_CAPTURE_TEST_LOCK.lock().unwrap();
+        let _dm_capture_lock = ROUTEB_PROC_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // SH167 (recon cone deleg_35857472 task-2): the CRT operator-new capture hook. The
         // guard must (a) be inert without JIT_DM_ALLOC_CAPTURE, (b) fire ONLY at the wrapper
         // block-entry pc 0x102a0d9b8, (c) seed the ACTIVE allocator-hook global 0x1067daaf0
         // with a host-call trail that returns a REAL allocation, (d) be idempotent, and
         // (e) NEVER clobber a nonzero (engine-installed) live hook.
         const ACTIVE: u64 = OP_NEW_ACTIVE_HOOK;
-        unsafe { std::env::remove_var("JIT_DM_ALLOC_CAPTURE") };
+        unsafe { env_test_remove("JIT_DM_ALLOC_CAPTURE") };
         assert!(
             routeb_ensure_writable(ACTIVE),
             "map the (unit-test-absent) hook page anon RW"
@@ -9729,7 +9764,7 @@ mod tests {
             "env-off must not seed the active hook"
         );
         // (b) env on + wrong pc -> no seed.
-        unsafe { std::env::set_var("JIT_DM_ALLOC_CAPTURE", "1") };
+        unsafe { env_test_set("JIT_DM_ALLOC_CAPTURE", "1") };
         routeb_dm_alloc_capture_guard(&mut st as *mut CpuState, 0x102a0d9a4);
         assert_eq!(
             unsafe { std::ptr::read_unaligned(ACTIVE as *const u64) },
@@ -9768,7 +9803,7 @@ mod tests {
         // hook is SAVED as the delegation target and the trail replaces it (capture-only
         // delegation), so the real allocation forwards through the engine's pool.
         unsafe {
-            std::env::set_var("JIT_DM_ALLOC_CAPTURE_DELEGATE", "1");
+            env_test_set("JIT_DM_ALLOC_CAPTURE_DELEGATE", "1");
         }
         routeb_dm_alloc_capture_guard(&mut st as *mut CpuState, OP_NEW_WRAPPER);
         let installed = unsafe { std::ptr::read_unaligned(ACTIVE as *const u64) };
@@ -9789,9 +9824,9 @@ mod tests {
             "delegate-mode install is idempotent"
         );
         unsafe {
-            std::env::remove_var("JIT_DM_ALLOC_CAPTURE_DELEGATE");
+            env_test_remove("JIT_DM_ALLOC_CAPTURE_DELEGATE");
             std::ptr::write_unaligned(ACTIVE as *mut u64, 0);
-            std::env::remove_var("JIT_DM_ALLOC_CAPTURE");
+            env_test_remove("JIT_DM_ALLOC_CAPTURE");
         }
         routeb_dm_alloc_capture_reset();
     }
@@ -9799,7 +9834,7 @@ mod tests {
     #[test]
     fn sh169_delegating_trail_falls_back_safely_when_no_guest_image() {
         // SH179: serialize against sh167 (shared PREV_DM_ALLOC_HOOK static + process env).
-        let _dm_capture_lock = DM_CAPTURE_TEST_LOCK.lock().unwrap();
+        let _dm_capture_lock = ROUTEB_PROC_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // SH169 delegation: with a saved engine hook (delegate mode), the capture trail routes
         // the real allocation through the JIT to the engine's own hook. In a hermetic test there
         // is no active guest image, so run_guest_callback must Err and the trail must fall back to
@@ -9940,8 +9975,23 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert!(moved >= 1, "matching CMP_REQUEUE must move the waiter, got {moved}");
+        // SH346/357: wake on dst must release the cmp-requeued waiter. The requeue moved
+        // it onto dst's queue, so a WAKE there returns >=1 the moment it is queued — but
+        // under heavy parallel scheduling the freshly-requeued waiter can still be
+        // mid-transition when the first WAKE syscall lands, so spin (same bounded window
+        // as the REQUEUE test above; a faked-0 handler exhausts the window and still
+        // fails this assertion — the SH133 regression is NOT weakened).
         let wake: [u64; 6] = [dst as u64, libc::FUTEX_WAKE as u64, 1, 0, 0, 0];
-        assert!(handle_futex(&wake) >= 1, "WAKE on dst must release the cmp-requeued waiter");
+        let mut woken: i64 = 0;
+        for _ in 0..20_000 {
+            let r = handle_futex(&wake);
+            if r >= 1 {
+                woken = r;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(woken >= 1, "WAKE on dst must release the cmp-requeued waiter, got {woken}");
         let _ = handle.join();
         unsafe { drop(Box::from_raw(src as *mut libc::c_int)); drop(Box::from_raw(dst as *mut libc::c_int)); }
     }
@@ -14535,7 +14585,7 @@ mod sh334_registry_live_guard_tests {
     fn inert_without_env() {
         // Default-inert: with JIT_ROUTEB_REG_LIVE unset the guard must no-op at its own
         // anchor pc (0x102168798) — no dump, no panic, no state write.
-        unsafe { std::env::remove_var("JIT_ROUTEB_REG_LIVE") };
+        unsafe { env_test_remove("JIT_ROUTEB_REG_LIVE") };
         let mut st = CpuState::new();
         routeb_registry_live_guard(&mut st as *mut CpuState, 0x102168798);
         // No observable side effect on a default state (guard returns before any read).
@@ -14546,12 +14596,12 @@ mod sh334_registry_live_guard_tests {
     fn wrong_pc_misses_even_with_env() {
         // Even when enabled, a non-anchor pc must be skipped (guard's only write is the
         // OnceLock latch, which must NOT trip here — otherwise a stray pc would consume it).
-        unsafe { std::env::set_var("JIT_ROUTEB_REG_LIVE", "1") };
+        unsafe { env_test_set("JIT_ROUTEB_REG_LIVE", "1") };
         let mut st = CpuState::new();
         routeb_registry_live_guard(&mut st as *mut CpuState, 0x102168700); // before anchor
         routeb_registry_live_guard(&mut st as *mut CpuState, 0x1021687a0); // after anchor
         assert_eq!(st.x[0], 0, "non-anchor pc must not fire the live dump");
-        unsafe { std::env::remove_var("JIT_ROUTEB_REG_LIVE") };
+        unsafe { env_test_remove("JIT_ROUTEB_REG_LIVE") };
     }
 }
 
@@ -14566,7 +14616,7 @@ mod routeb_lsm_keyfix_guard_tests {
     #[test]
     fn inert_without_env() {
         let _g = lock();
-        unsafe { std::env::remove_var("JIT_ROUTEB_LSM_KEYFIX") };
+        unsafe { env_test_remove("JIT_ROUTEB_LSM_KEYFIX") };
         let mut st = CpuState::new();
         st.x[0] = 0x101d968e4; // the SH341 poisoned .text key
         routeb_lsm_keyfix_guard(&mut st as *mut CpuState, 0x101d9a528);
@@ -14577,7 +14627,7 @@ mod routeb_lsm_keyfix_guard_tests {
     #[test]
     fn valid_key_untouched_even_with_env() {
         let _g = lock();
-        unsafe { std::env::set_var("JIT_ROUTEB_LSM_KEYFIX", "1") };
+        unsafe { env_test_set("JIT_ROUTEB_LSM_KEYFIX", "1") };
         let mut st = CpuState::new();
         st.x[0] = 0x7f81_1234_5678; // valid host-heap key (SH341: 0x7f81… completes)
         routeb_lsm_keyfix_guard(&mut st as *mut CpuState, 0x101d9a528);
@@ -14592,18 +14642,18 @@ mod routeb_lsm_keyfix_guard_tests {
         // In-this-crate writability: the substituted cell is a real host-heap allocation.
         unsafe { std::ptr::write_unaligned(cell as *mut u64, 0xdead_beef); }
         unsafe { assert_eq!(std::ptr::read_unaligned(cell as *const u64), 0xdead_beef); }
-        unsafe { std::env::remove_var("JIT_ROUTEB_LSM_KEYFIX") };
+        unsafe { env_test_remove("JIT_ROUTEB_LSM_KEYFIX") };
     }
 
     #[test]
     fn wrong_pc_misses_even_with_env() {
         let _g = lock();
-        unsafe { std::env::set_var("JIT_ROUTEB_LSM_KEYFIX", "1") };
+        unsafe { env_test_set("JIT_ROUTEB_LSM_KEYFIX", "1") };
         let mut st = CpuState::new();
         st.x[0] = 0x101d968e4;
         routeb_lsm_keyfix_guard(&mut st as *mut CpuState, 0x101d9a5a0); // pool-pop fn entry, not write-site
         assert_eq!(st.x[0], 0x101d968e4, "non-write-site pc must not edit x0");
-        unsafe { std::env::remove_var("JIT_ROUTEB_LSM_KEYFIX") };
+        unsafe { env_test_remove("JIT_ROUTEB_LSM_KEYFIX") };
     }
 }
 
@@ -16584,14 +16634,14 @@ mod fp16_and_fabd_fccmp_exec {
         let read = |sp: u64| unsafe { std::ptr::read_unaligned((sp + 32) as *const u64) };
 
         // (a) env unset: no change.
-        unsafe { std::env::remove_var("JIT_ROUTEB_SLADM_INVOKE") };
+        unsafe { env_test_remove("JIT_ROUTEB_SLADM_INVOKE") };
         let mut st = mkst(0x0); // [sp+32]==0 (a candidate: crossing allowed)
         let before = read(st.x[31]);
         routeb_startluaapp_invoke_guard(&mut st as *mut CpuState, 0x1023efeb0);
         assert_eq!(read(st.x[31]), before, "env-off must not write the slot");
 
         // (c) env set, but a REAL non-self pointer already present -> preserved.
-        unsafe { std::env::set_var("JIT_ROUTEB_SLADM_INVOKE", "1") };
+        unsafe { env_test_set("JIT_ROUTEB_SLADM_INVOKE", "1") };
         let real = 0x55aa00000001u64;
         let mut st2 = mkst(real);
         routeb_startluaapp_invoke_guard(&mut st2 as *mut CpuState, 0x1023efeb0);
@@ -16624,7 +16674,7 @@ mod fp16_and_fabd_fccmp_exec {
         let second = read(sp5);
         routeb_startluaapp_invoke_guard(&mut st5 as *mut CpuState, 0x1023efeb0);
         assert_eq!(read(sp5), second, "second crossing of a boxed slot must be idempotent (no rewrite)");
-        unsafe { std::env::remove_var("JIT_ROUTEB_SLADM_INVOKE") };
+        unsafe { env_test_remove("JIT_ROUTEB_SLADM_INVOKE") };
     }
 
     /// SH351: `stage_r1_core_scripts` writes the synthetic CoreScript module to the fsmap mirror
