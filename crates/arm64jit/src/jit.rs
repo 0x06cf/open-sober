@@ -9676,6 +9676,49 @@ mod tests {
     }
 
     #[test]
+    fn sh386_session_producer_engine_push_contract_pinned() {
+        // SH386 (real-image): byte-anchor the recon-v3 §A END-STATE self-drive mechanism the
+        // operator's SESSION PRODUCER HANDOFF ("push a real node via engine producer 0x10285682c
+        // + epoch bump [Q]+=0x1_0000_0000 high-32 only + FUTEX_WAKE_PRIVATE(0x81) on Q'+4;
+        // [node+112]=0x106829f00 -> re-enters vector -> self-drive") depends on. The
+        // --deque-node producer host path (elfjit.rs) publishes into the engine's own lock-free
+        // task deque (producer 0x10285682c / drain 0x102856e40) parked in the epoch futex, and the
+        // session-gated type4 producer (--taskv4-seed session) is the latent-but-correct handoff
+        // that drills this exact contract the instant a live session advances. This contract is
+        // currently pinned NOWHERE (the --deque-node code is comment-anchored only); these pins make
+        // it reproducible so the self-drive wiring stays grounded to the real binary. Index by FILE
+        // OFFSET (guest-0x100000000, ELF file-offset==vaddr in the r-x text segment).
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let word_at = |vaddr: u64| -> u32 {
+                let off = vaddr as usize;
+                let b = &img[off..off + 4];
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            };
+            // Engine task-deque PRODUCER 0x285682c (guest 0x10285682c): a real 0x60-frame prologue
+            // (stp x29,x30,[sp,#-0x60]! + callee-saved b/fa/f8/f6) — the node-push self-drive entry.
+            assert_eq!(word_at(0x285682c), 0xa9ba7bfd, "sh386 producer 0x285682c stp x29,x30,[sp,#-0x60]!");
+            assert_eq!(word_at(0x2856830), 0xf9000bfb, "sh386 producer str x27,[sp,#0x10]");
+            // Engine task-deque DRAIN 0x2856e40 (guest 0x102856e40): the consumer pop-loop that
+            // takes the w4==4 dispatch -> br [0x106829ea8]. Same prologue family.
+            assert_eq!(word_at(0x2856e40), 0xa9ba7bfd, "sh386 drain 0x2856e40 stp x29,x30,[sp,#-0x60]!");
+            // The drain's POP reads the head node cell [headcell+0] (ldr x23,[x20] @0x2856f94) then
+            // the tag guard (ldar x24,[x23] / ldur behind) — the [headcell+0] publish + [headcell+8]
+            // tag the --deque-node producer writes is exactly what the pop consumes.
+            assert_eq!(word_at(0x2856f94), 0xf9400297, "sh386 drain pop ldr x23,[x20] (head node cell +0x0)");
+            assert_eq!(word_at(0x2856f98), 0xc8dffef8, "sh386 drain pop ldar x24,[x23] (acquire head)");
+            // The drain's tag guard (0x2856e6c-78): ldr x26,[x1,#104]; cmp [headcell+8] tag —
+            // the node's high-16 tag == headcell+8 word the producer writes.
+            assert_eq!(word_at(0x2856e6c), 0xf940343a, "sh386 drain tag-guard ldr x26,[x1,#104]");
+            assert_eq!(word_at(0x2856e78), 0x54001041, "sh386 drain tag-guard b.ne (tag mismatch ret)");
+            eprintln!("sh386 engine-producer self-drive contract pinned (producer 0x285682c prologue + drain 0x2856e40 pop/tag-guard) — the recon-v3 §A handoff's node-push/epoch/futex wiring is grounded to the real binary");
+        } else {
+            eprintln!("sh386 real-image guard: no real libroblox.so, skipping producer-contract pins");
+        }
+    }
+
+    #[test]
     fn sh385_lsm_reader_value_slot_and_poolmove_base_pinned() {
         // SH385 (real-image): byte-anchor the FULL SH285 reader/pool-move mechanism that the
         // persistence-lane terminal (guestpc=0x101db1b08) faults on, refining SH285's "reader/pop

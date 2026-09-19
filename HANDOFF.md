@@ -1,5 +1,22 @@
 # Open Sober — Agent Handoff
 
+## SH386 (Sep 19, 2026, hermes-worker): recon-v3 §A END-STATE byte-anchored — pin the engine-producer self-drive contract (producer 0x10285682c / drain 0x102856e40 / pop + tag-guard) that the SESSION PRODUCER HANDOFF fires through the instant a live session advances (was pinned nowhere: --deque-node code was comment-anchored only)
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified green at
+HEAD: (1) capture_taskv4_frame.sh = 24 real task-driven frames `present swap Ok(0x1)`, 197 node
+pops, 0 json abort, 0 crash, EXIT 0; (2) JIT_JSON_ZERO_FIX len-clamp present; (3)
+capture_sh304_session_producer.sh = the session-gated producer is correctly INERT on bare boot
+(live_dm=true, app_ready=false -> UNGATED x3, GATED=0, lone present #0 = RENDERINIT warmup,
+0 crash) — the exact SH382 inverse control. New real-image hermetic
+`sh386_session_producer_engine_push_contract_pinned` (arm64jit lib 440->441): byte-anchors the
+recon-v3 §A end-state self-drive mechanism the operator's SESSION PRODUCER HANDOFF depends on —
+producer 0x285682c prologue (`stp x29,x30,[sp,#-0x60]!` 0xa9ba7bfd + str x27 0xf9000bfb), drain
+0x2856e40 prologue (0xa9ba7bfd), drain pop `ldr x23,[x20]` @0x2856f94 (0xf9400297) + `ldar x24,[x23]`
+@0x2856f98 (0xc8dffef8), tag-guard `ldr x26,[x1,#104]` @0x2856e6c (0xf940343a) + `b.ne` @0x2856e78
+(0x54001041) — MEASURED ok on the real binary. This grounds the end-state handoff's node-push/epoch/
+futex wiring on verified bytes (was comment-only). No production path / JIT hook default / guest byte
+touched; workspace green (cargo test --workspace EXIT 0, 621/0; arm64jit lib 441/0). Route-B live-DM
+structural gate UNCHANGED (DM-root [0x106a68818]=0, MH_* false, AppBridgeV2 0). +frontier-sh386 doc.
+
 ## SH385 (Sep 20, 2026, hermes-worker): MEASURED NEGATIVE (fully-composed LSM-crossing) + byte-anchored SH285 reader/pool-move mechanism — the LAST never-run composition loophole closed, refining the persistence-lane verdict to the exact fault mechanism
 Single-agent (cone suppressed). Before implementing the SH383/384 "wire the manufactured LSM
 manager into the lane" step, run the never-composed full-crossing intersection: the LSM crossings
