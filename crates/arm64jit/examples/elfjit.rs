@@ -1,8 +1,7 @@
-//! Integration spike: load an aarch64 ELF with libloader's `load_elf_image` (every PT_LOAD
-//! in one contiguous kernel-chosen mapping, guest vaddr == host addr), then run the entry
-//! in-process arm64jit translator - NO QEMU. Run: cargo run -p arm64jit --example elfjit
-//! /path/to/tiny.elf [entry-guest-hex]. Because guest==host, entry is BOTH guest vaddr AND
-//! host addr; ADRP/ADR + guest loads/stores deref the right host ptrs.
+//! Integration spike: load an aarch64 ELF via libloader's `load_elf_image`, then run
+//! the entry in-process arm64jit translator - NO QEMU. Run: cargo run -p arm64jit
+//! --example elfjit /path/to/tiny.elf [entry-guest-hex]. guest==host: entry is BOTH guest
+//! vaddr AND host addr; ADRP/ADR + guest loads/stores deref the right host ptrs.
 
 use arm64jit::jit::{CpuState, jit_run};
 use arm64jit::shims::set_anativewindow_xid;
@@ -6983,12 +6982,11 @@ fn main() {
                         eprintln!(
                             "[elfjit:v2boot] SH155 post-StartLuaAppDM: once-guard[0x6a68410]={og_now:#x} DM-root[0x106a68818]=0x{dm_now:x} liveDM={ok} once-slot[0x106a68408]=0x{once_slot:x}"
                         );
-                        // SH158: probe the AppBridgeV2 governor dispatch. do-init 0x1023eff4c builds the
-                        // singleton via GetOrCreate 0x2367270 then `blr [obj->vt+0x18]` @0x23effbc
-                        // -> governor 0x102e9fa84 (region-watch empty headlessly). Reads runtime
-                        // values to test the packed-RELA-vs-zero claims:
-                        // - [0x1063a3428] (vt 0x1063a3410 slot+0x18) == 0x2e9fa84?
-                        // - [0x106a705e8] AppBridgeV2 singleton obj slot, [0x106a70618] once-guard
+                        // SH158: probe AppBridgeV2 governor dispatch. do-init 0x1023eff4c builds the
+                        // singleton via GetOrCreate 0x2367270 then `blr [vt+0x18]` @0x23effbc
+                        // -> governor 0x102e9fa84 (empty headlessly). Reads packed-RELA values:
+                        // [0x1063a3428] (vt 0x1063a3410 slot+0x18)==0x2e9fa84? [0x106a705e8] singleton,
+                        // [0x106a70618] once-guard.
                         let abv_guard = if guest_page_mapped(0x106a70618u64) {
                             Some(unsafe { *(0x106a70618u64 as *const u8) })
                         } else {
@@ -8248,11 +8246,8 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                 }
             });
         }
-        // Synthetic app-command feed (JIT_DRIVE_LIFECYCLE): pushes Android
-        // lifecycle commands (APP_CMD_START/RESUME/INIT_WINDOW) ALooper
-        // queue GameActivity main loop reaching ALooper_pollOnce dispatches
-        // them (the commands preceding a real EGL context / first frame) instead
-        // of spinning empty queue.
+        // Synthetic app-command feed (JIT_DRIVE_LIFECYCLE): ALooper queue that
+        // the GameActivity main loop reaching ALooper_pollOnce would dispatch.
         if std::env::var_os("JIT_DRIVE_LIFECYCLE").is_some() {
             use arm64jit::shims::post_app_command;
             std::thread::spawn(|| {
@@ -8268,6 +8263,19 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                     post_app_command(*cmd);
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                let s = arm64jit::shims::app_command_drain_stats();
+                eprintln!(
+                    "[elfjit:appcmd] SH365 drain-stats: addfd={} pollonce={} posted={} -> {}",
+                    s[0],
+                    s[1],
+                    s[2],
+                    if s[0] == 0 && s[1] == 0 && s[2] > 0 {
+                        "DEAD-LETTER (guest glue loop never consumed APP_CMD — INIT_WINDOW never delivered to initEngine_)"
+                    } else {
+                        "drained (glue loop alive)"
+                    }
+                );
             });
         }
         // Real desktop X11 window for the ANativeWindow layer (GRAPHICS_-
@@ -8846,12 +8854,9 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                         (headcell as *mut u64).write_volatile(packed);
                         HEADCELL.store(headcell, Ordering::Relaxed);
                         PLACED.store(packed, Ordering::Relaxed);
-                        // ARM FORCE-POP exactly ONCE (SH44/SH11): patch the drain's pop-loop to always
-                        // fall through (`mov w24,w0` 0x102856f4c -> mov w24,#1 + NOP the tbz
-                        // 0x102856f7c) so the next drain iteration pops+dispatches OUR foreign
-                        // node, then drop the compiled drain block to recompile from patched
-                        // bytes. Doing this every re-injection re-evicts the block mid-drain
-                        // and desyncs the translation (SH44 crash 0x102856f7c).
+                        // ARM FORCE-POP ONCE (SH44/SH11): patch drain pop-loop to fall through
+                        // (`mov w24,w0` 0x102856f4c -> #1 + NOP tbz 0x102856f7c) so next drain pops
+                        // OUR foreign node; re-injecting re-evicts mid-drain (SH44 crash 0x102856f7c).
                         if !ARMED.swap(true, Ordering::Relaxed) {
                             let arm = [0x102856f4cu64, 0x102856f7cu64];
                             for a in arm {

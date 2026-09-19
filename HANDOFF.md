@@ -1,12 +1,36 @@
 # Open Sober — Agent Handoff
 
-## SH364 (Sep 20, 2026, hermes-worker): MEASURED — the messageBus experience-launch RECEIVE cb body is NEVER entered headlessly even with a REAL structured payload (SH347's named-open "real-string receive probe" is now closed: the cb-entry guard fires 0, the DM-holder read fires 0, publishRaw drives clean Ok(0x3e8)); recon-v3 immediate-priority deliverables re-verified green at HEAD
-Single-agent (cone suppressed). recon-v3 deliverables re-verified green at this
-HEAD (24 real task frames, swap Ok(0x1), dispatch #2638000, 197 node pops, 0
-json abort, 0 crash). Workspace green (cargo test --workspace EXIT 0, 0
-failures; arm64jit lib + elfjit example build). elfjit.rs / jit.rs stay under
-the 1MB pre-commit hook. Route-B live-DM gate UNCHANGED (DM-root 0x0, MH_*
-false, AppBridgeV2 0x0).
+## SH365 (Sep 19, 2026, hermes-worker): MEASURED dead-letter — the host app-command FIFO is never drained by the guest android_app glue loop (addfd=0, pollonce=0, posted=3, 3/3) on the completing ladder, pinning the SESSION-CTOR "window/GL-surface APP_CMD_INIT_WINDOW" precondition as an undelivered lifecycle event; recon-v3 deliverables re-verified green at HEAD
+Single-agent (cone suppressed). Always-on ALooper drain counters
+(`app_command_drain_stats` in shims.rs) + a 1.5s-grace readback in the elfjit
+app-command feed + one hermetic (`app_command_drain_stats_count_shim_entries_and_posted`,
+arm64jit lib 427) + capture `runs/capture_sh365_alooper_drain.sh`. No production
+path edited (4 cheap atomics; elfjit readback inside the existing
+JIT_DRIVE_LIFECYCLE block). Workspace green (cargo test --workspace EXIT 0,
+608/0 — was 607).
+
+### The forward this cycle
+SH264/276 drove the lifecycle NATIVES directly and each completes headlessly
+(initAppShellReporter/setActive/nativeInitClientSettings(_Signed)/
+nativeActivity_onEngineSettingsReceived all Ok), but SH264 *suspected* — never
+MEASURED — that the android_app glue main loop (guest 0x102bcd5d0) "busy-spins
+rather than dispatch APP_CMD_START/RESUME/INIT_WINDOW". The SESSION-CTOR
+directive names the window/surface `APP_CMD_INIT_WINDOW` as the precondition
+behind initEngine_'s "*** Engine settings is null" hard-assert, and the
+app-command FIFO was built to carry it. SH365 MEASURES the drain: on the
+completing ladder (3/3, EXIT 124 clean) the host posts 3 APP_CMD_* commands
+(START/RESUME/INIT_WINDOW) but the guest NEVER enters ALooper_addFd/ALooper_pollOnce
+(addfd=0, pollonce=0, posted=3) — the glue loop never consumes the FIFO, so the
+INIT_WINDOW event that would hand the wired X11 XID (0x200000, anativewindow fires
+1x) to the engine is never delivered. Cause-level MEASURED (SH264 inferred);
+Route-B live-DM structural gate UNCHANGED (DM-root 0x0, MH_* false). The drain
+stats are an always-on objective trigger: if a future drive brings the glue loop
+alive, addfd/pollonce flip >0 and the readback changes from DEAD-LETTER to drained.
+
+### Honest
+Does NOT manufacture a DataModel (DM-root 0, MH_* false). recon-v3 self-driven
+frame + JSON re-verified green at this HEAD (24 real task frames, swap Ok(0x1),
+197 node pops, 0 json abort, 0 crash).
 
 ### The forward this cycle
 SH347 measured the messageBus experience-launch RECEIVE path at the cb's

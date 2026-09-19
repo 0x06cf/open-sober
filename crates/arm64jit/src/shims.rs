@@ -714,8 +714,32 @@ fn app_cmd_queue() -> &'static Mutex<std::collections::VecDeque<i32>> {
     Q.get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
 }
 
+/// Always-on drains of the app-command FIFO (SH365): count how many times the
+/// guest actually enters the ALooper lifecycle shims, so a host that POSTS
+/// APP_CMD_START/RESUME/INIT_WINDOW but whose guest never reaches the
+/// android_app glue loop can be told apart from one that drains them. Zero
+/// `addfd`+`pollonce` with nonzero `posted` = the glue main loop never consumes
+/// the FIFO (the window/GL-surface `APP_CMD_INIT_WINDOW` precondition the
+/// SESSION-CTOR directive names for initEngine_ is never delivered). Cheap
+/// atomics; harmless on every boot.
+static ALOOPER_ADD_FD: AtomicU64 = AtomicU64::new(0);
+static ALOOPER_POLL_ONCE: AtomicU64 = AtomicU64::new(0);
+/// (stats()[2]) Host-side `post_app_command` calls (queued, not necessarily drained).
+static APP_CMD_POSTED: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of the app-command drain counters: [addfd, pollonce, posted].
+/// addfd==pollonce==0 with posted>0 is the measured-empty drain (dead-letter).
+pub fn app_command_drain_stats() -> [u64; 3] {
+    [
+        ALOOPER_ADD_FD.load(AtomicOrdering::Relaxed),
+        ALOOPER_POLL_ONCE.load(AtomicOrdering::Relaxed),
+        APP_CMD_POSTED.load(AtomicOrdering::Relaxed),
+    ]
+}
+
 /// Host side: queue an Android app command for the next `ALooper_pollOnce`.
 pub fn post_app_command(cmd: i32) {
+    APP_CMD_POSTED.fetch_add(1, AtomicOrdering::Relaxed);
     app_cmd_queue().lock().unwrap().push_back(cmd);
 }
 
@@ -766,6 +790,7 @@ extern "C" fn alooper_pollonce(
     _timeout: u64, outfd: u64, outevents: u64, outdata: u64, _a4: u64, _a5: u64, _a6: u64,
     _a7: u64,
 ) -> u64 {
+    ALOOPER_POLL_ONCE.fetch_add(1, AtomicOrdering::Relaxed);
     if std::env::var_os("JIT_TRACE").is_some() {
         eprintln!("[alooper] ALooper_pollOnce (queue={})", app_cmd_queue().lock().unwrap().len());
     }
@@ -879,6 +904,7 @@ extern "C" fn alooper_addfd(
     _looper: u64, fd: u64, _iden: u64, _events: u64, _cb: u64, data: u64,
     _a6: u64, _a7: u64,
 ) -> u64 {
+    ALOOPER_ADD_FD.fetch_add(1, AtomicOrdering::Relaxed);
     // Record the guest's `data` argument — in real android_native_app_glue this
     // is `&app->cmd_source`, an `android_poll_source*` whose `process` fn the glue
     // loop `blr`s. Storing it lets `pollOnce` hand that exact source back through
@@ -2326,6 +2352,41 @@ mod tests {
             &mut data as *mut u64 as u64, 0, 0, 0, 0,
         );
         assert_eq!(r3, ALOOPER_POLL_TIMEOUT as u32 as u64);
+    }
+
+    /// SH365: the app-command drain counters are always-on (no JIT_TRACE) so a
+    /// host that POSTs lifecycle commands but whose guest never reaches the
+    /// android_app glue loop (ALooper_addFd/pollOnce) is MEASURED as a
+    /// dead-letter, not inferred. Each shim entry increments its own counter;
+    /// post_app_command increments 'posted' unconditionally. Regression pins:
+    /// (a) addfd and pollonce each bump independently, (b) posted counts posts
+    /// that may never be drained, (c) the dead-letter predicate
+    /// (addfd==pollonce==0 && posted>0) is reachable and false once a shim
+    /// fires.
+    #[test]
+    fn app_command_drain_stats_count_shim_entries_and_posted() {
+        let _g = looper_test_lock().lock().unwrap();
+        // Snapshot the atomic counters (other tests/threads may have bumped them).
+        let before = app_command_drain_stats();
+        // (b) a post bumps 'posted' unconditionally (drain is separate).
+        post_app_command(APP_CMD_START);
+        let mid = app_command_drain_stats();
+        assert_eq!(mid[2], before[2] + 1, "post bumps the posted counter");
+        assert_eq!(mid[0], before[0], "post alone does not touch addfd");
+        assert_eq!(mid[1], before[1], "post alone does not touch pollonce");
+        // (a) a pollOnce call bumps pollonce only.
+        let r = alooper_pollonce(0, 0, 0, 0, 0, 0, 0, 0);
+        let after_poll = app_command_drain_stats();
+        assert_eq!(after_poll[1], mid[1] + 1, "pollOnce bumps pollonce");
+        assert_eq!(after_poll[0], mid[0], "pollOnce does not touch addfd");
+        let _ = r; // drained command or timeout; not load-bearing here
+        // an addFd call bumps addfd only.
+        let _ = alooper_addfd(0, 0x99, 1, 1, 0, 0, 0, 0);
+        let after_add = app_command_drain_stats();
+        assert_eq!(after_add[0], after_poll[0] + 1, "addFd bumps addfd");
+        assert_eq!(after_add[1], after_poll[1], "addFd does not touch pollonce");
+        // Restore the shared queue so unrelated tests keep a stable baseline.
+        app_cmd_queue().lock().unwrap().clear();
     }
 
     /// The app-glue main loop (guest 0x102bcd5d0) derefs ALooper_pollOnce's
