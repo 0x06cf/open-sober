@@ -200,3 +200,176 @@ pub fn layout_initial_stack(
 
     sp
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Walk the word image laid out from `sp` and return (argc, argv, envp,
+    /// auxv) as (guest-address, value) pairs — the same traversal glibc's
+    /// `_start` performs. Panics (test failure) on malformed framing.
+    fn walk_stack(
+        sp: u64,
+        stack_lo: u64,
+        stack_hi: u64,
+    ) -> (u64, Vec<u64>, Vec<u64>, Vec<(u64, u64)>) {
+        let mut r = |off: usize| -> u64 {
+            let a = sp + (off as u64) * 8;
+            assert!(
+                a >= stack_lo && a + 8 <= stack_hi,
+                "word image out of bounds"
+            );
+            unsafe { *((a) as *const u64) }
+        };
+        let argc = r(0);
+        let mut i = 1;
+        let mut argv = Vec::new();
+        for _ in 0..argc {
+            let p = r(i);
+            assert!(p != 0, "argv entry null before terminator");
+            argv.push(p);
+            i += 1;
+        }
+        assert_eq!(r(i), 0, "argv NULL terminator missing");
+        i += 1;
+        let mut envp = Vec::new();
+        loop {
+            let p = r(i);
+            if p == 0 {
+                break;
+            }
+            envp.push(p);
+            i += 1;
+        }
+        i += 1; // envp terminator already consumed as the `0`
+        let mut auxv = Vec::new();
+        loop {
+            let t = r(i);
+            let v = r(i + 1);
+            i += 2;
+            if t == AT_NULL {
+                break;
+            }
+            auxv.push((t, v));
+        }
+        (argc, argv, envp, auxv)
+    }
+
+    #[test]
+    fn layout_initial_stack_builds_parseable_word_image_aligned() {
+        // A 64KiB stack buffer; the guest stack occupies [buf, buf+64KiB).
+        let size = 65536usize;
+        let mut buf = vec![0xAu8; size];
+        let base = buf.as_mut_ptr() as u64;
+        let hi = base + size as u64;
+
+        let mut auxv: Vec<(u64, u64)> = vec![
+            (AT_PHDR, 0x400040),
+            (AT_PHENT, 56),
+            (AT_PHNUM, 4),
+            (AT_HWCAP, HWCAP_FP | HWCAP_ASIMD),
+            (AT_HWCAP2, 0),
+            (AT_RANDOM, 0),
+        ];
+        let env: Vec<&[u8]> = vec![b"HOME=/data", b"ANDROID_ROOT=/system", b"TERM=xterm"];
+
+        let sp = layout_initial_stack(
+            buf.as_mut_ptr(),
+            size,
+            Some(b"/data/open-sober"),
+            &env,
+            &mut auxv,
+        );
+
+        // sp must be 16-byte aligned and strictly inside the stack buffer.
+        assert_eq!(sp & 15, 0, "sp must be 16-byte aligned");
+        assert!(
+            sp >= base && sp + 64 <= hi,
+            "sp inside buffer with room for word image"
+        );
+
+        let (argc, argv, envp, walk_auxv) = walk_stack(sp, base, hi);
+        assert_eq!(argc, 1, "argc == 1 with an argv0 given");
+        assert_eq!(argv.len(), 1, "one argv entry");
+
+        // Every env string must be a null-terminated C string we wrote.
+        assert_eq!(envp.len(), env.len(), "all env entries present");
+        for (ptr, want) in envp.iter().zip(env.iter()) {
+            let cs = unsafe { std::ffi::CStr::from_ptr(*ptr as *const std::ffi::c_char) };
+            assert_eq!(cs.to_bytes(), *want, "env string round-trips");
+        }
+
+        // auxv contains everything we supplied.
+        for (t, v) in &auxv {
+            if *t == AT_RANDOM {
+                continue; // patched to a pointer, checked separately
+            }
+            assert!(
+                walk_auxv.contains(&(*t, *v)),
+                "auxv entry ({t:#x},{v:#x}) present"
+            );
+        }
+    }
+
+    #[test]
+    fn at_random_zero_slot_patched_to_nonzero_in_bounds_entropy() {
+        let size = 65536usize;
+        let mut buf = vec![0x5Au8; size];
+        let base = buf.as_mut_ptr() as u64;
+        let hi = base + size as u64;
+
+        let mut auxv: Vec<(u64, u64)> = vec![(AT_HWCAP, 0), (AT_RANDOM, 0), (AT_HWCAP2, 0)];
+        // No argv0: exercises the argc==0 branch too.
+        let env: Vec<&[u8]> = vec![b"A=B"];
+        let sp = layout_initial_stack(buf.as_mut_ptr(), size, None, &env, &mut auxv);
+
+        // The AT_RANDOM slot must now point at a real in-bounds address.
+        let mut random_ptr = 0u64;
+        for slot in auxv.iter() {
+            if slot.0 == AT_RANDOM {
+                random_ptr = slot.1;
+            }
+        }
+        assert!(
+            random_ptr >= base && random_ptr < hi,
+            "AT_RANDOM patched in bounds: {random_ptr:#x}"
+        );
+        assert_ne!(random_ptr, 0, "AT_RANDOM zero slot replaced");
+
+        // 16 bytes of entropy (all-zero block would be a degenerate canary).
+        let bytes: Vec<u8> = (0..16)
+            .map(|i| unsafe { *((random_ptr + i) as *const u8) })
+            .collect();
+        assert!(bytes.iter().any(|&b| b != 0), "entropy block not all zero");
+
+        // Walk: argc==0, argv empty (terminator at [sp+1]).
+        let (argc, argv, _, _) = walk_stack(sp, base, hi);
+        assert_eq!(argc, 0);
+        assert!(argv.is_empty(), "no argv entries when argv0 is None");
+    }
+
+    #[test]
+    fn no_at_random_leaves_auxv_untouched_and_terminates() {
+        let size = 65536usize;
+        let mut buf = vec![0xDu8; size];
+        let base = buf.as_mut_ptr() as u64;
+        let hi = base + size as u64;
+
+        let mut auxv: Vec<(u64, u64)> = vec![(AT_HWCAP, 7), (AT_HWCAP2, 0), (AT_PAGESZ, 4096)];
+        let env: Vec<&[u8]> = vec![];
+        let sp = layout_initial_stack(buf.as_mut_ptr(), size, Some(b"/p"), &env, &mut auxv);
+
+        let (_, _, _, walk_auxv) = walk_stack(sp, base, hi);
+        assert_eq!(
+            walk_auxv.len(),
+            3,
+            "all 3 non-AT_RANDOM entries survive unchanged"
+        );
+        for (t, v) in &auxv {
+            assert!(
+                walk_auxv.contains(&(*t, *v)),
+                "entry ({t:#x},{v:#x}) present unchanged"
+            );
+        }
+    }
+}

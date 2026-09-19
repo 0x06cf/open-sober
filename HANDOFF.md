@@ -1,5 +1,32 @@
 # Open Sober — Agent Handoff
 
+## SH424 (Sep 19, 2026, hermes-worker): hermetic coverage of the guest initial-stack builder (boot.rs) — the module that lays out `[argc][argv][envp][auxv, AT_NULL]` + arg/env strings for a remote-loaded aarch64 ELF and patches a zero AT_RANDOM slot to real entropy fed the glibc stack canary had ZERO tests of its own logic; SH424 fixes that with 3 deterministic hermetics, hardening the load-bearing boot surface (a garbage initial stack makes glibc `_start` IFUNC-dispatch into SVE/SME opcodes the JIT can't decode — the memory-note hole the module's minimal-HWCAP design exists to prevent)
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+re-verified green at this exact HEAD first (capture_taskv4_frame.sh attempt 1:
+24 real task-driven frames `present swap Ok(0x1)`, 196 node pops, 0 json abort,
+0 crash). Workspace green (cargo test --workspace EXIT 0; arm64jit lib 485/0
+incl. 3 new sh424 hermetics; cargo build --workspace OK, 0 errors).
+Production code ONLY in boot.rs (off the 1MiB hooks; jit.rs/elfjit.rs
+byte-unchanged). Pure `#[cfg(test)]` addition (+3 hermetics + a stack-walk
+helper), no production path / guest byte / JIT-hook-default touched.
+- boot.rs `layout_initial_stack` builds the kernel initial-stack word image and
+  patches zero-valued AT_RANDOM to a xorshift 16-byte entropy block (stack
+  canary without a getrandom syscall). It keeps AT_HWCAP minimal (FP+ASIMD),
+  deliberately NOT advertising SVE/SME/MTE/LSE so glibc takes scalar paths the
+  JIT fully decodes. Load-bearing: a garbage stack races IFUNC dispatch into
+  unsupported-opcode territory (`__libc_arm_za_disable` `str za`).
+- Genuine gap: boot.rs had ZERO self-tests — correctness only exercised
+  implicitly when a full boot reached `_start`. SH424's 3 hermetics pin: (1)
+  parseable aligned word image with env CStr round-trip + all non-AT_RANDOM
+  auxv present; (2) AT_RANDOM zero-slot patched to non-zero in-bounds pointer
+  with ≥1 non-zero entropy byte, argc==0 branch; (3) no-AT_RANDOM auxv left
+  byte-identical, AT_NULL termination. Deterministic, no real binary, no env
+  (mirrors the SH423 fsmap-coverage pattern).
+- Honest: NOT a DM (SH415 probe re-confirms DM-root [0x106a68818]=0x0 under the
+  complete substrate; Route-B live-DM gate unchanged). BUILD-THE-RUNTIME
+  boot-surface coverage completion, not a re-tread.
+- Files: docs/frontier-sh424-boot-stack-hermetics.md + crates/arm64jit/src/boot.rs
+
 ## SH423 (Sep 19, 2026, hermes-worker): the durable persistence contract (objective 2b "remembers sign-in") proven at the fsmap layer — a REMAPPED guest datastore path lands as a REAL on-disk host file, survives the in-memory override being cleared (simulated restart), and is readable back through a fresh independent remap; plus the 5-root longest-prefix precedence + pass-through rules pinned. fsmap.rs had ZERO tests of its own logic (only jit.rs harnessed it for R1 staging); SH423 delivers the module's own hermetic pair
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 re-verified green at this exact HEAD first (capture_taskv4_frame.sh attempt 1:
