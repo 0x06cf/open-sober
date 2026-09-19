@@ -25,3 +25,4 @@ runs/cycle2/
 
 # oversized binary capture (kept on disk, not in git)
 /runs/*.rgb
+crates/arm64jit/data/
