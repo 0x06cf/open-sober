@@ -1,5 +1,23 @@
 # Open Sober — Agent Handoff
 
+## SH389 (Sep 20, 2026, hermes-worker): correct a false doc claim in the recon-v3 §A session-gated producer's live-DM gate + re-verify all recon-v3 deliverables + the SH388 wall green at this exact HEAD
+Single-agent (cone suppressed). Recon-v3 immediate-priority deliverables re-verified green at this HEAD
+(no regression): capture_taskv4_frame.sh attempt 1 = 24 real task-driven frames `present swap Ok(0x1)`,
+197 node pops, 0 json abort, 0 crash; capture_sh304_session_producer.sh = session-gated producer
+correctly INERT on bare boot (0 GATED, 0 fabricated frames, lone present #0 = the independent
+render-plane warmup, EXIT 124 clean); JIT_JSON_ZERO_FIX present at 0x102355d40. The SH388
+setDataModelToCurrent cone-door wall reproduces exactly (GETTER 0 hits, BODY 0 hits,
+[0x102dbcc10,0x102dbcd40) 0 JIT region hits, terminal guestpc=0x101d9a528 EXIT 134) — the standing
+measured-closed persistence lane; DM-root 0, MH_* false. Fix: `session_live_dm`'s doc claimed "All
+reads page-guarded via read_visible_u64" but read_visible_u64 is a BARE DEREF (no page check) — the
+reads are safe only because the real image loader maps those .bss cells; corrected the comment to say
+so (documentation accuracy, no behavior change). Workspace green (cargo test --workspace EXIT 0,
+25 test binaries, 0 failures). Route-B live-DM structural gate UNCHANGED (DM-root [0x106a68818]=0,
+MH_* false). Do-not-re-tread unchanged: do NOT re-attack setDataModelToCurrent (SH388 measured
+not-executed); do NOT re-drive LSM crossings (SH385) / EC reader (SH355/356/374) / window-attach real
+(SH367) / ALooper (SH365); once-lambda store (SH381), -9 string (SH380), map-header repair (SH248h).
+SH174 capture-latch stays the single forward observer.
+
 ## SH388 (Sep 20, 2026, hermes-worker): MEASURED — the SEP-15 setDataModelToCurrent cone door is DEAD headlessly (getter 0x102dbcc10 / body 0x102dbcc1c never EXECUTED, whole 0x102dbcc region 0 JIT hits, even with a manufactured DM planted in the holder) — closing SH387's "cone door remains OPEN" with execution evidence
 Single-agent (cone suppressed). SH387 byte-anchored the operator's SEP-15 re-attack cone
 door (DataModelServices current-DM GETTER 0x102dbcc10 leaf / BODY 0x2dbcc1c persistence
