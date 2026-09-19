@@ -53,4 +53,16 @@ SEP-17 session-ctor seed set), the ladder COMPLETES end-to-end headlessly for th
   0x90028128 @0x102_24fa18, ldrb 0x39675108 @0x102_24fa20; asserts the corrected 0x1072739d4 and the
   stale 0x10672739d4 resolve to DIFFERENT image pages).
 - `cargo test --workspace` EXIT 0; elfjit examples 159/0; arm64jit lib 418/0.
+- recon-v3 frame plane RE-VERIFIED green at this HEAD (capture_taskv4_frame.sh: 24 frames, 195 node
+  pops, 0 json abort, 0 crash) — the jit.rs/elfjit.rs gate-addr change caused no render regression.
 - Repro live run (completing ladder, R1 arms all 5 gates): `runs/capture_sh352_r1_completing_ladder.sh`.
+
+## Addendum — honest region-watch negative (same cycle)
+JIT_REGION_WATCH across the post-do-init/governor/ScriptContext/app-shell bands on the completing
+ladder (full seed set incl. GOVFLAG+PRELOAD_VALUECELL, with append/pack skips): the governor
+0x102e9fa80 and ScriptContext loader 0x101f1d8ac bands show **0 hits**; the run terminates run-variable
+in the SH341/SH350 persistence pool-pop family (0x101d9a030 / 0x101d9a528) only when the do-init pipe's
+deep app-start continuation is re-driven (i.e. a partial flag set without skip-appstart's benign
+loop-completion). This matches SH340/SH308/SH342: the app-shell ctor runs but the session half
+(governor -> Lua) stays gated on a live DM. No Route-B advance beyond the SH352-measured completing
+ladder (app-events return, R1 stages, gates arm, once-slot "Execute" handle). DM-root 0, MH_* false.
