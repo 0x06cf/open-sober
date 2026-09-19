@@ -1,5 +1,29 @@
 # Open Sober — Agent Handoff
 
+## SH470 + SH471 (Sep 20, 2026, hermes-worker): complete the recon-named LocaleList + DeviceParams session-content read surface — getLanguage/getCountry, displayResolution, displayPhysical{Width,Height}Pixels
+Single-agent (cone suppressed). Continuation of SH469's display/config surface.
+Workspace green at final HEAD (arm64jit 680/0 incl. the sh469 hermetic).
+- **SH470 gap closed:** getLocales()->LocaleList(size=1, getLanguage="en",
+  getCountry="US") — getCountry was already wired (US) but getLanguage (en), the
+  companion the engine reads for locale-aware text/layout direction, was absent.
+  1-arm add to auto_value_string_getter + roundtrip assert (len==2).
+- **SH471 gap closed:** DeviceParams display-resolution surface. The recon v2
+  shape names displayResolution="1280x720" + displayPhysical{Width,Height}Pixels
+  =1280/720; both literals MEASURED present in the .so. Without them a UI that
+  derives a viewport scale from the resolution string / physical pixels reads
+  empty/0. Additions: getDisplayResolution→"1280x720" (string getter) +
+  displayPhysicalWidthPixels/HeightPixels=1280/720 (int-field dispatch);
+  hermetic roundtrip + field-test pins.
+- Honest: NOT a DM / not a live-DM step (Route-B gate UNCHANGED; DM-root
+  [0x106a68818]=0, structural SH462/467). BUILD-THE-RUNTIME session-content
+  completion. No re-treads (all three getter/field arms are recon-named, all in
+  auto_value_string_getter / jni_get_int_field = the ONE registry for params
+  reads; viewport Mm deferred — it needs the Java static
+  getScreenPhysicalSizeInMillimeters→Point→x/y FIELD path, a different ABI not
+  touched by boot probes).
+- Files: crates/arm64jit/src/jni.rs (production + hermetic). Commits (SH470,
+  SH471). Prior: SH469 (display/config field surface).
+
 ## SH469 (Sep 20, 2026, hermes-worker): wire the DisplayMetrics/Configuration session-content FIELD surface — GetIntField/GetFloatField/GetLongField + the getResources→getDisplayMetrics/getConfiguration object chain, so the engine self-constructs its login/home over REAL geometry
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverable re-verified
 GREEN at this fresh HEAD first (capture_taskv4_frame.sh attempt 1: 24 real
