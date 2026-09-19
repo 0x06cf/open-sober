@@ -1,5 +1,35 @@
 # Open Sober — Agent Handoff
 
+## SH438 (Sep 19, 2026, hermes-worker): hermetic coverage of the STRUCTURE-LOAD/STORE codegen family (translate.rs Ld2 / St2 — ld2/st2 {Vt, Vt1}, [Xn], the interleaved vertex-attribute / RG-z+texcoord structure-pair deinterleave) — 3 exact-byte pins
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables were
+re-verified green this cycle (capture_taskv4_frame.sh attempt 1: 24 real
+task-driven frames `present swap Ok(0x1)`, 195 node pops, 0 json abort, 0 crash,
+EXIT 124). Workspace green (cargo test --workspace EXIT 0; arm64jit lib 585/0
+incl. 3 new sh438 pins, was 582; cargo build --example elfjit OK). Production code
+ONLY in translate.rs `#[cfg(test)]` addition (translator core body byte-untouched;
+jit.rs 1,048,390 B < 1MiB hook unchanged; elfjit.rs/session.rs unchanged).
+- Ld2/St2 had no direct byte tests. SH438 pins the deinterleave offset math a byte
+  error silently corrupts: memory holds {V0.e0,V1.e0,V0.e1,V1.e1,...} — element i
+  of reg j at byte i*(2*es)+j*es; Ld2 writes reg j to VECTOR_BASE(0x110)+(rd+j)*16
+  +i*es, St2 reads them back. Pins: (1) Ld2 deinterleave — loads advance j mem+es
+  (0F B6 42 04) and i mem+2*es (0F B6 42 08), incl. the mod=0 disp-0 load (0F B6 02);
+  stores land V1.elt0 at [0x120] (2nd structure reg at +16) vs V0.elt0 at [0x110]
+  (88 83 20 01 00 00 / 88 83 10 01 00 00), element i advances es (88 83 14 01 00 00);
+  (2) St2 INVERSE flips the direction — movzx SOURCE becomes the [rbx+Vd-slot]
+  (0F B6 83 20 01 00 00) and the store becomes `88` to [rdx+mem-off], the
+  Ld2-vs-St2 direction discriminator; (3) q=true (16B, nelems=4) + post=0x20 —
+  V0.elt3 lands at [0x11c] AND the rn post-increment emits the imm32 add form
+  (48 8B 43 08 + 48 81 C0 20 00 00 00 + 48 89 43 08) — two encoding facts corrected
+  during development by dumping the emitted buffer (disp=0 uses mod=0 `0F B6 02` not
+  `0F B6 42 00`; add_ri64 emits `48 81 C0` imm32, not imm8) — the shipped tests pin
+  the real emission.
+- Honest: NOT a DM (SH415 probe re-confirms DM-root [0x106a68818]=0x0 under the
+  complete substrate; Route-B live-DM gate UNCHANGED). BUILD-THE-RUNTIME codegen-
+  surface coverage completion on the structure-pair family, distinct from SH437
+  SimdInsD (single-lane copy). No re-treads.
+- Files: docs/frontier-sh438-translator-ld2-st2-structure.md +
+  crates/arm64jit/src/translate.rs (`#[cfg(test)]` only). Commit b5ef728.
+
 ## SH437 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD lane-COPY codegen family (translate.rs SimdInsD — `mov Vd.T[dst], Vn.T[src]`, the per-element lane move used to splat/broadcast/shuffle one value across a vector: color/texel lane packing + 8-bit channel moves on render data paths) — 5 exact-byte pins
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables were
 re-verified green at the SH436 HEAD before adding coverage (capture_taskv4_frame.sh
