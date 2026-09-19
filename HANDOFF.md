@@ -1,5 +1,31 @@
 # Open Sober — Agent Handoff
 
+## SH396 (Sep 2026, hermes-worker): MEASURED NEGATIVE — manufacturing the LSM map-global cannot cross the SH285 reader wall (the pre-existing elfjit [lsm-map] seeder already provides a coherent empty map-global [0x10726f8c0] + per-node 0x20 cells, yet the full ladder STILL faults at guestpc=0x101db1b08 fault=0xff..ff 4/4) — closes SH384's "wire into the lane" manufacture hypothesis with execution evidence and refines SH285/SH385's path-independence verdict from a new angle
+Single-agent (cone suppressed). Recon-v3 immediate-priority deliverables re-verified green at
+this HEAD first (capture_taskv4_frame.sh attempt 1 = 24 real task-driven frames `present swap
+Ok(0x1)`, 197 node pops, 0 json abort, 0 crash; capture_sh304 session-gated producer INERT;
+JIT_JSON_ZERO_FIX present at 0x102355d40). SH396 implemented the SH384-line root-cross:
+MANUFACTURE a coherent empty LSM map-global into [0x10726f8c0] (mg_buf(key>>29) -> 8192-slot
+bucket(ubfx key,16,13) -> one node, [node+0]=0, [node+40]=writable value buffer) at the ladder
+entry block 0x2173ff4, gated on the map-global being unconstructed (0) — so the SH285 reader
+0x1d99e30 resolves ANY key to a writable value and the append completes instead of faulting
+(cause-not-symptom PATH-B reconstruction, INSTALL-only-when-0, +hermetic sh396, arm64jit lib
+446->447, workspace green). MEASURED (real libroblox.so, full SH384 env + MAP_MANUFACTURE,
+4/4): the manufacture NEVER installs because the existing elfjit [lsm-map] seeder
+(elfjit.rs ~6214-6310, SH267 static-empty-map machinery) already populates [0x10726f8c0] with
+a coherent map `(4194304 buckets, shared zero sub, node_cells=true)` — cur!=0, so the guard
+CORRECTLY declined — AND the ladder STILL SIGSEGVs at guestpc=0x101db1b08 fault=0xffffffffffffffff
+(sh285=1) every run. Interpretation: a coherent empty map-global does NOT cross the SH285 reader
+wall — the reached node's garbage [+40] is from a path-independent unconstructed object NOT in
+the seeded map, set only by a real LocalStorageManager session ctor (SH385's verdict, confirmed
+from a NEW manufacture attempt). This is the operator's "PROOF-of-dead-end" grind, measured not
+judged. REVERTED cleanly (git checkout jit.rs to HEAD; capture script removed) — the final tree
+is byte-identical to SH395 plus this doc + HANDOFF/STATUS; workspace green (cargo test
+--workspace EXIT 0, arm64jit lib 446/0). Route-B live-DM structural gate UNCHANGED (DM-root
+[0x106a68818]=0, MH_* false, AppBridgeV2 0). Do-not-re-tread +: do NOT re-manufacture
+[0x10726f8c0]-style coherent empty maps to cross the SH285 reader — the existing seeder already
+provides one and the reader still faults (measured 4/4).
+
 ## SH395 (Sep 21, 2026, hermes-worker): CORRECT the SH378/SH394 "capture latch never installs" attribution — it never installed because JIT_DM_ALLOC_CAPTURE_DELEGATE was UNSET and the engine's real allocator hook is present; with DELEGATE the SH174 latch installs + fires cleanly on the SAME furthest-advancing composition, delegating real allocations through the engine's own hook (prev_hook measured 0x1021ebaf4) — the "no DM" verdict is now proven by a WORKING observer, not a refused-install artifact
 Single-agent (cone suppressed). Recon-v3 immediate-priority deliverables re-verified green at this
 exact HEAD (capture_taskv4_frame.sh attempt 1 = 24 real task-driven frames `present swap Ok(0x1)`,
