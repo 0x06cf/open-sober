@@ -1,42 +1,41 @@
 # Open-Sober run status (hermes-worker)
 
-Updated 2026-09-20, this cycle: SH372 (convergence proof) then SH373 — MEASURED SH285
-CROSSOVER from the SH371 reaching-env: the standing SH285 persistence leaf (guestpc
-0x101db1b08) is deterministically crossed (5/5) via SH349's append sub-call skip +
-the M+0x48/appname seeds that make the DM-creator continuation run deep; terminal
-advances to 0x101d9a708 in the SAME measured-closed unconstructed-live-object family.
-recon-v3 deliverables re-verified green. Workspace green (615/0).
+## SH478 (this cycle): complete InitParams.buildVariant — now "release" (was "")
+The authoritative recon-framework-boot-order.md names buildVariant="release"; the JIT
+served "". MEASURED in the real .so that buildVariant is consumed in config/telemetry
+identity + compared against release/debug/production literals. getBuildVariant now
+returns b"release" (7 chars); both pins move out of the empty-default arm (fn-table
+len==7 + sh134 empty-set drop). arm64jit 683/0, workspace green.
+
+## Cycle opening (this session, all ingested into SH478)
+- recon-v3 deliverable re-verified GREEN at SH477 HEAD and re-re-verified at the SH478
+  HEAD after the production change (capture_taskv4_frame.sh attempt 1 BOTH times: 24 real
+  task-driven frames `present swap Ok(0x1)`, 195-197 node pops, 0 json abort, 0 crash,
+  EXIT 124 stable idle) — the buildVariant production edit did NOT regress the deliverable.
+- Do-init/Route-B baseline re-probed (capture_sh415): substrate 14/16 atoms completed
+  jit_run (11 non-zero) + 2/16 stopped, once-guard bit0=1, DM-root [0x106a68818]=0x0 ->
+  LIVE DM=false, MH_FLAGS_LOADED/ENGINE_INITIALIZED/APP_READY true, AppBridgeV2 vt
+  0x1063a3410, 0 crash.
 
 ## Current state
-
-- `dev` HEAD: SH373 (jit.rs sh372 convergence hermetic, arm64jit lib 434/0 + capture
-  capture_sh373_cont_appendskip.sh + frontier-sh373 doc).
-- Workspace green (cargo test --workspace EXIT 0, 615 passed/0 failed).
-- recon-v3 deliverables green (24 task-driven frames swap Ok(0x1), 0 json abort, 0 crash).
-- Route-B live-DM gate UNCHANGED: DM-root [0x106a68818]=0, MH_* all false.
-
-## What advanced this session
-
-- SH372: settings-state & DM-continuation init paths CONVERGE on the identical SH285 leaf
-  (path-independent), answering SH371's "same object or different?" with a fresh register dump.
-- SH373: first deterministic CROSS of the SH285 wall from the reaching env (sh285=0, 5/5).
-  Explanation of SH358's "0 continuation hits": that run lacked the M+0x48/appname seeds.
-  The cross lands at 0x101d9a708 (same family); append+pack combo parks at the pool-pop
-  write-site 0x101d9a528. Persistence lane remains measured-returned (whack-a-mole UNBOUNDED).
-- No production path edited (measurement + probes + docs only).
+- `dev` HEAD = SH478 (d6bf25f). Production change: getBuildVariant -> "release" (jni.rs).
+- Workspace green (cargo test --workspace EXIT 0, ~864 passed/0 failed; arm64jit 683/0).
+- recon-v3 deliverables green (self-driven task frames swap Ok(0x1), 0 json abort, 0 crash).
+- Route-B live-DM gate UNCHANGED: DM-root [0x106a68818]=0 (structural per SH462/467).
 
 ## Honest status
-
-- Route-B live-DM structural gate UNCHANGED. SH174 capture-latch stays the single forward
-  hook. SH373 closes the "is SH285 itself the invariant?" loophole (it is crossable into the
-  already-known closed family). Only a REAL LocalStorageManager/session ctor gets past.
+- No live DM. Route-B live-DM structural gate UNCHANGED. SH478 is a BUILD-THE-RUNTIME
+  session-config identity completion (the value the engine reads when it serializes its
+  params), latent-but-correct — not a Route-B seed.
 
 ## Next-forward candidates
-
-1. (PRIMARY, Route-B) The SESSION half remains THE wall: do-init must own a live DataModel
-   (SH184/185). Both measured dead-ends from the now-reached continuation are measured-closed
-   (SH285 live-object wall + F+0x18 controller floor) — do NOT re-drive LSM sub-call skips.
-2. R1 content half staged+armed+serviceable (SH351/352/354); latent until a live DM drives the
-   loader.
-3. Do NOT re-drive LSM sub-call skips (SH349/350/358/373); do NOT re-arm window-attach
-   once-guard (SH367); do NOT re-enter ALooper loop (SH365).
+1. (standing, TOP) do-init completeness / live-DM: aligned lever is the session-ctor /
+   runtime-surface drive (engine's OWN session constructs the DM). Real APK assets staged
+   at SOBER_ASSETS_ROOT so a completed do-init's first rbxasset/AAssetManager request has
+   REAL content.
+2. The SendAppEvent 'Home' fabricate path (SH339): a real 4-byte "Home" SSO reaching the
+   discriminator (currently the fabricated jstring materializes as size 6 -> event 0).
+   Open and downstream of the live-DM wall.
+3. DMCONT 0x102bd1d68 = 0 from the MAIN arm (unchanged).
+4. (CLOSED) DeviceParams viewport Mm (SH476).
+5. (CLOSED) LocaleList size()/get() flattening (SH477).

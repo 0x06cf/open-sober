@@ -1,5 +1,36 @@
 # Open Sober — Agent Handoff
 
+## SH478 (Sep 19/20, 2026, hermes-worker): set InitParams.buildVariant to the real production variant ("release") — an authoritative-doc-vs-code mismatch, latent session-config identity
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified
+GREEN at fresh SH477 HEAD first (capture_taskv4_frame.sh attempt 1: 24 real task-driven
+frames `present swap Ok(0x1)`, 195 node pops, 0 json abort, 0 crash, EXIT 124 stable
+idle); do-init/Route-B baseline re-probed on the real binary (capture_sh415: substrate
+14/16 completed jit_run (11 non-zero) + 2/16 stopped, once-guard bit0=1, DM-root
+[0x106a68818]=0x0 -> LIVE DM=false, MH_FLAGS_LOADED/ENGINE_INITIALIZED/APP_READY true,
+AppBridgeV2 vt 0x1063a3410, 0 crash). Workspace green at the SH478 HEAD after the change
+(cargo test --workspace EXIT 0; arm64jit 683/0; ~864 workspace total).
+- **The gap closed:** `docs/recon-framework-boot-order.md` (authoritative InitParams map,
+  line 74) names `buildVariant="release"`; the JIT's `auto_value_string_getter` served
+  `getBuildVariant` -> `""`. MEASURED in the real libroblox.so: buildVariant is consumed in
+  config/telemetry identity (`BuildVariant`, `AddBuildVariantToGlobalTags`,
+  `RobloxTelemetryAddAppBuildVariantToPoints`) and the engine holds
+  `release`/`debug`/`production` literals to compare against it. An empty variant is a
+  degenerate value for a shipping production client; `release` is the unambiguous constant.
+  The getter now returns `"release"` (7 bytes — a valid SSO length for the RBX::json::Writer,
+  strictly safer than the old 0-length; same family as the SH134 baseURL / SH475 selectedTheme
+  precedent). The two pins leave the empty-default arm: the fn-table test
+  (jni_auto_value_params_getters_resolve_via_fn_table) asserts len==7 through the REAL
+  CallObjectMethod + GetStringUTFLength dispatch; the sh134 empty-string set drops the
+  now-non-empty value (the OTHER empty getters' asserts are untouched). No test weakened.
+- Honest: NOT a DM / NOT a live-DM step (Route-B live-DM gate UNCHANGED; DM-root
+  [0x106a68818]=0, structural per SH462/467). Not an end-to-end-reachable fix — the params
+  serialization is on the latent session path; the change makes the config identity the engine
+  serializes CORRECT when a session advances, replacing a degenerate empty with the real
+  production variant. Latent-but-correct like every axis. Production code ONLY in jni.rs
+  (off the 1MiB hooks; jit.rs/elfjit.rs/session.rs untouched). No re-treads.
+- Files: docs/frontier-sh478-buildvariant-release.md + crates/arm64jit/src/jni.rs (production
+  value + 2 test pins). Commit d6bf25f (SH478).
+
 ## SH477 (Sep 20, 2026, hermes-worker): complete the android/os/LocaleList display surface — getLocales() -> LocaleList.size()==1 -> get(0) -> Locale.getLanguage()="en"/getCountry()="US"
 The locale chain (recon-framework-boot-order) was half-wired: `getLocales` returned a fake object and
 `getLanguage`/`getCountry` served en/US globally, but `LocaleList.size()` (int) fell through to 0 and
