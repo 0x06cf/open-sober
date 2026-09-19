@@ -1,60 +1,52 @@
-# Open-Sober run state (hermes-worker)
+# Open-Sober run status (hermes-worker)
 
-## HEAD: `dev` branch, SH316 (do-init once-guard SELF-LATCHES + the DM-ctor fast-path stores the
-## "Execute" service handle on the populated-registry SESSION-CTOR run; corrects SH315's
-## "never self-latches" and the once-slot vs DM-root cell distinction)
+Updated 2026-09-19, this session: SH350 — CROSSED the SH349+1 terminal (0x101d9a708) with a
+BOUNDED single-caller skip (JIT_ROUTEB_LSM_PACK_SKIP). The completing ladder advances deep
+into the LSM pool-pop continuation (175 pops) before terminating in the same run-variable
+live-object family — a third fencepost of evidence for SH349's "LSM sub-call-whack-a-mole is
+UNBOUNDED" verdict. recon-v3 plane stays green (24 frames). Workspace green.
 
-## — workspace green (elfjit examples 141/0; arm64jit lib 405/0; 585 total).
+## Current state
 
-**State**: `cargo test --workspace` green (exit 0): arm64jit lib 405/0 + elfjit examples 141/0
-(140 + sh316) + fsmap + others (585 total, 0 fail). `cargo build --workspace` EXIT 0. elfjit.rs
-held UNDER the 1MB pre-commit hook. Commit (SH316) on local dev, not pushed (operator pushes).
+- `dev` HEAD: SH350 (default-inert opt-in JIT_ROUTEB_LSM_PACK_SKIP + sh350 hermetic +
+  capture_sh350_pack_skip.sh + frontier-sh350). Workspace green (arm64jit lib 416/0; elfjit
+  example 157/0 incl. sh350; recon-v3 frame plane re-verified 24 frames/0 crash).
+- Route-B live-DM gate UNCHANGED: DM-root [0x106a68818]=0, MH_* all false.
 
-## This session (SH316)
+## What advanced this session
 
-1. **SH316 — do-init once-guard SELF-LATCHES on the plain SESSION-CTOR bus run** (corrects SH315).
-   With `--v2boot-skip-appstart + --v2boot-session-bus` (full seed set, real libroblox.so): the
-   do-init once-guard [0x106a68410]=0x1 and once-slot [0x106a68408]=0x400000b — the DM-ctor
-   fast-path fired on the populated registry and stored the matched "Execute" service handle.
-   3/3 deterministic, EXIT 124. SH315's "once-guard NEVER self-latches / DM-root stays 0" was
-   measured on its postbus re-drive, which CLEARS the guard + re-seeds main-id; the plain run's
-   __call_once COMPLETES headlessly.
-2. **CRITICAL CELL DISTINCTION**: the once-lambda `str x0,[x23,#1032] @0x2206d74` writes once-slot
-   [0x106a68408], and the do-init DONE-path reads it (`ldr x1,[x8,#1032] @0x2206c8c`, pinned). The
-   probe's "DM-root [0x106a68818]" is a SEPARATE cell (+0x410) with no static/once writer (SH155).
-   So "DM-root 0" != once failed; the ctor matched "Execute" (task-scheduler tier), which is NOT a
-   live DM — the live-DM structural gate still holds.
-3. **Sharper open lever**: the DM-ctor fast-path (cbnz x0 @0x61e3124) CAN fire headlessly on a
-   populated registry. The SESSION-CTOR lever is unchanged and precise: get "App" (the DM pair)
-   registered via the real session -> fast-path returns the DM controller -> once-slot -> done-path.
-4. **HONEST:** no DM (once-slot 0x400000b is a service handle, not a controller). Route-B live-DM
-   structural gate UNCHANGED. SESSION-CTOR binder route (SH315) is the working lever. Probe SH155
-   now also reads once-slot. +hermetic sh316 (4 image pins). Recon-v3 unchanged green.
+- Verified SH349's crossing holds on the full routeB ladder (SH285 terminal 0x101db1b08
+  crossed with JIT_ROUTEB_LSM_APPEND_SKIP; new terminal 0x101d9a708).
+- SH350 (measurement + implement): the new terminal 0x101d9a708 was a SINGLE-CALLER name-pack
+  helper (verified whole-region BL scan), unlike the unbounded hundreds-of-callers bl 0x1d9d8b0
+  family. Implemented `routeb_patch_lsm_pack_skip` (RET 0x101d9a708 -> caller takes benign
+  index-0 tst/b.eq path). MEASURED 4/4: pack-skip fires, old terminal GONE, ladder advances to
+  175 LSM pool-pops, then terminates run-variable (bad_function_call / 0x101d9a528 /
+  0x102b9dee0 / 0x1021e40dc) in the SAME live-object family SH343/346 documented. No Route-B
+  advance; DM-root 0, MH_* false. Committed.
+- Also measured (confirmed, not implemented): the messageBus "experience-launch" topic used by
+  SH347's publishRaw is a Java-side runtime string, not a hardcoded binary literal — so
+  SH347's negative (publishRaw Ok but cb never fires) is NOT a topic-string bug; it stands
+  confirmed. onAppLuaWillStart is an internal lambda (mangled Z-std-func), not an export.
 
-## Standing (honest, unchanged across sessions)
+## Honest status
 
-- **Route-B live-DM structural gate UNCHANGED**: no make_shared<DataModel> fires headlessly;
-  DM-root [0x106a68818] stays 0; MH_APP_READY stays false.
-- **SH315+316 advance**: the service registry is provably populated headlessly (0→12) by the
-  SESSION-CTOR binder route, AND do-init's once now completes (self-latches) with the ctor
-  fast-path returning the matched "Execute" handle into once-slot. Next gap: register "App" (the
-  DM pair) so the fast-path returns the DM controller.
-- **SESSION-CTOR is the primary lever** (operator Sep-17): drive the real app-start/Activity
-  session. The binder route (MessageBus.subscribe) is the concrete working path.
-- Everything achievable headlessly (llvmpipe); GPU host for performance later.
+- Route-B live-DM structural gate UNCHANGED. SH350 crossed one more LSM fencepost but the
+  persistence lane is now at THREE depths of measured live-object-wall evidence — SH349's
+  "unbounded, no bypass to app-start" verdict stands. The dataModel-bindings receive
+  (onAppLuaWillStart) is an internal binder behind the same live-DM migration gate. SH174
+  capture-latch stays the single forward hook. MessageBus publish being driveable-clean
+  (SH347) remains the small live receive surface.
 
 ## Next-forward candidates
 
-(a) Register the "App" service (SH313: ONE "App" entry -> fast-path returns a live DM-controller)
-    so the ctor's fast-path hits and once-slot gets a real DM controller -> done-path dispatches
-    into the app-shell ctor. This is the precise open lever now that the fast-path provably fires.
-(b) After DM-root/once-slot populates a live controller, the done-path dispatches -> app-shell/EC.
-(c) R1 content path (synthetic CoreScript module) latent until a live DM requests rbxasset://.
-(d) SH304 session-gated producer fires the instant a real session owns a live DM.
-
-## Do-not-re-tread (added this session)
-
-- "do-init's once-guard never self-latches (SH315)" — SH316 measured it SELF-LATCHES (0x1) on the
-  plain bus run; SH315's claim was specific to its guard-cleared postbus re-drive.
-- "DM-root 0 means the once-lambda failed" — the once-slot [0x106a68408] is the real once result /
-  done-path controller source; DM-root [0x106a68818] is a distinct no-writer live-object cell (SH155).
+1. (PRIMARY, non-persistence Route-B) SH174 capture-latch remains the single forward hook;
+   the Route-B live-DM wall is the standing gate. Next concrete path: the R1 synthetic
+   CoreScript content path (stage a hand-authored ~20-line Luau ScreenGui module into the
+   filesdir the rbxasset://scripts/CoreScripts resolver serves) so that the INSTANT do-init
+   owns a live DM, the engine self-constructs real GuiObjects -> R+0x180/0x188 nodes with zero
+   host layout. Content-path machinery (fsmap, --v2boot-set-filesdir, JIT_ASSET_TRACE
+   rbxasset logging) already exists; the synthetic module + loader gate seeds are the omitted
+   piece.
+2. onAppLuaWillStart (dataModel-bindings live binder) stays migration-gated; not seedable.
+3. Do NOT re-drive LSM sub-call skips — 3 fenceposts of measured evidence it is unbounded.

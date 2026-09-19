@@ -87,11 +87,9 @@ fn seed_libcpp_long_string(global: u64, buf: u64, bytes: &[u8]) -> u64 {
     global
 }
 
-/// SH156: live object for DM-root [0x106a68818] so do-init match advances into REAL
-/// global-init construction Ok(0x3e8). Match (0x2206df4..0x2206e24): `ldr x0,[x19,#32]`
-/// (appbridge[+0x20]=DM-root); cbz->Ok(0x3e8); `ldr x8,[x0]; ldr x1,[x8,#48]; br x1`. Real
-/// vtable (0x10635cce0) +0x30 = 0x102207b50 (real global-init CTOR, ZERO `this` derefs on
-/// globals); a 0x10 object whose only live word is [0x00]=vtable suffices. `buf` RW >=0x10.
+/// SH156: live object for DM-root [0x106a68818] so do-init match (0x2206df4..e24: ldr x0,[x19,#32];
+/// cbz->Ok(0x3e8); ldr x8,[x0]; ldr x1,[x8,#48]; br x1) advances into REAL global-init ctor
+/// (vtable 0x10635cce0 +0x30=0x102207b50, zero `this` derefs). A 0x10 obj ([0]=vtable) suffices.
 fn routeb_dm_root_object(buf: u64) -> u64 {
     if buf == 0 {
         return 0;
@@ -142,16 +140,13 @@ fn routeb_map_guest_page(guest_addr: u64) -> bool {
     r != libc::MAP_FAILED
 }
 
-// SH60 task-driven frame plane (recon §A): the dispatcher's type-4 popped-task
-// vector [0x106829ea8] is external-glue (.bss, no in-image store), host
-// seeds it with a non-recursive host-thunk that marshals each dispatched node
-// into a REAL frame: make-current (vt[+16]=0x105b3b358) -> frame-fn (0x105b32c00)
-// -> swap (vt[+24]=0x105b3b408) recovered real ctx. Must NOT re-enter the
-// dispatcher/drain/vector (would recurse). RENDERCTX==0 (not yet recovered) -> no-op.
+// SH60 task-driven frame plane (recon §A): type-4 popped-task vector [0x106829ea8] is .bss glue,
+// host-seeded with a non-recursive thunk -> REAL frame: make-current(vt+16=0x105b3b358) ->
+// frame-fn(0x105b32c00) -> swap(vt+24=0x105b3b408) on recovered ctx. Must NOT re-enter the
+// dispatcher/drain/vector (recurse); RENDERCTX==0 -> no-op.
 
-/// The engine's real 0x48-byte render ctx recovered by --renderthunk (thunk
-/// 0x105b3a280 returns it in x0). 0 == not yet recovered (type-4 dispatch
-/// no-ops). Published --renderinit thread after the thunk returns.
+/// Engine's real 0x48-byte render ctx recovered by --renderthunk (0x105b3a280 returns x0);
+/// 0 = not yet recovered (type-4 dispatch no-ops). Published --renderinit thread.
 static RENDERCTX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Base leaked fabricated renderer/view/clear objects the frame thunk
@@ -169,11 +164,9 @@ static RENDERSCENE_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::Ato
 
 static LADDER_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// SH128 combined re-drive: when StartApp RETURNS under the serialized ladder, no guest
-/// thread is in the drain pop-loop 0x102856e40, --deque-node-live type-4 nodes are never
-/// popped, and the combined run presents 0 frames (structural drain-not-driven). --deque-redrive
-/// makes the MAIN thread re-run the drain bounded jit_run AFTER the ladder joins, so injector ->
-/// type-4 thunk -> PENDING_PRESENTS -> frames. These statics coordinate all three parties.
+/// SH128 combined re-drive: when StartApp RETURNS under serialized ladder no guest thread is in
+/// the drain pop-loop, so --deque-node-live nodes are never popped (0 frames). --deque-redrive has
+/// the MAIN thread re-run the drain after the ladder joins; these statics coordinate the parties.
 static REDRIVE_X1: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static REDRIVE_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static REDRIVE_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -278,11 +271,10 @@ fn reseed_task_frame_color(base: u64, cc: [f32; 4]) {
 
 static PENDING_PRESENTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// SH131 combined-run flood bound: after the serialized-capture presenter finishes, the type-4
-/// vector [0x106829ea8] is nulled to boot-idle no-op (`ldr x3,[x8,#3752]; br x3` returns doing
-/// nothing when slot==0) and this gate stops --deque-node-live re-injecting foreign nodes. Without
-/// presenter stopped (PENDING_PRESENTS grows unbounded), and a released engine
-/// clone worker hits untrapped guest raise(SIGTRAP)=exit 133. Combined-capture only.
+/// SH131 combined-run flood bound: after the serialized presenter finishes, [0x106829ea8] is nulled
+/// (boot-idle no-op @ slot==0) and this gate stops --deque-node-live re-injecting foreign nodes —
+/// else PENDING_PRESENTS grows + a released clone worker hits untrapped raise(SIGTRAP)=exit 133.
+/// Combined-capture only.
 static TASKFRAME_HALT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// True in the SH130/129 combined serialized-capture mode (JIT_SERIALIZE_RENDER
@@ -380,11 +372,11 @@ extern "C" fn type4_session_gated_thunk(
     0
 }
 
-/// Build the fabricated-but-engine-native render-manager R that `--renderscene` drives through
-/// engine's OWN scene renderer (guest 0x105b2ead4). Reads for this=x0=R: R+0x160=ctx(vt),
-/// R+0x170=view(W/H @112/116), R+0x180/0x188=scene head/tail (stride 0x28). op_new(0x98)->
-/// frame-desc ctor 0x5b34de8->link 0x5b2d9e0; scene non-empty builds one 0x98 frame per 0x28
-/// node ([node+8]=render-obj,[node+0x18]=view). 0=legacy empty-scene. R+0x188=tail=head+count*0x28.
+/// Build the fabricated-but-engine-native render-manager R that `--renderscene` drives through the
+/// engine's OWN scene renderer (guest 0x105b2ead4). this=x0=R: R+0x160=ctx(vt), R+0x170=view(W/H@112/116),
+/// R+0x180/0x188=scene head/tail (stride 0x28). op_new(0x98)->frame-desc ctor 0x5b34de8->link 0x5b2d9e0;
+/// scene non-empty builds one 0x98 frame per 0x28 node ([node+8]=render-obj,[node+0x18]=view).
+/// R+0x188=tail=head+count*0x28.
 fn render_scene_base(node_count: u64) -> u64 {
     let existing = RENDERSCENE_BASE.load(core::sync::atomic::Ordering::Relaxed);
     let populated = SCENE_NODES.load(core::sync::atomic::Ordering::Relaxed);
@@ -399,14 +391,13 @@ fn render_scene_base(node_count: u64) -> u64 {
     unsafe {
         // R+0x160 = ctx slot (caller fills; 0 here), R+0x170 = internal view sub-object.
         *(r.wrapping_add(0x170) as *mut u64) = view;
-        // View W/H at +112/+116 (`ldp w1,w2,[x8,#112]`). DELIBERATELY != real surface dims
-        // (dims-query vt[+64] returns live EGL size): renderer takes BUILD branch only when they
-        // disagree (`cmp w8,x22; b.eq skip`); equal => wrongly skips construction. Sentinel never
-        // matches => ctor/link runs, registering a real frame-desc with queried dims.
+        // View W/H at +112/+116 (`ldp w1,w2,[x8,#112]`). DELIBERATELY != live surface dims so the
+        // renderer's `cmp w8,x22; b.eq skip` build-branch is never skipped -> ctor/link registers a
+        // real frame-desc with the QUERIED dims.
         *(view.wrapping_add(112) as *mut u32) = 0xFFFFFFFF;
         *(view.wrapping_add(116) as *mut u32) = 0xFFFFFFFE;
-        // Scene list (SH63). Each 0x28-stride node: [node+8]=render-obj (=ctx, vt[+64] = dims-query
-        // blr'd with x0=obj), [node+0x18]=view (sentinel, forced build branch; 0x5b2d9e0 linker
+        // Scene list (SH63). Each 0x28-stride node: [node+8]=render-obj (=ctx, vt[+64]=dims-query
+        // blr'd x0=obj), [node+0x18]=view (sentinel, forces the build branch; 0x5b2d9e0 linker
         // overwrites with the frame), other cells zero (linker [container+8]==0 skips chaining).
         for i in 0..node_count {
             let n = head + i * 0x28;
@@ -1081,10 +1072,9 @@ fn routeb_singleton_obj_addr() -> u64 {
         o
     })
 }
-/// SH111: `routeb_singleton_obj_leaf` returns a DEDICATED stable zeroed 0x40 guest object
-/// (guest==host identity-mapped, field reads don't fault). Default for the [0x60,0x580)
-/// band: the blanket 0x580 identity-widening regressed nativeInitializeNativeFlags (a
-/// high-slot virtual returned identity `this`, caller deref'd x0+0x28 -> NULL+0x28 SIGSEGV).
+/// SH111: `routeb_singleton_obj_leaf` returns a stable zeroed 0x40 guest object (identity-mapped,
+/// field reads don't fault). Default for [0x60,0x580): blanket 0x580 identity-widening regressed
+/// nativeInitializeNativeFlags (high-slot virtual returned identity `this`; x0+0x28 = NULL+0x28).
 /// A non-NULL zeroed object makes any [ret+off] a valid zeroed field read, never NULL+0x28.
 extern "C" fn routeb_singleton_obj_leaf(_a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64) -> u64 {
     routeb_singleton_obj_addr()
@@ -1131,12 +1121,10 @@ fn routeb_singleton_vtable_slot(byte_off: u64) -> SingletonVtableSlot {
 }
 const ROUTEB_SINGLETON_VTABLE_LEN: u64 = 0x60;
 
-/// SH101: dispatch-1 in the do-init walker (`ldr x8,[x10,#0x10]; blr x8` @
-/// 0x1022084f0/500) returns the leaf's x0, guest memzeros
-/// `leaf_ret + (x25<<4)` (0x102208508, x25=0). identity -> leaf_ret==obj erases
-/// obj[0]/obj[8], so dispatch-2 (`ldr x9,[obj]... [+0x18]` @0x102208574/578)
-/// faults [0x18] with x9=0. Fix: the leaf must return a DEDICATED WRITABLE scratch
-/// != obj so memzero hits scratch and obj[0] keeps its real vtable pointer.
+/// SH101: do-init walker dispatch-1 (`ldr x8,[x10,#0x10]; blr x8` @0x1022084f0) returns the leaf's
+/// x0, then guest memzeros `leaf_ret + (x25<<4)` (0x102208508, x25=0). identity==obj erases obj[0]/[8],
+/// so dispatch-2 ([obj]+0x18 @0x102208574) faults. Fix: leaf returns a DEDICATED WRITABLE scratch !=
+/// obj so memzero hits scratch and obj[0] keeps its real vtable.
 static SH101_SCRATCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 extern "C" fn routeb_disptch1_scratch_leaf(
     _a0: u64,
@@ -1155,23 +1143,19 @@ extern "C" fn routeb_disptch1_scratch_leaf(
     })
 }
 
-/// SH99: nativeGameGlobalInit probes a global 0x10-stride vector at 0x106dcae08 (`ldp x10,x8,[x19]`
-/// @0x102208490 -> +0x08=begin). Under JIT begin=0; header probe `ldrb w9,[x8]` @0x10220845c derefs
-/// unconditionally before the empty check -> SIGSEGV. begin=end=0 would re-crash. Fix: point
-/// {begin,end,cap} at ONE non-null zeroed leaked node so `ldrb[node]=0` + `(end-begin)>>4` count==0
-/// resolve safely. Idempotent (OnceLock).
+/// SH99: nativeGameGlobalInit probes a 0x10-stride vector @0x106dcae08 (ldp @0x102208490 ->+8=begin);
+/// begin=0 -> `ldrb [x8]` @0x10220845c derefs pre-empty-check -> SIGSEGV. Point {begin,end,cap} at ONE
+/// non-null zeroed leaked node so ldrb=0 + count==0 resolve safely. Idempotent.
 pub fn routeb_seed_game_global_vector() -> u64 {
     use std::sync::OnceLock;
     static SEEDED: OnceLock<u64> = OnceLock::new();
     *SEEDED.get_or_init(|| {
-        // A 0x40 zeroed node: begin=node means `ldrb [node]` reads 0 (valid), the
-        // csel @0x10220846c/470 keeps a sane embedded/short value, and the element
-        // count (end-begin)>>4 = 0 since begin==end==node.
+        // A 0x40 zeroed node: begin=node -> ldrb=0, csel keeps a sane value, count
+        // (end-begin)>>4 = 0 (begin==end==node).
         let node = Box::leak(vec![0u8; 0x40usize].into_boxed_slice()).as_mut_ptr() as u64;
-        // The do-init block reads a 4th pointer at [0x106dcae20] (the object
-        // itself at +0xe20 in the 0x106dca000 region) and virtual-dispatches
-        // `ldr x10,[x0]; ldr x8,[x10,#8]; blr x8` (0x1022084f0/4fc/500). Make it a
-        // coherent object whose +8 virtual benign host leaf.
+        // Do-init reads a 4th ptr at [0x106dcae20] and virtual-dispatches
+        // `ldr x10,[x0]; ldr x8,[x10,#8]; blr x8` (0x1022084f0/4fc/500). Make it a coherent
+        // object whose +8 virtual is a benign host leaf.
         let leaf =
             *ROUTEB_LEAF_ADDR.get_or_init(|| {
                 let a = arm64jit::jit::register_host_call_auto(routeb_singleton_leaf);
@@ -1236,12 +1220,10 @@ pub fn routeb_seed_game_global_vector() -> u64 {
     })
 }
 
-/// SH87: string/span hash-map dispatch (0x29f427c) branches through optional hash-2 slot (+0x18)
-/// when nonzero; OTel rehash gives +0x18 static 0x1800064 (unmapped) -> SIGSEGV. hash2 REDUNDANT
-/// (aliases `br x1`), so patch `blr x8`->`blr x1`. SH93: do-init PARKS on CEvent completion (bl
-/// 2207578 futex-wait) set by a never-run worker; NOP `bl 2207578` @0x2206e70. SH159c: governor
-/// 0x102e9fa84 version-gate takes a modern appendix re-reading V2Init params + faults; patch
-/// `b.cc 0x2e9fb20` @0x102e9fad8 -> `b` (router).
+/// SH87: hash-map dispatch (0x29f427c) branches through optional hash-2 slot (+0x18) = OTel
+/// rehash 0x1800064 (unmapped) -> SIGSEGV; hash2 REDUNDANT (aliases br x1), patch blr x8->blr x1.
+/// SH93: do-init parks on CEvent futex-wait (bl 2207578) set by a never-run worker; NOP it @0x2206e70.
+/// SH159c: governor version-gate appendix re-reads V2Init params + faults; b.cc->b @0x102e9fad8.
 fn routeb_patch_gov_router() {
     const ADDR: u64 = 0x102e9fad8; // `b.cc 0x2e9fb20` (0x54000243)
     let want = 0x1400_0012u32; // `b 0x2e9fb20` (unconditional, imm26=0x12)
@@ -1389,8 +1371,7 @@ fn routeb_patch_lsm_init_skip() {
 /// SH349 (opt-in JIT_ROUTEB_LSM_APPEND_SKIP=1, default-INERT): RET the faulty byte-copy sub-call
 /// 0x101d9a15c the SH285 fault lives inside. SH348 showed the fault survives a whole-init leaf-ret
 /// (caller block reached by mid-function direct jump past the entry), so skip the FAILING SUB-CALL:
-/// this pure-memcpy leaf is ret'd, stubbing EVERY path into the 0x101db1b08
-/// strb. CAUSE-level (SH117), NOT a live-object repair (SH248h).
+/// a pure-memcpy leaf, stubbing EVERY path into the 0x101db1b08 strb. CAUSE-level (SH117), not SH248h.
 fn routeb_patch_lsm_append_skip() {
     if std::env::var_os("JIT_ROUTEB_LSM_APPEND_SKIP").is_none() {
         return;
@@ -1420,6 +1401,39 @@ fn routeb_patch_lsm_append_skip() {
     arm64jit::jit::block_cache_drop_region(0x101_db1_a80u64, 0x101_db1_b80u64);
 }
 
+/// SH350 (opt-in JIT_ROUTEB_LSM_PACK_SKIP=1, default-INERT): RET the single-caller name-pack
+/// helper 0x101d9a708 (SH349+1 terminal); ONE caller (BL scan), BOUNDED vs the hundreds-of-callers
+/// bl 0x1d9d8b0 family. RET -> caller's benign index-0 path (tst x0;b.eq), not the faulty
+/// byte-copy of the caller's garbage source string. Pure helper; CAUSE-level (SH117), not SH248h.
+fn routeb_patch_lsm_pack_skip() {
+    if std::env::var_os("JIT_ROUTEB_LSM_PACK_SKIP").is_none() {
+        return;
+    }
+    const ENTRY: u64 = 0x101_d9a_708; // name-pack helper entry (sub sp,#0x50)
+    const PROLOGUE: u32 = 0xd101_43ff;
+    const RET: u32 = 0xd65f_03c0;
+    let page = ENTRY & !0xfff;
+    unsafe {
+        if libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_WRITE) != 0 {
+            eprintln!("[elfjit:routeb] WARN SH350 mprotect RW failed @0x{ENTRY:x} errno={}", std::io::Error::last_os_error());
+            return;
+        }
+        let before = *(ENTRY as *const u32);
+        if before == PROLOGUE {
+            *(ENTRY as *mut u32) = RET;
+            eprintln!("[elfjit:routeb] SH350 `ret` name-pack @0x{ENTRY:x} ({before:08x}->{RET:08x}) — SH349+1 terminal inert (single caller -> benign index-0 path)");
+        } else if before == RET {
+            eprintln!("[elfjit:routeb] SH350 name-pack @0x{ENTRY:x} already `ret`");
+        } else {
+            eprintln!("[elfjit:routeb] WARN SH350 name-pack @0x{ENTRY:x} unexpected prologue {before:08x}, not patched");
+        }
+        libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_EXEC);
+    }
+    // Re-translate helper + its single caller block with the patch (no stale byte-copy block).
+    arm64jit::jit::block_cache_drop_region(0x101_d9a_540u64, 0x101_d9a_7b0u64);
+    arm64jit::jit::block_cache_drop_region(0x101_d9a_5a0u64, 0x101_d9a_6c0u64);
+}
+
 /// SH327: force AppStarted factory 0x2e890c4 construction DETERMINISTICALLY (0x1025f5300 gate
 /// needs [appstart+24]!=0; 0x2e890f4 b.ne->ret when tag==2 returned unconstructed).
 fn routeb_patch_appstart_construct_force() {
@@ -1444,11 +1458,9 @@ fn routeb_patch_appstart_construct_force() {
     arm64jit::jit::block_cache_drop_region(0x102e890c4, 0x102e89174);
 }
 
-/// SH328: fn 0x25f52b4 (V2StartAppWithParams body) reads its params reg x20 (x0, =0 headlessly) at
-/// #320/#328/#0x148/#0x18..#0x110 -> fault ldr w3,[x20,#320]@0x25f5328 (fault=0x140). Fix: point x20
-/// at the mapped zeroed guarded RW tail: `adrp x20,0x107334000` @0x25f52d8 replaces `mov x20,x0`
-/// (same footprint, page-base offset 0), all reads benign, fn completes to [x19]vt+16@0x25f5460.
-/// Gated JIT_ROUTEB_DM_SEED/DMFORCE; idempotent.
+/// SH328: 0x25f52b4 (V2StartAppWithParams) reads params x20 (=0 headless) -> fault ldr w3,[x20,#320]
+/// @0x25f5328. Fix: point x20 at the mapped zeroed guarded RW tail (`adrp x20,0x107334000` @0x25f52d8
+/// replaces `mov x20,x0`), reads benign, fn completes to [x19]vt+16. Gated DM_SEED/DMFORCE.
 fn routeb_patch_startapp_params_x20() {
     let (a, want) = (0x1025f52d8u64, 0xf002_69f4u32); // adrp x20,0x107334000 (was mov x20,x0 0xaa0003f4)
     let page = a & !0xfff;
@@ -1471,9 +1483,9 @@ fn routeb_patch_startapp_params_x20() {
     arm64jit::jit::block_cache_drop_region(0x1025f52b4, 0x1025f5550);
 }
 
-/// SH161: governor TAIL (0x2e9fdf4) `ldr x0,[x19,#1088]`(impl[+0x440]); bl 24c3768
-/// (device-display shared_ptr) derefs [x0,#320] (fault=0x140; impl+0x440 NULL, live-launch).
-/// Return DISCARDED so NOPing the 3-insn window (0xf9422260/0xaa1403e1/0x97d88e5b) is benign.
+/// SH161: governor TAIL (0x2e9fdf4) `ldr x0,[x19,#1088]`(impl+0x440); bl 24c3768 (display
+/// shared_ptr) derefs [x0,+320] (fault=0x140; impl+0x440 NULL). Return discarded; NOP the
+/// 3-insn window (0xf9422260/0xaa1403e1/0x97d88e5b).
 // SH176/177 (JIT_ROUTEB_COOKIE_READBACK, parked detour): cookie getter returns WebLogin only;
 // route-B needs both read-back-local gates NOPed: getter 0x1021ff72c tbnz w8,#0 -> nop;
 // B) 0x105fee9c4 tbz w0,#0 -> nop (17-caller stub 1dc7428 untouched)
@@ -1832,11 +1844,10 @@ fn routeb_patch_taskscheduler_flags_gate() {
     ROUTEB_TASKSCHED_FLAGSGATE_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
-// -- SH115: scoped singleton-dispatch patch (V2Init/V2Start/V1AppStart/SendAppEventOnAppReady) --
-// Nullable-singleton accessors dispatch through the seeded 0x60 vtable (`ldr x8,[x8,#off]; blr x8`)
-// reading past +0x60 into host bytes -> soft-return. Flat `blr->mov x0,xzr` regresses nativeInit
-// (return IS deref'd at +0x28). Fix: patch each 28B window to MATERIALIZE routeb_singleton_obj_addr
-// into x0 + store objA[0]=[x19] + RETURN it (7-insn window).
+// SH115 scoped singleton-dispatch (V2Init/V2Start/V1AppStart/SendAppEventOnAppReady): accessors
+// dispatch via seeded 0x60 vtable (blr past +0x60 = host bytes -> soft-return); flat blr->mov x0,xzr
+// regresses nativeInit (return deref'd at +0x28). Fix: patch each 28B window to MATERIALIZE
+// routeb_singleton_obj_addr into x0 + store objA[0]=[x19] + RETURN it.
 fn sh115_movz_x8_imm(imm16: u16) -> u32 {
     0xD280_0000u32 | ((imm16 as u32) << 5) | 8
 }
@@ -1998,11 +2009,9 @@ pub fn sh201_v2_family_scan(image: &[u8]) -> Vec<(u64, u64)> {
 }
 
 static ROUTEB_LOCK_OWNER_PATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-/// SH116: nativeInitializeNativeFlags' helper (file 0x2320710) reads the .bss global via
-/// `adrp x8,7273000; ldr x0,[x8,#2480]` = *(guest 0x10672739c0). Page UNMAPPED at runtime
-/// (mprotect RW -> ENOMEM), can't be store-seeded. Patch helper slots to MATERIALIZE a stable
-/// all-zero 0x60 obj into x0; `add x0,x0,#0x28; bl pthread_mutex_lock` then locks &obj+0x28
-/// (all-zero = valid PTHREAD_MUTEX_INITIALIZER). Leaves the unmapped global untouched.
+/// SH116: nativeInitializeNativeFlags helper (0x2320710) reads *(0x10672739c0) — page UNMAPPED at
+/// runtime (mprotect->ENOMEM), can't store-seed. Patch helper to MATERIALIZE an all-zero 0x60 obj
+/// into x0 so `add x0,#0x28; bl pthread_mutex_lock` locks the object (all-zero = valid mutex).
 fn routeb_patch_nativeinit_lock_owner() {
     if ROUTEB_LOCK_OWNER_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
         return;
@@ -2042,11 +2051,9 @@ fn routeb_patch_nativeinit_lock_owner() {
     ROUTEB_LOCK_OWNER_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 static ROUTEB_FLAGMAP_PATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-/// SH117: nativeInitializeNativeFlags (after SH115/116) advances into a hash-map ramp-probe
-/// helper (guest 0x10232090c, sole caller `bl 232090c` @0x23208d8). The map's +0 bucket-array ptr
-/// is unseeded host garbage -> `ldr x8,[x8,x11,lsl#3]` SIGSEGV. No fixed seed (per-run leak);
-/// leaf-rewrite the helper prologue to `ret` (return x0 = non-zero map) so caller's `cbz x0` takes
-/// the "found" path and skips the insert. Deterministic, 8 bytes, single call site.
+/// SH117: nativeInitializeNativeFlags advances into a hash-map ramp-probe (0x10232090c, sole
+/// caller 0x23208d8); map's +0 bucket ptr unseeded -> ldr SIGSEGV (no fixed seed, per-run leak).
+/// Leaf-rewrite prologue to `ret` (x0!=0) so caller's cbz takes the found path, skips insert.
 fn routeb_patch_nativeinit_flagmap_helper() {
     if ROUTEB_FLAGMAP_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
         return;
@@ -2182,11 +2189,9 @@ fn sh245_getter_tail_words(ret: bool) -> u32 {
         0x1503_6690u32 // b 0x624e6c0 (tail into the FMOD/AAudio distractor)
     }
 }
-/// SH245 (JIT_ROUTEB_GETTER_TAIL_RET): engine-init getter 0x102174c04 ends with an
-/// UNCONDITIONAL tail `b 0x624e6c0` (FMOD audio) that never returns to the dispatcher
-/// (0x2bd8d18 stays 0; getter tails into FMOD). x30 was already restored to 0x2bd8d18 at
-/// 0x2174c7c, so patching tail `b`->`ret` returns STRAIGHT to the dispatcher, which reaches
-/// `bl sub_2bd8dac` -> vt[+0x1f0]: with DMCONT REAL continueAfterFlagsLoaded_. Default INERT.
+/// SH245 (JIT_ROUTEB_GETTER_TAIL_RET): engine-init getter 0x102174c04 tails `b 0x624e6c0` (FMOD,
+/// never returns to dispatcher; 0x2bd8d18 stays 0). x30 already = 0x2bd8d18 @0x2174c7c, so patch
+/// tail b->ret -> dispatcher -> `bl sub_2bd8dac` -> vt[+0x1f0]. With DMCONT REAL continuation. INERT.
 fn routeb_patch_getter_fmod_tail_ret() {
     if ROUTEB_GETTER_FMOD_TAIL_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
         return;
@@ -2333,11 +2338,10 @@ fn routeb_patch_cont_opnew_box() {
 }
 static ROUTEB_CONT_OPNEW_BOX_PATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static ROUTEB_OPNEW_SIZEGATE_PATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// SH246/247: activated continuation (0x102bd1d68) NULL-allocs - both op_new variants return
-/// NULL for size>0xa when [0x10727570c].bit0 clear (headless). Broad bit0=1 fix MEASURED
-/// regression (SH245 #4). Route every size same ≤0xa "small path" (scudo size-class descriptor,
-/// real alloc 0x1db1c60). One word per variant: size-gate `b.ls SMALL` -> unconditional `b SMALL`,
-/// no bit0. Opt-in JIT_ROUTEB_OPNEW_SIZE_GATE, byte-guarded, whole-fn block-cache drop.
+/// SH246/247: activated continuation (0x102bd1d68) NULL-allocs (op_new NULLs size>0xa when
+/// [0x10727570c].bit0 clear; broad bit0 fix regressed SH245). Route every size onto the ≤0xa small
+/// path (scudo size-class, alloc 0x1db1c60): size-gate `b.ls SMALL`->`b SMALL`. Opt-in
+/// JIT_ROUTEB_OPNEW_SIZE_GATE.
 fn routeb_patch_opnew_size_gate() {
     if ROUTEB_OPNEW_SIZEGATE_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
         return;
@@ -2446,12 +2450,9 @@ fn routeb_reassert_canary_guard() {
     }
 }
 static ROUTEB_SENDAPP_PATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-/// SH119: SendAppEventOnAppReady (0x102bb463c) for-returns through two UNGATED
-/// singleton lambdas the SH115 patch can't reach (gate-backed CLEAN path
-/// dispatches direct off the too-short 0x60 vtable): lambda 0x6251610
-/// (`ldr x8,[x8,#0xf0]; blr x8` @0x6251670/74, window 0x6251670..84) + lambda
-/// 0x6260a68 (`ldr x8,[x8,#0x550]; blr x8` @0x6260abc/c0, window 0x6260abc..c8),
-/// each -> materialize OBJ into x0 + nop + repoint both gates to the epilogue.
+/// SH119: SendAppEventOnAppReady (0x102bb463c) for-returns through two UNGATED singleton lambdas
+/// the SH115 patch can't reach (too-short 0x60 vtable): 0x6251610 (blr[+0xf0] @0x6251670) +
+/// 0x6260a68 (blr[+0x550] @0x6260abc); each -> materialize OBJ into x0 + repoint gates to epilogue.
 fn routeb_patch_sendapp_singleton_lambdas() {
     if ROUTEB_SENDAPP_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
         return;
@@ -2518,11 +2519,10 @@ fn routeb_patch_sendapp_singleton_lambdas() {
 }
 
 static ROUTEB_SENDAPP_VTABLE_PATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// SH126 (deleg_f595f562): SendAppEventOnAppReady (0x102bb463c) builds a real app-event whose
-/// vtable 0x635e068 is ALL-ZERO - terminal `blr x8` (@0x102bb4984, x8=0x28) is `blr 0` -> benign
-/// soft-return, MH_* never latch. Fix: materialize slots +0x20/+0x28 to the benign leaf; seed pipe
-/// sync-gate [0x10683d010]=-1 so `bl 0x2baeeec` takes SYNCHRONOUS do-init (bl 0x2206c40) not async
-/// pthread_cond_wait. file 0x635e068 -> guest 0x106362068 (RW LOAD, plain store).
+/// SH126 (deleg_f595f562): SendAppEventOnAppReady (0x102bb463c) builds a real app-event whose vtable
+/// 0x635e068 is ALL-ZERO; terminal blr x8 (@0x102bb4984) -> soft-return, MH_* never latch. Fix:
+/// materialize +0x20/+0x28 slots to a benign leaf; seed pipe sync-gate [0x10683d010]=-1 so
+/// `bl 0x2baeeec` takes synchronous do-init. file 0x635e068 -> guest 0x106362068 (RW LOAD).
 fn routeb_patch_sendapp_appevent_vtable() {
     if ROUTEB_SENDAPP_VTABLE_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
         return;
@@ -2683,11 +2683,10 @@ fn routeb_patch_v2_dispatch() {
     }
     ROUTEB_V2_DISPATCH_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
-/// Drive engine's REAL per-node PRESENT walker 0x28-stride DRAWS (SH63 present-side gap).
-/// Entry 0x105b2eec0 (x19=R; SH64 crashed iter-2 nested-jit_run desync). SH64 fix: each node's
-/// render-obj vt[+24] = REGISTERED HOST THUNK (walker_item_draw_thunk). ABI: x19=R;
-/// ldp x20,x22,[R+0x180]=head/tail; per node x0=[node+8](render-obj); x8=[x0]->vt[+24]; blr
-/// draw; last x0=[R+0x160]=ctx; ctx-vt[+24]=swap; blr swap. MUST run on renderinit thread.
+/// Drive engine's REAL per-node PRESENT walker (0x28-stride DRAWS, SH63 present gap). Entry
+/// 0x105b2eec0 (x19=R; SH64's nested-jit_run iter-2 desync fix: each render-obj vt[+24]=HOST THUNK
+/// walker_item_draw_thunk). ABI: x19=R; ldp head/tail[R+0x180]; per node x0=[node+8], vt[+24] blr
+/// draw; x0=[R+0x160]=ctx, vt[+24]=swap, blr. MUST run on renderinit thread.
 fn render_engine_present_walker(
     ctx: u64, n: u64, node_count: u64, iimg: &[u8], ibase: u64, tpidr: u64, isp: u64,
 ) -> u64 {
@@ -2774,12 +2773,11 @@ fn read_visible_u64(a: u64) -> u64 {
     }
 }
 
-/// Guest-arena build of engine's REAL geometry context G for ITS geometry emitter (0x105b35288,
-/// SH66) to draw an authored quad; desync-safe (own top-level jit_run). Emitter ABI (SH66):
-/// x0=G,w1=idx,w2=count,w3=key,w4=first,w5=indexed; x19=G; w22=w1;
-/// bl primitive_setup(G,w3)->mask; !indexed && [G+0x78]!=0 -> glDrawElements else glDrawArrays.
-/// primitive_setup: x25=[G+0x38]=M; spec[M+0x48)24B/e; BD@G+0x48 slot[attr]*0x10; BD+0x48=u32 VBO;
-/// stride=[M+0x60]tbl[attr]; vform[0xcecf8c+fmt*12]. Fabricate minimal G.
+/// Guest-arena engine REAL geometry ctx G for its emitter (0x105b35288, SH66) drawn as an authored
+/// quad; desync-safe (own top-level jit_run). Emitter ABI: x0=G,x1=idx,x2=count,x3=key,x4=first,
+/// x5=indexed; primitive_setup(G,x3)->mask; !indexed && [G+0x78] -> Elements else Arrays.
+/// primitive_setup: M=[G+0x38]; spec[M+0x48)24B; BD@G+0x48 slot[attr]*0x10; BD+0x48=u32 VBO;
+/// stride=[M+0x60]tbl; vform[0xcecf8c+fmt*12]. Fabricate minimal G.
 pub fn render_engine_emitter_quad(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) -> u64 {
     if !(ctx >= 0x100000000 && ctx >> 56 == 0) {
         return 0;
@@ -3192,12 +3190,8 @@ fn imgpix_rect(
     ((x_ndc + 1.0) / 2.0 * vw, (1.0 - y_ndc) / 2.0 * vh)
 }
 
-// ============================================================================
-// SH77 - minimal pure-std TrueType outline rasterizer (login-form text labels).
-// Parses sfnt tables (cmap Format-4 + glyf simple contours), flattens quadratic
-// outlines, fills non-zero winding (4x4 supersampled) into RGBA8 strips (same
-// textured emitter path). Zero new deps / no network (fonts/ SourceSansPro-Bold.ttf).
-// ============================================================================
+// SH77 minimal pure-std TrueType outline rasterizer (login labels): sfnt cmap-4 + glyf
+// contours, quadratic flatten, nonzero-fill 4x4-super into RGBA8 strips. No deps/network.
 fn be16(d: &[u8], o: usize) -> u16 {
     u16::from_be_bytes([d[o], d[o + 1]])
 }
@@ -3208,12 +3202,9 @@ fn be32(d: &[u8], o: usize) -> u32 {
     u32::from_be_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
 }
 
-// ============================================================================
-// Roblox .mesh v2 parser (pure std). Reads real APK content/*.mesh: "version 2.00\n" (13B)
-// then FileMeshHeaderV2: u16 header-sz(=12); u8 vertex-sz(36/40); u8 face-sz(=12); u32 numVerts;
-// u32 numFaces; numVerts* FileMeshVertex {pos[3]f32,norm[3]f32,uv[2]f32,tangent[4]i8[,color[4]u8
-// if 40]}; numFaces* FileMeshFace {a,b,c u32}. Feeds the geometry wrapper.
-// ============================================================================
+// Roblox .mesh v2 parser (pure std) for APK content/*.mesh: "version 2.00\n" (13B) then
+// FileMeshHeaderV2 {u16 hs(=12); u8 vert-sz(36/40); u8 face-sz(=12); u32 nVerts; u32 nFaces},
+// verts {pos,norm,uv[,tangent i8][,color u8]} + faces {a,b,c}. Feeds the geometry wrapper.
 fn le16(d: &[u8], o: usize) -> u16 {
     u16::from_le_bytes([d[o], d[o + 1]])
 }
@@ -4932,12 +4923,9 @@ fn real_ui_textures() -> Vec<RealSprite> {
     .clone()
 }
 
-/// SH72 - the engine's REAL geometry emitter 0x105b35288 draws a FULL MULTI-SPRITE
-/// "login/home" composite frame in ONE top-level jit_run: dark backdrop + one
-/// aspect-correct box per real Roblox UI sprite (spinner, robux icon, jump button) from
-/// a shared vertical atlas, composited GL_BLEND. Per-sprite verified from the DECODED
-/// sprite rgba (not hard-coded) via imgpix_rect (vUV-linear shader mapping) — a present
-/// sprite proves its real pixels landed.
+/// SH72: the engine's REAL geometry emitter 0x105b35288 draws a FULL MULTI-SPRITE login/home
+/// composite in ONE top-level jit_run (dark backdrop + aspect box per real Roblox UI sprite from a
+/// shared atlas, GL_BLEND). Per-sprite verified from DECODED sprite rgba (imgpix_rect, vUV-linear).
 pub fn render_engine_emitter_multi(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) -> u64 {
     if !(ctx >= 0x100000000 && ctx >> 56 == 0) {
         return 0;
@@ -5635,11 +5623,10 @@ fn render_engine_emitter_mesh(ctx: u64, iimg: &[u8], ibase: u64, isp: u64) -> u6
     r
 }
 
-/// Present ONE real task-driven frame on the CURRENT thread (renderinit thread, EGL current -
-/// SH61b). Binds via make-current 0x105b3b358, frame-fn 0x105b32c00, swap 0x105b3b408. n = serial.
-/// SH152 (RENDER_TASKFRAME_HOME=1): present REAL home artwork via the emitter 0x105b35288 in a
-/// SEPARATE top-level jit_run (reuses cached textured program + pre-uploaded texture - no nested
-/// guest-bridge GLSL alloc, the SH151 SIGABRT class). Default = flat palette.
+/// Present ONE real task-driven frame on the CURRENT thread (EGL current, SH61b): make-current
+/// 0x105b3b358 -> frame-fn 0x105b32c00 -> swap 0x105b3b408; n=serial. SH152 (RENDER_TASKFRAME_HOME=1):
+/// present REAL home artwork via emitter 0x105b35288 in a SEPARATE top-level jit_run (no nested
+/// guest GLSL alloc, the SH151 SIGABRT class). Default = flat palette.
 fn present_one_task_frame(ctx: u64, n: u64, iimg: &[u8], ibase: u64, isp: u64) -> u64 {
     let vt = unsafe { *(ctx as *const u64) };
     if !(vt >= 0x100000000 && vt >> 56 == 0) {
@@ -5965,11 +5952,9 @@ fn install_xvfb_reaper() {
     });
 }
 
-/// Bring up an Xvfb X server + 1280x720 window, register its XID as the guest's ANativeWindow
-/// handle (GRAPHICS_RECOMMENDATION §5.3). Runs SYNCHRONOUSLY so the real window is wired before
-/// StartApp reaches the window/EGL surface path (a racing thread would hand the guest the
-/// sentinel). The X connection is leaked so the window outlives this fn. Returns the wired XID,
-/// or 0 if no window could be opened (caller keeps the sentinel fallback).
+/// Bring up Xvfb + 1280x720 window, register its XID as the guest's ANativeWindow (REC §5.3). Runs
+/// SYNCHRONOUSLY so the real window is wired before StartApp hits the EGL surface path (a racing
+/// thread would hand the sentinel). X connection leaked so the window outlives fn. Returns XID or 0.
 fn wire_real_window() -> u64 {
     // SH112: a stale /tmp/.X11-unix/X<n> socket from a dead prior session must
     // NOT be trusted - the old code saw the file and "broke", skipping the
@@ -6647,6 +6632,9 @@ fn main() {
             // SH349 (opt-in JIT_ROUTEB_LSM_APPEND_SKIP=1): RET the faulty byte-copy sub-call 0x101d9a15c
             // (SH348 reached it past the entry patch via mid-function jump; this stubs every path).
             routeb_patch_lsm_append_skip();
+            // SH350 (opt-in JIT_ROUTEB_LSM_PACK_SKIP=1): RET the single-caller name-pack helper
+            // 0x101d9a708 (the SH349+1 new terminal) — the ONE-caller bounded continuation past SH349.
+            routeb_patch_lsm_pack_skip();
             let boot_sp = st.x[31];
             let tpidr = arm64jit::jit::current_guest_tp();
             let ib = base;
@@ -15650,6 +15638,30 @@ mod sh115_tests {
             eprintln!("sh349 LSM append byte-copy inert-target pinned (SH285 fault body 0x101d9a15c).");
         } else {
             eprintln!("sh349 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
+    fn sh350_lsm_namepack_single_caller_pins_inert_target() {
+        // SH350: JIT_ROUTEB_LSM_PACK_SKIP RETs the name-pack helper 0x101d9a708 (SH349+1 terminal,
+        // the ONE-caller bounded continuation past SH349). Pin patched/inert words: helper entry
+        // 0xd10143ff (sub sp,#0x50), caller bl 0x94000041, benign tst 0xf276541f / b.eq 0x540002a0,
+        // natural ret 0xd65f03c0.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            assert_eq!(word(0x101_d9a_708), 0xd10143ff, "sh350 name-pack entry prologue sub sp,#0x50 (the patched target)");
+            assert_eq!(word(0x101_d9a_604), 0x94000041, "sh350 single caller bl 0x1d9a708 (b-format imm26 word)");
+            assert_eq!(word(0x101_d9a_608), 0xf276541f, "sh350 caller tst x0,#0xfffffc00 (benign index-0 path selector)");
+            assert_eq!(word(0x101_d9a_610), 0x540002a0, "sh350 caller b.eq index-0 (branch commons of the FATAL-sub-path vs index-0)");
+            assert_eq!(word(0x101_d9a_704), 0xd65f03c0, "sh350 name-pack natural ret (the inert-substituted word below it)");
+            eprintln!("sh350 LSM name-pack single-caller inert-target pinned (SH349+1 terminal 0x101d9a708; one caller -> benign index-0 continuation).");
+        } else {
+            eprintln!("sh350 real-image guard: no real libroblox.so, skipping anchors");
         }
     }
 

@@ -1,5 +1,39 @@
 # Open Sober — Agent Handoff
 
+## SH350 (Sep 19, 2026, hermes-worker): CROSS the SH349+1 terminal — bounded single-caller skip of the name-pack helper 0x101d9a708; ladder advances deep into the LSM pool-pop continuation, then the same run-variable live-object family (3rd fencepost that LSM sub-call-whack-a-mole is unbounded)
+Single-agent (cone suppressed). Default-inert opt-in `JIT_ROUTEB_LSM_PACK_SKIP=1`
+(`routeb_patch_lsm_pack_skip`, elfjit.rs — RETs the single-caller name/version string-pack
+helper 0x101d9a708, the SH349+1 terminal; caller takes the benign index-0 tst/b.eq path) +
+`sh350` hermetic (real-image pins: helper entry 0xd10143ff / single caller bl 0x94000041 /
+benign tst 0xf276541f / b.eq index-0 0x540002a0 / natural ret 0xd65f03c0 @0x101d9a704) +
+runs/capture_sh350_pack_skip.sh. Workspace green (arm64jit lib 416/0; elfjit example 157/0
++ sh350); recon-v3 frame plane re-verified green (24 frames, 0 crash).
+
+### The forward this cycle
+SH349+1's new terminal 0x101d9a708 is a name-pack helper with exactly ONE caller
+(0x101d9a604, verified whole-region BL scan) — BOUNDED, unlike the unbounded hundreds-of-
+callers `bl 0x1d9d8b0` family. RET'ing it crosses the SH349+1 wall.
+
+### MEASURED (real libroblox.so, full SH285-B/SH343-350 ladder env + LSM_NODES + 3 skips, 4 runs)
+- SH350 fires every run; the OLD 0x101d9a708 terminal is GONE in all 4 runs.
+- Ladder ADVANCES to 175 LSM pool-pop iterations (0x101d9a5a0/0x101d9a528, SH341 lines) — the
+  deepest persistence-lane penetration measured — before terminating run-variable
+  (bad_function_call / 0x101d9a528 / 0x102b9dee0 / 0x1021e40dc) in the SAME live-object family
+  SH343/346 documented. DM-root 0, MH_* all false; Route-B live-DM gate UNCHANGED.
+
+### Conclusion + next
+SH350 is a real BOUNDED fencepost (SH285->SH349->SH350 crossed 2 levels). It does NOT
+manufacture a DM and provides no path to app-start 0x2bd2058 — the advance lands in the same
+unconstructed live-object family at THREE depths of evidence, closing the persistence-lane
+re-attack permanently (do NOT re-drive LSM sub-call skips). Also measured this cycle: the
+messageBus "experience-launch" publish topic is a Java-side runtime string (SH347's never-
+firing cb is NOT a topic-string bug), and onAppLuaWillStart is an internal lambda, not an
+export. Next forward (non-persistence Route-B): R1 synthetic CoreScript content path — stage a
+hand-authored ~20-line Luau ScreenGui module into the filesdir the rbxasset://scripts/
+CoreScripts resolver serves so the INSTANT do-init owns a live DM the engine self-constructs
+real GuiObjects -> R+0x180/0x188 nodes with zero host layout. SH174 capture-latch stays the
+single forward hook.
+
 ## SH349 (Sep 19, 2026, hermes-worker): CROSS the long-standing SH285 terminal — RET the faulty LSM byte-copy sub-call 0x101d9a15c; persistence lane advances one fencepost to a GOT/canary read wall at 0x101d9a708
 Single-agent (cone suppressed). Default-inert opt-in `JIT_ROUTEB_LSM_APPEND_SKIP=1`
 (`routeb_patch_lsm_append_skip`, elfjit.rs — RETs the `ldr w8,[x2]` byte-copy sub-call that the
