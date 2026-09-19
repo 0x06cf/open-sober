@@ -9318,6 +9318,90 @@ mod tests {
     }
 
     #[test]
+    fn sh445_veccmp_2s_fcmeq_allones_mask_full_buffer_and_cc() {
+        // fcmeq V1.2s, V2.2s, V3.2s (esize=4, op=0, cc=sete): each lane -> all-ones
+        // if equal else 0. rd=1 rn=2 rm=3 -> Vd@0x120, Vn@0x130, Vm@0x140, 2 lanes.
+        let b = tr_bytes(Inst::VecFpCmp { rd: 1, rn: 2, rm: 3, esize: 4, op: 0, q: false, abs: false });
+        assert_eq!(b, vec![
+            // lane 0
+            0x8b, 0x83, 0x30, 0x01, 0x00, 0x00, // mov eax,[rbx+0x130] Vn lane0
+            0x66, 0x0f, 0x6e, 0xc0,             // movd xmm0,eax
+            0x8b, 0x83, 0x40, 0x01, 0x00, 0x00, // mov eax,[rbx+0x140] Vm lane0
+            0x66, 0x0f, 0x6e, 0xc8,             // movd xmm1,eax
+            0x40, 0x0f, 0x2f, 0xc1,             // comiss xmm0,xmm1 (CF/ZF)
+            0x0f, 0x94, 0xc0,                   // sete al  (cc 4)
+            0x0f, 0xb6, 0xc0,                   // movzx eax,al
+            0x48, 0xf7, 0xd8,                   // neg rax   -> +1 becomes all-ones
+            0x89, 0x83, 0x20, 0x01, 0x00, 0x00, // mov [rbx+0x120],eax Vd lane0
+            // lane 1
+            0x8b, 0x83, 0x34, 0x01, 0x00, 0x00, // mov eax,[rbx+0x134] Vn lane1
+            0x66, 0x0f, 0x6e, 0xc0,
+            0x8b, 0x83, 0x44, 0x01, 0x00, 0x00, // mov eax,[rbx+0x144] Vm lane1
+            0x66, 0x0f, 0x6e, 0xc8,
+            0x40, 0x0f, 0x2f, 0xc1,             // comiss
+            0x0f, 0x94, 0xc0,                   // sete al
+            0x0f, 0xb6, 0xc0,                   // movzx eax,al
+            0x48, 0xf7, 0xd8,                   // neg rax
+            0x89, 0x83, 0x24, 0x01, 0x00, 0x00, // mov [rbx+0x124],eax Vd lane1
+        ]);
+        // the all-ones mask: setback is 1 -> neg yields 0xffffffff, so a lane store
+        // carries the full all-ones mask for a matched lane (0 -> 0 for a miss).
+        assert!(b.windows(3).any(|w| w == [0x48, 0xf7, 0xd8]), "compare->mask must emit neg rax (1 -> all-ones)");
+        // lane addressing advances +4/lane across Vn/Vm/Vd.
+        assert!(b.windows(6).any(|w| w == [0x89, 0x83, 0x24, 0x01, 0x00, 0x00]), "lane1 stores Vd@0x124");
+        // cc discriminator: fcmeq = sete (0f 94), fcmgt = seta (0f 97), fcmge = setae (0f 93).
+        let gt = tr_bytes(Inst::VecFpCmp { rd: 1, rn: 2, rm: 3, esize: 4, op: 1, q: false, abs: false });
+        assert!(gt.windows(3).any(|w| w == [0x0f, 0x97, 0xc0]), "fcmgt = seta (0f 97)");
+        assert!(!gt.windows(3).any(|w| w == [0x0f, 0x94, 0xc0]), "fcmgt must NOT emit sete");
+        let ge = tr_bytes(Inst::VecFpCmp { rd: 1, rn: 2, rm: 3, esize: 4, op: 2, q: false, abs: false });
+        assert!(ge.windows(3).any(|w| w == [0x0f, 0x93, 0xc0]), "fcmge = setae (0f 93)");
+        assert!(!ge.windows(3).any(|w| w == [0x0f, 0x94, 0xc0]), "fcmge must NOT emit sete");
+        // comiss carries the always-REX 0x40 (same quirk as maxss/minss/sh444).
+        assert!(b.windows(4).any(|w| w == [0x40, 0x0f, 0x2f, 0xc1]), "single-path compare = comiss (40 0f 2f c1)");
+    }
+
+    #[test]
+    fn sh445_veccmp_2d_comisd_width_discriminator() {
+        // fcmeq V1.2d, V2.2d, V3.2d (esize=8): 1 lane (8/8). Double uses movq_load
+        // (f3 48 0f 7e) + comisd (66 40 0f 2f c1) + 64-bit store (48 89 83) — the
+        // esize=8 width discriminator vs the single single-precision path.
+        let b = tr_bytes(Inst::VecFpCmp { rd: 1, rn: 2, rm: 3, esize: 8, op: 0, q: false, abs: false });
+        assert_eq!(b, vec![
+            0xf3, 0x48, 0x0f, 0x7e, 0x83, 0x30, 0x01, 0x00, 0x00, // movq xmm0,[rbx+0x130] Vn
+            0xf3, 0x48, 0x0f, 0x7e, 0x8b, 0x40, 0x01, 0x00, 0x00, // movq xmm1,[rbx+0x140] Vm
+            0x66, 0x40, 0x0f, 0x2f, 0xc1,                         // comisd xmm0,xmm1
+            0x0f, 0x94, 0xc0,                                     // sete al
+            0x0f, 0xb6, 0xc0,                                     // movzx eax,al
+            0x48, 0xf7, 0xd8,                                     // neg rax
+            0x48, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00,             // mov [rbx+0x120],rax (64-bit)
+        ]);
+        assert!(b.windows(5).any(|w| w == [0x66, 0x40, 0x0f, 0x2f, 0xc1]), "double-path compare = comisd (66 40 0f 2f c1)");
+        assert!(b.windows(9).any(|w| w == [0xf3, 0x48, 0x0f, 0x7e, 0x83, 0x30, 0x01, 0x00, 0x00]), "double-path loads Vn via movq (f3 48 0f 7e)");
+        assert!(b.windows(7).any(|w| w == [0x48, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00]), "double-path stores 64-bit mask (48 89 83)");
+        // width discriminator: the double path exclusively uses movq_load
+        // (f3 48 0f 7e) — it must NOT emit the single path's movd (66 0f 6e c0).
+        assert!(!b.windows(4).any(|w| w == [0x66, 0x0f, 0x6e, 0xc0]), "double-path must NOT emit the single-precision movd (66 0f 6e c0)");
+    }
+
+    #[test]
+    fn sh445_veccmp_abs_signmask_pand_before_compare() {
+        // facgt/facge (abs): compare |Vn| vs |Vm| — the emit clears each sign bit
+        // (pand with 0x7fffffff) BEFORE the comiss. The signmask constant +
+        // pand sequence is the abs-vs-nonabs discriminator.
+        let b = tr_bytes(Inst::VecFpCmp { rd: 1, rn: 2, rm: 3, esize: 4, op: 1, q: false, abs: true });
+        assert!(b.windows(4).any(|w| w == [0x66, 0x0f, 0xdb, 0xc2]), "abs clears |Vn| sign via pand xmm0,xmm2 (66 0f db c2)");
+        assert!(b.windows(4).any(|w| w == [0x66, 0x0f, 0xdb, 0xca]), "abs clears |Vm| sign via pand xmm1,xmm2 (66 0f db ca)");
+        assert!(b.windows(10).any(|w| w == [0x48, 0xb8, 0xff, 0xff, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00]),
+            "abs sign-clear merges the 0x7fffffff constant (mov rax,0x7fffffff)");
+        assert!(b.windows(5).any(|w| w == [0x66, 0x48, 0x0f, 0x6e, 0xd0]), "abs loads mask into xmm2 (movq xmm2,rax, 66 48 0f 6e d0)");
+        // the pand must precede the comiss (sign cleared before compare).
+        let c_pos = b.windows(4).position(|w| w == [0x40, 0x0f, 0x2f, 0xc1]).unwrap();
+        let pand_pos = b.windows(4).position(|w| w == [0x66, 0x0f, 0xdb, 0xc2]).unwrap();
+        assert!(pand_pos < c_pos, "abs must pand (clear sign) BEFORE the comiss compare");
+        assert!(b.windows(3).any(|w| w == [0x0f, 0x97, 0xc0]), "facgt keeps seta (0f 97)");
+    }
+
+#[test]
     fn sh439_fcvtztoint_fixed_point_fbits_scales_by_2pown_mulsd() {
         // fcvtzu x0, s1, #4 (fixed-point, fbits=4): result = Fn * 2^4.
         // The scale const (2^4 = 16.0 double = 0x4030_0000_0000_0000) is

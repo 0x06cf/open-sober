@@ -1,5 +1,44 @@
 # Open Sober — Agent Handoff
 
+## SH445 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD single-precision FP COMPARE->mask codegen family (translate.rs VecFpCmp — fcmeq/fcmgt/fcmge/facgt/facge) — 3 exact-byte pins
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+re-verified green at this HEAD first (capture_taskv4_frame.sh attempt 1: 24
+real task-driven frames `present swap Ok(0x1)`, 0 json abort, 0 crash,
+EXIT 0). Workspace green (cargo test --workspace EXIT 0; arm64jit lib 609/0
+incl. 3 new sh445 pins, was 606; cargo build --example elfjit OK). Production
+code ONLY in translate.rs `#[cfg(test)]` addition (translator core body
+byte-untouched; jit.rs 1,048,390 B < 1MiB hook unchanged; elfjit.rs/session.rs
+unchanged).
+- VecFpCmp (fcmeq/fcmgt/fcmge + abs facgt/facge — the per-lane or-mask the
+  shader-like branch/blend/color-decision lanes lean on) had zero direct byte
+  tests. SH445 pins the exact emit (rd=1 rn=2 rm=3; Vd@0x120 Vn@0x130 Vm@0x140):
+  single .2s per lane `mov eax,[Vn+4l]` + movd xmm0 (66 0f 6e c0) + `mov
+  eax,[Vm+4l]` + movd xmm1 (66 0f 6e c8) + comiss xmm0,xmm1 (40 0f 2f c1) +
+  `set?cc al` + movzx eax,al (0f b6 c0) + neg rax (48 f7 d8 -> +1 becomes
+  all-ones) + `mov [Vd+4l],eax` (89 83 d32). The cc byte IS the semantic:
+  fcmeq = sete 0f 94 c0, fcmgt = seta 0f 97 c0, fcmge = setae 0f 93 c0 — a
+  wrong condition picks the wrong comparison. Double .2d swaps to movq_load
+  (f3 48 0f 7e) + comisd (66 40 0f 2f c1) + 64-bit store (48 89 83) — the
+  width discriminator.
+- Discoveries: (1) comiss/comisd ALSO always emit the REX 0x40 (like the SH444
+  maxss/minss quirk) — comiss(0,1)=40 0f 2f c1, comisd(0,1)=66 40 0f 2f c1;
+  (2) a negative `windows(4)==40 0f 2f c1` for the double path is a BAD
+  discriminator because comisd's bytes `66 40 0f 2f c1` contain that window —
+  replaced with the correct one (double path never emits movd 66 0f 6e c0);
+  (3) abs/facgt clears each lane's sign bit BEFORE the compare (mov rax,0x7fff
+  ffff + movq xmm2,rax 66 48 0f 6e d0 + pand 66 0f db c2/ca, then comiss) — the
+  pand-before-compare ordering is the abs discriminator.
+- Deterministic: synthetic Inst -> translate() -> CodeBuf.as_slice() (zero-pc
+  0x1000); [RBX]=CpuState, vector slot v[t]=VECTOR_BASE(0x110)+t*16. Emission
+  established precisely with a one-off eprintln dump (removed before commit) so
+  pins match the real emission. 3 exact-byte pins.
+- Honest: NOT a DM (SH415 probe re-confirms DM-root [0x106a68818]=0x0 under the
+  complete substrate; Route-B live-DM gate UNCHANGED). BUILD-THE-RUNTIME
+  codegen-surface coverage completion on the compare->mask family, adjacent to
+  SH444 (VecFpArith 2-src FP arithmetic). No re-treads.
+- Files: docs/frontier-sh445-translator-veccmp.md + crates/arm64jit/src/
+  translate.rs (`#[cfg(test)]` only). Commit (pending).
+
 ## SH444 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD single-precision FP TWO-SOURCE arithmetic codegen family (translate.rs VecFpArith — fadd/fsub/fmul/fdiv op 0..3 + fmax/fmin/fmaxnm/fminnm op 4..7 + frecps/frsqrts op 8/9) — 3 exact-byte pins
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 unchanged-green (the change is `#[cfg(test)]`-only, so the runtime deliverable
