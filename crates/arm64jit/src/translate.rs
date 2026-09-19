@@ -15,7 +15,7 @@
 // the flags result is only written back as a placeholder.
 
 use crate::decode::{Inst, ShiftKind};
-use crate::x86::{CodeBuf, RSI, RAX, RBX, RCX, RDX, RDI, R10};
+use crate::x86::{CodeBuf, R10, RAX, RBX, RCX, RDI, RDX, RSI};
 
 // ---------------------------------------------------------------------------
 // SH106-NEXT diagnostic: an env-gated, DEFAULT-INERT STORE-WATCH that names the
@@ -58,6 +58,47 @@ pub fn set_canary_store_watch_test(on: bool) {
     CANARY_STORE_WATCH.store(on, Ordering::Relaxed);
 }
 
+// -- SH462: DM-root store-watch (default-inert) ---------------------------
+// The Route-B structural wall is measured as "DM-root [0x106a68818] = 0 and the
+// once-lambda reaches its br-x1 dispatch but no live DataModel is held". Every
+// existing instrument (SH361/381/334/388) READS that cell; NO instrument names
+// the exact guest store that would populate it (the once-slot [0x106a68408] /
+// DM-root [0x106a68818] window). This watch answers the operator's "dynamic
+// DM-ctor trace rather than a static seed" ask at the STORE level: for any
+// 64-bit guest store landing in the DM-holder 0x60-byte window it logs the guest
+// pc + written value. Fires means a writer EXISTS on a reached path (store value
+// tells whether it wrote a non-null obj); full-run silence means the wall is
+// genuinely structural (no writer path reached HEADLESSLY). Enabled ONLY by
+// JIT_DMROOT_STORE_WATCH=1 (default off => emitted store bytes byte-identical).
+// Writes no guest bytes (post-store observation only).
+static DMROOT_STORE_WATCH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static DMROOT_STORE_WATCH_TEST_OVERRIDE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+const DMROOT_WIN_LO: u64 = 0x106a683f0; // just below once-guard [0x106a68410]
+const DMROOT_WIN_HI: u64 = 0x106a68828; // just above DM-root [0x106a68818]
+
+/// Read the JIT_DMROOT_STORE_WATCH env once (lazily). Idempotent.
+fn dmroot_store_watch_enabled() -> bool {
+    use std::sync::atomic::Ordering;
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        if !DMROOT_STORE_WATCH_TEST_OVERRIDE.load(Ordering::Relaxed) {
+            let on = std::env::var("JIT_DMROOT_STORE_WATCH").ok().as_deref() == Some("1");
+            DMROOT_STORE_WATCH.store(on, Ordering::Relaxed);
+        }
+    });
+    DMROOT_STORE_WATCH.load(Ordering::Relaxed)
+}
+
+/// Test-only override so a hermetic can toggle the flag without touching env.
+#[doc(hidden)]
+pub fn set_dmroot_store_watch_test(on: bool) {
+    use std::sync::atomic::Ordering;
+    DMROOT_STORE_WATCH_TEST_OVERRIDE.store(true, Ordering::Relaxed);
+    DMROOT_STORE_WATCH.store(on, Ordering::Relaxed);
+}
+
 /// Host store-watch: called from emitted code AFTER a 64-bit guest store (so
 /// the stored value is preserved and this can only observe, never perturb).
 /// Args (SysV): RDI=state, RSI=dest, RDX=value, RCX=pc.
@@ -67,7 +108,31 @@ extern "C" fn canary_store_watch(
     value: u64,
     pc: u64,
 ) -> u64 {
-    if !CANARY_STORE_WATCH.load(std::sync::atomic::Ordering::Relaxed) {
+    let dmroot_on = DMROOT_STORE_WATCH.load(std::sync::atomic::Ordering::Relaxed);
+    let canary_on = CANARY_STORE_WATCH.load(std::sync::atomic::Ordering::Relaxed);
+    if !canary_on && !dmroot_on {
+        return 0;
+    }
+    // SH462: if enabled, FIRST report any 64-bit store landing in the DM-holder
+    // window (once-slot [0x106a68408] .. DM-root [0x106a68818]) — the exact
+    // guest store that would own a live DataModel. A fire here NAMES the writer
+    // (pc + value); full-run silence is the dynamic proof the Route-B wall is
+    // structural (no writer path reaches the holder headlessly, i.e. NOT
+    // seedable-by-writer). De-dups consecutive repeats, one line per distinct
+    // (pc,value) pair.
+    if dmroot_on && dest >= DMROOT_WIN_LO && dest <= DMROOT_WIN_HI {
+        static DLAST: std::sync::Mutex<Option<(u64, u64)>> = std::sync::Mutex::new(None);
+        if let Ok(mut l) = DLAST.lock() {
+            if *l == Some((pc, value)) {
+                return 0;
+            }
+            *l = Some((pc, value));
+        }
+        eprintln!(
+            "[dmroot-store-watch] pc={pc:#x} dst={dest:#x} val={value:#x} (once-guard[0x106a68410]/DM-root[0x106a68818] window)"
+        );
+    }
+    if !canary_on {
         return 0;
     }
     // Narrow to the SH103/SH106 leak signature: a FOREIGN HOST pointer
@@ -187,7 +252,13 @@ pub fn host_return_leak_watch(pc: u64, ret: u64, caller: u64) {
 /// (the operand-reload-per-instruction model reloads from state).
 fn emit_canary_store_watch(buf: &mut CodeBuf, pc: u64, dest_reg: u8, val_reg: u8) {
     let _ = canary_store_watch_enabled(); // lazily sync the atomic from env once
-    if !CANARY_STORE_WATCH.load(std::sync::atomic::Ordering::Relaxed) {
+    let _ = dmroot_store_watch_enabled(); // lazily sync the atomic from env once
+    // SH462: emit when EITHER the canary watch or the DM-root store-watch is on
+    // (the host fn first filters DM-window stores when dmroot_on, else the canary
+    // leak signature; both default-off => emitted bytes byte-identical).
+    if !CANARY_STORE_WATCH.load(std::sync::atomic::Ordering::Relaxed)
+        && !DMROOT_STORE_WATCH.load(std::sync::atomic::Ordering::Relaxed)
+    {
         return;
     }
     let addr = canary_store_watch as usize as u64;
@@ -7317,6 +7388,43 @@ mod tests {
         CANARY_STORE_WATCH.store(false, Ordering::Relaxed);
         set_canary_store_watch_test(false);
         assert!(buf.len() >= 3, "store+watch must emit at least a mov + call");
+    }
+
+    // SH462 hermetic: the DM-root store-watch (JIT_DMROOT_STORE_WATCH) is
+    // default-inert too, and its EMISSION gate is OR'd with the canary watch —
+    // dmroot_ON alone must emit the post-store probe, both OFF stays byte-inert.
+    // The host fn reports (logs) only stores landing in the DM-holder window
+    // [0x106a683f0 .. 0x106a68828] and never panics / never writes guest bytes;
+    // it returns 0 regardless of armed state (observation-only).
+    #[test]
+    fn dmroot_store_watch_gated_and_window_classified() {
+        use std::sync::atomic::Ordering;
+        let _guard = CANARY_WATCH_TEST_LOCK.lock().unwrap();
+        // Both watches off => byte-inert emit.
+        set_canary_store_watch_test(false);
+        set_dmroot_store_watch_test(false);
+        DMROOT_STORE_WATCH.store(false, Ordering::Relaxed);
+        let _ = dmroot_store_watch_enabled(); // run lazy env sync (default off)
+        let mut off = crate::x86::CodeBuf::new();
+        emit_canary_store_watch(&mut off, 0x1000, RDX, RAX);
+        let off_len = off.len();
+        // dmroot ONLY on => emit fires (gate OR).
+        DMROOT_STORE_WATCH.store(true, Ordering::Relaxed);
+        set_dmroot_store_watch_test(true);
+        let mut on = crate::x86::CodeBuf::new();
+        emit_canary_store_watch(&mut on, 0x1000, RDX, RAX);
+        let on_len = on.len();
+        // host fn: window store + non-window store both return 0, no panic,
+        // (logged path is observational); idempotent with both off.
+        let _ = canary_store_watch(std::ptr::null(), 0x106a68818u64, 0x7f00000001d0, 0x10258b5d8);
+        let _ = canary_store_watch(std::ptr::null(), 0x106a68818u64, 0x7f00000001d0, 0x10258b5d8); // dup suppressed
+        let _ = canary_store_watch(std::ptr::null(), 0x1000u64, 0x7f00000001d0, 0x1001); // outside window
+        // reset both to off for other tests.
+        DMROOT_STORE_WATCH.store(false, Ordering::Relaxed);
+        set_dmroot_store_watch_test(false);
+        set_canary_store_watch_test(false);
+        assert_eq!(off_len, 0, "dmroot watch must be byte-inert when both watches off");
+        assert!(on_len >= 5, "dmroot watch ON must emit a call+args (gate OR'd with canary)");
     }
 
     // SH4xx-next hermetic: the host-RETURN leak watch is byte-safe + gated the
