@@ -87,11 +87,11 @@ fn seed_libcpp_long_string(global: u64, buf: u64, bytes: &[u8]) -> u64 {
     global
 }
 
-/// SH156: build a live object for DM-root [0x106a68818] so do-init match advances into REAL
-/// global-init construction benign Ok(0x3e8). Match (0x2206df4..0x2206e24): `ldr x0,[x19,#32]`
-/// (appbridge[+0x20]=DM-root); cbz->Ok(0x3e8); `ldr x8,[x0]; ldr x1,[x8,#48]; br x1`. Real dispatch
-/// vtable (0x10635cce0) +0x30 = 0x102207b50 (real global-init CTOR, ZERO `this` derefs on globals);
-/// a 0x10 object whose only live word is [0x00]=vtable suffices. `buf` RW >=0x10. Returns buf.
+/// SH156: live object for DM-root [0x106a68818] so do-init match advances into REAL
+/// global-init construction Ok(0x3e8). Match (0x2206df4..0x2206e24): `ldr x0,[x19,#32]`
+/// (appbridge[+0x20]=DM-root); cbz->Ok(0x3e8); `ldr x8,[x0]; ldr x1,[x8,#48]; br x1`. Real
+/// vtable (0x10635cce0) +0x30 = 0x102207b50 (real global-init CTOR, ZERO `this` derefs on
+/// globals); a 0x10 object whose only live word is [0x00]=vtable suffices. `buf` RW >=0x10.
 fn routeb_dm_root_object(buf: u64) -> u64 {
     if buf == 0 {
         return 0;
@@ -429,12 +429,11 @@ fn render_scene_base(node_count: u64) -> u64 {
     r
 }
 
-/// Drive the engine's REAL scene renderer (guest 0x105b2ead4) current thread with the
-/// fabricated-but-engine-native R from `render_scene_base`. Binds ctx, lets the ENGINE's
-/// frame-desc ctor + linker build a real 0x98 frame item into R+0x170 AND, when
-/// node_count>0, one real frame per populated 0x28-stride scene node (SH63), then swaps.
-/// Returns swap result (1 = genuine present). Verifies real frame-descs (R+0x170 + each node
-/// point at nonzero frames with [+140] set, [+144]==1).
+/// Drive the engine's REAL scene renderer (guest 0x105b2ead4) current with the
+/// fabricated-but-engine-native R from `render_scene_base`. Binds ctx, lets the engine's
+/// frame-desc ctor + linker build a real 0x98 frame into R+0x170 AND, when node_count>0, one
+/// frame per populated 0x28-stride node (SH63), then swaps. Returns swap result (1=present).
+/// Verifies frames (R+0x170 + nodes point at nonzero frames, [+140] set, [+144]==1).
 fn render_engine_scene(ctx: u64, n: u64, node_count: u64) -> u64 {
     if !(ctx >= 0x100000000 && ctx >> 56 == 0) {
         return 0;
@@ -995,11 +994,11 @@ fn routeb_patch_dispatch_gate() {
     ROUTEB_GATE_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// SH88: OTel/pb_defaults registration passes a static `.data.rel.ro` protobuf field-TAG constant
-/// (e.g. 0x1800064) as map/this to hash-map FIND (0x1029f424c); the upstream registry map (BSS
-/// 0x106838368/378/380) is never built under JIT. Tag < 0x100000000 -> FIND `ldp x1,x8,[x19,#16]`
-/// reads unmapped [tag+16] -> SIGSEGV. Fix: seed a coherent empty span-hash map once + install it
-/// in pb_defaults slots; jit.rs routeb_map_op_entry substitutes it for any non-zero sub-image x0.
+/// SH88: OTel/pb_defaults passes a static `.data.rel.ro` protobuf field-TAG (e.g. 0x1800064)
+/// as map/this to hash FIND (0x1029f424c); the upstream registry map (0x106838368/378/380) is
+/// never built under JIT. Tag<0x100000000 -> FIND `ldp x1,x8,[x19,#16]` reads [tag+16] SEGV.
+/// Fix: seed an empty span-hash map + install in pb_defaults slots; jit.rs routeb_map_op_entry
+/// substitutes it for any non-zero sub-image x0.
 pub fn routeb_seed_pb_registry_map(image: &[u8], base: u64) -> u64 {
     use std::sync::OnceLock;
     static SEEDED: OnceLock<u64> = OnceLock::new();
@@ -1405,12 +1404,12 @@ fn routeb_patch_startapp_params_x20() {
     arm64jit::jit::block_cache_drop_region(0x1025f52b4, 0x1025f5550);
 }
 
-/// SH161: governor TAIL continuation (0x2e9fdf4) `ldr x0,[x19,#1088]`(impl[+0x440]); bl 24c3768
-/// (device-display shared_ptr) derefs [x0,#320] (fault=0x140; impl[+0x440] NULL, live-launch).
+/// SH161: governor TAIL (0x2e9fdf4) `ldr x0,[x19,#1088]`(impl[+0x440]); bl 24c3768
+/// (device-display shared_ptr) derefs [x0,#320] (fault=0x140; impl+0x440 NULL, live-launch).
 /// Return DISCARDED so NOPing the 3-insn window (0xf9422260/0xaa1403e1/0x97d88e5b) is benign.
-// SH176/177 (opt-in JIT_ROUTEB_COOKIE_READBACK, persistence detour, parked): cookie getter
-// returns WebLogin only; route-B needs both read-back-local gates NOPed: A) getter 0x1021ff72c
-// tbnz w8,#0 -> nop; B) 0x105fee9c4 tbz w0,#0 -> nop (17-caller stub 1dc7428 untouched)
+// SH176/177 (JIT_ROUTEB_COOKIE_READBACK, parked detour): cookie getter returns WebLogin only;
+// route-B needs both read-back-local gates NOPed: getter 0x1021ff72c tbnz w8,#0 -> nop;
+// B) 0x105fee9c4 tbz w0,#0 -> nop (17-caller stub 1dc7428 untouched)
 fn routeb_patch_cookie_readback() {
     if std::env::var_os("JIT_ROUTEB_COOKIE_READBACK").is_none() {
         return;
@@ -2116,12 +2115,11 @@ fn sh245_getter_tail_words(ret: bool) -> u32 {
         0x1503_6690u32 // b 0x624e6c0 (tail into the FMOD/AAudio distractor)
     }
 }
-/// SH245 (opt-in JIT_ROUTEB_GETTER_TAIL_RET): engine-init getter 0x102174c04 ends with an
+/// SH245 (JIT_ROUTEB_GETTER_TAIL_RET): engine-init getter 0x102174c04 ends with an
 /// UNCONDITIONAL tail `b 0x624e6c0` (FMOD audio) that never returns to the dispatcher
 /// (0x2bd8d18 stays 0; getter tails into FMOD). x30 was already restored to 0x2bd8d18 at
-/// 0x2174c7c, so patching tail `b`->`ret` returns STRAIGHT to the dispatcher, which then
-/// reaches `bl sub_2bd8dac` -> vt[+0x1f0]: with DMCONT REAL continueAfterFlagsLoaded_.
-/// Default INERT, idempotent.
+/// 0x2174c7c, so patching tail `b`->`ret` returns STRAIGHT to the dispatcher, which reaches
+/// `bl sub_2bd8dac` -> vt[+0x1f0]: with DMCONT REAL continueAfterFlagsLoaded_. Default INERT.
 fn routeb_patch_getter_fmod_tail_ret() {
     if ROUTEB_GETTER_FMOD_TAIL_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
         return;
@@ -2268,12 +2266,11 @@ fn routeb_patch_cont_opnew_box() {
 }
 static ROUTEB_CONT_OPNEW_BOX_PATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static ROUTEB_OPNEW_SIZEGATE_PATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// SH246/247: the activated continuation (0x102bd1d68) NULL-allocs - both op_new
-/// variants return NULL for size>0xa when [0x10727570c].bit0 clear (headless). Broad
-/// bit0=1 fix MEASURED regression (SH245 #4). Route every size same
-/// ≤0xa "small path" (builds a scudo size-class descriptor, calls real alloc 0x1db1c60).
-/// Single word per variant: size-gate `b.ls SMALL` -> unconditional `b SMALL`, no bit0.
-/// Opt-in JIT_ROUTEB_OPNEW_SIZE_GATE, byte-guarded, whole-fn block-cache drop.
+/// SH246/247: activated continuation (0x102bd1d68) NULL-allocs - both op_new variants return
+/// NULL for size>0xa when [0x10727570c].bit0 clear (headless). Broad bit0=1 fix MEASURED
+/// regression (SH245 #4). Route every size same ≤0xa "small path" (scudo size-class descriptor,
+/// real alloc 0x1db1c60). One word per variant: size-gate `b.ls SMALL` -> unconditional `b SMALL`,
+/// no bit0. Opt-in JIT_ROUTEB_OPNEW_SIZE_GATE, byte-guarded, whole-fn block-cache drop.
 fn routeb_patch_opnew_size_gate() {
     if ROUTEB_OPNEW_SIZEGATE_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
         return;
@@ -2312,12 +2309,10 @@ fn routeb_patch_opnew_size_gate() {
     ROUTEB_OPNEW_SIZEGATE_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 static ROUTEB_RUNG0_DISPATCH_PATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// SH126-followup: with JIT_SERIALIZE_RENDER drain overlap gone, residual rung-0 null-store in
-/// nativeInitializeNativeFlags (0x10232048c): a virtual `blr x8` @0x62514e0 (vt[+232]) enters
-/// flag-recorder 0x101d97c70 with this/map===0. Same SendAppEvent family as SH115/119, but caller
-/// 0x6251438 is an UNPATCHED third site. Fix: leaf-rewrite callee entry 0x101d97c70 to materialize
-/// the singleton into x0 +
-/// ret (benign). Mirrors SH119 site-1 + SH117. Opt-in JIT_SH115_SINGLETON_PATCH.
+/// SH126-followup: rung-0 null-store in nativeInitializeNativeFlags (0x10232048c): virtual `blr
+/// x8` @0x62514e0 (vt[+232]) enters flag-recorder 0x101d97c70 with this/map===0. SendAppEvent
+/// family as SH115/119, caller 0x6251438 UNPATCHED third site. Fix: leaf-rewrite callee entry
+/// 0x101d97c70 to materialize the singleton into x0 + ret (benign). Mirrors SH119 site-1 + SH117.
 fn routeb_patch_rung0_flag_recorder() {
     if ROUTEB_RUNG0_DISPATCH_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
         return;
@@ -2456,7 +2451,7 @@ fn routeb_patch_sendapp_singleton_lambdas() {
 }
 
 static ROUTEB_SENDAPP_VTABLE_PATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// SH126 (recon deleg_f595f562): SendAppEventOnAppReady (0x102bb463c) builds a real app-event whose
+/// SH126 (deleg_f595f562): SendAppEventOnAppReady (0x102bb463c) builds a real app-event whose
 /// vtable 0x635e068 is ALL-ZERO - terminal `blr x8` (@0x102bb4984, x8=0x28) is `blr 0` -> benign
 /// soft-return, MH_* never latch. Fix: materialize slots +0x20/+0x28 to the benign leaf; seed pipe
 /// sync-gate [0x10683d010]=-1 so `bl 0x2baeeec` takes SYNCHRONOUS do-init (bl 0x2206c40) not async
@@ -2623,10 +2618,9 @@ fn routeb_patch_v2_dispatch() {
 }
 /// Drive engine's REAL per-node PRESENT walker 0x28-stride DRAWS (SH63 present-side gap).
 /// Entry 0x105b2eec0 (x19=R; SH64 crashed iter-2 nested-jit_run desync). SH64 fix: each node's
-/// render-obj vt[+24] = REGISTERED HOST THUNK (walker_item_draw_thunk).
-/// ABI (0x5b2eec0): x19=R; ldp x20,x22,[R+0x180]=head/tail; per node x0=[node+8](render-obj);
-/// x8=[x0]->vt[+24]; blr draw; last x0=[R+0x160]=ctx; ctx-vt[+24]=swap; blr swap. MUST run on
-/// renderinit thread (EGL current). Returns final swap.
+/// render-obj vt[+24] = REGISTERED HOST THUNK (walker_item_draw_thunk). ABI: x19=R;
+/// ldp x20,x22,[R+0x180]=head/tail; per node x0=[node+8](render-obj); x8=[x0]->vt[+24]; blr
+/// draw; last x0=[R+0x160]=ctx; ctx-vt[+24]=swap; blr swap. MUST run on renderinit thread.
 fn render_engine_present_walker(
     ctx: u64, n: u64, node_count: u64, iimg: &[u8], ibase: u64, tpidr: u64, isp: u64,
 ) -> u64 {
@@ -5904,11 +5898,11 @@ fn install_xvfb_reaper() {
     });
 }
 
-/// Bring up an Xvfb X server + a 1280x720 window and register its XID as the guest's ANativeWindow
+/// Bring up an Xvfb X server + 1280x720 window, register its XID as the guest's ANativeWindow
 /// handle (GRAPHICS_RECOMMENDATION §5.3). Runs SYNCHRONOUSLY so the real window is wired before
-/// StartApp reaches the window/EGL surface path — a racing spawned thread would lose and hand the
-/// guest the sentinel. The X connection is leaked (kept alive) so the window outlives this fn.
-/// Returns the wired XID, or 0 if no window could be opened (caller keeps the sentinel fallback).
+/// StartApp reaches the window/EGL surface path (a racing thread would hand the guest the
+/// sentinel). The X connection is leaked so the window outlives this fn. Returns the wired XID,
+/// or 0 if no window could be opened (caller keeps the sentinel fallback).
 fn wire_real_window() -> u64 {
     // SH112: a stale /tmp/.X11-unix/X<n> socket from a dead prior session must
     // NOT be trusted - the old code saw the file and "broke", skipping the
@@ -6751,27 +6745,27 @@ fn main() {
                         let me = unsafe { libc::pthread_self() };
                         unsafe {
                             *(main_id_cell as *mut u64) = me as u64;
-                            // GATE-FIX (do-init 0x102206c40 disasm): do NOT set once-guard [0x106a68410].bit0=1 here —
-                            // the guard (0x2206c80 ldarb/tbz) runs __call_once ONLY when bit0==0, and
-                            // that lambda populates DM-root [0x106a68818]; forcing 1 skips it -> Ok(0x3e8).
+                            // GATE-FIX (do-init 0x102206c40): do NOT set once-guard
+                            // [0x106a68410].bit0=1 here — the guard (0x2206c80 ldarb/tbz) runs
+                            // __call_once ONLY when bit0==0, and that lambda populates DM-root
+                            // [0x106a68818]; forcing 1 skips it -> Ok(0x3e8).
                             let og = 0x106a68410u64 as *mut u8;
                             let _ = og; // left CLEAR (0) so __call_once runs and builds the DM
-                            // SH125 (do-init 0x102206c40 disasm): the flags-loaded GETTER (guest 0x10220671c)
+                            // SH125 (do-init 0x102206c40): the flags-loaded GETTER (guest 0x10220671c)
                             // reads `ldrb w0,[0x106a683e8]` (file 0x2206738) before the thread-dispatch
                             // worker. bit0==0 -> "fallback" [x21+0] (host garbage) / "live DM" [x21+8].
                             // Seed bit0=1 to consume the real DM/app-config slot (SH82/122 pattern).
                             let flags_latch = 0x106a683e8u64 as *mut u8;
                             *flags_latch |= 1;
                             eprintln!("[elfjit:v2boot] SH125 seeded flags-loaded latch [0x106a683e8].bit0=1 (live DM)");
-                            // SH156: with the once-guard LEFT CLEAR (SH155), do-init __call_once completes and the
-                            // match dispatch at 0x2206df4 reads DM-root [0x106a68818]; leaving it 0 takes
-                            // the benign Ok(0x3e8). Host-seed a live object whose vtable REAL GlobalInit
-                            // dispatch 0x10635cce0 (+0x30 -> genuine global-init ctor 0x102207b50) so
-                            // match brs into real construction. Opt-in.
+                            // SH156: once-guard LEFT CLEAR so do-init __call_once completes and match
+                            // (0x2206df4) reads DM-root [0x106a68818]; leaving 0 takes benign Ok(0x3e8).
+                            // Host-seed a live object whose vtable REAL GlobalInit dispatch 0x10635cce0
+                            // (+0x30 -> genuine global-init ctor 0x102207b50) so match brs real. Opt-in.
                             if std::env::var("JIT_ROUTEB_DM_SEED").ok().as_deref() == Some("1") {
-                                // SH239: two options for the do-init DM-root layout (match reads [[0x106a68818]+0x20]
-                                // then vt+0x30). DEFAULT: 0x10 box with only [0]=vtable (vt+0x30 not a real
-                                // DM). OPT-IN JIT_ROUTEB_DM_ROOT_GENUINE=1: place the MANUFACTURED genuine
+                                // SH239: two do-init DM-root layouts (match reads [[0x106a68818]+0x20]
+                                // then vt+0x30). DEFAULT: 0x10 box with only [0]=vtable (vt+0x30 not real
+                                // DM). OPT-IN JIT_ROUTEB_DM_ROOT_GENUINE=1: MANUFACTURED genuine
                                 // RBX::DataModel (vt=0x1067162e8, SH187) at [0x106a68818]+0x20, vt+0x30 ->
                                 // app-shell ctor 0x1057d6ef4, and measure whether that ctor body fires.
                                 use arm64jit::jit::routeb_manufactured_dm;
@@ -6825,8 +6819,8 @@ fn main() {
                                     // helper 24c3768 with x0=impl[+0x440]==NULL (fault [x0,#320]); return discarded,
                                     // NOP the 3-insn window.
                                     routeb_patch_gov_tail_cont();
-                                    // SH159b (deleg_0eff24ca): governor 0x102e9fa84 reads x19=[x0+0x20] @0x2e9fac0 (x0=wrapper
-                                    // @[0x106a705e8]; x19=impl=[0x106a70608]); host-garbage -> MODERN appendix SIGSEGV.
+                                    // SH159b (deleg_0eff24ca): governor 0x102e9fa84 reads x19=[x0+0x20] @0x2e9fac0 (x0=wrapper @
+                                    // [0x106a705e8]; x19=impl=[0x106a70608]); host-garbage -> MODERN appendix SIGSEGV.
                                     // Seed a real guest impl buffer + +0x408 DISPATCH obj + DISPATCH vt[+0x18]=benign.
                                     let gov_leaf = *ROUTEB_LEAF_ADDR.get_or_init(|| {
                                         let a = arm64jit::jit::register_host_call_auto(routeb_singleton_leaf);
@@ -7689,6 +7683,19 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                     }
                     eprintln!("[elfjit:v2boot] SH337 post-V1: registry={} DM-root[0x106a68818]={:#x} once-guard={:#x} entries=[{}]", reg(), dm(), og, names.join(", "));
                     dump("SH337-V1AppStart-postbus");
+                }
+                // SH347 (--v2boot-session-pub): drive the messageBus RECEIVE half — publishRaw
+                // (0x102334684) -> cb file 0x2bd7444/0x2bd76e8 reads [DataModelBindings+16]. Subscribe
+                // runs Ok(0x3e8) headlessly (SH269/315/337); this converts SH185's static-only
+                // closure into a measured readback (JIT_ROUTEB_BUSRECV=1).
+                if std::env::args().any(|a| a == "--v2boot-session-pub") {
+                    let ret = arm64jit::jit::drive_messagebus_publish_receive(
+                        iimg, ib, tpidr, boot_sp, env_ptr, thiz,
+                    );
+                    eprintln!("[elfjit:v2boot-pub] publishRaw -> {ret:#x}");
+                    let dm = unsafe { *(0x106a68818u64 as *const u64) };
+                    eprintln!("[elfjit:v2boot-pub] post-publish DM-root[0x106a68818]={dm:#x}");
+                    dump("MessageBus.publishRaw");
                 }
                 // SH131 (disasm 21f7654): seed engine's OWN files-dir global. Real client stores it via
                 // nativeSetFilesDirectory (0x1021f7654) - 24-byte libc++ std::string at 0x10726d600.
@@ -9913,10 +9920,10 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                     // context creation silently rasterizes nothing.
                                     let _ = gcall(plt_viewport, 0, 0, 1280, 720, 0, 0);
                                     let _ = gcall(plt_scissor, 0, 0, 1280, 720, 0, 0);
-                                    // --renderframe-mesh-tex <dds> + --renderframe-mesh <path> together: the SH143 real
+                                    // --renderframe-mesh-tex <dds> + --renderframe-mesh <path>: the SH143 real
                                     // per-vertex UV + perspective-MVP (mesh bbox + fixed camera, NOT NDC-baked)
-                                    // ascent. Vertex shader passes clip pos through (already NDC) except in
-                                    // SH143 mode where the real uMVP uniform transforms model-space + aUV varies.
+                                    // ascent: vertex shader passes clip pos through (already NDC) except in
+                                    // SH143 mode where real uMVP transforms model-space + aUV varies.
                                     let mesh_uv_mode = renderframe_args.iter().any(|a| a == "--renderframe-mesh-tex")
                                         && renderframe_args.iter().any(|a| a == "--renderframe-mesh");
                                     let vs_src: &[u8] = if mesh_uv_mode {
@@ -10149,8 +10156,7 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                                                                 stex.x[7] = GL_UNSIGNED_BYTE; // type
                                                                                 let _ = arm64jit::jit::jit_run(iimg, ibase, plt_tex_image_2d, &mut stex as *mut CpuState);
                                                                             } else if tex_mode {
-                                                                                // RGBA 2x2 checkerboard via 9-arg glTexImage2D; the pixels (9th arg)
-                                                                                // rides the guest stack at [sp+0], read by the bridge's gs_stack.
+                                                                                // RGBA 2x2 checkerboard: pixels (9th arg) ride guest [sp+0] -> gs_stack.
                                                                                 const TEX: [u8; 16] = [
                                                                                     255, 0, 0, 255, // texel(0,0) RED
                                                                                     0, 255, 0, 255, // texel(1,0) GREEN
@@ -10174,7 +10180,7 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                                                                 let _ = arm64jit::jit::jit_run(iimg, ibase, plt_tex_image_2d, &mut stex as *mut CpuState);
                                                                             } else {
                                                                                  // ETC1/ETC2-RGB live-path: upload a REAL 8x8 ETC1 (4 solid 4x4 blocks=32B) via
-                                                                                 // glCompressedTexImage2D; the bridge decodes ETC1->RGBA + re-uploads glTexImage2D.
+                                                                                 // glCompressedTexImage2D; bridge decodes ETC1->RGBA + re-uploads glTexImage2D.
                                                                                  // Indiv mode cw0 sel0 -> color=(c*0x11)+2; ETC2 mode1/2==ETC1; relabel internalformat
                                                                                  // to prove decode_etc2_rgb handles the real path.
                                                                                 const GL_ETC1_RGB8_OES: u64 = 0x8d64;
@@ -10182,8 +10188,7 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                                                                 let comp_fmt = if etc2_mode { GL_COMPRESSED_RGB8_ETC2 } else { GL_ETC1_RGB8_OES };
                                                                                 let enc = |t: i32| -> u8 { let c = ((t - 2).clamp(0, 240) >> 4) as u8; (c << 4) | c };
                                                                                 let blk = |r: u8, g: u8, b: u8| -> [u8; 8] { [r, g, b, 0, 0, 0, 0, 0] };
-                                                                                // 8x8 ETC1: 4 blocks row-major top-first -> (255,2,2) red,(2,255,2) green,
-                                                                                // (2,2,255) blue,(255,255,255) white.
+                                                                                // 8x8 ETC1: 4 blocks row-major top-first -> red,green,blue,white solids.
                                                                                 let etc_data: [u8; 32] = {
                                                                                     let mut d = [0u8; 32];
                                                                                     let red = blk(enc(255), enc(2), enc(2));

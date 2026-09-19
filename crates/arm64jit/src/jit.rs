@@ -674,6 +674,71 @@ fn routeb_appstart_408_benign_obj() -> u64 {
     })
 }
 
+/// SH347 (opt-in JIT_ROUTEB_BUSRECV=1): MEASURE the SEP-17 messageBus experience-launch
+/// RECEIVE path headlessly. SH185 closed this by STATIC judgment only (cb 0x102bd76e8 reads the
+/// DM holder [x20+16]; static "subscribe never registers"). SH269/315/316/337 later MEASURED that
+/// the subscribe side executes headlessly (registry 0->12), overturning SH185's premise; SH264 left
+/// this receive as the un-drive honest-next-candidate. This guard fires at the cb's DM-holder read
+/// (file 0x2bd7474 `ldr x0,[x0,#16]`, guest 0x102bd7474) and snapshots [x0+16] — converting SH185's
+/// static-only closure into a measured readback. READ-ONLY (no guest write), fires once.
+fn routeb_busrecv_holder_guard(state: *mut CpuState, pc: u64) {
+    if std::env::var("JIT_ROUTEB_BUSRECV").ok().as_deref() != Some("1") {
+        return;
+    }
+    if pc != 0x102bd7474 {
+        return;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let s = unsafe { &*state };
+    ONCE.call_once(|| {
+        let base = s.x[0];
+        let dm = if base != 0 && base < 0x8000_0000_0000 {
+            unsafe { std::ptr::read_unaligned((base + 16) as *const u64) }
+        } else {
+            0
+        };
+        let in_image = (0x100000000..0x107333c3c).contains(&dm) && dm != 0;
+        eprintln!(
+            "[routeb-busrecv] SH347 cb @0x102bd7474: [x0+16]=[DataModelBindings+16]=0x{dm:x} in_image={in_image} (x0={base:#x}) — receive-side DM holder measured headlessly"
+        );
+    });
+}
+
+/// SH347 (opt-in --v2boot-session-pub): drive the messageBus publishRaw receive entry
+/// (guest 0x102334684 Java_com_roblox_universalapp_messagebus_MessageBus_publishRaw) with an
+/// "experience-launch request" event so the engine's cb (file 0x2bd7444/0x2bd76e8) fires and reads
+/// [DataModelBindings+16]. Pairs with the existing --v2boot-session-bus subscribe (SH269/315/337
+/// measured subscribe runs headlessly); this is the RECEIVE half SH185 closed statically-only.
+/// ABI = publishRaw(env, thiz, topic jstring x2, payload jstring x3). Single jit_run, serialized.
+pub fn drive_messagebus_publish_receive(
+    iimg: &[u8],
+    ib: u64,
+    tpidr: u64,
+    boot_sp: u64,
+    env_ptr: u64,
+    thiz: u64,
+) -> u64 {
+    let topic = crate::jni::new_string_utf_handle(b"experience-launch");
+    let payload = crate::jni::new_string_utf_handle(b"");
+    let mut st = CpuState::new();
+    st.tpidr = tpidr;
+    st.x[31] = boot_sp;
+    st.x[0] = env_ptr;
+    st.x[1] = thiz;
+    st.x[2] = topic;
+    st.x[3] = payload;
+    match jit_run(iimg, ib, 0x102334684, &mut st as *mut CpuState) {
+        Err(e) => {
+            eprintln!("[elfjit:v2boot-pub] MessageBus.publishRaw stopped: {e}");
+            0
+        }
+        Ok(r) => {
+            eprintln!("[elfjit:v2boot-pub] MessageBus.publishRaw returned Ok({r:#x})");
+            r
+        }
+    }
+}
+
 /// SH330 (opt-in JIT_ROUTEB_APPSART_408SEED): the app-start continuation's standing gate is
 /// AppStarted+0x408 == 0 — the live member read by `ldr x0,[x19,#1032]` @0x25f504c (both arms of the
 /// SH329 governor-flag fork converge on it), then `ldr x8,[x0]; ldr x8,[x8,#136]; blr x8` @0x25f5050/58/5c.
@@ -6500,6 +6565,7 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         routeb_lsm_keytrace_guard(state, pc); // SH341 (JIT_ROUTEB_LSM_KEYTRACE): attribute which LSM pool-pop call site passes a poisoned .text KEY (root-cause of the SH268 unwritable-write wall; READ-ONLY)
         routeb_lsm_keyfix_guard(state, pc); // SH341-cross (JIT_ROUTEB_LSM_KEYFIX): redirect the LSM pop's write-target away from a poisoned .text key so the pop completes and the full-ladder Route-B route passes the persistence-lane terminal wall
         routeb_appstart_408_guard(state, pc); // SH330: seed [AppStarted+0x408] (runtime heap x19) benign vt[+136] leaf at the 0x25f5050 gate (JIT_ROUTEB_APPSART_408SEED, standalone)
+        routeb_busrecv_holder_guard(state, pc); // SH347 (JIT_ROUTEB_BUSRECV): measure [DataModelBindings+16] at the messageBus experience-launch cb (file 0x2bd7474) — receive-side DM holder readback (READ-ONLY, once)
         routeb_cookie_jar_guard(state, pc); // SH175: seed cookie-jar container + gates at worker 0x102203148 (JIT_ROUTEB_COOKIE)
         // SH248d (opt-in JIT_ROUTEB_APPSART_JAR_SEED): seed [0x106ed7a20] cookie-jar string
         // at the nativeAppBridgeAppStart string-assign site 0x1021f4830 (was NULL -> crash).
@@ -7525,6 +7591,33 @@ mod tests {
     /// env set/remove interleave makes "env-off inert" run-variable. Same pattern as
     /// DM_INSTANCE_TEST_LOCK/CONT_MGR_TEST_LOCK for shared fixed-.bss pages + env.
     static DM_MANAGER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// SH347 (JIT_ROUTEB_BUSRECV): the receive-side probe guard is read-only and gated on the
+    /// process env var. Give it a fresh env per test so a parallel run can't leak env state.
+    #[test]
+    fn busrecv_guard_inert_without_env() {
+        unsafe { std::env::remove_var("JIT_ROUTEB_BUSRECV") };
+        // Wrong pc AND env-off -> must return without touching anything.
+        let mut s = CpuState::new();
+        s.x[0] = 1;
+        routeb_busrecv_holder_guard(&mut s, 0x102bd7474); // env off
+        routeb_busrecv_holder_guard(&mut s, 0x102bd7600); // wrong pc
+    }
+
+    #[test]
+    fn busrecv_guard_fires_at_cb_reads_holder() {
+        unsafe { std::env::set_var("JIT_ROUTEB_BUSRECV", "1") };
+        // Arrange a readable backing buffer: x0 -> [u64 @ +16] = in-image sentinel.
+        let mem = Box::leak(vec![0u32; 0x20].into_boxed_slice());
+        let base = mem.as_ptr() as u64;
+        unsafe { *(base.wrapping_add(16) as *mut u64) = 0x102_a68818; }
+        let mut s = CpuState::new();
+        s.x[0] = base;
+        routeb_busrecv_holder_guard(&mut s, 0x102bd7474);
+        // x0=0 (no object) must also be safe (guarded read).
+        let mut s0 = CpuState::new();
+        routeb_busrecv_holder_guard(&mut s0, 0x102bd7474);
+    }
 
     #[test]
     fn worker_gate_park_bounded_wait_unparks_promptly() {
