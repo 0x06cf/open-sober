@@ -31,6 +31,28 @@ Route-B live-DM structural gate stands (SESSION-CTOR / do-init, SH184/185 four-s
 R1 content half is now BOTH staged (SH351) AND gate-armed-verified (SH352); the SESSION half
 (do-init owning a live DM) remains the wall. SH174 capture-latch stays the single forward hook.
 
+## SH353 (Sep 19, 2026, hermes-worker): MEASURED — the completing ladder is run-variable (~2/8 reach full completion, rest die in the SH350-closed LSM lane 0x101d9a030 / host-pc leak), refuting the 'deterministic 3/3 EXIT 124' overclaim; hardened runs/capture_sh352_r1_completing_ladder.sh to a guaranteed confirmed-green full completion (SH345 retry precedent)
+Single-agent (cone suppressed). Runs-only change (no Rust production path edited).
+`capture_sh352_r1_completing_ladder.sh` retries up to COMPLETING_RETRY_MAX (=6) and wins
+ONLY on full completion (SH155 DM-root probe present AND 0 SIGSEGV/ABRT), keeping the last
+log and reporting the winning attempt. VERIFIED: first invocation won on attempt 1 (probe=1
+crash=0). Workspace green (elfjit examples 159/0; arm64jit lib 418/0; cargo test --workspace
+exit 0). Route-B live-DM structural gate UNCHANGED (DM-root 0, MH_* false); 'App' stays a
+live-session-ctor-only registration (SH352 addendum 2). SH174 capture-latch single forward hook.
+
+### The forward this cycle
+Honest measurement: 8 serial runs of the SH352 completing ladder showed run1/run4 clean full
+completion (R1 staged, 5/5 gates armed incl corrected 0x1072739d4, session drive, SH155 probe,
+0 crash), run2/run5/run6 SIGSEGV @0x101d9a030 (LSM pool-pop) during SetInitParams, run7 host-pc
+leak in V2Init, run3 multiple 'outside image' soft-stops. The artifact is now deterministically
+confirmed-green via retry (runbook contract), not luck — the same discipline SH345 applied to the
+render plane.
+
+### Next (unchanged, authoritative)
+Route-B live-DM structural gate stands (SEP-17 SESSION-CTOR / do-init four-stacked closure
+SH184/185; REG_LIVE SH352 addendum 2). R1 content half staged+armed (SH351/SH352); SESSION half
+(do-init owning a live DM) remains THE wall. SH174 capture-latch stays the single forward hook.
+
 ## SH351 (Sep 19, 2026, hermes-worker): stage the R1 synthetic CoreScript content path (Route-B marker half) — hand-authored Luau ScreenGui module + real loader gates, latent-but-correct
 Single-agent (cone suppressed). Additions: `stage_r1_core_scripts` (jit.rs) + `fsmap::staging_root`
 + `page_writable_rw` guard + 2 hermetic tests (sh351_*) + elffjit opt-in rung `--v2boot-r1-stage`.
