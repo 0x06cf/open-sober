@@ -1,5 +1,33 @@
 # Open Sober — Agent Handoff
 
+## SH355 (Sep 19, 2026, hermes-worker): CORRECT the EC-world reader-gate record — fresh disasm refutes sh301/302's "internal soft-return" premise (no `ret` in [0x2e245f4,0x2e246e0)); the reader 0x2e246f4 is gated by a real `cbz x0` on the live-object slot `[[x29,#104]+0x20]` == 0, a SH174/SH204-class value seed, not a compile-block early-exit. recon-v3 self-driven frame deliverable re-verified green.
+Single-agent (cone suppressed). One new hermetic `sh355_ec_reader_block_no_softreturn_gate_is_live_object_slot`
+(arm64jit lib real-image pins: zero `ret` scanned across [0x2e245f4,0x2e246e0); gate loads
+`ldr x8,[x29,#104]`@0x2e246b0 + `ldr x0,[x8,#32]`@0x2e246d8 + `cbz x0,0x2e246f4`@0x2e246dc;
+interior bl-return 0x2e24694 = real block boundary). No production path edited. Workspace green
+(arm64jit lib 420/0; elfjit examples ~159/0; cargo test --workspace exit 0).
+
+### The forward this cycle
+The test-suite record told the next session that the EC reader (0x2e246f4) sits behind a
+compile-block "internal early-exit" and to hunt that exit. Disasm REFUTES it: no `ret` in the
+window; the only out to the reader is the real data-dependent `cbz x0` on `[[x29,#104]+0x20]`.
+This re-scopes the do-not-re-tread: sh302's seed is mechanism-correct but entry-timing-gated;
+the residual is a FABRICATED live-object value at [x29,#104]+0x20, not a phantom block exit.
+recon-v3 deliverable (1) (type4_frame_thunk self-driven frame) re-verified green (24 frames,
+0 crash, exit 124).
+
+### Honest
+Does NOT manufacture a DataModel. Route-B live-DM structural gate UNCHANGED (DM-root 0,
+MH_* false; canonical full-ladder probe re-ran EXIT 134 at the run-variable live-object arm
+guestpc 0x10284cf5c, 0 region hits). SH174 capture-latch stays the single forward hook.
+
+### Next (unchanged, authoritative)
+Route-B live-DM structural gate stands (SESSION-CTOR / do-init, SH184/185 four-stacked closure;
+REG_LIVE SH352: 'App' is live-session-ctor-only). R1 content half staged+armed+serviceable
+(SH351/352/354); the SESSION half (do-init owning a live DM) remains THE wall — and if the EC
+reader is re-attacked it must be via a FABRICATED live object at [x29,#104]+0x20, not a
+compile/early-exit fix (SH355). SH174 capture-latch stays the single forward hook.
+
 ## SH354 (Sep 19, 2026, hermes-worker): close the R1 content-half art — prove the staged CoreScript is SERVICEABLE end-to-end (new hermetic sh354: a guest open of the exact files-dir CoreScript path resolves through fsmap::remap_path to the staged mirror and is readable) + measure that even with the SH352-corrected flags-loaded gate armed (5/5), a completing ladder runs JIT_ASSET_TRACE with 0 hits (content staged-but-DORMANT — loader still waits on a live DM)
 Single-agent (cone suppressed). One new hermetic `sh354_r1_core_script_is_serviceable_through_remap`
 (arm64jit lib 418->419) + a shared module-level `FS_ROOT_LOCK` serializing fsmap-root-mutating tests

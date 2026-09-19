@@ -8691,6 +8691,51 @@ mod tests {
     }
 
     #[test]
+    fn sh355_ec_reader_block_no_softreturn_gate_is_live_object_slot() {
+        // SH355 (single-agent, real-image): CORRECTS the sh301/sh302 record. sh301's doctrine
+        // asserted the EC body "provably soft-returns BEFORE the reader at 0x2e246f4". Fresh
+        // disasm of the real block [0x2e245f4..0x2e247dc] REFUTES that: there is NO `ret`
+        // (0xd65f03c0) anywhere in [0x2e245f4, 0x2e246dc] — the block's only out to the reader
+        // is the REAL data-dependent branch `cbz x0, 0x2e246f4` at 0x2e246dc, where
+        // x0 = [x8+#32] = [[x29,#104]+0x20], and [x29,#104] is loaded at 0x2e246b0. So the
+        // reader is gated on a CLOSED-LOOP live-object slot (SH174/SH204 class), NOT a compile-
+        // block "internal early-exit" artifact. The interior string-assign `bl 0x2b504e4` at
+        // 0x2e24690 returns to 0x2e24694 = a REAL block boundary (sh301 proved interior bls
+        // open block entries), so the reader-gate block starts at 0x2e24694. Consequence for
+        // the next frontier: sh302's seed of entry_sp+8 is mechanism-correct but only helps if
+        // the SAME frame that reaches 0x2e246dc is the one seeded (entry-timing, not block-cache);
+        // the residual is the live-object pointer value at [x29,#104]+0x20, i.e. we must hand a
+        // coherent object whose [+0x20]==0 to the actual construction entry — a value seed that
+        // fabricates the live object, not a compile/early-exit fix.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let word_at = |vaddr: u64| -> u32 {
+                let off = vaddr as usize;
+                let b = &img[off..off + 4];
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            };
+            // No `ret` in the window => no internal early soft-return; the only way to the
+            // reader is the cbz. Scan [0x2e245f4, 0x2e246e0) (4-aligned) for 0xd65f03c0.
+            let mut ret_found = None;
+            for a in (0x2e245f4..0x2e246e0).step_by(4) {
+                if word_at(a) == 0xd65f03c0 { ret_found = Some(a); }
+            }
+            assert_eq!(ret_found, None, "sh355 NO ret in EC window [0x2e245f4,0x2e246e0) — soft-return premise refuted");
+            // The gate: [x29,#104] loaded at 0x2e246b0, [..+0x20] at 0x2e246d8, cbz at 0x2e246dc.
+            assert_eq!(word_at(0x2e246b0), 0xf94037a8, "sh355 ldr x8,[x29,#104]");
+            assert_eq!(word_at(0x2e246d8), 0xf9401100, "sh355 ldr x0,[x8,#32] (=[x29,#104]+0x20)");
+            assert_eq!(word_at(0x2e246dc), 0xb40000c0, "sh355 cbz x0, 0x2e246f4 (reader gate)");
+            // Interior bl-return 0x2e24694 = real block boundary (sh301: interior bls split blocks).
+            assert_eq!(word_at(0x2e24690), 0x97f4af95, "sh355 bl 0x2b504e4 (returns to 0x2e24694)");
+            assert_eq!(word_at(0x2e24694), 0x394272a9, "sh355 reader-gate block entry 0x2e24694");
+            eprintln!("sh355 EC block [0x2e245f4,0x2e246dc] has NO internal ret; reader gated by cbz on [x29,#104]+0x20 live-object slot — sh301 soft-return premise corrected (value seed, not early-exit)");
+        } else {
+            eprintln!("sh355 real-image guard: no real libroblox.so, skipping byte pins");
+        }
+    }
+
+    #[test]
     fn sh302_ec_world_reader_gate_guard_is_env_pc_gated_and_seeds_caller_frame_slot() {
         // SH302: seed the EC reader-gate caller-frame object [x29,#104]=[entry_sp+8]
         // to a zeroed buffer so the `cbz x0, reader` @0x2e246dc is TAKEN -> the
