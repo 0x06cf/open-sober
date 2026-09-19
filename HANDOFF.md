@@ -1,5 +1,39 @@
 # Open Sober — Agent Handoff
 
+## SH439 (Sep 19, 2026, hermes-worker): hermetic coverage of the float→int UNSIGNED BIG-PATH + fixed-point codegen family (translate.rs FcvtToInt over [2^63, 2^64) — fcvtzu) — 3 exact-byte pins, closes the SH435-named next-forward
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables were
+re-verified green THIS cycle (capture_taskv4_frame.sh: 24 real task-driven
+frames `present swap Ok(0x1)`, 197 node pops, 0 json abort, 0 crash, EXIT 124).
+Workspace green (cargo test --workspace EXIT 0; arm64jit lib 588/0 incl. 3 new
+sh439 pins, was 585; cargo build --example elfjit OK). Production code ONLY in
+translate.rs `#[cfg(test)]` addition (translator core body byte-untouched;
+jit.rs 1,048,390 B < 1MiB hook unchanged; elfjit.rs/session.rs unchanged).
+- FcvtToInt's UNSIGNED big-path had no direct byte tests (SH435 pinned the
+  fcvtzu small path clamp but left "[2^63,2^64) and fixed-point scale" as
+  next-forward). SH439 pins the discriminators a byte error silently corrupts
+  (a bare signed cvttsd2si saturates to INT64_MIN, corrupting the high half of
+  an unsigned u64 dst): (1) fcvtzu (unsigned, mode 0) EMITS the full range gate
+  — 2^63 const (mov rcx,0x43e0_0000_0000_0000 = 48 B9 .. E0 43), `comisd
+  xmm0,xmm1` (66 40 0F 2F C1 — the REX byte is ALWAYS present, a `66 0F 2F`
+  window misses it), JB (0F 82) to the signed path, big-path `subsd xmm0,xmm1`
+  (F2 0F 5C C1, d-2^63) + `add rax,rcx` (+2^63 restore, 48 01 C8), u64::MAX
+  saturation (`mov rax,-1`, 48 B8 FF..) for d>=2^64, and the cmovs negative-to-0
+  clamp (48 0F 48 C1); (2) signed fcvtzs is a BARE trunc (movq_load + single
+  `cvttsd2si rax,xmm0` F2 48 0F 2C C0 + 64-bit stg store, NO comisd/subsd/
+  cmovs/u64::MAX) — comisd presence is the fcvtzu-vs-fcvtzs discriminator;
+  (3) fbits>0 fixed-point scales BEFORE truncating (2^fbits double 0x4030.. ->
+  `movq xmm1,rax` 66 48 0F 6E C8 -> `mulsd xmm0,xmm1` F2 0F 59 C1), fbits=0 must
+  NOT mulsd. 3 exact-byte pins via synthetic Inst -> translate() (zero-pc
+  deterministic); window + inverse asserts; [RBX]=CpuState, vector slot
+  v[t]=VECTOR_BASE(0x110)+t*16.
+- Honest: NOT a DM (SH415 probe re-confirms DM-root [0x106a68818]=0x0 under the
+  complete substrate; Route-B live-DM gate UNCHANGED). BUILD-THE-RUNTIME
+  codegen-surface coverage completion on the FcvtToInt unsigned family,
+  distinct from SH435 (Fcvt/FcvtTzReg/FcvtHalf) and the SH427-438 lineage. No
+  re-treads.
+- Files: docs/frontier-sh439-translator-fcvttoint-unsigned-bigpath.md +
+  crates/arm64jit/src/translate.rs (`#[cfg(test)]` only). Commit 04ed640.
+
 ## SH438 (Sep 19, 2026, hermes-worker): hermetic coverage of the STRUCTURE-LOAD/STORE codegen family (translate.rs Ld2 / St2 — ld2/st2 {Vt, Vt1}, [Xn], the interleaved vertex-attribute / RG-z+texcoord structure-pair deinterleave) — 3 exact-byte pins
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables were
 re-verified green this cycle (capture_taskv4_frame.sh attempt 1: 24 real
