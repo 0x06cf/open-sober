@@ -7366,6 +7366,100 @@ mod tests {
         c.as_slice().to_vec()
     }
 
+    // SH440: hermetic coverage of the byte-COUNT + horizontal-SUM codegen pair
+    // (translate.rs SimdPopcnt — `cnt Vd.8b, Vn.8b`; SimdSum8 — `uaddlv
+    // h{rd}, Vn.8b`). These SWAR reductions had zero direct byte tests. SH440
+    // pins the exact emitted x86 with rd=1, rn=2 (Vn slot = VECTOR_BASE
+    // 0x110+2*16=0x130, Vd slot = 0x110+1*16=0x120):
+    //  (1) SimdPopcnt full buffer — the SWAR popcount: load Vn@0x130, then
+    //      x = x - ((x>>1)&0x5555..) [shr 1 + and 0x5555.. + sub], then
+    //      (x&0x3333..)+((x>>2)&0x3333..) [shr 2], then (x+(x>>4))&0x0f0f..
+    //      [shr 4 + add], store Vd@0x120. The three mask constants
+    //      (0x5555../0x3333../0x0f0f..) + the shift progression 1/2/4 are the
+    //      byte-count discriminators a wrong mask or shift silently corrupts.
+    //  (2) SimdSum8 full buffer — the horizontal byte sum (uaddlv): load
+    //      Vn@0x130, then pairwise-sum three times: (x + (x>>8))&0x00ff00ff..,
+    //      then (x + (x>>16))&0x0000ffff0000ffff, then (x + (x>>32))&0xffffffff
+    //      [shr imm8 8/16/32 + the three widening masks], store Vd@0x120. The
+    //      shift-progression 8/16/32 (vs SimdPopcnt's 1/2/4) is the
+    //      count-vs-sum discriminator; a byte error here mis-sums a
+    //      lane-mask/popcount total.
+    #[test]
+    fn sh440_simdpopcnt_swar_byte_count_emits_masks_and_shift_ladder() {
+        // rd=1 rn=2: src Vn slot = 0x130, dst Vd slot = 0x120.
+        let b = tr_bytes(Inst::SimdPopcnt { rd: 1, rn: 2 });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x83, 0x30, 0x01, 0x00, 0x00, // mov rax,[rbx+0x130] load Vn
+            0x48, 0x89, 0xc2,                         // mov rdx,rax        x
+            0x48, 0xc1, 0xea, 0x01,                   // shr rdx,1         x>>1
+            0x48, 0xb9, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, // mov rcx,0x5555..
+            0x48, 0x21, 0xca,                         // and rdx,rcx       (x>>1)&0x5555..
+            0x48, 0x29, 0xd0,                         // sub rax,rdx       x-(...)
+            0x48, 0x89, 0xc2,                         // mov rdx,rax
+            0x48, 0xc1, 0xea, 0x02,                   // shr rdx,2         x>>2
+            0x48, 0xb9, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, // mov rcx,0x3333..
+            0x48, 0x21, 0xca,                         // and rdx,rcx
+            0x48, 0x21, 0xc8,                         // and rax,rcx
+            0x48, 0x01, 0xd0,                         // add rax,rdx
+            0x48, 0x89, 0xc2,                         // mov rdx,rax
+            0x48, 0xc1, 0xea, 0x04,                   // shr rdx,4         x>>4
+            0x48, 0x01, 0xd0,                         // add rax,rdx       x+(x>>4)
+            0x48, 0xb9, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f, // mov rcx,0x0f0f..
+            0x48, 0x21, 0xc8,                         // and rax,rcx
+            0x48, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00, // mov [rbx+0x120],rax store Vd
+        ]);
+        // The three SWAR masks must appear in ascending bit-half order.
+        assert!(b.windows(10).any(|w| w[0] == 0x48 && w[1] == 0xb9 && w[2..].iter().all(|&x| x == 0x55)));
+        assert!(b.windows(10).any(|w| w[0] == 0x48 && w[1] == 0xb9 && w[2..].iter().all(|&x| x == 0x33)));
+        assert!(b.windows(10).any(|w| w[0] == 0x48 && w[1] == 0xb9 && w[2..].iter().all(|&x| x == 0x0f)));
+        // The shift ladder goes 1/2/4 (shr rdx,imm8) — never 8/16/32 (that is
+        // SimdSum8's ladder below): shr rdx.imm8 = 48 c1 ea imm.
+        assert!(b.windows(4).any(|w| w == [0x48, 0xc1, 0xea, 0x01]));
+        assert!(b.windows(4).any(|w| w == [0x48, 0xc1, 0xea, 0x02]));
+        assert!(b.windows(4).any(|w| w == [0x48, 0xc1, 0xea, 0x04]));
+        assert!(!b.windows(4).any(|w| w == [0x48, 0xc1, 0xea, 0x08]),
+            "popcount must not use the sum-ladder shr 8");
+    }
+
+    #[test]
+    fn sh440_simdsum8_horizontal_byte_sum_emits_widening_masks_and_ladder() {
+        // rd=1 rn=2: src Vn slot = 0x130, dst Vd slot = 0x120.
+        let b = tr_bytes(Inst::SimdSum8 { rd: 1, rn: 2 });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x83, 0x30, 0x01, 0x00, 0x00, // mov rax,[rbx+0x130] load Vn
+            0x48, 0xb9, 0xff, 0x00, 0xff, 0x00, 0xff, 0x00, 0xff, 0x00, // mov rcx,0x00ff00ff00ff00ff
+            0x48, 0x89, 0xc2,                         // mov rdx,rax
+            0x48, 0xc1, 0xea, 0x08,                   // shr rdx,8         x>>8
+            0x48, 0x21, 0xca,                         // and rdx,rcx
+            0x48, 0x21, 0xc8,                         // and rax,rcx
+            0x48, 0x01, 0xd0,                         // add rax,rdx       (x + x>>8)
+            0x48, 0x89, 0xc2,                         // mov rdx,rax
+            0x48, 0xc1, 0xea, 0x10,                   // shr rdx,16
+            0x48, 0xb9, 0xff, 0xff, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, // mov rcx,0x0000ffff0000ffff
+            0x48, 0x21, 0xca,                         // and rdx,rcx
+            0x48, 0x21, 0xc8,                         // and rax,rcx
+            0x48, 0x01, 0xd0,                         // add rax,rdx
+            0x48, 0x89, 0xc2,                         // mov rdx,rax
+            0x48, 0xc1, 0xea, 0x20,                   // shr rdx,32
+            0x48, 0xb9, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, // mov rcx,0x00000000ffffffff
+            0x48, 0x21, 0xca,                         // and rdx,rcx
+            0x48, 0x21, 0xc8,                         // and rax,rcx
+            0x48, 0x01, 0xd0,                         // add rax,rdx
+            0x48, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00, // mov [rbx+0x120],rax store Vd
+        ]);
+        // Horizontal-sum widening ladder 8/16/32 (shr rdx,imm8) — the
+        // sum-vs-count discriminator (SimdPopcnt uses 1/2/4).
+        assert!(b.windows(4).any(|w| w == [0x48, 0xc1, 0xea, 0x08]));
+        assert!(b.windows(4).any(|w| w == [0x48, 0xc1, 0xea, 0x10]));
+        assert!(b.windows(4).any(|w| w == [0x48, 0xc1, 0xea, 0x20]));
+        assert!(!b.windows(4).any(|w| w == [0x48, 0xc1, 0xea, 0x01]),
+            "horizontal sum must not use the popcount ladder shr 1");
+        // The three widening masks, in order.
+        assert!(b.windows(10).any(|w| w[0] == 0x48 && w[1] == 0xb9 && w[2] == 0xff && w[3] == 0x00 && w[4] == 0xff && w[5] == 0x00 && w[6] == 0xff && w[7] == 0x00));
+        assert!(b.windows(10).any(|w| w[0] == 0x48 && w[1] == 0xb9 && w[2] == 0xff && w[3] == 0xff && w[4] == 0x00 && w[5] == 0x00 && w[6] == 0xff && w[7] == 0xff));
+        assert!(b.windows(10).any(|w| w[0] == 0x48 && w[1] == 0xb9 && w[2] == 0xff && w[3] == 0xff && w[4] == 0xff && w[5] == 0xff && w[6] == 0x00 && w[7] == 0x00));
+    }
+
     #[test]
     fn sh431_logicimm_orr_xzr_mov_alias_materializes_mask() {
         // `mov x0,#7` = ORR x0,xzr,#7 (op=1, rn==31): rn==31 must read as XZR
