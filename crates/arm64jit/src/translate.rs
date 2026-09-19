@@ -7366,7 +7366,73 @@ mod tests {
         c.as_slice().to_vec()
     }
 
-    // TEMPORARY-REMOVED probe (captured emission, then deleted).
+    #[test]
+    fn sh452_adalp_pairwise_sum_doublewidth_full_buffer() {
+        // saddlp V1.2s, V2.2s (se=4 np=2 signed=true acc=false): pairwise-ADD-
+        // LONG — sum each adjacent pair (2i,2i+1) of 4-byte srcs into a dst lane
+        // of WIDTH 8 (2*se). Each pair: mov_load32(RAX,[0x130]) (8b 83) +
+        // mov_load32(RCX,[0x134]) (8b 8b — RCX base) + `add rax,rcx` (48 01 c8)
+        // + mov_store64 (48 89 83) into the 8-byte dst. The double-width dest
+        // (2x source) IS the pairwise-add-LONG semantic — a flub storing only
+        // the low 4 bytes drops the pair-carry. rd=1 rn=2 -> Vn@0x130 Vd@0x120.
+        let b = tr_bytes(Inst::SimdAdalp { rd: 1, rn: 2, src_esize: 4, n_pairs: 2, signed: true, upper: false, acc: false });
+        assert_eq!(b, vec![
+            // pair 0: (Vn[0], Vn[1]) -> Vd[0] (8B)
+            0x8b, 0x83, 0x30, 0x01, 0x00, 0x00, // mov eax,[rbx+0x130] src[2i]
+            0x8b, 0x8b, 0x34, 0x01, 0x00, 0x00, // mov ecx,[rbx+0x134] src[2i+1]
+            0x48, 0x01, 0xc8,                   // add rax,rcx
+            0x48, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00, // mov [rbx+0x120],rax (dst 8B)
+            // pair 1: (Vn[2], Vn[3]) -> Vd[1]
+            0x8b, 0x83, 0x38, 0x01, 0x00, 0x00, // src[2] at 0x138
+            0x8b, 0x8b, 0x3c, 0x01, 0x00, 0x00, // src[3] at 0x13c
+            0x48, 0x01, 0xc8,
+            0x48, 0x89, 0x83, 0x28, 0x01, 0x00, 0x00, // dst 8B at 0x128
+        ]);
+        // the widening: 4-byte source loads feed an 8-byte dest store.
+        assert!(b.windows(6).any(|w| w == [0x8b, 0x83, 0x30, 0x01, 0x00, 0x00]), "4B source [2i]");
+        assert!(b.windows(6).any(|w| w == [0x8b, 0x8b, 0x34, 0x01, 0x00, 0x00]), "4B source [2i+1] into RCX (8b 8b)");
+        assert!(b.windows(7).any(|w| w == [0x48, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00]), "double-width (8B) dst store (48 89 83)");
+        // the 4-byte source loads never feed a 32-bit store: both stores are the
+        // 64-bit 48 89 83 forms (the assert_eq above pins them exactly).
+        assert_eq!(b.windows(7).filter(|w| w == &[0x48, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00] || w == &[0x48, 0x89, 0x83, 0x28, 0x01, 0x00, 0x00]).count(), 2, "both pair sums store 64-bit dst (0x120, 0x128)");
+    }
+
+    #[test]
+    fn sh452_adalp_word_pair_sum_and_signed_byte_signextend() {
+        // uadalp V1.4s, V2.4h (se=2 np=4 signed=false acc=false): pairwise sum
+        // of 2-byte srcs into 4-byte dst lanes. movzx_word (0f b7 83/0f b7 8b)
+        // + add + mov_store32 (89 83). And saddlp V1.4h, V2.8b (se=1 signed=true):
+        // movsx_byte_mem (48 0f be) SIGN-extends then adds into 2-byte dst (66 89).
+        let b = tr_bytes(Inst::SimdAdalp { rd: 1, rn: 2, src_esize: 2, n_pairs: 4, signed: false, upper: false, acc: false });
+        assert!(b.windows(7).any(|w| w == [0x0f, 0xb7, 0x83, 0x34, 0x01, 0x00, 0x00]), "pair2 [2i] movzx word at 0x134");
+        assert!(b.windows(7).any(|w| w == [0x0f, 0xb7, 0x8b, 0x36, 0x01, 0x00, 0x00]), "pair2 [2i+1] movzx word at 0x136 (RCX)");
+        assert!(b.windows(6).any(|w| w == [0x89, 0x83, 0x24, 0x01, 0x00, 0x00]), "dst lane1 4B store at 0x124");
+        // signed byte sources are SIGN-extended (movsx 48 0f be), not zero (0f b6).
+        let sb = tr_bytes(Inst::SimdAdalp { rd: 1, rn: 2, src_esize: 1, n_pairs: 8, signed: true, upper: false, acc: false });
+        assert!(sb.windows(7).any(|w| w == [0x48, 0x0f, 0xbe, 0x83, 0x30, 0x01, 0x00, 0x00]) || sb.windows(8).any(|w| w == [0x48, 0x0f, 0xbe, 0x83, 0x30, 0x01, 0x00, 0x00]),
+            "signed byte source uses movsx (48 0f be)");
+        assert!(!sb.windows(7).any(|w| w == [0x0f, 0xb6, 0x83, 0x30, 0x01, 0x00, 0x00]), "signed must NOT zero-extend (no 0f b6)");
+        assert!(sb.windows(7).any(|w| w == [0x66, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00]), "byte-pair sum -> 2B dst store (66 89 83)");
+    }
+
+    #[test]
+    fn sh452_adalp_acc_accumulate_load16_add_before_store() {
+        // uadalp V1.2s, V2.2s (se=4 np=2 acc=true): the ACCUMULATE form reads the
+        // existing dst lane into R10 (4c 8b 93) and ADDS the pair sum (4c 01 d0)
+        // before storing — uadalp/sadalp (acc) vs saddlp (acc=false) which does
+        // NOT touch the dst. The mov_load64-into-R10 + add-r10 is the acc
+        // discriminator: a flub that omits it overwrites instead of accumulating.
+        let acc = tr_bytes(Inst::SimdAdalp { rd: 1, rn: 2, src_esize: 4, n_pairs: 2, signed: true, upper: false, acc: true });
+        let now_acc = tr_bytes(Inst::SimdAdalp { rd: 1, rn: 2, src_esize: 4, n_pairs: 2, signed: true, upper: false, acc: false });
+        assert!(acc.windows(7).any(|w| w == [0x4c, 0x8b, 0x93, 0x20, 0x01, 0x00, 0x00]), "acc loads dst lane into R10 (4c 8b 93)");
+        assert!(acc.windows(3).any(|w| w == [0x4c, 0x01, 0xd0]), "acc adds R10 into RAX (4c 01 d0)");
+        assert!(!now_acc.windows(7).any(|w| w == [0x4c, 0x8b, 0x93, 0x20, 0x01, 0x00, 0x00]), "non-acc must NOT read the dst");
+        // the accumulate must precede the store.
+        let r10_load = acc.windows(7).position(|w| w == [0x4c, 0x8b, 0x93, 0x20, 0x01, 0x00, 0x00]).unwrap();
+        let store = acc.windows(7).position(|w| w == [0x48, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00]).unwrap();
+        assert!(r10_load < store, "accumulate read must come BEFORE the dst store");
+        assert!(acc.windows(7).any(|w| w == [0x48, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00]), "acc still stores the 8B dst");
+    }
 
     #[test]
     fn sh451_shrn_8to4_narrowing_width_full_buffer() {
