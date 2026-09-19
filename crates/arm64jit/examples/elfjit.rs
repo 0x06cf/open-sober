@@ -323,13 +323,26 @@ fn session_producer_gate(mh_app_ready: bool, live_dm: bool) -> bool {
     mh_app_ready && live_dm
 }
 
-/// Guest holds a live DataModel: current-DM holder [0x106391908] (SH172) or do-init
-/// DM-root [0x106a68818] carries a coherent guest vtable (page-guarded).
+/// A guest cell value looks like a coherent live-DataModel holder iff it is a
+/// guest-visible pointer (>= 0x100000000), not a host/stack address (top-16
+/// cleared), and non-zero. This rejects the SH381-measured do-init once-lambda
+/// "Execute" service-handle sentinel 0x400000b (SH155/311/316, < 0x100000000) so
+/// the session-gated producer never mistakes it for a live DM.
+fn live_dm_cell_value_ok(v: u64) -> bool {
+    v >= 0x100000000 && v >> 56 == 0 && v != 0
+}
+
+/// Guest holds a live DataModel: current-DM holder [0x106391908] (SH172), do-init
+/// DM-root [0x106a68818] (+0x410, no writer SH155), OR — per the SH381 address
+/// reconciliation — the once-lambda's ACTUAL write target once-slot [0x106a68408]
+/// (str x0,[x23,#1032] @0x2206d74, x23=adrp 6a68000). The once-slot is a DISTINCT
+/// cell from DM-root; a live DM written there (a coherent guest vtable) counts.
+/// All reads page-guarded via read_visible_u64.
 fn session_live_dm() -> bool {
     let holder = read_visible_u64(0x106391908u64);
     let root = read_visible_u64(0x106a68818u64);
-    let ok = |v: u64| v >= 0x100000000 && v >> 56 == 0 && v != 0;
-    ok(holder) || ok(root)
+    let once = read_visible_u64(0x106a68408u64);
+    live_dm_cell_value_ok(holder) || live_dm_cell_value_ok(root) || live_dm_cell_value_ok(once)
 }
 
 /// SESSION-GATED type-4 producer (self-drive handoff) at [0x106829ea8] via
@@ -1468,9 +1481,8 @@ fn routeb_patch_startapp_params_x20() {
 /// SH161: governor TAIL (0x2e9fdf4) `ldr x0,[x19,#1088]`(impl+0x440); bl 24c3768 (display
 /// shared_ptr) derefs [x0,+320] (fault=0x140; impl+0x440 NULL). Return discarded; NOP the
 /// 3-insn window (0xf9422260/0xaa1403e1/0x97d88e5b).
-// SH176/177 (JIT_ROUTEB_COOKIE_READBACK, parked detour): cookie getter returns WebLogin only;
-// route-B needs both read-back-local gates NOPed: getter 0x1021ff72c tbnz w8,#0 -> nop;
-// B) 0x105fee9c4 tbz w0,#0 -> nop (17-caller stub 1dc7428 untouched)
+// SH176/177 (JIT_ROUTEB_COOKIE_READBACK, parked detour): getter returns WebLogin only;
+// NOP both read-back-local gates: getter 0x1021ff72c tbnz w8,#0->nop; 0x105fee9c4 tbz w0,#0->nop.
 fn routeb_patch_cookie_readback() {
     if std::env::var_os("JIT_ROUTEB_COOKIE_READBACK").is_none() {
         return;
@@ -1600,12 +1612,10 @@ fn routeb_patch_globalinit_cevent_barrier() {
     arm64jit::jit::block_cache_drop_region(0x102206e20, 0x102206f00);
 }
 
-/// SH102: gameGlobalInit do-init reaches a GATED, purely-DIAGNOSTIC base-URL
- /// logging block (prologue 0x102dadb2c) derefing a lazily-init singleton slot
- /// *(0x106ED7A28) (bss PastEndOfFile, never set under JIT) -> `bl 0x10221364c`
- /// returns 0, `ldrb w8,[x0]` @0x102dade34 faults 0x0. Runs only when ClientRunInfo
- /// counter>=1; emits a base-url log only. Patch gate `b.lt`(0x54000cab)->`b 0x194`
- /// so the null-deref logging body is unreachable. Semantically neutral + deterministic.
+/// SH102: gameGlobalInit do-init reaches a GATED, purely-DIAGNOSTIC base-URL logging block
+/// (0x102dadb2c) derefing lazily-init singleton *(0x106ED7A28) (never set under JIT) -> bl 0x10221364c
+/// returns 0, `ldrb w8,[x0]` @0x102dade34 faults. Runs only when ClientRunInfo counter>=1; emits a
+/// base-url log. Patch gate `b.lt`(0x54000cab)->`b 0x194` so the null-deref body is unreachable.
 fn routeb_patch_clientruninfo_url_log() {
     const ADDR: u64 = 0x102dade08; // gate: `ldr w8,[x27,#14]; cmp #1; b.lt +0x194`
     let want = 0x1400_0065u32; // b 0x194 (always skip the logging block)
@@ -2238,11 +2248,11 @@ fn routeb_patch_preload_valuecell() {
     ROUTEB_PRELOAD_VALUE_PATCHED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 static ROUTEB_CONT_OPNEW_BOX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-/// SH245 next gate: continueAfterFlagsLoaded_ 0x102bd1d68 reaches `bl operator_new(0x28)`
-/// @0x2bd2128. operator_new 0x1db1a38 returns NULL for size>0xa when [0x10727570c].bit0 clear
-/// (headless) -> NULL-deref bad_alloc; broad bit0=1 seed MEASURED regression. SCOPE to window
-/// 0x2bd2120..0x2bd212c: materialize a leaked 0x40 zeroed box into x0 (movz/movk <2^48) so
-/// 0x2bd2140/154/158 box a real 0x40 closure. Idempotent opt-in JIT_ROUTEB_DM_CONT_OPNEW_BOX.
+/// SH245: continueAfterFlagsLoaded_ 0x102bd1d68 reaches `bl operator_new(0x28)` @0x2bd2128;
+/// operator_new 0x1db1a38 returns NULL for size>0xa when [0x10727570c].bit0 clear (headless) ->
+/// NULL-deref bad_alloc; broad bit0=1 seed REGRESSES. SCOPE to window 0x2bd2120..0x2bd212c:
+/// materialize a leaked 0x40 zeroed box into x0 (movz/movk <2^48) so 0x2bd2140/154/158 box a real
+/// 0x40 closure. Idempotent opt-in JIT_ROUTEB_DM_CONT_OPNEW_BOX.
 fn routeb_patch_cont_opnew_box() {
     if ROUTEB_CONT_OPNEW_BOX_PATCHED.load(core::sync::atomic::Ordering::Relaxed) {
         return;
@@ -4776,13 +4786,11 @@ fn login_ui_textures() -> Vec<RealSprite> {
         // bar. 256x16 rows keep the boxes wide (aspect 16).
         solid("field.png", (224, 224, 230, 255), 256, 16);
         solid("loginbtn.png", (0, 158, 68, 255), 256, 16);
-        // SH77 - a 2nd field (the password row) + real TEXT labels rasterized
-        // APK's own SourceSansPro-Bold.ttf (glyph outlines flattened
-        // with quadratic sampling, non-zero-winding 4x4-supersampled into
-        // transparent 256-wide RGBA8 rows). White "Log In" composites over the
-        // green button; dark-slate field placeholders over the two fields. The
-        // FS outputs texture2D, so color is baked glyph texels and the
-        // text rows sit AFTER their backing prim in atlas/painter order.
+        // SH77 - 2nd field (password row) + real TEXT labels rasterized from the APK's own
+        // SourceSansPro-Bold.ttf (glyph outlines flattened w/ quadratic sampling, non-zero-winding
+        // 4x4-supersampled into transparent 256-wide RGBA8 rows). White "Log In" over the green button;
+        // dark-slate field placeholders over both fields. Texture2D output bakes color into glyph
+        // texels; text rows sit AFTER their backing prim in atlas/painter order.
         solid("field2.png", (224, 224, 230, 255), 256, 16);
         for (name, color, w, h, pu) in [
             ("Log In", [255u8, 255, 255, 255], 512u32, 80u32, 0.068f32),
@@ -6180,12 +6188,10 @@ fn main() {
         .fold(0u64, |m, s| m.max(s.guest_vaddr + s.memsz));
     let len = (full_end - base) as usize;
 
-    // Reserve a writable guest tail past the ELF's mapped span. Real Roblox
-    // nativeInitCrashpad walks a link-time & bss table by a slot index reaching tens of MB
-    // past the last PT_LOAD .bss end; on real Android that's mapped anonymous, our loader maps
-    // only the ELF span. Reserve 384MB RW headroom so deep table writes have real backing
-    // instead of SIGSEGV. MAP_FIXED at a page-aligned addr after base+len is safe (host
-    // heap/stack live elsewhere); must be page-aligned or mmap EINVALs.
+    // Reserve writable guest tail past ELF mapped span: nativeInitCrashpad walks link-time+bss tables
+    // tens of MB past last PT_LOAD .bss; real Android maps that anon, we map only the ELF span.
+    // Reserve 384MB RW headroom for deep table writes; MAP_FIXED page-aligned after base+len (safe,
+    // host heap/stack elsewhere; misalign -> mmap EINVAL).
     let tail_start = (full_end as usize + 0xfff) & !0xfff;
     const TAIL_SIZE: usize = 384 * 1024 * 1024;
     match libloader::elf::reserve_guest_tail(tail_start, TAIL_SIZE) {
@@ -6393,13 +6399,11 @@ fn main() {
         println!("JNI boot: x0 = JavaVM* 0x{:x}", vm);
     }
 
-    // PC-driven dispatcher: compiles reachable regions and re-enters on
-    // indirect branch (`blr`) / `br` / `ret`, so real (blr-heavy) Roblox code
-    // can *execute* rather than stopping first blr.
-    // SH130: in the SERIALIZED combined run, gate the engine's self-spawned
-    // clone workers (spawned during boot) until LADDER_DONE so they can't race
-    // the ladder's rung jit_runs (SH55/64 false stack-smash). Cleared at
-    // "ladder done". Only engages with JIT_SERIALIZE_RENDER=1 + --v2boot.
+    // PC-driven dispatcher: compiles reachable regions + re-enters on blr/br/ret, so real
+    // (blr-heavy) code EXECUTES rather than stopping at first blr.
+    // SH130: in serialized combined run, gate engine's self-spawned clone workers until LADDER_DONE so
+    // they can't race ladder rungs (SH55/64 false stack-smash); cleared at "ladder done".
+    // Only with JIT_SERIALIZE_RENDER=1 + --v2boot.
     if std::env::var("JIT_SERIALIZE_RENDER").ok().as_deref() == Some("1")
         && std::env::args().any(|a| a == "--v2boot")
     {
@@ -6973,11 +6977,9 @@ fn main() {
                         // controller; the match path then reads the appbridge obj's
                         // +0x20 field [0x106a68818]. Report both.
                         let once_ok = (0x100000000..0x107333c3c).contains(&once_slot);
-                        // SH156: the real GlobalInit dispatch ctor 0x102207b50 (the match's br target once
-                        // DM-root live) runs its OWN __call_once latched on once-guard [0x6a64d70]
-                        // (`ldarb w8,[0x6a64d70]` @0x2207b68, self-set via stlrb) and reads a flags
-                        // byte [0x7285fb0]. Reading both post-rung shows whether the ctor chain ENGAGED
-                        // (guard self-set 0->1) without JIT_TRACE. Guarded so unmapped pages can't crash.
+                        // SH156: real GlobalInit dispatch ctor 0x102207b50 (br target once DM-root live) runs
+                        // __call_once latched on once-guard [0x6a64d70] (`ldarb` @0x2207b68, self-set stlrb)
+                        // + reads flags byte [0x7285fb0]. Reading post-rung shows if the ctor chain ENGAGED.
                         let _ctor_guard = if guest_page_mapped(0x106a64d70u64) {
                             Some(unsafe { *(0x106a64d70u64 as *const u8) })
                         } else {
@@ -8004,12 +8006,10 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
         } else {
             s2.x[2] = params;
         }
-        // Concurrent guest-thread state sampler (JIT_THREADS=1): StartApp's jit_run parks main
-        // forever (engine lifecycle-await), so post-run sampler never runs. Instead spawn a
-        // detached host sampler polling `snapshot_threads()` every ~200ms for a bounded window,
-        // dumping each parked thread's hostcall slot (pc), guest call-site (x30), wait-object
-        // args (x0..x2) — pins the boot wall to the exact guest fn that
-        // blocks and what it awaits. Runs concurrently with the jit_run.
+        // Concurrent guest-thread state sampler (JIT_THREADS=1): StartApp's jit_run parks main forever,
+        // so post-run sampler never runs; spawn a detached host sampler polling `snapshot_threads()`
+        // ~200ms for a bounded window, dumping each parked thread's hostcall slot (pc), guest call-site
+        // (x30), wait-object args (x0..x2) — pins the boot wall to the exact guest fn that blocks.
         if std::env::var_os("JIT_THREADS").is_some() {
             std::thread::spawn(|| {
                 // SH196 (JIT_DMCELLS=1): in-run observable for do-init __call_once completion. The
@@ -8286,11 +8286,10 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
         if std::env::var_os("JIT_DRIVE_LIFECYCLE").is_some() {
             wire_real_window();
         }
-        // Per-thread futex latch kicker (--futex-kick <ms>). Engine idle barrier (cycle L) is a REAL
-        // per-thread futex: each thread parks in FUTEX_WAIT_BITSET on its OWN latch (uaddr=x1=x19+4,
-        // awaited 0xF4240) at lr=0x10284d134. Host producer must CHANGE the latch + WAKE (plain WAKE
-        // is spurious; value still awaited so re-blocks). Unreachable by static --kicker; the sampler
-        // exposes each thread's x1 -> write value != awaited before waking -> one tick/kick.
+        // Per-thread futex latch kicker (--futex-kick <ms>). Engine idle barrier (cycle L) = per-thread
+        // futex parking FUTEX_WAIT_BITSET on its OWN latch (uaddr=x1=x19+4, awaited 0xF4240) at
+        // lr=0x10284d134. Producer must CHANGE latch + WAKE (plain WAKE spurious re-blocks).
+        // Sampler -> write value != awaited before waking.
         if let Some(hex) = {
             let args: Vec<String> = std::env::args().collect();
             args.iter()
@@ -11442,12 +11441,11 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
 
                     }
                 }
-                // --renderclear <r,g,b,a>: draw an actual colored clear through the JIT's GLES
-                // float bridge on this live ctx, then swap again, so the presented frame is
-                // non-black (the idle main loop never issues glClearColor). Drive the guest
-                // PLT directly: glClearColor@plt 0x1062d7710 (floats in s0..s3 = v[0..6] low
-                // lanes), then glClear@plt 0x1062d7740 (GL_COLOR_BUFFER_BIT=0x4000 in x0),
-                // each via jit_run -> plt stub -> host GLES bridge on the current Mesa ctx.
+                // --renderclear <r,g,b,a>: draw an actual colored clear through the JIT GLES float bridge on
+                // this live ctx, then swap again, so the presented frame is non-black (idle main loop
+                // never glClearColor). Drive guest PLT directly: glClearColor@plt 0x1062d7710 (floats
+                // s0..s3=v[0..6] low lanes), then glClear@plt 0x1062d7740 (GL_COLOR_BUFFER_BIT=0x4000 in
+                // x0), each via jit_run -> plt stub -> host GLES bridge on the current Mesa ctx.
                 if renderframe_args.iter().any(|a| a == "--renderclear") {
                     let cc: Vec<f32> = renderframe_args
                         .iter()
@@ -11641,11 +11639,10 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
         }
     }
 
-    // SH175 follow-on (--cookie-ingress): drive pure-native cookie worker 0x102203148
-    // (under nativeSetMultipleCookies 0x102202ff8) as a STANDALONE top-level jit_run on main
-    // BEFORE StartApp, JIT_ROUTEB_COOKIE=1 seeds jar [0x106ed7a20] + clears boot gates
-    // ([0x106dcfc30]/[0x1072739d4] bit0) — closing the SH129/174 jar-ctor NULL fault at 0x220331c.
-    // ABI 6 args; w4(arg4)&1==1 REQUIRED (arg4=0 early-bails @0x2203b20). JAR READ-ONLY here.
+    // SH175 (--cookie-ingress): drive pure-native cookie worker 0x102203148 (under nativeSetMultipleCookies
+    // 0x102202ff8) as a STANDALONE jit_run on main BEFORE StartApp; JIT_ROUTEB_COOKIE=1 seeds jar
+    // [0x106ed7a20] + clears boot gates ([0x106dcfc30]/[0x1072739d4] bit0) — closes SH129/174 jar-ctor NULL
+    // fault @0x220331c. ABI 6 args; w4&1==1 required (arg4=0 early-bails @0x2203b20). JAR READ-ONLY here.
     // Standalone = first/only top-level jit_run on main (SH55/64-safe).
     if std::env::args().any(|a| a == "--cookie-ingress") {
         const COOKIE_WORKER: u64 = 0x102203148;
@@ -11741,12 +11738,9 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
         const CFG: u64 = 0x10683d7e8; // config singleton
         const CFG_GATE: u64 = 0x10683d810; // gate byte
         const GATE_FLAGS: u64 = 0x1072739d4;
-        // SH177 recon: Route-B is gated by keep/domain CLASSIFIER 0x22035c0 validating a
-        // DOTTED HOST (byte[pos-1]=='.'; ':'/'/' etc.; 1 only on a valid dotted host).
-        // Route B reads the jar STRING (getter 0x21fce24), lowercases (21ff8fc), feeds it -
-        // jar must hold a pure DOTTED DOMAIN like ".roblox.com" ('='/cookie breaks the gate).
-        // RFC6265 '#HttpOnly_.%s\tTRUE\t/\t%s\t0\t%s\t%s' line (rodata 0x100304d0e) formatted
-        // by domain + env/class-JNI name/value backing (5feee7c/21ff8fc - Java CookieManager).
+        // SH177 recon: Route-B gated by keep/domain CLASSIFIER 0x22035c0 (1 only on a valid
+        // DOTTED host); jar STRING must be a pure DOTTED DOMAIN like ".roblox.com".
+        // RFC6265 line (rodata 0x100304d0e) by domain + class-JNI cookie (5feee7c/21ff8fc).
         let TOK: &[u8] = b".roblox.com";
         // Route B requires probe F()==0 -> the getter's `tbnz w8,#0` takes Main
         // (reads the WebLogin store, empty headlessly). Patching read-back-local
@@ -11946,12 +11940,10 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                 Err(_) => eprintln!("[elfjit:v2boot-join] ladder thread panicked"),
             }
         }
-        // SH128 --deque-redrive: engine idle-main-loop drain 0x102856e40 is normally
-        // driven by StartApp's jit_run (guest thread 0); in the serialized combined run
-        // StartApp RETURNS drain is never populated and the combined run presents
-        // 0 frames (frontier-sh127). Re-drive the drain bounded top-level jit_run on
-        // the MAIN thread (TLS still holds the scheduler obj) so injector dispatches
-        // become real frames renderinit presenter, both held open for REDRIVE_ACTIVE.
+        // SH128 --deque-redrive: engine idle-main-loop drain 0x102856e40 is normally driven by StartApp's
+        // jit_run (guest thread 0); when StartApp RETURNS in the serialized combined run the drain is
+        // never populated -> 0 frames (frontier-sh127). Re-drive the drain bounded top-level jit_run
+        // on MAIN (TLS still holds scheduler obj) so injector dispatches become real presenter frames.
         if redrive_enabled() {
             let rtp = arm64jit::jit::current_guest_tp();
             // x1 = task-queue obj (engine scheduler). The pump derives it via helper
@@ -12690,12 +12682,9 @@ mod sh79_tests {
 #[cfg(test)]
 mod sh111_tests {
     use super::*;
-    // SH111: a widened dispatch-singleton vtable (0x60->0x580), filled with identity leaves
-    // (b19b1c2) or a zeroed-object leaf (SH111 attempt), REGRESSES nativeInitializeNativeFlags
-    // (exit 134): the vtable is SHARED; nativeInit stays clean ONLY because 0x60 slots read-past
-    // into host bytes -> benign soft-return; growth lets V2Start/V2Init resolve deep +0xf8/etc
-    // gates and fault. Committed = 0x60 baseline; fix SCOPED-patches the 3 blr SITES
-    // (0x62517c4/0x6251aa8/0x6260948), not a vtable widening. Locks baseline.
+    // SH111: widened dispatch-singleton vtable (0x60->0x580) REGRESSES nativeInitializeNativeFlags (exit 134):
+    // vtable SHARED; 0x60 slots read-past benign; growth resolves deep +0xf8 gates + faults. Keep 0x60;
+    // SCOPED-patch the 3 blr SITES (0x62517c4/0x6251aa8/0x6260948), not vtable widening. Locks baseline.
     #[test]
     fn sh111_singleton_vtable_stays_0x60_baseline() {
         // The committed vtable is 0x60 (the benchmarked clean milestone).
@@ -12840,13 +12829,11 @@ mod sh115_tests {
     }
     #[test]
     fn sh246_cont_opnew_closure_boxes_real_object_not_null() {
-        // SH245-candidate-1: continuation reaches `bl operator_new(0x28)` @0x2bd2128; op-new
-        // fast path returns NULL for size>0xa when alloc byte [0x10727570c].bit0 clear ->
-        // closure boxes NULL -> bad_alloc. Fix: leak 0x40 box into x0 over the 3-slot window
-        // + drop the bl. This hermetic pins the 3 call-site words, the movz/movk 48-bit
-        // round-trip, and the guard failing on a drifted window. Site words
-        // (0x2bd2120..28): mov w0,#0x28 (0x52800500) ; mov w1,#0x8
-        // (0x52800101) ; bl 0x1db1a38.
+        // SH245-cand-1: continuation reaches `bl operator_new(0x28)` @0x2bd2128; fast path returns
+        // NULL for size>0xa when alloc byte [0x10727570c].bit0 clear -> closure boxes NULL -> bad_alloc.
+        // Fix: leak 0x40 box into x0 over the 3-slot window + drop the bl. Pins the 3 call-site words,
+        // movz/movk 48-bit round-trip, + guard failing on drifted window. Sites (0x2bd2120..28):
+        // mov w0,#0x28 (0x52800500) ; mov w1,#0x8 (0x52800101) ; bl 0x1db1a38.
         let window_file_start = 0x2bd2120usize;
         let expected = [0x5280_0500u32, 0x5280_0101u32, 0x97c7_7e44u32];
         let make_word = |hw: u32, imm: u16| -> u32 {
@@ -13033,12 +13020,11 @@ mod sh115_tests {
     }
     #[test]
     fn sh251b_classdesc_register_advances_into_ctor_fencepost() {
-        // SH251b (Route-B re-attack, fresh): under class-desc-REGISTERED + genuine-DM
-        // CONSUMER+DISPATCH (JIT_ROUTEB_DM_SERVICES=1), the SH189 guard drives the REAL
-        // PlayerGui+ScreenGui class-register getters headlessly; the continuation ADVANCES into
-        // large ctor 0x102b9eca0 (sub sp,#0x480) whose `ldr x3,[x19,#16]` faults this=NULL
-        // (fault=0x10) - a STABLE new downstream fencepost (3/3 EXIT 134/139 @0x102b9ecbc),
-        // reachable ONLY via the class-desc path. Pin them (real-image, skip-if-absent).
+        // SH251b: under class-desc-REGISTERED + genuine-DM CONSUMER+DISPATCH (JIT_ROUTEB_DM_SERVICES=1),
+        // the SH189 guard drives REAL PlayerGui+ScreenGui class-register getters headlessly; the
+        // continuation ADVANCES into large ctor 0x102b9eca0 (sub sp,#0x480) whose `ldr x3,[x19,#16]`
+        // faults this=NULL (fault=0x10) — STABLE downstream fencepost (3/3 @0x102b9ecbc), reachable
+        // ONLY via class-desc. Pin (real-image, skip-if-absent).
         let sites: [(usize, u32); 8] = [
             (0x201fce0, 0xd10103ff), // PlayerGui class-register getter entry (sub sp,#64)
             (0x201fce8, 0xf9001bf3), // PlayerGui getter +8 (stp x29,x30 / str x19,[sp,#24])
@@ -13072,7 +13058,7 @@ mod sh115_tests {
     }
     #[test]
     fn sh251c_getter_landingpad_cleanup_not_forward_ctor() {
-        // SH251b CORRECTION (SH251c): 0x102b9eca0 is NOT an indirect-only "next-unsynthesized" ctor.
+        // SH251c CORRECTION: 0x102b9eca0 is NOT an indirect-only "next-unsynthesized" ctor.
         // TRUE entry = 0x2b9ec9c (`paciasp`); exec seg has 64,748 `bl 0x2b9ec9c` + ZERO `bl 0x2b9eca0`.
         // Two callers in PlayerGui getter 0x10201fce0 are EXCEPTION LANDING PADS (each preceded by a
         // __cxa cleanup bl): NULL-this crash @0x102b9ecbc = unwind teardown (spawned-thread SIGTRAP),
@@ -13157,12 +13143,10 @@ mod sh115_tests {
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let img = std::fs::read(p).expect("read real libroblox.so");
-            // (a) full sweep: collect every `adrp 0x6dca000 + add #0xe70` -> resolver-map
-            // forming site. MEASURED via objdump: exactly 2 - 0x2208b10 (bulk registrar
-            // 0x2208ae8's dest-map pointer) and 0x2208be4 (same registrar, re-load after the
-            // insert). BOTH live inside nativeGameGlobalInit's registrar region. There is NO
-            // standalone lazy-static ctor for it: every resolver-forming site is in
-            // [0x2208418, 0x2208cf8) (the in-ladder header default-construct + registrar body).
+            // (a) full sweep: collect every `adrp 0x6dca000 + add #0xe70` -> resolver-map forming site.
+            // objdump: exactly 2 — 0x2208b10 (bulk registrar 0x2208ae8 dest-map ptr) + 0x2208be4
+            // (same registrar, re-load after insert), both in nativeGameGlobalInit's registrar region.
+            // NO standalone lazy-static ctor: every resolver-forming site is in [0x2208418,0x2208cf8).
             let mut sites = Vec::<u64>::new();
             let mut pc = 0usize;
             while pc + 8 <= XEND as usize {
@@ -14006,13 +13990,12 @@ mod sh115_tests {
 
     #[test]
     fn sh232_ec_callers_pinned_to_ladder_rungs() {
-        // SH232 (Route-B): 241 static bl/b callers EC DM-creation world
-        // [0x102e1c650,0x102e25200) incl. two in ladder rungs: StartLuaAppDM (0x1023f1294 ->
-        // bl 0x2e24598) + V2InitWithParams (0x1023cfd68 -> bl 0x2e24468). Measured: on
-        // govtail-positive runs both enclosing bodies stay 0 - benign-complete UPSTREAM
-        // (live-DM gate). Pins: SLADM 0x1023efe2c=d10183ff; EC-caller 0x1023f1294=9428ccc1;
-        // EC-arg 0x1023f11f4=a9bf7bfd; V2Init EC-caller 0x1023cfd68=942951c0; V2Init deep
-        // 0x1023cfafc=a9bc7bfd.
+        // SH232: 241 static bl/b callers EC DM-creation world
+        // [0x102e1c650,0x102e25200) incl. two in ladder rungs (StartLuaAppDM 0x1023f1294->bl 0x2e24598,
+        // V2InitWithParams 0x1023cfd68->bl 0x2e24468). On govtail-positive runs both enclosing bodies
+        // stay 0 — benign-complete UPSTREAM (live-DM gate).
+        // Pins: SLADM 0x1023efe2c=d10183ff; EC-caller 0x1023f1294=9428ccc1; EC-arg 0x1023f11f4=a9bf7bfd;
+        // V2Init EC-caller 0x1023cfd68=942951c0; V2Init deep 0x1023cfafc=a9bc7bfd.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
@@ -14216,12 +14199,11 @@ mod sh115_tests {
 
     #[test]
     fn sh258_appstart_deepest_reach_2339d44_then_map_wall_rx_this() {
-        // SH258 (Route-B): deepest app-start reach FULL combined seed set.
-        // do-init->governor->app-start reaches 0x102339d44 (orchestrator fn 0x2339d0c, bl 21dac2c) -
-        // DEEPEST ever; then terminates at live-object map wall 0x1021dde34 (x20=x21=0x100548ca9 =
-        // file 0x548ca9 map-this, garbage hash). 0x100548ca9 is inside the single R-E exec LOAD
-        // segment [0x0,0x62d8190) - execute-only, NO seed/repair/clamp lever. FAIL-LOUD pin of
-        // deepest reach. Route-B gate UNCHANGED.
+        // SH258: deepest app-start reach FULL combined seed set. do-init->governor->app-start hits
+        // 0x102339d44 (orchestrator fn 0x2339d0c, bl 21dac2c) — DEEPEST ever; then terminates at the
+        // live-object map wall 0x1021dde34 (x20=x21=0x100548ca9 = file 0x548ca9 map-this, garbage hash).
+        // 0x100548ca9 sits inside the single R-E exec LOAD [0x0,0x62d8190) — execute-only, no seed lever.
+        // FAIL-LOUD pin of deepest reach. Route-B gate UNCHANGED.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
         );
@@ -14351,12 +14333,11 @@ mod sh115_tests {
 
     #[test]
     fn sh276_engine_settings_receive_transition_pinned() {
-        // SH276: engine-settings RECEIVE nativeActivity_onEngineSettingsReceived
-        // (0x2bd1c38) - SEP-17's OTHER named primitive - never driven (SH264-275 covered lifecycle +
-        // client-settings). --v2boot-session-engine drives it on a fabricated zeroed manager. Pins:
-        // prologue sub sp,#0x40; version [0x10683d8f8]; gate cmp/ccmp/b.eq; FLog 0x2bd1c7c; mutex
-        // lock 2b53a68 @0x2bd1ca8 / unlock @0x2bd1cc8; LATCH strb [this+0x288] @0x2bd1cb4;
-        // state-3 store str w8,[this,#16] @0x2bd1cc0.
+        // SH276: engine-settings RECEIVE nativeActivity_onEngineSettingsReceived (0x2bd1c38) — never
+        // driven (SH264-275 covered lifecycle+client-settings); --v2boot-session-engine drives it on a
+        // fabricated zeroed manager. Pins: prologue sub sp,#0x40; version [0x10683d8f8]; gate cmp/ccmp/
+        // b.eq; FLog 0x2bd1c7c; mutex 2b53a68 @0x2bd1ca8 / unlock @0x2bd1cc8; LATCH strb [this+0x288]
+        // @0x2bd1cb4; state-3 store str w8,[this,#16] @0x2bd1cc0.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -17125,5 +17106,24 @@ mod sh304_session_gate_tests {
     #[test]
     fn gate_opens_only_when_session_owns_live_dm() {
         assert!(session_producer_gate(true, true), "app-ready AND live-DM -> gated");
+    }
+
+    #[test]
+    fn live_dm_cell_ok_rejects_sh381_execute_sentinel() {
+        // SH381: the do-init once-lambda's DM-constructor 0x2173b3c returns the
+        // 0x400000b "Execute" service-handle sentinel into once-slot [0x106a68408].
+        // That is NOT a live DM — the predicate must reject it (< 0x100000000) so
+        // the session-gated producer never mistakes a sentinel for a session.
+        use super::live_dm_cell_value_ok;
+        assert!(!live_dm_cell_value_ok(0x400000b), "Execute sentinel != live DM");
+        assert!(!live_dm_cell_value_ok(0), "zero holder != live DM");
+        // Note: the predicate uses `v >> 56 == 0`, which holds for BOTH guest
+        // vtables (0x106xxxxxx) and host user-space pointers (0x7f7b...; Linux top
+        // byte is 0x00 for canonical user addresses). Its discriminator is the
+        // low-value + zero rejection above (0x400000b sentinel / 0). A coherent
+        // guest vtable pointer (guest-visible) IS live.
+        assert!(live_dm_cell_value_ok(0x1067162e8), "genuine guest DM vtable is live");
+        assert!(live_dm_cell_value_ok(0x106a68408), "a DM written to once-slot counts");
+        assert!(live_dm_cell_value_ok(0x7f7b40110a00), "coherent pointer-valued holder >=1<<32 counts (host/guest indistinguishable by this coarse predicate)");
     }
 }

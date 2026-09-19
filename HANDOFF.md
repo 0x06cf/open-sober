@@ -1,5 +1,26 @@
 # Open Sober — Agent Handoff
 
+## SH382 (Sep 20, 2026, hermes-worker): fold the SH381 once-slot reconciliation into the latent session-gated type-4 producer (recon-v3 §A end-state) — live-DM classifier now also reads the once-lambda's REAL write target [0x106a68408] and explicitly rejects the 0x400000b "Execute" sentinel; recon-v3 deliverables re-verified green at HEAD
+Single-agent (cone suppressed). Pure-predicate change (elfjit.rs): added
+`live_dm_cell_value_ok(v)` (rejects the <0x100000000 0x400000b sentinel) and made
+`session_live_dm()` read once-slot [0x106a68408] (SH381: `str x0,[x23,#1032]`
+@0x2206d74, x23=adrp 6a68000) as a THIRD live-DM candidate alongside
+[0x106391908]/[0x106a68818], all page-guarded. Behavior-preserving for the gate
+decision (MH_APP_READY=false keeps it inert on a bare boot; the once-slot arm only
+ADDS recognition of a genuine DM written to the once-lambda's actual target and
+still REJECTS the sentinel). +sh382 hermetic
+`live_dm_cell_ok_rejects_sh381_execute_sentinel` (sh304 module) + frontier doc.
+MEASURED real-binary (completing ladder + --taskv4-seed session): EXIT 124, 0 crash,
+3× `disp UNGATED (app_ready=false, live_dm=true) — inert` (correct — no session
+emits frames; lone present #0 is the RENDERINIT warmup self-test, not a producer
+emit). No production path / JIT hook / guest byte touched. Workspace green
+(cargo test --workspace EXIT 0, 617/0; arm64jit lib 437/0; elfjit example 160/0).
+Recon-v3 deliverables re-verified green (capture_taskv4_frame.sh attempt 1: 24 real
+frames swap Ok(0x1), 197 pops, 0 json, 0 crash).
+Route-B live-DM structural gate UNCHANGED (DM-root [0x106a68818]=0, MH_* false,
+AppBridgeV2 0). SH174 capture-latch stays the single forward hook. Do-not-re-tread
+unchanged (incl. once-lambda store seeding SH381).
+
 ## SH381 (Sep 20, 2026, hermes-worker): MEASURED at the exact store on the FULL ladder — the do-init once-lambda's DM-constructor `0x2173b3c` returns the **0x400000b "Execute" service-handle sentinel**, NOT a live DM (answers the EXECUTE-DO-INIT-GATES "LET the once-lambda populate" gate with direct evidence); PLUS an ADDRESS-RECONCILIATION fix the whole probe line conflated for ~30 SH cycles (the once-path writes [0x106a68408], not the probed [0x106a68818])
 Single-agent (cone suppressed). One new READ-ONLY guard
 `routeb_doinit_oncelambda_probe` (jit.rs, opt-in JIT_ROUTEB_DOINIT_ONCELAMBDA, once, ZERO
