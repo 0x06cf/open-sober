@@ -10077,6 +10077,99 @@ mod tests {
     }
 
     #[test]
+    fn sh456_vshift_sshl_d8_full_buffer() {
+        // sshl vL.2d, vV.2d, vC.2d (esize=8 signed_=true): per-lane variable
+        // shift. bbits==64 (no wmask, no out-of-range clamp because x86's
+        // shl/sar mask CL to the low 6 bits = the exact 0..63 ARM range). EMIT
+        // per lane: mov rax,[V] + mov rcx,[C] + `test rcx,rcx` (48 85 c9) + js
+        // (0f 88) to the right path + LEFT `shl rax,cl` (48 d3 e0) + jmp + RIGHT
+        // `neg rcx` (48 f7 d9) + `sar rax,cl` (48 d3 f8, arithmetic) + mov
+        // [Vd],rax. rd=1 rn=2 rm=3 -> Vd@0x120 V@0x130 C@0x140.
+        let b = tr_bytes(Inst::SimdVShift { rd: 1, rn: 2, rm: 3, esize: 8, signed_: true, q: false, rounding: false });
+        assert_eq!(b, vec![
+            // lane 0
+            0x48, 0x8b, 0x83, 0x30, 0x01, 0x00, 0x00, // mov rax,[rbx+0x130] V
+            0x48, 0x8b, 0x8b, 0x40, 0x01, 0x00, 0x00, // mov rcx,[rbx+0x140] C
+            0x48, 0x85, 0xc9,                         // test rcx,rcx (SF from sign)
+            0x0f, 0x88, 0x08, 0x00, 0x00, 0x00,       // js right (+8)
+            0x48, 0xd3, 0xe0,                         // shl rax,cl (left, C>=0)
+            0xe9, 0x06, 0x00, 0x00, 0x00,             // jmp done
+            0x48, 0xf7, 0xd9,                         // neg rcx = magnitude k
+            0x48, 0xd3, 0xf8,                         // sar rax,cl (arithmetic right)
+            0x48, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00, // mov [rbx+0x120],rax
+        ]);
+        assert!(b.windows(3).any(|w| w == [0x48, 0xd3, 0xe0]), ".2d left = shl rax,cl");
+        assert!(b.windows(3).any(|w| w == [0x48, 0xd3, 0xf8]), ".2d signed right = sar rax,cl (F8)");
+        assert!(!b.windows(3).any(|w| w == [0x48, 0xd3, 0xe8]), "sshl must NOT emit shr (E8)");
+    }
+
+    #[test]
+    fn sh456_vshift_ushl_signextend_count_and_js_direction() {
+        // ushl v1.2s, v2.2s, v3.2s (esize=4 signed_=false): per 32-bit lane. The
+        // COUNT lane C is SIGN-extended (movsxd rcx,ecx 48 63 c9) so a negative
+        // (high-bit-set) C makes the JS branch take the right path — a
+        // zero-extend (no movsxd) turns a negative count into a huge positive
+        // and wrongly takes the left path. The `test rcx,rcx` + `js` (0f 88)
+        // sign-dispatch is the variable-shift control-flow discriminator.
+        let b = tr_bytes(Inst::SimdVShift { rd: 1, rn: 2, rm: 3, esize: 4, signed_: false, q: false, rounding: false });
+        // lane0 sign-extend + sign-dispatch
+        assert!(b.windows(7).any(|w| w == [0x8b, 0x83, 0x30, 0x01, 0x00, 0x00, 0x8b]), "V lane0 loaded via mov eax,[rbx+0x130]");
+        assert!(b.windows(3).any(|w| w == [0x48, 0x63, 0xc9]), "count sign-extends via movsxd rcx,ecx (48 63 c9) — a negative C must dispatch right");
+        assert!(b.windows(3).any(|w| w == [0x48, 0x85, 0xc9]), "test rcx,rcx sets SF from the sign-extended count");
+        assert!(b.windows(4).any(|w| w == [0x0f, 0x88, 0x31, 0x00]), "js = 0f 88 dispatches C<0 to the right path");
+        // left path must guard C>=B (32) -> 0, with the wmask and-back
+        assert!(b.windows(3).any(|w| w == [0x48, 0xd3, 0xe0]), "left path = shl rax,cl");
+        assert!(b.windows(8).any(|w| w == [0x48, 0xba, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00]), "esize=4 left ANDs the wmask 0xffffffff");
+        assert!(b.windows(3).any(|w| w == [0x48, 0x21, 0xd0]), "left masks via and rax,rdx (48 21 d0)");
+        // store is 32-bit (89 83), the esize=4 width
+        assert!(b.windows(6).any(|w| w == [0x89, 0x83, 0x20, 0x01, 0x00, 0x00]), "lane0 stores 32-bit Vd (89 83 0x120)");
+        assert!(!b.windows(6).any(|w| w == [0x48, 0x89, 0x83, 0x20, 0x01, 0x00]), "esize=4 must NOT mov_store64");
+    }
+
+    #[test]
+    fn sh456_vshift_sshl_vs_ushl_right_shift_opcode() {
+        // The signed/unsigned RIGHT-shift opcode is the core semantic: sshl/srshl
+        // (signed_) right path uses `sar rax,cl` (48 d3 f8, arithmetic — sign-
+        // extends, keeps a negative V negative), ushl/urshl uses `shr rax,cl`
+        // (48 d3 e8, logical — zero-fills). A flub flips the direction-of-shift
+        // semantics for every negative count. Both sign-extend the VALUE V (for
+        // esize=4: movsxd rax,eax 48 63 c0) before the arithmetic right shift.
+        let signed = tr_bytes(Inst::SimdVShift { rd: 1, rn: 2, rm: 3, esize: 4, signed_: true, q: false, rounding: false });
+        assert!(signed.windows(3).any(|w| w == [0x48, 0xd3, 0xf8]), "sshl right = sar rax,cl (48 d3 f8, arithmetic)");
+        assert!(signed.windows(3).any(|w| w == [0x48, 0x63, 0xc0]), "signed right sign-extends the VALUE V first (movsxd rax,eax)");
+        assert!(!signed.windows(3).any(|w| w == [0x48, 0xd3, 0xe8]), "sshl must NOT emit shr (E8)");
+        // signed out-of-range right: sign-fill (V<0 -> wmask 0xffffffff, V>=0 -> 0)
+        assert!(signed.windows(4).any(|w| w == [0x0f, 0x89, 0x0f, 0x00]), "signed out-of-range = jns (0f 89) to zero");
+        assert!(signed.windows(8).any(|w| w == [0x48, 0xb8, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00]), "signed big-shift = sign-fill value 0xffffffff");
+        let unsigned = tr_bytes(Inst::SimdVShift { rd: 1, rn: 2, rm: 3, esize: 4, signed_: false, q: false, rounding: false });
+        assert!(unsigned.windows(3).any(|w| w == [0x48, 0xd3, 0xe8]), "ushl right = shr rax,cl (48 d3 e8, logical)");
+        assert!(!unsigned.windows(3).any(|w| w == [0x48, 0xd3, 0xf8]), "ushl must NOT emit sar (F8)");
+        assert!(!unsigned.windows(3).any(|w| w == [0x48, 0x63, 0xc0]), "unsigned right must NOT sign-extend the value");
+        // unsigned out-of-range right -> plain 0 (mov rax,0, no jns/sign-fill)
+        assert!(!unsigned.windows(4).any(|w| w == [0x0f, 0x89, 0x0f, 0x00]), "unsigned big-shift has NO jns (just mov rax,0)");
+    }
+
+    #[test]
+    fn sh456_vshift_urshl_rounding_bias_before_shift() {
+        // urshl (rounding=true): the in-range right path adds the half-up bias
+        // 1<<(k-1) to V BEFORE the logical right shift. That bias is
+        // `mov rdx,1` + `shl rdx,cl` (48 d3 e2) + `shr rdx,1` (48 c1 ea 01) +
+        // `add rax,rdx` (48 01 d0), THEN `shr rax,cl`. The presence + position
+        // of the add BEFORE the final shift is the round discriminator — a flub
+        // that skips the bias truncates (round-half-down) instead of half-up.
+        let b = tr_bytes(Inst::SimdVShift { rd: 1, rn: 2, rm: 3, esize: 4, signed_: false, q: false, rounding: true });
+        assert!(b.windows(3).any(|w| w == [0x48, 0xd3, 0xe2]), "rounding bias = shl rdx,cl (48 d3 e2)");
+        assert!(b.windows(4).any(|w| w == [0x48, 0xc1, 0xea, 0x01]), "rounding = shr rdx,1 (48 c1 ea 01, 1<<(k-1))");
+        assert!(b.windows(3).any(|w| w == [0x48, 0x01, 0xd0]), "rounding = add rax,rdx (48 01 d0, V += bias)");
+        let bias_at = b.windows(3).position(|w| w == [0x48, 0x01, 0xd0]).unwrap();
+        let shift_at = b.windows(3).position(|w| w == [0x48, 0xd3, 0xe8]).unwrap();
+        assert!(bias_at < shift_at, "rounding bias must precede the final shr");
+        // control: the non-rounding form has NO 1<<(k-1) ladder.
+        let plain = tr_bytes(Inst::SimdVShift { rd: 1, rn: 2, rm: 3, esize: 4, signed_: false, q: false, rounding: false });
+        assert!(!plain.windows(8).any(|w| w == [0x48, 0xc1, 0xea, 0x01, 0x48, 0x01, 0xd0, 0x48]), "non-rounding must NOT emit the bias-1<<(k-1) ladder");
+    }
+
+    #[test]
     fn sh455_fmuscalar_fmul_double_movq_mulsd_direction() {
         // fmul d1, d2, d3 (double=true neg=false): Dd = Dn * Dm. The scalar
         // 2-source FP multiply — the SAME product core as Fma3 but with NO
