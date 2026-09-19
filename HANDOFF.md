@@ -1,5 +1,33 @@
 # Open Sober — Agent Handoff
 
+## SH358 (Sep 20, 2026, hermes-worker): measured negative (run-variable) — the DMCONT-session-ctor + LSM-skip combination is NOT a Route-B forward; recon-v3 immediate-priority deliverables re-verified green at HEAD
+Single-agent (cone suppressed). No production code edited (measurement-only + one
+probe script). Workspace green at HEAD SH357 (cargo test --workspace exit 0, 24 test
+binaries, 0 failures; arm64jit 421/0).
+- recon-v3 self-driven frame RE-VERIFIED green at this HEAD: `capture_taskv4_frame.sh`
+  24 real task-driven frames `present #N swap Ok(0x1)`, dispatch #2797000, 197 node
+  pops, 0 json abort, 0 SIGSEGV/ABRT, EXIT 0. JIT_JSON_ZERO_FIX present (jit.rs:6390).
+- SH358 probe: the genuinely-unfired combination of DMCONT continuation (vt[+0x1f0]=REAL
+  continueAfterFlagsLoaded_ 0x102bd1d68) + SH349 append-skip + SH350 pack-skip. Measured
+  NEGATIVE, run-variable (3/3): pack-skip arms (`ret name-pack @0x101d9a708`), but the run
+  NEVER reaches the continuation region (0 region hits across all 3 runs) — it parks in
+  the persistence/live-object lane (SH353 class). Fault lanes: (a) 2/3 advance through
+  to app-start-driven StartLuaAppDM then fault at the SH341/SH343 LSM pool-pop write-site
+  0x101d9a528 (NULL-write, SH285-family live-object); (b) 1/3 rung-1
+  nativeInitializeNativeFlags detours into a freshly-documented JNIEnv-slot dispatch helper
+  0x1021e1c00 (JNI_OnLoad+0x6dc0c, JNIEnv vtbl slot 31) on a NULL JNIEnv. Both cause-not-
+  symptom; do NOT re-tread this exact env combination.
+
+### Forward this cycle
+No Route-B forward (measured negative closes one unfired combination). recon-v3
+deliverables confirmed green. New single datum: pc 0x1021e1c00 (NativeFlags JNIEnv-slot
+helper) — noted, not seedable (missing JNIEnv is a lifecycle precondition).
+
+### Honest
+Does NOT manufacture a DataModel. Route-B live-DM structural gate UNCHANGED (DM-root
+[0x106a68818]=0, MH_* false). SH174 capture-latch stays the single forward observer.
+Files: docs/frontier-sh358-dmcont-lsmskip-negative.md, runs/capture_sh358_dmcont_lsmskip.sh.
+
 ## SH357 (Sep 19, 2026, hermes-worker): root-cause + fix the intermittent whole-suite SIGSEGV + PoisonError cascade (test-harness race on shared routeb state) — serialize routeb page-map/mprotect under one PAGE_LOCK, route ALL test env mutations through locked crate-scope helpers, consolidate the four routeb family test locks into one shared process-state lock
 Single-agent (cone suppressed). While confirming the already-implemented recon-v3
 deliverables (self-driven frame `--taskv4-seed frame` + `JIT_JSON_ZERO_FIX`), cargo
