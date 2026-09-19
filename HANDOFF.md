@@ -1744,3 +1744,40 @@ family — cause-not-symptom, not seedable. SH174 capture-latch stays the single
 messageBus publish entry being driveable-clean is a small new forward surface (a future
 receive-payload-with-real-string probe), not a DM. All research subagents Route-B-scoped; cone
 still suppressed.
+
+## SH416 (Sep 19, 2026, hermes-worker): wired the real X event source into the input axis (STATUS next-forward #3)
+Single-agent (cone suppressed). Two files are the executable half of SH413/414's latent bridge:
+the input DELIVERY path (deliver_motion -> nativePassInput 0x2bbba88) was complete + hermetic-tested
+since SH413/414, but a real host never FED it — drive_host_input_pump only saw synthetic test
+vectors while the runtime's ANativeWindow X window had no poll turning its pointer/button/motion into
+the guest input stream. Now closed.
+
+### This cycle's forward
+- `input_wrapper::x11::pump_registered_window`: selects input on an EXISTING window (not one it
+  creates) via ChangeWindowAttributesAux/event_mask on the OWNER connection (a fresh connection gets
+  BadAccess on Xvfb — the BadAccess was measured and root-caused), drains through the existing
+  PointerTracker -> Android MotionEvent translation.
+- `input_wrapper::x11::register_window_connection`: the window layer registers the owner conn
+  (replacing Box::leak-only) so the pump selects on the same client = no BadAccess. Both wire_real_window
+  sites updated.
+- `session::drive_host_input_poll`: drains one non-blocking real-event batch -> drive_host_input_pump
+  -> nativePassInput, gated on JIT_AINPUT_BRIDGE + a real registered XID (+ live image). Inert on the
+  current boot path (no live DM, no constructed screen). Opt-in `--v2boot-input-poll` rung.
+- 2 new tests: sh416 poll inert-guards (hermetic, no X server needed) + input-wrapper Xvfb
+  registered-window pump (real Xvfb). Workspace green (arm64jit lib 469/0, full 651/0).
+
+### Measured (real libroblox.so, runs/capture_sh416_input_poll.sh)
+- Real X window wired (XID 0x200000 on :275) as the guest ANativeWindow; the poll subscribed it,
+  drained 0 raw X events -> 0 translated -> 0 delivered, clean. The one-shot poll completes.
+- Fault AFTER the poll: the known run-variable nativeInit "outside image" ladder lane
+  (guestpc 0x1029f3f7c map-probe, EXIT 134) — pre-existing Route-B, unchanged, NOT this change.
+- SH415 substrate re-verified unregressed: 11/16 atoms Ok, EXIT 124. recon-v3 deliverables re-verified
+  green (24 task frames, swap Ok(0x1), 0 json, 0 crash).
+
+### Honest
+Does NOT manufacture a DataModel. Route-B live-DM structural gate UNCHANGED (DM-root [0x106a68818]=0,
+MH_APP_READY false). This is the cause-not-symptom input-axis runtime surface (BUILD-THE-RUNTIME):
+real desktop pointer input now has a wired path into the guest nativePassInput that fires the moment
+a completed do-init owns a live DM + a constructed login/home screen. Latent-but-correct exactly like
+SH132/SH413/414. elfjit.rs trimmed SH-prose comments (addresses kept) to stay under the 1MiB hook
+(1048539 B).
