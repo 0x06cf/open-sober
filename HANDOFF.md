@@ -1,5 +1,37 @@
 # Open Sober — Agent Handoff
 
+## SH468 (Sep 20, 2026, hermes-worker): pin the FULL login-vs-home discriminator through the real NativeHelper dispatch — the HOME / remembered-sign-in branch was an untested half of the recon-named login gate
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+re-verified green at THIS fresh HEAD first (capture_taskv4_frame.sh attempt 1:
+24 real task-driven frames `present swap Ok(0x1)`, dispatch #2206000, 196 node
+pops, 0 json abort, 0 crash, EXIT 124 = stable idle) — the deliverable survived
+the SH462 translate.rs production window byte-identical. Workspace green (cargo
+test --workspace EXIT 0; arm64jit lib 678->679 incl. 1 new sh468 hermetic;
+cargo build --workspace + --example elfjit OK). Production code UNCHANGED
+(test-only jni.rs addition).
+- **The gap closed:** recon-routeB names onDidLogInReceived "the only non-trivial
+  ABI gap" (VOID-with-String login-vs-home gate). The prior pins covered only
+  HALF of it: session.rs pinned empty-payload -> LOGIN; jni.rs's dispatch test
+  only asserted "returns void, does not fault" with a3=0. The HOME branch — a
+  NON-EMPTY payload (persisted `.ROBLOSECURITY`) -> MH_LOGGED_IN=1 -> the
+  remembered-sign-in path — was untested at the dispatch level, so a regression
+  that broke HOME (payload ignored / logged_in always false) would pass the
+  whole suite.
+- New hermetic `login_payload_discriminates_login_vs_home_through_dispatch`
+  pins the full truth table THROUGH the real dispatch (jni.rs test): empty
+  payload -> received+not-logged-in -> LOGIN; non-empty `.ROBLOSECURITY=...` ->
+  logged_in=true -> HOME; resolves the host discriminator the session reads
+  exactly. Public path exercised: `fire_nativehelper_login_payload` -> the SAME
+  registered CallVoidMethod shim (slot 61) the engine uses. Pure host logic,
+  no image/env, parallel-safe.
+- Honest: NOT a DM / NOT a live-DM step (Route-B live-DM gate UNCHANGED; DM-root
+  [0x106a68818]=0 structural per SH462/467). BUILD-THE-RUNTIME session-surface
+  contract completion: the "login renders first, home after remembered sign-in"
+  split the operator named is now a tested contract in both directions. No
+  re-treads (prior two tests each covered only one direction at one layer).
+- Files: docs/frontier-sh468-loginhome-discriminator.md + crates/arm64jit/src/
+  jni.rs (test-only). Commit (SH468).
+
 ## SH466 (Sep 20, 2026, hermes-worker): promote the SESSION PRODUCER HANDOFF gate core into the tested library — the recon-v3 §A END-STATE / SEP-17 self-drive decision logic is now a hermetic-pinned library contract, not example-only glue
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified
 green at this HEAD first (capture_taskv4_frame.sh attempt 1: 24 real task-driven

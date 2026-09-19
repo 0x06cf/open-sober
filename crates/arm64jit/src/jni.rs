@@ -1973,6 +1973,39 @@ mod tests {
         }
     }
 
+    /// SH468: pin the FULL login-vs-home discriminator through the real
+    /// `jni_call_void_method` dispatch, not just the empty-login direction.
+    /// `fire_nativehelper_login_payload` (SH410) is the host side of the
+    /// onDidLogInReceived VOID-with-String callback — the recon calls it "the
+    /// only non-trivial ABI gap" (the login-vs-home gate). The existing tests
+    /// only pin the session-level empty payload (session.rs
+    /// lifecycle_milestones_driven_in_order -> LOGIN) and the dispatch-level
+    /// "returns void, no fault" (nativehelper_game_activity_callbacks... with
+    /// a3=0). The HOME branch — a non-empty payload -> MH_LOGGED_IN=1 — was
+    /// untested at the dispatch level. Pin both directions via the public
+    /// helper so the remembered-sign-in path (the real app's "stay logged in")
+    /// is a tested contract, and the empty-payload LOGIN fallback stays exact.
+    #[test]
+    fn login_payload_discriminates_login_vs_home_through_dispatch() {
+        // Fresh state (mirrors the milestone test's reset).
+        MH_LOGIN_RECEIVED.store(0, AtOrd::Relaxed);
+        MH_LOGGED_IN.store(0, AtOrd::Relaxed);
+        // (1) EMPTY payload = no persisted credential -> received, NOT logged in
+        //     -> the session steers to LOGIN (the fresh headless first screen).
+        crate::jni::fire_nativehelper_login_payload(b"");
+        assert!(nativehelper_login_received(), "empty payload still records the callback arrived");
+        assert!(!nativehelper_logged_in(), "empty payload => logged_in=false => LOGIN screen");
+        // (2) lay the remembered-sign-in path over it: a NON-EMPTY payload is a
+        //     persisted credential -> logged_in=true => HOME. The dispatch must
+        //     flip the same latch the discriminator reads.
+        crate::jni::fire_nativehelper_login_payload(b".ROBLOSECURITY=abc123");
+        assert!(nativehelper_login_received(), "non-empty payload also records received");
+        assert!(nativehelper_logged_in(), "non-empty payload => logged_in=true => HOME screen");
+        // (3) the discriminator the session reads resolves both states exactly.
+        let screen = if crate::jni::nativehelper_logged_in() { "home" } else { "login" };
+        assert_eq!(screen, "home");
+    }
+
     /// The legacy V1 start entry nativeAppBridgeAppStart__ (file vaddr 0x2338510,
     /// guest 0x102338510) is the recon-v1 "still-live lower-effort alternative":
     /// it reads six JNI args straight from x2..x7 as String,String,Z,Boolean,
