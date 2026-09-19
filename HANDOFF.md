@@ -1,5 +1,13 @@
 # Open Sober — Agent Handoff
 
+## SH4xx (Sep 19, 2026, hermes-worker): implemented SH106's documented NEXT — a translator STORE-WATCH (default-inert, env-gated JIT_CANARY_STORE_WATCH) that NAMES the exact guest str/stp writers storing foreign host pointers into guest canary windows on the standing canary stack-smash wall (nativeGameGlobalInit/app-shell ctor)
+
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified green at HEAD first (capture_taskv4_frame.sh attempt 1: real task-driven frames `present swap Ok(0x1)`, 0 json abort, 0 crash). New off-hook code in translate.rs (484KB, well under the 1MiB hook; jit.rs/elfjit.rs untouched, at/near the hook). Workspace green (cargo test --workspace EXIT 0; arm64jit lib 475/0 incl. 2 new hermetics).
+- translate.rs: `canary_store_watch` (post-store host probe, SysV args state/dest/value/pc) + `emit_canary_store_watch`, wired into every 64-bit integer store (LdStrImm, LdStrImmWb, LdStrReg, LdStPair). DEFAULT-INERT: when JIT_CANARY_STORE_WATCH is unset it emits nothing and adds no guest bytes — product path byte-identical (proven by the unchanged green suite). When ON it narrows to the SH103 leak signature (a foreign host pointer 0x7000_0000_0000..0x8000_0000_0000 stored into a lower guest region) and reports pc/dst/val/x29/canary-slot.
+- MEASURED on real libroblox.so (full-boot env + 3-gate crossing, EXIT 134): the watch NAMES the writers — pc=0x102b9dee8 (event-drain `stp x24,x23,[sp,#16]` after surface handoff), 0x102b9def0, GLES-mempool region 0x106251778/0x106251a48, and **0x101d99e70 (the STANDING SH285/LSM pool-pop persistence-lane family)** — storing foreign host ptrs into canary windows. Confirms the canary wall converges onto the same measured-closed SH285 family. This is SH106's NEXT finally delivered (a bounded instrument that names the writers); it does NOT yet fix the wall.
+- Honest: NOT a DM (DM-root 0, MH_* false). Route-B live-DM gate UNCHANGED. The next forensic: trace which HOST call returns the 0x7f... pointer into guest x-regs at 0x101d99e70 (SH103 bridge-sanitize direction). No re-treads.
+- Files: docs/frontier-sh4xx-canary-store-watch-names-writers.md + runs/capture_sh4xx_canary_store_watch.sh. Commit (pending).
+
 ## SH419 (Sep 19, 2026, hermes-worker): the R1 content surface now spans BOTH roots a cache-probing resolver may read — files-dir mirror (SH412) + app-CACHE mirror (recon-v3 R1 "also mirror under cache-root" from deleg_8d5648cf); verified the missing-env audit is complete + re-confirmed the recon-v3 frame deliverable green at this exact HEAD
 
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables

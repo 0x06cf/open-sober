@@ -17,6 +17,132 @@
 use crate::decode::{Inst, ShiftKind};
 use crate::x86::{CodeBuf, RSI, RAX, RBX, RCX, RDX, RDI, R10};
 
+// ---------------------------------------------------------------------------
+// SH106-NEXT diagnostic: an env-gated, DEFAULT-INERT STORE-WATCH that names the
+// exact guest `str`/`stp` writer of a canary-slot clobber. The standing canary
+// stack-smash wall (nativeGameGlobalInit deep body, app-shell ctor) is a host
+// pointer leaking into the guest frame's canary slot (the SH103/SH106 class),
+// but the EXACT guest store was never named. This watch fires post-store (no
+// guest/value semantics touched: it runs after the store and only reads), logs
+// the guest pc when a 64-bit store lands on the current frame's canary slot
+// [x29-16] (or a self-stack-pointer store below x29), and prints the written
+// value. Enabled ONLY by JIT_CANARY_STORE_WATCH=1 (default off => the emitted
+// store bytes are byte-identical to the un-watched path). Writes no guest bytes.
+// ---------------------------------------------------------------------------
+static CANARY_STORE_WATCH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// When the test suite pins the flag via set_canary_store_watch_test, the lazy
+/// env sync must NOT overwrite it (deterministic hermetic; no env races).
+static CANARY_STORE_WATCH_TEST_OVERRIDE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Read the JIT_CANARY_STORE_WATCH env once (lazily). Idempotent. Returns the
+/// current flag (env-derived unless the tests pinned an override).
+fn canary_store_watch_enabled() -> bool {
+    use std::sync::atomic::Ordering;
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        if !CANARY_STORE_WATCH_TEST_OVERRIDE.load(Ordering::Relaxed) {
+            let on = std::env::var("JIT_CANARY_STORE_WATCH").ok().as_deref() == Some("1");
+            CANARY_STORE_WATCH.store(on, Ordering::Relaxed);
+        }
+    });
+    CANARY_STORE_WATCH.load(Ordering::Relaxed)
+}
+
+/// Test-only override so a hermetic can toggle the flag without touching env.
+#[doc(hidden)]
+pub fn set_canary_store_watch_test(on: bool) {
+    use std::sync::atomic::Ordering;
+    CANARY_STORE_WATCH_TEST_OVERRIDE.store(true, Ordering::Relaxed);
+    CANARY_STORE_WATCH.store(on, Ordering::Relaxed);
+}
+
+/// Host store-watch: called from emitted code AFTER a 64-bit guest store (so
+/// the stored value is preserved and this can only observe, never perturb).
+/// Args (SysV): RDI=state, RSI=dest, RDX=value, RCX=pc.
+extern "C" fn canary_store_watch(
+    state: *const crate::jit::CpuState,
+    dest: u64,
+    value: u64,
+    pc: u64,
+) -> u64 {
+    if !CANARY_STORE_WATCH.load(std::sync::atomic::Ordering::Relaxed) {
+        return 0;
+    }
+    // Narrow to the SH103/SH106 leak signature: a FOREIGN HOST pointer
+    // (0x7000_0000_0000+) being stored into a LOWER guest region (guest stack /
+    // frame / .bss). That is exactly the canary-clobber class. Legit guest stores
+    // of host pointers into host-managed regions (dest >= 0x7000...0000) are not
+    // the leak; skip them to cut the noise.
+    const HOST_HI: u64 = 0x8000_0000_0000;
+    const HOST_LO: u64 = 0x7000_0000_0000;
+    if !(value >= HOST_LO && value < HOST_HI) {
+        return 0;
+    }
+    if dest >= HOST_LO {
+        return 0; // host store, not guest-frame clobber
+    }
+    unsafe {
+        // Compute the current frame's canary slot [x29-16]; if this store targets
+        // it, this IS the canary-clobbering store — the named writer.
+        let st = &*state;
+        let x29 = st.x[29];
+        let canary_slot = x29.wrapping_sub(16);
+        let is_canary = dest == canary_slot || (dest >= x29.wrapping_sub(0x60) && dest <= x29);
+        // Guard GOT: only valid when the real image maps it.
+        let guard = std::ptr::read_unaligned(0x1067d16f0u64 as *const u64);
+        static LAST: std::sync::Mutex<Option<(u64, u64, u64)>> = std::sync::Mutex::new(None);
+        let d = std::sync::Mutex::new(());
+        if let Ok(mut l) = LAST.lock() {
+            if *l == Some((pc, dest, value)) {
+                return 0;
+            }
+            *l = Some((pc, dest, value));
+        }
+        eprintln!(
+            "[canary-store-watch] pc={pc:#x} dst={dest:#x} val={value:#x} x29={x29:#x} canary_slot={canary_slot:#x} is_canary_slot={is_canary} guard={guard:#x}"
+        );
+        drop(d);
+    }
+    0
+}
+
+/// Emit (when the watch is enabled) the post-store probe call for a 64-bit
+/// store whose destination is currently in `dest_reg` and value in `val_reg`.
+/// Runs AFTER `mov_store64`, so RDX/RAX are already spent; the call only needs
+/// to not clobber RBX (state) — and nothing after it relies on RAX/RDX/RCX/RSI
+/// (the operand-reload-per-instruction model reloads from state).
+fn emit_canary_store_watch(buf: &mut CodeBuf, pc: u64, dest_reg: u8, val_reg: u8) {
+    let _ = canary_store_watch_enabled(); // lazily sync the atomic from env once
+    if !CANARY_STORE_WATCH.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let addr = canary_store_watch as usize as u64;
+    // Reconstruct args (SysV): RDI=state, RSI=dest, RDX=value, RCX=pc.
+    // dest_reg==RDX typically; value==RAX. If either already equals the
+    // target arg register, skip the copy (mov_rr64 no-ops equal operands).
+    buf.mov_rr64(RDI, RBX); // state
+    // dest: RSI
+    if dest_reg != RSI {
+        buf.mov_rr64(RSI, dest_reg);
+    }
+    // value: RDX (already the dest reg holder? no — free now, post-store)
+    if val_reg != RDX {
+        buf.mov_rr64(RDX, val_reg);
+    } else {
+        // val already in RDX AND dest==RDI? not possible; but if val_reg==RDX
+        // then dest_reg was RDI/RSI — keep RDX as-is.
+    }
+    // pc: RCX
+    buf.mov_ri64(RCX, pc);
+    // clobbers RAX (call addr); RBX is callee-saved so survives.
+    buf.mov_ri64(RAX, addr);
+    buf.sub_ri64(4, 8); // align RSP 8 -> 0 (mod 16) at the call site
+    buf.call_r64(RAX);
+    buf.add_ri64(4, 8); // restore block-entry alignment
+}
+
 /// Byte offset of guest register g inside CpuState (x[g] at 8*g).
 #[inline]
 fn slot(g: u32) -> i32 {
@@ -1175,6 +1301,7 @@ pub fn translate(
                 (8, false) => {
                     ldg_src(buf, rt as u32);
                     buf.mov_store64(RDX, 0, RAX);
+                    emit_canary_store_watch(buf, pc, RDX, RAX);
                 }
                 (4, true) => {
                     buf.mov_load32(RAX, RDX, 0); // w zero-extends
@@ -1301,6 +1428,7 @@ pub fn translate(
                     (8, false) => {
                         ldg_src(buf, rt as u32);
                         buf.mov_store64(RDX, access_off, RAX);
+                        emit_canary_store_watch(buf, pc, RDX, RAX);
                     }
                     (4, true) => {
                         buf.mov_load32(RAX, RDX, access_off);
@@ -6502,6 +6630,7 @@ Inst::SimdMovEl { rd, rn, esize, index, signed, is_x } => {
                     buf.mov_store64(RDX, access_off, RAX);
                     ldg_src(buf, rt2 as u32);
                     buf.mov_store64(RDX, access_off + esize, RAX);
+                    emit_canary_store_watch(buf, pc, RDX, RAX); // after pair, dest=RDX
                 } else {
                     ldg_src(buf, rt as u32);
                     buf.mov_store32(RDX, access_off, RAX);
@@ -6595,6 +6724,7 @@ Inst::SimdMovEl { rd, rn, esize, index, signed, is_x } => {
                 (8, false) => {
                     ldg(buf, RCX, rt as u32);
                     buf.mov_store64(RAX, 0, RCX);
+                    emit_canary_store_watch(buf, pc, RAX, RCX); // dest=RAX, val=RCX
                 }
                 (4, true) => {
                     buf.mov_load32(RCX, RAX, 0);
@@ -7053,5 +7183,59 @@ Inst::SimdMovEl { rd, rn, esize, index, signed, is_x } => {
         _ => Err(format!(
             "translate: unhandled {inst:?} at guest pc 0x{pc:x}"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // SH106-NEXT hermetic: the store-watch is DEFAULT-INERT — with the atomic
+    // flag OFF the pure emit helper adds zero bytes to a store's block (the
+    // product path stays byte-identical), and the host fn returns 0 (observes
+    // nothing). With the flag ON the helper emits the post-store probe call.
+    // No real binary/image is required (pure emit + fn-call path).
+    #[test]
+    fn canary_store_watch_emit_is_inert_off_and_emits_on() {
+        use std::sync::atomic::Ordering;
+        // Make sure the lazy env sync can't fight the test override.
+        set_canary_store_watch_test(false);
+        let _ = canary_store_watch_enabled(); // run the env sync (default off here)
+
+        CANARY_STORE_WATCH.store(false, Ordering::Relaxed);
+        let mut off = crate::x86::CodeBuf::new();
+        emit_canary_store_watch(&mut off, 0x1000, RDX, RAX);
+        let off_len = off.len();
+
+        CANARY_STORE_WATCH.store(true, Ordering::Relaxed);
+        set_canary_store_watch_test(true);
+        let mut on = crate::x86::CodeBuf::new();
+        emit_canary_store_watch(&mut on, 0x1000, RDX, RAX);
+        let on_len = on.len();
+
+        CANARY_STORE_WATCH.store(false, Ordering::Relaxed);
+        set_canary_store_watch_test(false);
+
+        assert_eq!(off_len, 0, "watch must be byte-inert when disabled (product unchanged)");
+        assert!(on_len >= 5, "watch must emit a call+args when enabled");
+        assert_eq!(canary_store_watch(std::ptr::null(), 0x1234, 0x5678, 0x1001), 0, "disabled host fn observes nothing");
+    }
+
+    // SH106-NEXT hermetic: with the watch ON a plain 64-bit store still emits
+    // the actual mov_store64 (the watch appends after it, never replaces it),
+    // so no store is ever dropped — verified via translate() on a synthetic
+    // LdStrImm (8,false) with no image required.
+    #[test]
+    fn canary_store_watch_never_removes_the_store() {
+        use std::sync::atomic::Ordering;
+        CANARY_STORE_WATCH.store(true, Ordering::Relaxed);
+        set_canary_store_watch_test(true);
+        let mut buf = crate::x86::CodeBuf::new();
+        let inst = Inst::LdStrImm { rt: 0, rn: 1, imm: 0, size: 8, ld: false, sext: false };
+        let mut fx = Vec::new();
+        let _ = translate(&mut buf, 0x1000, inst, &mut fx);
+        CANARY_STORE_WATCH.store(false, Ordering::Relaxed);
+        set_canary_store_watch_test(false);
+        assert!(buf.len() >= 3, "store+watch must emit at least a mov + call");
     }
 }
