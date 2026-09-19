@@ -10077,6 +10077,64 @@ mod tests {
     }
 
     #[test]
+    fn sh457_pmull_low64_movq_pclmulq_128bit_store() {
+        // pmull v1.1Q, v2.1D, v3.1D (hi=false): 64x64 carry-less (polynomial)
+        // multiply -> 128-bit via x86 PCLMULQDQ imm=0x00. EMIT: movq_load
+        // xmm0=[0x130] (f3 48 0f 7e, low64 of Vn) + movq_load xmm1=[0x140]
+        // (f3 48 0f 7e, low64 of Vm) + `pclmulqdq xmm0,xmm1,0x00` (66 0f 3a 44
+        // c1 00) + movdqu_store 0x120 (f3 0f 7f). rd=1 rn=2 rm=3 -> Vn@0x130
+        // Vm@0x140 Vd@0x120. A pclmulq slip (the wrong 2-vs-3-byte form) or a
+        // 16B-vs-8B store shows in the exact buffer.
+        let b = tr_bytes(Inst::Pmull1q { rd: 1, rn: 2, rm: 3, hi: false });
+        assert_eq!(b, vec![
+            0xf3, 0x48, 0x0f, 0x7e, 0x83, 0x30, 0x01, 0x00, 0x00, // movq xmm0,[rbx+0x130] Vn low64
+            0xf3, 0x48, 0x0f, 0x7e, 0x8b, 0x40, 0x01, 0x00, 0x00, // movq xmm1,[rbx+0x140] Vm low64
+            0x66, 0x0f, 0x3a, 0x44, 0xc1, 0x00,                   // pclmulqdq xmm0,xmm1,0x00
+            0xf3, 0x0f, 0x7f, 0x83, 0x20, 0x01, 0x00, 0x00,       // movdqu [rbx+0x120],xmm0 (128b)
+        ]);
+        assert!(b.windows(6).any(|w| w == [0x66, 0x0f, 0x3a, 0x44, 0xc1, 0x00]), "pmull = PCLMULQDQ xmm0,xmm1,0x00 (66 0f 3a 44)");
+        assert!(b.windows(8).any(|w| w == [0xf3, 0x0f, 0x7f, 0x83, 0x20, 0x01, 0x00, 0x00]), "128-bit result stored via movdqu (f3 0f 7f, 16B)");
+    }
+
+    #[test]
+    fn sh457_pmull_hi2_high_half_source_offset() {
+        // pmull2 (hi=true): identical emit EXCEPT the selected 64-bit halves are
+        // the UPPER elements (bytes 8..15) of Vn/Vm — sources advance +8 to
+        // 0x138/0x148 (vs hi=false's 0x130/0x140). The hi flag is the ONLY thing
+        // that moves the sources; the pclmulq imm stays 0x00 and the store stays
+        // at Vd 0x120. A flub reading the low half still "works" arithmetically
+        // but multiplies the wrong polynomial elements (silent wrong value).
+        let hi = tr_bytes(Inst::Pmull1q { rd: 1, rn: 2, rm: 3, hi: true });
+        // high-half source reads
+        assert!(hi.windows(9).any(|w| w == [0xf3, 0x48, 0x0f, 0x7e, 0x83, 0x38, 0x01, 0x00, 0x00]), "pmull2 reads Vn high half at 0x138");
+        assert!(hi.windows(9).any(|w| w == [0xf3, 0x48, 0x0f, 0x7e, 0x8b, 0x48, 0x01, 0x00, 0x00]), "pmull2 reads Vm high half at 0x148");
+        // the imm + opcode + store unchanged from hi=false
+        assert!(hi.windows(6).any(|w| w == [0x66, 0x0f, 0x3a, 0x44, 0xc1, 0x00]), "pmull2 still PCLMULQDQ imm=0x00");
+        assert!(hi.windows(8).any(|w| w == [0xf3, 0x0f, 0x7f, 0x83, 0x20, 0x01, 0x00, 0x00]), "pmull2 stores at Vd 0x120 (same 128b)");
+        // negative: hi=true must NOT read the low halves.
+        assert!(!hi.windows(9).any(|w| w == [0xf3, 0x48, 0x0f, 0x7e, 0x83, 0x30, 0x01, 0x00, 0x00]), "pmull2 must NOT read Vn low half 0x130");
+        assert!(!hi.windows(9).any(|w| w == [0xf3, 0x48, 0x0f, 0x7e, 0x8b, 0x40, 0x01, 0x00, 0x00]), "pmull2 must NOT read Vm low half 0x140");
+        // control: hi=false reads the low halves.
+        let lo = tr_bytes(Inst::Pmull1q { rd: 1, rn: 2, rm: 3, hi: false });
+        assert!(lo.windows(9).any(|w| w == [0xf3, 0x48, 0x0f, 0x7e, 0x83, 0x30, 0x01, 0x00, 0x00]), "pmull (hi=false) reads Vn low half 0x130");
+    }
+
+    #[test]
+    fn sh457_pmull_pclmulq_imm_selects_direction() {
+        // The pclmulq immediate (0x00 = low64 x low64) is the pmull1q semantic.
+        // The byte lock is the three-byte PCLMULQDQ opcode 66 0f 3a 44 with the
+        // imm following in the /r ib: the polynomial multiply must never degrade
+        // to an integer mul (48 0f af) or a different imm that crosses halves
+        // (0x11/0x10/0x01 would select the wrong 64-bit lanes and corrupt the
+        // carry-less result's polynomial degree).
+        let b = tr_bytes(Inst::Pmull1q { rd: 1, rn: 2, rm: 3, hi: false });
+        assert!(b.windows(6).any(|w| w == [0x66, 0x0f, 0x3a, 0x44, 0xc1, 0x00]), "the imm 0x00 selects low64 x low64");
+        assert!(!b.windows(6).any(|w| w == [0x66, 0x0f, 0x3a, 0x44, 0xc1, 0x01]), "imm must not select vn.low x vm.high");
+        assert!(!b.windows(6).any(|w| w == [0x66, 0x0f, 0x3a, 0x44, 0xc1, 0x10]), "imm must not select vn.high x vm.low");
+        assert!(!b.windows(3).any(|w| w == [0x48, 0x0f, 0xaf]), "pmull must NOT degrade to an integer imul (48 0f af)");
+    }
+
+    #[test]
     fn sh456_vshift_sshl_d8_full_buffer() {
         // sshl vL.2d, vV.2d, vC.2d (esize=8 signed_=true): per-lane variable
         // shift. bbits==64 (no wmask, no out-of-range clamp because x86's
