@@ -1,5 +1,43 @@
 # Open Sober — Agent Handoff
 
+## SH420 (Sep 26, 2026, hermes-worker): a `__stack_chk_fail` host shim NAMES the GENUINE canary `*** stack smashing ***` wall's failing frame — the STATUS-#2 "distinct store on the deeper nativeGameGlobalInit ladder" finally measured against ITS OWN canary slot, with an instrument that fires ONCE (zero scheduling perturbation)
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+re-verified green at HEAD (capture_taskv4_frame.sh: real task-driven frames
+`present swap Ok(0x1)`, 0 json abort, 0 crash). Workspace green (cargo test
+--workspace EXIT 0; arm64jit lib 477/0 incl. the new sh420 hermetic; cargo
+build --example elfjit OK). Production code ONLY in shims.rs (off-hook, 130KB);
+jit.rs/elfjit.rs untouched (both at/near the 1MiB hook, byte-unchanged).
+- The SH4xx store-watch is DOUBLY inadequate for the genuine wall: (a) it emits
+  a host call after EVERY 64-bit store, which perturbs scheduling so the run no
+  longer reproduces the stack-smash; (b) it filters to the SH103 leak class
+  (value >= 0x7000_0000_0000) only, so a canary clobber by any other value class
+  (a zeroed slot) is invisible. SH420 replaces it with a `__stack_chk_fail` host
+  shim (fires exactly once at the check failure; reads the dispatcher's
+  current_guest_pc = the guest return addr of the `bl __stack_chk_fail` = inside
+  the failing fn's epilogue; best-effort frame read; then forwards to the real
+  libc fail so the abort is byte-identical whether or not JIT_STACKCHK_DUMP=1).
+- shims.rs: `stack_chk_fail_dump` registered in register_shims() as
+  `__stack_chk_fail` (register_named precedence over the dlsym resolver), test
+  override (live) + muted forward for the hermetic; +hermetic
+  `stack_chk_fail_dump_returns_safely_under_test_override`.
+- MEASURED on real libroblox.so (SH54 full-boot env + 3-gate crossing,
+  JIT_STACKCHK_DUMP=1, EXIT 134). The one-shot line names the wall:
+  `[stack_chk_fail] __guest_pc=0x102206d90 ... canary@-8=0x0 expected=0x55c6...` +
+  `*** stack smashing detected ***`. Disassembly pins it: file 0x2206c40 =
+  nativeGameGlobalInit body; prologue `stur x8,[x29,#-8]` @0x2206c70 stores the
+  canary; epilogue `cmp x8,x9; b.ne 0x2206d8c` @0x2206cf4; 0x2206d8c
+  `bl __stack_chk_fail@plt`. The canary slot [x29,#-8] is ZEROED during the
+  do-init once-path (a callee overruns it between 0x2206c70 and 0x2206cf4) — the
+  distinct clobber SH4xx-next anticipated, correlated against the wall's own slot.
+- Honest: NOT a DM (DM-root 0, no make_shared, MH_GAME_LOADED false). Route-B
+  live-DM structural gate UNCHANGED. This NAMES the genuine wall and its likely
+  writer window (do-init once-path callee overrunning [x29,#-8]); it does not fix
+  the zeroing. NEXT (STATUS #2): a store-watch scoped narrowly to that once-path
+  window (not the whole run) to name the exact zeroing writer. No re-treads
+  (mempool/LSM lane is a measured FALSE POSITIVE — do NOT chase it).
+- Files: docs/frontier-sh420-stackchk-fail-shim-names-wall.md +
+  runs/capture_sh420_stackchk_fail.sh. Commit 07a3082.
+
 ## SH4xx-next (Sep 26, 2026, hermes-worker): completed the SH4xx canary forensic's PRODUCER side — a default-inert host-RETURN leak watch (JIT_HOST_RETURN_WATCH=1) wired at the jit.rs integer host-return site (`s.x[0]=ret`) that logs every host fn whose return lands a foreign host pointer (0x7000..0x8000_0000_0000) in guest x0; MEASURED on real libroblox.so it round-trips the canary value by-exact-match and NAMES `boot.mempool_calloc` as the host producer of the canary-smashing pointer at pc=0x101d99e70
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 re-verified green at this HEAD first (capture_taskv4_frame.sh: real task-driven
