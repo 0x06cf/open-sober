@@ -23,7 +23,7 @@ new sh415 hermetic; cargo test --workspace EXIT 0).
   gate into a reported observable of the runtime — "measure, don't guess." recon-v3
   deliverables + Rule-1 regression all green at HEAD.
 - Files: docs/frontier-sh415-doinit-completion-observable.md +
-  runs/capture_sh415_doinit_completion.sh. Commit 6ff8a1c.
+  runs/capture_sh415_doinit_completion.sh. Commit bb87cb3.
 
 ## SH414 (Sep 22, 2026, hermes-worker): complete the INPUT runtime axis — the SEP-18 list's last part (session boot, screens, audio, input) was landed latent-but-correct by SH400-413, but the ainput bridge was ORPHANED (zero production callers) and input-wrapper was a DEV-ONLY dependency. SH414 wires them: input-wrapper promoted to a real arm64jit dep; new ainput::from_motion_event/deliver_motion (translated MotionEvent -> guest nativePassInput ABI) + session::drive_host_input_pump (a first-class host-input step, three inert guards, returns delivered count). This is the executable half of the input axis — a real host loop delivering X-window pointer events into the guest input native for a constructed login/home screen
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified
