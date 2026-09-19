@@ -10075,4 +10075,87 @@ mod tests {
         // no 64-bit movq in the single-precision q form.
         assert!(!b.windows(9).any(|w| w == [0xf3, 0x48, 0x0f, 0x7e, 0x83, 0x30, 0x01, 0x00, 0x00]), "4s q must stay single-path (no movq)");
     }
+
+    #[test]
+    fn sh454_fma3_fmadd_double_addsd_mulsd_direction() {
+        // fmadd d1, d2, d3, d4 (sz=true sub=false neg=false): Dd = Da + Dn*Dm.
+        // The EMIT is: movq_load xmm0=[0x130] (f3 48 0f 7e, Dn) + movq_load
+        // xmm1=[0x140] (Dm) + `mulsd xmm0,xmm1` (f2 0f 59 c1) + movq_load
+        // xmm2=[0x150] (Da) + `addsd xmm2,xmm0` (f2 0f 58 d0) + movq_store
+        // [0x120] (66 48 0f d6). The PROD direction is rn*rm (mulss into xmm0),
+        // and the accumulate is ra + prod — never prod + ra. rd=1 rn=2 rm=3 ra=4.
+        let b = tr_bytes(Inst::Fma3 { rd: 1, rn: 2, rm: 3, ra: 4, sz: true, sub: false, neg: false });
+        assert_eq!(b, vec![
+            0xf3, 0x48, 0x0f, 0x7e, 0x83, 0x30, 0x01, 0x00, 0x00, // movq xmm0,[rbx+0x130] Dn
+            0xf3, 0x48, 0x0f, 0x7e, 0x8b, 0x40, 0x01, 0x00, 0x00, // movq xmm1,[rbx+0x140] Dm
+            0xf2, 0x0f, 0x59, 0xc1,                               // mulsd xmm0,xmm1 -> prod
+            0xf3, 0x48, 0x0f, 0x7e, 0x93, 0x50, 0x01, 0x00, 0x00, // movq xmm2,[rbx+0x150] Da
+            0xf2, 0x0f, 0x58, 0xd0,                               // addsd xmm2,xmm0 = da+prod
+            0x66, 0x48, 0x0f, 0xd6, 0x93, 0x20, 0x01, 0x00, 0x00, // movq [rbx+0x120],xmm2
+        ]);
+        assert!(b.windows(4).any(|w| w == [0xf2, 0x0f, 0x59, 0xc1]), "fmadd = mulsd xmm0,xmm1 (f2 0f 59 c1)");
+        assert!(b.windows(4).any(|w| w == [0xf2, 0x0f, 0x58, 0xd0]), "fmadd = addsd xmm2,xmm0 (f2 0f 58 d0)");
+        // the double path stores via movq_store (66 48 0f d6), never movd (66 0f 7e).
+        assert!(b.windows(8).any(|w| w == [0x66, 0x48, 0x0f, 0xd6, 0x93, 0x20, 0x01, 0x00]), "double FMA stores via movq_store (66 48 0f d6)");
+    }
+
+    #[test]
+    fn sh454_fma3_fmsub_add_vs_sub_opcode_fnmsub_direction() {
+        // The sub/neg pair picks the accumulate opcode AND its direction:
+        // fmsub (sub=true neg=false): `subsd xmm2,xmm0` (f2 0f 5c d0) = da - prod;
+        // fnmsub (sub=true neg=true): `subsd xmm0,xmm2` (f2 0f 5c c2) = prod - da
+        // (the signed negation makes it rn*rm - da, REQUIRING the operands
+        // swapped — a lone subss in the wrong order negates the wrong term).
+        // The 0x58-adds-vs-0x5c-subsd opcode byte AND the c0/c2 operand order
+        // discriminate the four fmadd/fmsub/fnmadd/fnmsub combinations.
+        let sub = tr_bytes(Inst::Fma3 { rd: 1, rn: 2, rm: 3, ra: 4, sz: true, sub: true, neg: false });
+        assert!(sub.windows(4).any(|w| w == [0xf2, 0x0f, 0x5c, 0xd0]), "fmsub = subsd xmm2,xmm0 (da - prod, f2 0f 5c d0)");
+        assert!(!sub.windows(4).any(|w| w == [0xf2, 0x0f, 0x58, 0xd0]), "fmsub must NOT emit addsd");
+        let fnms = tr_bytes(Inst::Fma3 { rd: 1, rn: 2, rm: 3, ra: 4, sz: true, sub: true, neg: true });
+        assert!(fnms.windows(4).any(|w| w == [0xf2, 0x0f, 0x5c, 0xc2]), "fnmsub = subsd xmm0,xmm2 (prod - da, f2 0f 5c c2 — SWAPPED)");
+        assert!(!fnms.windows(4).any(|w| w == [0xf2, 0x0f, 0x5c, 0xd0]), "fnmsub must NOT emit the da-prod order");
+        assert!(!fnms.windows(4).any(|w| w == [0xf2, 0x0f, 0x58, 0xd0]), "fnmsub must NOT emit addsd");
+        // fnmsub stores from xmm0 (the prod-da result) — movq_store [0x120],xmm0 (83).
+        assert!(fnms.windows(8).any(|w| w == [0x66, 0x48, 0x0f, 0xd6, 0x83, 0x20, 0x01, 0x00]), "fnmsub stores xmm0 via movq [0x120] (83 base)");
+        // fmadd (control) takes the addsd path.
+        let add = tr_bytes(Inst::Fma3 { rd: 1, rn: 2, rm: 3, ra: 4, sz: true, sub: false, neg: false });
+        assert!(add.windows(4).any(|w| w == [0xf2, 0x0f, 0x58, 0xd0]), "fmadd = addsd xmm2,xmm0");
+    }
+
+    #[test]
+    fn sh454_fma3_fnmadd_negate_via_pxor_sub() {
+        // fnmadd (sub=false neg=true): -(Da + Dn*Dm) — emits addsd xmm2,xmm0
+        // then pxor xmm3,xmm3 (66 0f ef db, +0.0) then `subsd xmm3,xmm2`
+        // (f2 0f 5c da = 0 - xmm2) to NEGATE, storing FROM xmm3. The
+        // pxor+subsd-into-scratch is the negate discriminator vs the plain
+        // fnmsub's swapped subss — a flub that skips the 0-sub leaves the sign
+        // un-negated.
+        let b = tr_bytes(Inst::Fma3 { rd: 1, rn: 2, rm: 3, ra: 4, sz: true, sub: false, neg: true });
+        assert!(b.windows(4).any(|w| w == [0x66, 0x0f, 0xef, 0xdb]), "fnmadd negates via pxor xmm3,xmm3 (66 0f ef db)");
+        assert!(b.windows(4).any(|w| w == [0xf2, 0x0f, 0x5c, 0xda]), "fnmadd = subsd xmm3,xmm2 (0 - result, f2 0f 5c da)");
+        assert!(b.windows(8).any(|w| w == [0x66, 0x48, 0x0f, 0xd6, 0x9b, 0x20, 0x01, 0x00]), "fnmadd stores xmm3 via movq [0x120] (9b base)");
+        // the addsd-before-negate ordering.
+        let add_pos = b.windows(4).position(|w| w == [0xf2, 0x0f, 0x58, 0xd0]).unwrap();
+        let pxor_pos = b.windows(4).position(|w| w == [0x66, 0x0f, 0xef, 0xdb]).unwrap();
+        assert!(add_pos < pxor_pos, "fnmadd must add before negating");
+    }
+
+    #[test]
+    fn sh454_fma3_single_precision_mulss_addss_width() {
+        // fmadd s1, s2, s3, s4 (sz=false): the SINGLE-precision path swaps to
+        // movd_xmm_r32 (66 0f 6e) + mulss (f3 0f 59 c1) + addss (f3 0f 58 d0) +
+        // movd_r32_xmm (66 0f 7e) + 32-bit store (89 83). The F3-Mulss-vs-F2-
+        // Mulsd prefix is the single-vs-double width discriminator. 4 operands
+        // at 0x130/0x140/0x150, dst 0x120.
+        let b = tr_bytes(Inst::Fma3 { rd: 1, rn: 2, rm: 3, ra: 4, sz: false, sub: false, neg: false });
+        assert!(b.windows(4).any(|w| w == [0x66, 0x0f, 0x6e, 0xc0]), "single loads Vn via movd xmm0,eax (66 0f 6e c0)");
+        assert!(b.windows(4).any(|w| w == [0xf3, 0x0f, 0x59, 0xc1]), "single = mulss xmm0,xmm1 (f3 0f 59 c1)");
+        assert!(b.windows(4).any(|w| w == [0xf3, 0x0f, 0x58, 0xd0]), "single = addss xmm2,xmm0 (f3 0f 58 d0)");
+        assert!(b.windows(4).any(|w| w == [0x66, 0x0f, 0x7e, 0xd0]), "single = movd eax,xmm2 (66 0f 7e d0)");
+        assert!(b.windows(6).any(|w| w == [0x89, 0x83, 0x20, 0x01, 0x00, 0x00]), "single stores 32-bit dst (89 83)");
+        // width: single must NOT use mulsd/addsd/movq_store.
+        assert!(!b.windows(4).any(|w| w == [0xf2, 0x0f, 0x59, 0xc1]), "single must NOT emit mulsd (f2 0f 59)");
+        assert!(!b.windows(4).any(|w| w == [0xf2, 0x0f, 0x58, 0xd0]), "single must NOT emit addsd (f2 0f 58)");
+        assert!(!b.windows(8).any(|w| w == [0x66, 0x48, 0x0f, 0xd6, 0x93, 0x20, 0x01, 0x00]), "single must NOT emit movq_store (66 48 0f d6)");
+    }
 }
