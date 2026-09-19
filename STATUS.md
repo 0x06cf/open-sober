@@ -1,43 +1,50 @@
 # Open-Sober run status (hermes-worker)
 
-Updated 2026-09-19, this session: SH334 — LIVE answer to the standing "App"-registration question
-(candidate #1) via a default-inert block-entry registry readout at the DM-ctor lookup, surviving the
-FMOD/LSM crash; workspace green with 2 new hermetic tests.
+Updated 2026-09-19/20, this session: SH367 = MEASURED NEGATIVE — arming the real window-attach
+GL-surface path faults (SH366 next-forward executed); the SH366 clean INIT_WINDOW drive is
+preserved and the fault is pinned one level deeper into the deep GL post-init 0x22985c0.
+Route-B live-DM structural gate UNCHANGED (DM-root 0, MH_* false).
 
 ## Current state
 
-- `dev` HEAD: to be committed (SH334). Clean after commit, NOT pushed (operator pushes).
-- `cargo test --workspace` green (arm64jit lib 410/0 incl. 2 new sh334 tests; elfjit examples 154/0; all crates 0 fail). elfjit.rs byte-identical at 1048570 B (under 1MB pre-commit hook — not touched this cycle).
-- New repro probe: `runs/probe_sh334_reglive.sh`. New frontier doc: `docs/frontier-sh334-reglive.md`.
+- `dev` HEAD (local): SH367 (window-attach real-path measured negative; SH366 clean drive preserved).
+- Workspace green (cargo test --workspace EXIT 0, 610 passed/0 failed; arm64jit lib 430).
+- Route-B live-DM structural gate UNCHANGED: DM-root [0x106a68818]=0x0, MH_* all false.
+- recon-v3 immediate-priority deliverables CONFIRMED green at HEAD.
 
 ## What advanced this session
 
-- **SH334 (measured 3/3 deterministic):** added `routeb_registry_live_guard` (crates/arm64jit/src/jit.rs,
-  opt-in `JIT_ROUTEB_REG_LIVE=1`, read-only, fires once) that snapshots the service-registry count +
-  entry names + DM-root + once-slot + tier-2 controller cell at the EXACT moment the DM-controller
-  ctor's name->service lookup (fn 0x2168798, entry 0x102168798) runs — BEFORE the run-variable
-  FMOD/LSM crash that makes the post-ladder dump() unreachable.
-- **Decisive result:** at the ctor lookup, `service-registry-count[0x106fe2f08]=0 entries=[] DM-root=0
-  once-slot=0 fixidx0=0 tier2-cell=""` — the registry is EMPTY when the lookup runs on the SH332-style
-  MAIN path, so "App" is NOT registered before the crash. This resolves candidate #1's long-standing
-  "open but UNCHANGED" status with a live measurement: the registration-walk+lookup execute, but they
-  do not produce the "App" entry before the run dies. Consistent with SH315/318 (only the bus route
-  populates the registry, and even then no "App").
-- Terminal remains run-variable (FMOD 0x106240cb8 / LSM reader 0x101dcab68 / leaked-host-pc) — the
-  SH332/SH330-class known downstream, no new stable gate.
+- **SH367**: executed + MEASURED the SH366 next-forward (hand a REAL wired ANativeWindow so
+  window-attach 0x2bd29a0 takes its real GL-surface path). Arming the once-guard
+  ([win+0x268].bit0=1) + crafting [win+0x278] + registering XID=0x200000 made the run HARD-FAULT
+  (8/8 EXIT 134/139, marker never set, fault guestpc=0x7f0000001f50 fault=0x7f818c0097) because the
+  deep GL post-init 0x22985c0 needs a REAL EGL surface/context — a fabricated obj cannot satisfy it.
+  **Reverted** to the SH366 clean drive; re-verified clean (process_cmd Ok, [inner+9] marker set,
+  artifact attempt 1: EXIT 124 crash 0). Added read-only routeb_glue_realattach_guard + sh367
+  hermetic (arm64jit lib 430). This CONFIRMS the window precondition is a real GL-surface wall on
+  the SESSION-CTOR line, not a seedable global.
 
 ## Honest status
 
-- No DM (DM-root [0x106a68818]=0, MH_* false); Route-B live-DM structural gate UNCHANGED.
-- SH334 measures and resolves candidate #1's open status (registry empty at the ctor lookup on the
-  MAIN path); it does not manufacture a DataModel. The SESSION-CTOR "App"-registration remains the
-  standing unblock.
+- Route-B live-DM structural gate UNCHANGED. Do-init still never owns a live DataModel
+  (DM-root 0, MH_* false). SH174 capture-latch stays the single forward observer.
+- SH367 does not manufacture a DM; it closes the \"arm the once-guard to force the real
+  window-attach path\" candidate with evidence and pins the real GL-surface completion as a
+  genuine Session-Ctor wall.
 
 ## Next-forward candidates
 
-1. (SESSION-CTOR) The "App" service registration so the DM-ctor fast-path resolves a live controller.
-   SH334 pins the decisive measurement point (empty registry at the lookup); the remaining work is to
-   get a REAL app-start session to register "App" (SH313/315/316/317/318 line) — live-state work.
-2. Clear the FMOD/AAudio + LSM reader run-variable walls (0x106240cb8 / 0x101dcab68) only if a stable
-   gate can be pulled from them — note SH212/213/132/SH332 class them run-variable/non-seedable
-   (do-not-re-derive); SH334 now gives a live readout that survives them, so the dump-gap is closed.
+1. (PRIMARY, standing) The SESSION half remains THE wall: do-init must own a live DM (SH184/185
+   four-stacked closure). Persistence lane measured unbounded (SH349/350/358), dispatch body
+   unreachable (SH362), receive cb never entered (SH347/364), app-command drain dead (SH365),
+   real window-attach GL completion faults on a fabricated obj (SH367) — all point to a REAL
+   Android Activity/AppBridge session drive with a genuine EGL surface + onAppReady + real jstring,
+   per the operator's SESSION-CTOR directive.
+2. The window-attach COMPLETION (0x22985c0 deep GL post-init) needs a genuine EGL surface/context —
+   wire a real ANativeWindow/surface into the session drive (not a fabricated obj; SH367).
+3. R1 content half is staged + armed + serviceable (SH351/352/354); fires the moment a live DM
+   drives the loader.
+4. Do NOT re-arm the window-attach once-guard (SH367 measured fault); do NOT re-enter the ALooper
+   glue LOOP (SH365); bounded process_cmd remains the guarded entry (SH366); do NOT re-drive LSM
+   sub-call skips (SH349/350/358); do NOT seed [0x106a64da0] (SH362); do NOT re-attack EC
+   reader-gate (SH356); do NOT seed [0x107275550] (SH359).

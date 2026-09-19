@@ -674,6 +674,37 @@ fn routeb_appstart_408_benign_obj() -> u64 {
     })
 }
 
+/// SH367 (opt-in JIT_ROUTEB_GLUE_REALATTACH=1): READ-ONLY observation that the armed real
+/// window-attach path (SH367, --v2boot-glue-cmd) actually entered the deep GL post-init.
+/// SH366's window-attach 0x2bd29a0 benign-returned on the zeroed once-guard [win+0x268]==0.
+/// With the once-guard ARMED (bit0=1) + [win+0x278] crafted, the body's tbz @0x2bd2a14 is not
+/// taken -> bl 0x2291c24 (returns 1) -> add x0,x19,#0x278 @0x2bd2a24 -> bl 0x22985c0 (real GL
+/// post-init; its `cbz [x0]` @0x22985c4 fast-returns 1 on a NULL first word). Fires when a
+/// block-entry pc in that real chain is reached, proof the real GL-surface path ran headlessly.
+fn routeb_glue_realattach_guard(state: *mut CpuState, pc: u64) {
+    if std::env::var("JIT_ROUTEB_GLUE_REALATTACH").ok().as_deref() != Some("1") {
+        return;
+    }
+    // Block-entry pcs in the armed window-attach REAL chain after the once-guard branch:
+    // 0x102bd2a18 (add x0,x19,#0x278; bl 0x2291c24) and 0x102bd2a24 (add x0,x19,#0x278; bl 0x22985c0).
+    if pc != 0x102bd2a18 && pc != 0x102bd2a24 {
+        return;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let s = unsafe { &*state };
+    let x19 = s.x[19];
+    let globj = if x19 != 0 && x19 < 0x8000_0000_0000 {
+        unsafe { std::ptr::read_unaligned((x19 + 0x278) as *const u64) }
+    } else {
+        0
+    };
+    ONCE.call_once(move || {
+        eprintln!(
+            "[routeb-glue-realattach] SH367 window-attach REAL GL path entered @0x{pc:x} (win obj x19={x19:#x} [x19+0x278]={globj:#x}) — once-guard armed, GL post-init reached headlessly"
+        );
+    });
+}
+
 /// SH347 (opt-in JIT_ROUTEB_BUSRECV=1): MEASURE the SEP-17 messageBus experience-launch
 /// RECEIVE path headlessly. SH185 closed this by STATIC judgment only (cb 0x102bd76e8 reads the
 /// DM holder [x20+16]; static "subscribe never registers"). SH269/315/316/337 later MEASURED that
@@ -818,6 +849,15 @@ pub fn drive_messagebus_publish_receive_payload(
 /// makes the dispatcher take the INIT_WINDOW body, set [inner+9]=1, and call the real
 /// window-attach path headlessly for the first time. Returns Ok(0); the [inner+9]==1 marker
 /// proves the engine's own INIT_WINDOW case EXECUTED. Single jit_run, serialized.
+/// SH367 (opt-in --v2boot-glue-cmd): MEASURED NEGATIVE — the once-guard-armed real window-attach
+/// path faults. Window-attach 0x2bd29a0, with [win+0x268].bit0 ARMED, falls into the real GL
+/// post-init chain: bl 0x2291c24 (returns ([?win+0x278]!=0)) then bl 0x22985c0, whose DEEP body
+/// (cbz @0x22985c4 NOT fast-returned, because the crafted non-null obj makes 0x2291c24 return 1)
+/// needs a REAL EGL surface/context object — a fabricated NULL-first-word obj cannot satisfy it,
+/// and the run SIGSEGVs inside the host GL dispatch (guestpc=0x7f0000001f50 fault=0x7f818c0097,
+/// EXIT 134) before the INIT_WINDOW body completes. This pins the real window-attach COMPLETION
+/// (and the do-init chain) as the standing Session-Ctor wall, one level deeper than SH366. Keep
+/// the once-guard OFF (SH366 clean entry) so the drive stays confirmed-green.
 pub fn drive_glue_process_cmd(iimg: &[u8], ib: u64, tpidr: u64, boot_sp: u64) -> u64 {
     // Version gate word [0x10683d8b0]: keep 0 so `b.cc`/`cbz` route straight to the body.
     const VERSION_GATE: u64 = 0x10683d8b0;
@@ -6993,6 +7033,7 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         routeb_appstart_408_guard(state, pc); // SH330: seed [AppStarted+0x408] (runtime heap x19) benign vt[+136] leaf at the 0x25f5050 gate (JIT_ROUTEB_APPSART_408SEED, standalone)
         routeb_busrecv_holder_guard(state, pc); // SH347 (JIT_ROUTEB_BUSRECV): measure [DataModelBindings+16] at the messageBus experience-launch cb (file 0x2bd7474) — receive-side DM holder readback (READ-ONLY, once)
         routeb_busrecv_cb_entry_guard(state, pc); // SH364 (JIT_ROUTEB_BUSRECV): measure whether the messageBus receive cb BODY (file 0x2bd744c) is ENTERED at all headlessly — distinguishes publish-side topic-match failure from live-DM-holder-null (READ-ONLY, once)
+        routeb_glue_realattach_guard(state, pc); // SH367 (JIT_ROUTEB_GLUE_REALATTACH): READ-ONLY — proof the armed real window-attach GL path (@0x102bd2a18/0x102bd2a24, bl 0x22985c0) is ENTERED headlessly, not benign-returned on the zeroed once-guard (once)
         routeb_cookie_jar_guard(state, pc); // SH175: seed cookie-jar container + gates at worker 0x102203148 (JIT_ROUTEB_COOKIE)
         // SH248d (opt-in JIT_ROUTEB_APPSART_JAR_SEED): seed [0x106ed7a20] cookie-jar string
         // at the nativeAppBridgeAppStart string-assign site 0x1021f4830 (was NULL -> crash).
@@ -9146,6 +9187,55 @@ mod tests {
             eprintln!("sh366 app-cmd dispatcher contract (process_cmd ABI + INIT_WINDOW case) pinned on libroblox.so");
         } else {
             eprintln!("sh366 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
+    fn sh367_window_attach_real_path_pinned_and_guard() {
+        // SH367 (real-image): pin the REAL window-attach GL-surface path so the --v2boot-glue-cmd
+        // arming (jit.rs drive_glue_process_cmd) stays grounded. Window-attach 0x2bd29a0 reads the
+        // once-guard [x19+0x268] (ldarb @0x2bd2a10, tbz @0x2bd2a14). With bit0 ARMED the tbz is not
+        // taken -> `add x0,x19,#0x278` @0x2bd2a18 -> bl 0x2291c24 (`ldr x8,[x0]; cset w0,ne` =1 when
+        // [x0] non-null) -> `add x0,x19,#0x278` @0x2bd2a24 -> bl 0x22985c0 (real GL post-init, its
+        // `cbz [x0]` @0x22985c4 fast-returns 1 on a NULL first word). These pins + the guard's env/pc
+        // gating let the drive craft [win+0x268].bit0=1 + [win+0x278]=NULL-first-word obj so the REAL
+        // path runs headlessly.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let word_at = |vaddr: u64| -> u32 {
+                let off = vaddr as usize;
+                let b = &img[off..off + 4];
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            };
+            // window-attach once-guard read + branch.
+            assert_eq!(word_at(0x2bd2a0c), 0x9109a268, "sh367 add x8,x19,#0x268 (once-guard)");
+            assert_eq!(word_at(0x2bd2a10), 0x08dffd08, "sh367 ldarb w8,[x8]");
+            assert_eq!(word_at(0x2bd2a14), 0x360000c8, "sh367 tbz w8,#0 (bit0 armed -> not taken)");
+            // armed chain: bl 0x2291c24 then bl 0x22985c0.
+            assert_eq!(word_at(0x2bd2a18), 0x9109e260, "sh367 add x0,x19,#0x278 (arg to GL helper)");
+            assert_eq!(word_at(0x2bd2a1c), 0x97dafc82, "sh367 bl 0x2291c24 (cset w0,ne on [x0])");
+            assert_eq!(word_at(0x2bd2a24), 0x9109e260, "sh367 add x0,x19,#0x278 (deep GL)");
+            assert_eq!(word_at(0x2bd2a28), 0x97db16e6, "sh367 bl 0x22985c0 (real GL post-init)");
+            // 0x2291c24: ldr x8,[x0]; cmp x8,#0; cset w0,ne -> returns ([x0]!=0).
+            assert_eq!(word_at(0x2291c24), 0xf9400008, "sh367 2291c24 ldr x8,[x0]");
+            // 0x22985c0 deep body: cbz [x0] fast-return.
+            assert_eq!(word_at(0x22985c4), 0xb4000148, "sh367 22985c0 cbz [x0] (NULL -> fast-return 1)");
+
+            // Guard env/pc gating (mirrors the drive's observable contract).
+            let mut st: CpuState = unsafe { std::mem::zeroed() };
+            st.x[19] = 0x1063_1110; // fake win obj (mapped .bss page via routeb_ensure_writable)
+            routeb_ensure_writable(st.x[19]);
+            env_test_remove("JIT_ROUTEB_GLUE_REALATTACH");
+            routeb_glue_realattach_guard(&mut st, 0x102bd2a24); // env off -> inert
+            env_test_set("JIT_ROUTEB_GLUE_REALATTACH", "1");
+            routeb_glue_realattach_guard(&mut st, 0x102bd2a18); // fires (armed chain entry)
+            routeb_glue_realattach_guard(&mut st, 0x102bd2a24); // fires (deep GL)
+            routeb_glue_realattach_guard(&mut st, 0x102b00000); // wrong pc -> inert (no match)
+            env_test_remove("JIT_ROUTEB_GLUE_REALATTACH");
+            eprintln!("sh367 real window-attach GL path (once-guard + bl 0x2291c24 + bl 0x22985c0) pinned on libroblox.so + guard gating verified");
+        } else {
+            eprintln!("sh367 real-image guard: no real libroblox.so, skipping anchors");
         }
     }
 

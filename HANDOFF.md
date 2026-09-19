@@ -1,5 +1,41 @@
 # Open Sober — Agent Handoff
 
+## SH367 (Sep 19/20, 2026, hermes-worker): MEASURED NEGATIVE — arming the real window-attach GL-surface path faults (SH366 next-forward executed); the SH366 clean INIT_WINDOW drive is preserved + fault pinned one level deeper into the deep GL post-init 0x22985c0
+Single-agent (cone suppressed). One new read-only observation guard
+`routeb_glue_realattach_guard` (jit.rs, opt-in JIT_ROUTEB_GLUE_REALATTACH=1, once, ZERO guest
+mutation) + real-image hermetic `sh367_window_attach_real_path_pinned_and_guard` (arm64jit lib
+429->430) + capture runs/capture_sh367_glue_cmd_real.sh (SH366-clean-entry predicate, confirmed
+green attempt 1: EXIT 124, crash 0, drive Ok, marker [inner+9]=1) + frontier doc. elfjit.rs
+unchanged. Workspace green (cargo test --workspace EXIT 0, 430/0).
+
+### The attempt (STATUS/frontier-sh366 next-forward, executed + measured)
+STATUS named \"hand the engine a REAL wired ANativeWindow in [inner+64] so window-attach 0x2bd29a0
+takes its real GL-surface path\". SH367 implemented exactly that: armed [win+0x268].bit0=1, crafted
+[win+0x278]=NULL-first-word obj (so the deep GL call fast-returns), registered XID 0x200000 via
+set_anativewindow_xid. Disasm pins the real chain: armed -> `add x0,x19,#0x278` @0x2bd2a18 -> bl
+0x2291c24 (0x2291c24 `cset w0,ne on [x0]` = ([?win+0x278]!=0)) -> bl 0x22985c0 (deep GL post-init).
+MEASURED (8 attempts): every run **hard-faults before the INIT_WINDOW body completes** — EXIT 134/139,
+marker [inner+9]=1 never fires, drive no longer returns Ok, fault inside the host GL dispatch
+(guestpc=0x7f0000001f50 fault=0x7f818c0097). Root cause: because the crafted non-null [win+0x278]
+makes 0x2291c24 return 1, control REACHES 0x22985c0, whose DEEP body needs a REAL EGL surface/context
+object — a fabricated obj cannot satisfy it. This is the exact object only a live Android
+Activity/AppBridge session drive provides. **Reverted** to the SH366 clean drive (guard left OFF);
+re-verified clean (process_cmd Ok, marker set). Kept the read-only guard + hermetic pins as the
+measured-negative instrumentation.
+
+### Honest
+Does NOT manufacture a DataModel. Route-B live-DM structural gate UNCHANGED (DM-root [0x106a68818]=0x0,
+MH_* false). SH174 capture-latch stays the single forward observer. SH367 confirms the window
+precondition is a REAL GL-surface wall (Session-Ctor operator directive), not a seedable global.
+
+### Next (unchanged, authoritative)
+Route-B live-DM structural gate stands (SEP-17 SESSION-CTOR / do-init four-stacked closure
+SH184/185; REG_LIVE SH352 addendum 2). The window-attach COMPLETION needs a genuine EGL surface +
+onAppReady — a real Activity/AppBridge session drive, not a value seed. R1 content half staged+armed
+(SH351/352/354); SESSION half (do-init owning a live DM) remains THE wall. SH174 capture-latch stays
+the single forward hook. Do NOT re-seed [win+0x268]/[win+0x278] (SH367); do NOT re-enter the ALooper
+loop (SH365); bounded process_cmd remains the guarded-entry (SH366).
+
 ## SH366 (Sep 19, 2026, hermes-worker): FIRST headless ENTRY into the engine's own app-command DISPATCHER process_cmd (0x102bcd6e4) — the APP_CMD_INIT_WINDOW case body EXECUTED (marker [inner+9]==1), the SESSION-CTOR window/GL-surface precondition the operator names for initEngine_ was driven (not just watched); Route-B live-DM structural gate UNCHANGED (DM-root 0, MH_* false)
 Single-agent (cone suppressed). One new bounded cause-level drive
 `drive_glue_process_cmd` (arm64jit/src/jit.rs, opt-in rung `--v2boot-glue-cmd` at the
