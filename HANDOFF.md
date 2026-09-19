@@ -1,6 +1,38 @@
 # Open Sober — Agent Handoff
 
-## SH440 (Sep 19, 2026, hermes-worker): hermetic coverage of the byte-COUNT + horizontal-SUM codegen pair (SimdPopcnt `cnt` / SimdSum8 `uaddlv`) — 2 exact-byte pins
+## SH441 (Sep 19, 2026, hermes-worker): hermetic coverage of the SCALAR-REDUCTION + WIDEN codegen families (translate.rs FMaxV `fmaxv/fminv` + WidenShl `shll/shll2`) — 4 exact-byte pins
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+unchanged-green (24 real task-driven frames `present swap Ok(0x1)`, 0 json
+abort, 0 crash — SH440/439 baseline unchanged). Workspace green (cargo test
+--workspace EXIT 0; arm64jit lib 594/0 incl. 4 new sh441 pins, was 590; cargo
+build --workspace + --example elfjit OK). Production code ONLY in translate.rs
+`#[cfg(test)]` addition (translator core body byte-untouched; jit.rs
+1,048,390 B < 1MiB hook unchanged; elfjit.rs/session.rs unchanged).
+- FMaxV/WidenShl had no direct byte tests. SH441 pins the exact emitted x86
+  (rd=1, rn=2; Vn@0x130, Vd@0x120): (1) FMaxV fmaxv full buffer — reduce Vn.4s
+  into scalar Sd: movd xmm0=<Vn.0>, then movd xmm1=<Vn.i> + maxss for i=1..3,
+  movd eax + mov [0x120],eax; the 0x5f maxss-vs-0x5d minss opcode + REX.B 40
+  is the max/min discriminator; (2) FMaxV fminv — same ladder but 0x5d,
+  asserts no 0x5f; (3) WidenShl shll signed vs unsigned — reverse iter dst
+  lane1(0x124) then lane0(0x120), signed movsx_word_mem (48 0f bf) vs unsigned
+  movzx_word_mem (0f b7, NO REX.W) — REX.W presence is the signed/unsigned
+  discriminator; (4) WidenShl shll2 upper-half byte widen — src base Vn+8=0x138,
+  reverse iter 0x13b..0x138, dst 2-apart, movsx_byte_mem (48 0f be) + 16-bit
+  66 89 store; asserts the upper-half base (never 0x130) and 16-bit store
+  width. Each pins exact full emit + the semantic discriminators.
+- Deterministic: synthetic Inst -> translate() -> CodeBuf.as_slice() (zero-pc
+  0x1000); [RBX]=CpuState, vector slot v[t]=VECTOR_BASE(0x110)+t*16. Trunk
+  verified by a one-off eprintln dump (removed before commit) so pins match real
+  emission. One dev-time assert window-width fix (windows(7)->windows(6) on a
+  6-byte store) corrected during development — shipped tests pin real emission.
+- Honest: NOT a DM (SH415 probe re-confirms DM-root [0x106a68818]=0x0 under the
+  complete substrate; Route-B live-DM gate UNCHANGED). BUILD-THE-RUNTIME
+  codegen-surface coverage completion on the scalar-reduction + widen families,
+  distinct from SH440 (popcnt/sum8), SH439 (fcvtzu). No re-treads.
+- Files: docs/frontier-sh441-translator-fmaxv-widenshl.md + crates/arm64jit/src/
+  translate.rs (`#[cfg(test)]` only). Commit 959212c.
+
+## SH440 onward (see commit history for the full lantern ledger)
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables were
 re-verified green at HEAD first (capture_taskv4_frame.sh: 24 real task-driven
 frames `present swap Ok(0x1)`, 0 json abort, 0 crash — SH439 baseline
