@@ -1,5 +1,21 @@
 # Open Sober — Agent Handoff
 
+## SH380 (Sep 20, 2026, hermes-worker): MEASURED + REVERTED — SH248's `-9` bad_alloc string-repair and SH248c's 0x102b504e4 NULL-dest seeds BOTH fire 0x on the current full env (both levers already crossed); the continuation's DETERMINISTIC terminal (8/8) is the SH248g map-insert wall guestpc=0x1021dde34 (live-object map construction) — the standing Route-B structural gate re-pinned on the full env; recon-v3 deliverables re-verified green
+Single-agent (cone suppressed). Attempted then measured+reverted two named Route-B "next levers":
+(a) `routeb_contstring_repair_guard` (JIT_ROUTEB_CONTSTRING_REPAIR) for SH248's
+`operator_new(-9)->bad_alloc` — MEASURED 0-firement: the assign fn 0x102b505f0 is NEVER entered
+(region-watch 0x102b505e8-0x102b50614 = 0 hits); SH248c already crossed the -9 via the M+0x48 cap
+seed (`routeb_dm_manager_cont` -> valid long cap 0x11). (b) `routeb_appstart_controller_str_guard`
+(JIT_ROUTEB_APPSTART_CTRLSTR) for SH248c's 0x102b504e4 NULL-dest — MEASURED 0-firement: the block
+IS entered (0x102b504e4 region hit) but x0's destination is already constructed (SH248c's `x0=0`
+was a run-variable single-run terminal). Both REVERTED cleanly (no cruft committed; tree at SH379
+HEAD). Do-not-re-tread updated: do NOT re-implement the -9 string seed or re-attack 0x102b504e4.
+Honest: does NOT manufacture a DM; Route-B live-DM gate UNCHANGED (DM-root [0x106a68818]=0, MH_*
+false). recon-v3 self-driven-frame deliverable re-verified green (capture_taskv4_frame.sh attempt
+1: 24 real task-driven frames `present swap Ok(0x1)`, 197 node pops, 0 json abort, 0 crash).
+Files: docs/frontier-sh380-crossed-levers-terminal-mapwall.md; logs
+/home/hermes-worker/runs/sh380-*.txt (outside repo, incl. 8/8 terminal 0x1021dde34).
+
 ## SH379 (Sep 20, 2026, hermes-worker): MEASURED NEGATIVE (never-run intersection closed) — GOVFLAG+PRELOAD_VALUECELL+PACK_SKIP are INEFFECTUAL on the FULL --v2boot ladder (app-start driven): governor/DM-creator/setDataModelToCurrent/ScriptContext all 0 hits, run drains into the same closed LSM pool-pop lane 0x101d9a528 — the SH376/377 governor gates only matter on the skip-appstart send-appevent env
 Single-agent (cone suppressed). One new probe runs/capture_sh379_full_ladder_govgates.sh (full
 --v2boot ladder + SH373 crossing + GOVFLAG + PRELOAD_VALUECELL + PACK_SKIP, region-watch on governor/
