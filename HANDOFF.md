@@ -1,5 +1,42 @@
 # Open Sober — Agent Handoff
 
+## SH430 (Sep 19, 2026, hermes-worker): hermetic coverage of the MUL/DIV/LONG arithmetic + branch control-flow codegen families (translate.rs MulDiv, MulLong, ClzCls, B/Cbz/Tbz) — 13 exact-byte pins incl. the two documented historical-bug discriminators (the msub `ra - product` direction fix, the clz REX.W-after-F3 order fix) + the ra==31-XZR-not-SP accumulate skip + the call/jmp/jcc fixup-shape pins
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+re-verified green at this exact HEAD first (capture_taskv4_frame.sh attempt 1:
+24 real task-driven frames `present swap Ok(0x1)`, 194 node pops, 0 json abort,
+0 crash, EXIT 124). Workspace green (cargo test --workspace EXIT 0; arm64jit lib
+546/0 incl. 13 new sh430 pins, was 533; cargo build --example elfjit OK).
+Production code ONLY in translate.rs `#[cfg(test)]` addition (translator core
+body byte-untouched; jit.rs/elfjit.rs/session.rs unchanged).
+- The MUL/DIV/LONG arithmetic plus branch control-flow families had no direct
+  byte tests (decode pins decode, jit pins runtime, but the byte EMISSION
+  between them was uncovered for these two families). SH430 pins the
+  semantically-critical discriminators a byte error silently corrupts:
+  (1) the msub DIRECTION BUGFIX — x0 = ra - rn*rm (`sub rdi,rax` + `mov rax,rdi`),
+  the exact fix for `n - q*d` compiling to msub returning -48 for 1298-25*50;
+  (2) the clz REX.W-ORDER BUGFIX — `f3 48 0f bd c0` (REX.W AFTER the F3 prefix,
+  immediately before 0F; `48 f3 0f bd` makes the CPU run a 32-bit lzcnt,
+  clz(0x16136740)=3 vs oracle 35); (3) mul with ra==31 (XZR) SKIPS the accumulate
+  entirely — must never read the SP slot [RBX+0xf8] (adding SP corrupts the
+  product); (4) udiv xor-rdx-vs-cqo signed/unsigned high-half + div /6 vs idiv /7;
+  (5) smull/umaddl 32-bit-operand sign-/zero-extend before imul (umsubl = neg then
+  add ra); (6) the B.L LR-save + `call rel32` placeholder, B `e9`, Cbz/Tbz jcc
+  fixup shapes (cc=0x84/0x85/0xfe/0xff, target=pc+imm) incl the tbz masked
+  single-bit `mov rcx,1<<bit; test rax,rcx` that distinguishes it from cbz.
+- 13 exact-byte pins via synthetic `Inst` -> translate() -> CodeBuf.as_slice()
+  (zero-pc 0x1000 = deterministic fixup targets). [RBX]=CpuState; GPR slot
+  =[RBX+g*8]. Deterministic, no image, no env, parallel-safe. A `tr_bytes_fx`
+  helper returns the byte buffer + the emitted Fixup list so cc/target_pc are
+  pinned alongside the bytes.
+- Honest: NOT a DM (SH415 probe re-confirms DM-root [0x106a68818]=0x0 under the
+  complete substrate; Route-B live-DM gate UNCHANGED). BUILD-THE-RUNTIME
+  codegen-surface coverage completion on the arithmetic + control-flow families
+  (the MADD/MSUB/UDIV/SDIV/smull + B/cbz/tbz every translated block leans on),
+  continuing the SH427/SH428/SH429 translator-core lineage. No re-treads (distinct
+  from SH427 move/add/logic/bcond, SH428 LdStrImm, SH429 LdStPair/FP-SIMD).
+- Files: docs/frontier-sh430-translator-muldiv-clz-branch.md +
+  crates/arm64jit/src/translate.rs (`#[cfg(test)]` only). Commit (pending).
+
 ## SH429 (Sep 19, 2026, hermes-worker): hermetic coverage of the load/store-PAIR + scalar FP/SIMD codegen families (translate.rs LdStPair, FpLdStImm) — the families that move real rendered geometry/vertex data; SH429 pins them with 9 deterministic exact-byte hermetics (stride-16 vector slot for FP d-pairs — the Session-99 BUGFIX, pair width/zero-extend, offset raw-byte immediate, fp_scalar_xfer low-N-bytes)
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 re-verified green at this exact HEAD first (capture_taskv4_frame.sh attempt 1:

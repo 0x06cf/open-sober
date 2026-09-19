@@ -7366,6 +7366,234 @@ mod tests {
         c.as_slice().to_vec()
     }
 
+    fn tr_bytes_fx(inst: Inst) -> (Vec<u8>, Vec<Fixup>) {
+        let mut c = crate::x86::CodeBuf::new();
+        let mut fx = Vec::new();
+        translate(&mut c, 0x1000, inst, &mut fx).expect("translate must succeed");
+        (c.as_slice().to_vec(), fx)
+    }
+
+    #[test]
+    fn sh430_muldiv_madd_64_accumulates_rn_mul_rm_plus_ra() {
+        // madd x0,x1,x2,x3 = x0 = x1*x2 + x3 (MADD, div=false, signed=false).
+        // Pin: load rn(1)+rm(2), imul (RAX = product), load ra(3) into RDI,
+        // `add rax,rdi` (accumulate +), store slot0. The accumulate direction
+        // (product + ra) is the discriminator against the msub case.
+        let b = tr_bytes(Inst::MulDiv { div: false, signed: false, rd: 0, rn: 1, rm: 2, ra: 3, sf: true });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x43, 0x08, // mov rax,[rbx+0x08] (rn=1)
+            0x48, 0x8b, 0x4b, 0x10, // mov rcx,[rbx+0x10] (rm=2)
+            0x48, 0x0f, 0xaf, 0xc1, // imul rax,rcx  (RAX = rn*rm, low 64)
+            0x48, 0x8b, 0x7b, 0x18, // mov rdi,[rbx+0x18] (ra=3)
+            0x48, 0x01, 0xf8, // add rax,rdi  (RAX += ra)
+            0x48, 0x89, 0x03, // mov [rbx],rax (store rd=0)
+        ]);
+    }
+
+    #[test]
+    fn sh430_muldiv_msub_64_subtracts_product_from_ra() {
+        // msub x0,x1,x2,x3 = x0 = x3 - x1*x2. Historical bug (doc): `n - q*d`
+        // compiled to msub returned -48 for 1298-25*50 (should be +48) until the
+        // direction was fixed to `ra - product`. Pin the FIXED shape: RDI=ra,
+        // `sub rdi,rax` (RDI = ra - product), `mov rax,rdi` (RAX = ra - product),
+        // store. A regression back to `rn*rm - ra` flips the sub operand order.
+        let b = tr_bytes(Inst::MulDiv { div: false, signed: true, rd: 0, rn: 1, rm: 2, ra: 3, sf: true });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x43, 0x08, // mov rax,[rbx+0x08] (rn=1)
+            0x48, 0x8b, 0x4b, 0x10, // mov rcx,[rbx+0x10] (rm=2)
+            0x48, 0x0f, 0xaf, 0xc1, // imul rax,rcx
+            0x48, 0x8b, 0x7b, 0x18, // mov rdi,[rbx+0x18] (ra=3)
+            0x48, 0x29, 0xc7, // sub rdi,rax  (RDI = ra - product)
+            0x48, 0x89, 0xf8, // mov rax,rdi  (RAX = ra - product)
+            0x48, 0x89, 0x03, // mov [rbx],rax (store rd=0)
+        ]);
+    }
+
+    #[test]
+    fn sh430_muldiv_mul_xzr_accumulate_skipped_not_sp() {
+        // mul x0,x1,x2 = madd with ra==31 (XZR, accumulate 0). The ra==31 slot
+        // must be XZR (skip entirely), NOT a SP read — ldg(ra=31) would read the
+        // stack pointer at [rbx+0xf8] and corrupt the product with it. Pin that
+        // after the imul the result stores directly: NO [rbx+...] ra/SP load and
+        // NO add/sub appear anywhere in the 14 bytes.
+        let b = tr_bytes(Inst::MulDiv { div: false, signed: false, rd: 0, rn: 1, rm: 2, ra: 31, sf: true });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x43, 0x08, // mov rax,[rbx+0x08] (rn=1)
+            0x48, 0x8b, 0x4b, 0x10, // mov rcx,[rbx+0x10] (rm=2)
+            0x48, 0x0f, 0xaf, 0xc1, // imul rax,rcx
+            0x48, 0x89, 0x03, // mov [rbx],rax (store rd=0)
+        ]);
+        assert!(!b.windows(7).any(|w| w == [0x48, 0x89, 0x83, 0xf8, 0x00, 0x00, 0x00])
+            && !b.windows(4).any(|w| w == [0x48, 0x8b, 0x83, 0xf8]),
+            "ra==31 must not touch the SP slot [rbx+0xf8]");
+    }
+
+    #[test]
+    fn sh430_muldiv_udiv_64_unsigned_quotient_in_rax() {
+        // udiv x0,x1,x2: unsigned — zero the RDX:RAX high half with `xor rdx,rdx`
+        // (NOT cqo), then `div rcx` (quotient in RAX), store. The signed/unsigned
+        // discriminator is xor-rdx (48 31 d2) vs cqo (48 99) + idiv.
+        let b = tr_bytes(Inst::MulDiv { div: true, signed: false, rd: 0, rn: 1, rm: 2, ra: 31, sf: true });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x43, 0x08, // mov rax,[rbx+0x08] (rn=1 dividend)
+            0x48, 0x31, 0xd2, // xor rdx,rdx  (zero high half — unsigned)
+            0x48, 0x8b, 0x4b, 0x10, // mov rcx,[rbx+0x10] (rm=2 divisor)
+            0x48, 0xf7, 0xf1, // div rcx  (/6 group-3 unsigned divide)
+            0x48, 0x89, 0x03, // mov [rbx],rax (store quotient)
+        ]);
+    }
+
+    #[test]
+    fn sh430_muldiv_sdiv_32_signextends_both_operands() {
+        // sdiv w0,w1,w2 (sf=false, signed=true): the 32-bit operands must be
+        // sign-extended to 64 BEFORE the signed divide (movsxd rax,eax +
+        // movsxd rcx,ecx) and the dividend high half must come from cqo.
+        // Then cqo, idiv rcx (quotient in RAX), 32-bit zero-ext store.
+        let b = tr_bytes(Inst::MulDiv { div: true, signed: true, rd: 0, rn: 1, rm: 2, ra: 31, sf: false });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x43, 0x08, // mov rax,[rbx+0x08] (rn=1)
+            0x48, 0x63, 0xc0, // movsxd rax,eax (sign-extend W dividend)
+            0x48, 0x99, // cqo (signed RDX:RAX)
+            0x48, 0x8b, 0x4b, 0x10, // mov rcx,[rbx+0x10] (rm=2)
+            0x48, 0x63, 0xc9, // movsxd rcx,ecx (sign-extend W divisor)
+            0x48, 0xf7, 0xf9, // idiv rcx  (/7 signed divide)
+            0x89, 0xc0, // mov eax,eax (W zero-extend of quotient)
+            0x48, 0x89, 0x03, // mov [rbx],rax (store slot0)
+        ]);
+    }
+
+    #[test]
+    fn sh430_mullong_smull_64_signextends_w32_operands() {
+        // smull x0,w1,w2 = 64-bit product of two 32-bit SIGNED operands.
+        // Pin: ffrom 8b 43 08 (load rn), movsxd rax,eax, movsxd rcx,ecx,
+        // imul (low-64 of signed 32x32 product), store. A 32x32 signed product
+        // always fits in 64 bits, so low-64 imul is exact.
+        let b = tr_bytes(Inst::MulLong { rd: 0, rn: 1, rm: 2, ra: 31, signed: true, sub: false });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x43, 0x08, // mov rax,[rbx+0x08] (rn=1)
+            0x48, 0x63, 0xc0, // movsxd rax,eax (sign-extend rn)
+            0x48, 0x8b, 0x4b, 0x10, // mov rcx,[rbx+0x10] (rm=2)
+            0x48, 0x63, 0xc9, // movsxd rcx,ecx (sign-extend rm)
+            0x48, 0x0f, 0xaf, 0xc1, // imul rax,rcx
+            0x48, 0x89, 0x03, // mov [rbx],rax (store rd=0)
+        ]);
+    }
+
+    #[test]
+    fn sh430_mullong_umsubl_negates_product_then_adds_ra() {
+        // umsubl x0,w1,w2,x3 = x0 = (u32)x3 - (u32)x1*(u32)x2. Pin: zero-extend
+        // both operands (mov eax,eax = 89 c0 / mov ecx,ecx = 89 c9), imul, load
+        // ra(3) into RDI, `neg rax` (48 f7 d8) then `add rax,rdi` (48 01 f8)
+        // = RAX = ra - product. The neg+add pair is the umsubl discriminator.
+        let b = tr_bytes(Inst::MulLong { rd: 0, rn: 1, rm: 2, ra: 3, signed: false, sub: true });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x43, 0x08, // mov rax,[rbx+0x08] (rn=1)
+            0x89, 0xc0, // mov eax,eax (zero-extend rn)
+            0x48, 0x8b, 0x4b, 0x10, // mov rcx,[rbx+0x10] (rm=2)
+            0x89, 0xc9, // mov ecx,ecx (zero-extend rm)
+            0x48, 0x0f, 0xaf, 0xc1, // imul rax,rcx
+            0x48, 0x8b, 0x7b, 0x18, // mov rdi,[rbx+0x18] (ra=3)
+            0x48, 0xf7, 0xd8, // neg rax (RAX = -product)
+            0x48, 0x01, 0xf8, // add rax,rdi (RAX = ra - product)
+            0x48, 0x89, 0x03, // mov [rbx],rax (store rd=0)
+        ]);
+    }
+
+    #[test]
+    fn sh430_clz_64_rexw_before_f3_lzcnt() {
+        // clz x0,x1 (sf=true) emits LZCNT with the documented REX.W-order fix:
+        // `f3 48 0f bd c0` — the REX.W prefix MUST come after F3 and immediately
+        // before the 0F opcode. A regression to `48 f3 0f bd` makes the CPU
+        // ignore REX.W and execute a 32-bit lzcnt (clz(x<2^32) returns 32-len(x),
+        // e.g. the real repro clz(0x16136740) returned 3 vs oracle 35).
+        let b = tr_bytes(Inst::ClzCls { rd: 0, rn: 1, sf: true, cls: false });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x43, 0x08, // mov rax,[rbx+0x08] (rn=1)
+            0xf3, 0x48, 0x0f, 0xbd, 0xc0, // lzcnt rax,rax (F3 then REX.W then 0F BD)
+            0x48, 0x89, 0x03, // mov [rbx],rax (store rd=0)
+        ]);
+    }
+
+    #[test]
+    fn sh430_clz_w32_zext_then_32bit_lzcnt() {
+        // clz w0,w1 (sf=false): zero-extend the W operand first (89 c0), then the
+        // 32-bit lzcnt form `f3 0f bd c0` (no REX.W). The upper-32-zeroing via the
+        // 32-bit lzcnt matches the W zero-extend semantics.
+        let b = tr_bytes(Inst::ClzCls { rd: 0, rn: 1, sf: false, cls: false });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x43, 0x08, // mov rax,[rbx+0x08] (rn=1)
+            0x89, 0xc0, // mov eax,eax (W zero-extend)
+            0xf3, 0x0f, 0xbd, 0xc0, // lzcnt eax,eax (no REX.W)
+            0x48, 0x89, 0x03, // mov [rbx],rax (store rd=0)
+        ]);
+    }
+
+    #[test]
+    fn sh430_branch_bl_stores_lr_then_call_placeholder() {
+        // bl (link=true): save guest LR = pc+4 into slot30 (mov rax,pc+4 then
+        // mov [rbx+0xf0],rax), then a host `call rel32` whose 4-byte displacement
+        // placeholder is emitted as zeros (patched later by jit.rs). Pin the
+        // exact bytes + the call fixup metadata (target = pc+imm = 0x1000+0x30,
+        // cc=0xfe call).
+        let (b, fx) = tr_bytes_fx(Inst::B { imm: 0x30, link: true });
+        assert_eq!(b, vec![
+            0x48, 0xb8, 0x04, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rax,0x1004 (=pc+4, LR)
+            0x48, 0x89, 0x83, 0xf0, 0x00, 0x00, 0x00, // mov [rbx+0xf0],rax (slot30 = x30/LR)
+            0xe8, 0x00, 0x00, 0x00, 0x00, // call rel32 (placeholder; E8 + 4 zero disp)
+        ]);
+        assert_eq!(fx.len(), 1);
+        assert_eq!(fx[0].cc, 0xfe, "call fixup");
+        assert_eq!(fx[0].target_pc, 0x1030, "BL target = pc + imm");
+        // the 4-byte displacement placeholder follows the E8 opcode at index 17
+        assert_eq!(&b[18..22], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn sh430_branch_b_uncond_jmp_fixup() {
+        // b (link=false): a single host `jmp rel32` (E9) with the displacement
+        // placeholder; fixup target = pc + imm = 0x1000 - 0x20 (backward), cc=0xff
+        // (the unconditional-jmp marker).
+        let (b, fx) = tr_bytes_fx(Inst::B { imm: -0x20, link: false });
+        assert_eq!(b, vec![0xe9, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(fx.len(), 1);
+        assert_eq!(fx[0].cc, 0xff, "unconditional jmp fixup marker");
+        assert_eq!(fx[0].target_pc, 0xfe0, "B target = pc + imm (backward)");
+    }
+
+    #[test]
+    fn sh430_branch_tbz_single_bit_and_test() {
+        // tbz x7,#3 (nonzero -> tbnz): load rt(7) from slot 0x38, compare the
+        // single bit 3 (mov rcx, 1<<3 = 8 then `test rax,rcx` 48 85 c8), branch
+        // jnz (cc=0x85) to pc+imm=0x1040. Pins the one-bit masked compare used to
+        // implement the bit-test (not a full zero-test like cbz).
+        let (b, fx) = tr_bytes_fx(Inst::Tbz { rt: 7, bit: 3, imm: 0x40, nonzero: true, sf: true });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x43, 0x38, // mov rax,[rbx+0x38] (rt=7)
+            0x48, 0xb9, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rcx, 1<<3
+            0x48, 0x85, 0xc8, // test rax,rcx
+            0x0f, 0x85, 0x00, 0x00, 0x00, 0x00, // jnz (nonzero)
+        ]);
+        assert_eq!(fx.len(), 1);
+        assert_eq!(fx[0].cc, 0x85, "jnz for tbnz");
+        assert_eq!(fx[0].target_pc, 0x1040);
+    }
+
+    #[test]
+    fn sh430_branch_cbz_zero_test_two_operand() {
+        // cbz x9 (nonzero=false): load rt(9), `test rax,rax` (48 85 c0), branch jz
+        // (cc=0x84) to pc+imm=0x1000-0x10=0xff0. Distinguishes cbz (whole-register
+        // zero test, test rax,rax) from tbz (masked single-bit test).
+        let (b, fx) = tr_bytes_fx(Inst::Cbz { rt: 9, imm: -0x10, nonzero: false, sf: false });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x43, 0x48, // mov rax,[rbx+0x48] (rt=9)
+            0x48, 0x85, 0xc0, // test rax,rax
+            0x0f, 0x84, 0x00, 0x00, 0x00, 0x00, // jz (nonzero=false)
+        ]);
+        assert_eq!(fx.len(), 1);
+        assert_eq!(fx[0].cc, 0x84, "jz for cbz");
+        assert_eq!(fx[0].target_pc, 0xff0);
+    }
+
     // movz x0,#0x1234, 64-bit: `mov r32-imm` shortcut (mov_eax_imm32 into a
     // 64-bit dest) then store to [RBX+0]. The 64-bit form may use the imm32
     // short-cut because movz zero-extends — pin that choice and the store.
