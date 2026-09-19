@@ -1,5 +1,31 @@
 # Open Sober — Agent Handoff
 
+## SH417 (Sep 19, 2026, hermes-worker): the persistent-tracker host input LOOP — STATUS next-forward #3 — a real host loop keeps ONE PointerTracker across poll iterations so a press's DOWN and its MOVE across frames stay the same pointer (the SH416 one-shot rebuilt the tracker each call and mistracked them); the bounded loop drains the registered ANativeWindow XID N=INPUT_LOOP_ITERS times through the exact SH413/414 bridge into guest nativePassInput, tested inert + measured on the real binary
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified green at HEAD first
+(capture_taskv4_frame.sh attempt 1: 24 real task frames `present swap Ok(0x1)`, 195 node pops, 0 json
+abort, 0 crash). Production code only in session.rs + elfjit.rs rung; jit.rs untouched (at the 1MiB hook).
+elffjit.rs condensed SH-prose comments (addresses kept) to stay under the 1MiB pre-commit hook
+(1,048,552 B < 1,048,576). Workspace green (arm64jit lib 470/0 incl. new sh417 hermetic; cargo test
+--workspace EXIT 0).
+- session.rs: `drive_host_input_loop(iimg, ib, tpidr, boot_sp, iterations)` — bounded persistent-tracker
+  loop. Three guards checked ONCE up front (JIT_AINPUT_BRIDGE + registered window XID + live image), then
+  drains N non-blocking batches through ONE PointerTracker (pointer-down/multi-touch state survives across
+  iterations), marshalling each translated MotionEvent via deliver_motion -> nativePassInput. Mid-loop X
+  error stops the loop keeping events already delivered. New hermetic `sh417_host_input_loop_inert_without_all_guards`
+  (all three guard trips + zero-iteration bounded, no X connect).
+- elfjit.rs: `--v2boot-input-loop` rung (INPUT_LOOP_ITERS, default 8).
+- MEASURED (real libroblox.so, SH416 env + INPUT_LOOP_ITERS=4): window wired XID 0x200000 on :308; loop
+  ran all 4 iterations `0 raw -> 0 translated -> 0 delivered`, total 0; `[elfjit:v2boot-input-loop] SH417
+  ... delivered 0 events`; no input-path crash (terminal SIGSEGV at guestpc 0x1029f3f7c is the known
+  pre-existing nativeInit "outside image" Route-B lane, SH416 documented identically — not this change).
+- Honest: inert-by-construction like every runtime axis (no live DM -> no constructed login/home screen to
+  deliver to -> 0 events moved). BUILD-THE-RUNTIME cause-not-symptom input surface: the moment a live DM
+  advances, the same bounded loop delivers real desktop pointer input with correct persisting pointer state.
+  Route-B live-DM structural gate UNCHANGED (DM-root [0x106a68818]=0, MH_GAME_LOADED false, no make_shared).
+  No re-treads. recon-v3 deliverables unchanged-green.
+- Files: docs/frontier-sh417-host-input-loop.md + runs/capture_sh417_host_input_loop.sh.
+
+## SH416 (Sep 22, 2026, hermes-worker): wire the real X event source into the input axis — the input delivery path (deliver_motion -> nativePassInput 0x2bbba88) was complete+hermetic but a real host NEVER fed it: drive_host_input_pump only saw synthetic test vectors while the registered ANativeWindow had no poll. New input_wrapper::x11::pump_registered_window (owner-connection select on an EXISTING window; a fresh conn gets BadAccess on Xvfb) + register_window_connection at both wire_real_window sites + session::drive_host_input_poll (one non-blocking real-event batch -> nativePassInput, gated JIT_AINPUT_BRIDGE + real XID). Opt-in --v2boot-input-poll. Head commit 0b8825e. (See commit history for full body + sh416 hermetic + MEASURED window XID 0x200000 on :275, 0 raw -> 0 delivered clean.)
 ## SH415 (Sep 22, 2026, hermes-worker): make do-init COMPLETION a first-class observable of the ordered session substrate — the four EXECUTE-DO-INIT-GATES live-DM markers (once-guard [0x106a68410].bit0, DM-root [0x106a68818] + in-image vt, app-DM counter [0x106dca0e88]) are now REPORTED right after the two do-init-reaching atoms (StartLuaAppDM 0x1023efe2c + V2StartAppWithParams 0x10258b144), not guessed from one-off probes
 Single-agent (cone suppressed). recon-v3 deliverables re-verified green at HEAD first
 (capture_taskv4_frame.sh attempt 1: 24 real task frames `present swap Ok(0x1)`, 197 node
