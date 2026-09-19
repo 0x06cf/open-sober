@@ -1,5 +1,31 @@
 # Open Sober — Agent Handoff
 
+## SH394 (Sep 21, 2026, hermes-worker): MEASURED the never-run composition — the SH393 FULL safe app-command table drive + the SH174 DM-allocation capture latch (single forward observer) on the furthest-advancing SH378 env: the capture latch never even ARMS, 0 validated make_shared<DataModel>, terminal still the standing SH285 persistence-lane wall
+Single-agent (cone suppressed). Recon-v3 immediate-priority deliverables re-verified green at this
+exact HEAD first (capture_taskv4_frame.sh attempt 1 = 24 real task-driven frames `present swap
+Ok(0x1)`, 196 node pops, 0 json abort, 0 crash; capture_sh304 session-gated producer INERT 0 GATED;
+JIT_JSON_ZERO_FIX present at 0x102355d40). SH393 established the full app-command table drive (the
+engine's OWN process_cmd consuming all 15/20 safe APP_CMD cases in lifecycle order). But SH393's
+capture never set JIT_DM_ALLOC_CAPTURE, and SH378 ran the SH174 latch on the SH377
+env WITHOUT the full-table drive. SH394 runs the genuinely-never-composed intersection: full safe
+table + DM-capture latch + the furthest SH378 world-build env. New probe
+runs/capture_sh394_dmcap_fulltable.sh + docs/frontier-sh394-dmcap-fulltable.md.
+MEASURED (real libroblox.so, 1/3, confirm=1): full-table 15/15 `process_cmd returned Ok`, cmd-11
+INIT_WINDOW marker, `glue-full SH393 done`, SendAppEventOnAppReady returned Ok — but **the DM-capture
+latch NEVER installs** (0 `routed ... capture trail` lines, so operator-new 0x102a0d9b8 is never
+enterinstallably on this composition) and **`[validated]` make_shared<DataModel> = 0**; the only
+`bytes=` hit is the SH339 "Home" jstring readback, not an allocation. Terminal: SIGABRT/SIGSEGV
+drains to the standing SH285 LSM pool-pop write-site guestpc 0x101d9a528 (EXIT 134). Post-lifecycle
+MH_FLAGS_LOADED=false MH_APP_READY=false AppBridgeV2[0x106a705e8]=0x0.
+Interpretation: composing the engine's full own-command-queue drive with the DM-allocation latch on
+the furthest env STILL does not route any dispatch to make_shared<DataModel> — and the latch
+stronger-than-SH378 refuses even to install. Re-confirms SH366/368/393's reading: AppBridgeV2/surface/
+DM "move only when a live session/do-init builds the DM world." Route-B live-DM structural gate
+UNCHANGED (DM-root [0x106a68818]=0, MH_* false, AppBridgeV2 0). Do-not-re-tread unchanged + SH393's
+cmd 1/13/15/17/18 exclusion. Work done beyond the standing walls: this is a never-run-intersection
+map-completion (probe-only, no Rust/guest-byte/JIT-hook-default touched); workspace green (cargo
+test --workspace EXIT 0; arm64jit lib 446/0).
+
 ## SH393 (Sep 21, 2026, hermes-worker): drive the FULL app-command dispatcher table on the confirmed-green SH366 entry — a complete per-command safety map (15/20 safe, cmd 1/13/15/17/18 measured-unsafe) of the engine's own process_cmd, the SESSION-CTOR command-queue lever advanced from SH368's 3-command subset
 Single-agent (cone suppressed). Recon-v3 immediate-priority deliverables re-verified green at this
 exact HEAD first: capture_taskv4_frame.sh (SH391 guard armed) attempt 1 = 24 real task-driven frames
