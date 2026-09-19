@@ -1,6 +1,37 @@
 # Open Sober — Agent Handoff
 
-## SH441 (Sep 19, 2026, hermes-worker): hermetic coverage of the SCALAR-REDUCTION + WIDEN codegen families (translate.rs FMaxV `fmaxv/fminv` + WidenShl `shll/shll2`) — 4 exact-byte pins
+## SH442 (Sep 19, 2026, hermes-worker): hermetic coverage of the scalar FcvtToInt ROUNDING-mode paths (translate.rs mode 2 `fcvtau` / mode 3 `fcvtpu`,`fcvtps` / mode 4 `fcvtmu`,`fcvtms`) — 5 exact-byte pins
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+unchanged-green (24 real task-driven frames `present swap Ok(0x1)`, 0 json
+abort, 0 crash — SH441/440 baseline unchanged). Workspace green (cargo test
+--workspace EXIT 0; arm64jit lib 599/0 incl. 5 new sh442 pins, was 594; cargo
+build --workspace + --example elfjit OK). Production code ONLY in translate.rs
+`#[cfg(test)]` addition (translator core body byte-untouched; jit.rs
+1,048,390 B < 1MiB hook unchanged; elfjit.rs/session.rs unchanged).
+- SH435 pinned FcvtToInt mode 0 (fcvtzs/fcvtzu) + SH439 pinned fcvtzu's
+  [2^63,2^64) big-path; the ROUND-before-truncate modes had zero byte tests.
+  SH442 pins the exact emit (rd=0, rn=1 d-src; src@0x120, dst g0):
+  (1) fcvtau (unsigned, mode 2) = roundsd NEAREST-EVEN (imm8 0x00) + cvttsd2si,
+  NO unsigned cmovs clamp (comment-documented saturation edge) — pinned
+  negative; (2) fcvtpu (unsigned, mode 3, +inf) = roundsd CEIL (imm8 0x02) +
+  cvttsd2si + clamp trio (xor rcx,rcx; test rax,rax; cmovs rax,rcx = 48 0f 48
+  c1); (3) fcvtmu (unsigned, mode 4, -inf) = roundsd FLOOR (imm8 0x01) +
+  cvttsd2si + same clamp — imm8 0x01-vs-0x02 is the mu/pu discriminator;
+  (4,5) signed mode 3/4 (fcvtps/fcvtms) = same roundsd but NO clamp — cmovs
+  absence is the signed discriminator.
+- Deterministic: synthetic Inst -> translate() -> CodeBuf.as_slice() (zero-pc
+  0x1000); [RBX]=CpuState, vector slot v[t]=VECTOR_BASE(0x110)+t*16. Trunk
+  verified by a one-off eprintln dump (removed before commit) so pins match the
+  real emission. One workspace run exited 101 (transient; re-run 0 — the
+  accepted load-sensitive SH345/346/357/370 family), canonical exit 0.
+- Honest: NOT a DM (SH415 probe re-confirms DM-root [0x106a68818]=0x0 under the
+  complete substrate; Route-B live-DM gate UNCHANGED). BUILD-THE-RUNTIME
+  codegen-surface coverage completing the SH435/439 mode-0 line with the
+  mode-2/3/4 rounding family. No re-treads.
+- Files: docs/frontier-sh442-translator-fcvtoint-rounding-modes.md +
+  crates/arm64jit/src/translate.rs (`#[cfg(test)]` only). Commit 336c6fe.
+
+## SH441 onward (see commit history for the full lantern ledger)
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 unchanged-green (24 real task-driven frames `present swap Ok(0x1)`, 0 json
 abort, 0 crash — SH440/439 baseline unchanged). Workspace green (cargo test
