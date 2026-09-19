@@ -7563,6 +7563,103 @@ mod tests {
         assert!(!b.windows(7).any(|w| w == [0x89, 0x83, 0x24, 0x01, 0x00, 0x00]));
     }
 
+    // SH443: hermetic coverage of the BYTE-REVERSE codegen family (translate.rs
+    // SimdRev — rev64/rev32/rev16 Vd.T, Vn.T: byte-reverse within each
+    // granule). SimdRev had zero direct byte tests. SH443 pins the exact
+    // emitted x86 with rd=1, rn=2 (Vn base = VECTOR_BASE 0x110+2*16=0x130,
+    // Vd base = 0x110+1*16=0x120):
+    //  (1) rev64 (granule 8, q=0) — one 8B granule: `mov rax,[rbx+0x130]` +
+    //      bswap r64 (`48 0f c8`) + `mov [rbx+0x120],rax`. The bswap-r64
+    //      opcode (48 0f c8) is the 8B-granule discriminator.
+    //  (2) rev64 q=1 — TWO 8B granules: second reads Vn+8 (0x138), bswaps,
+    //      stores Vd+8 (0x128). The q cross-lane advance +0x8 pins the
+    //      whole-register reversal (a made-only-low-half buggy emit would
+    //      never touch 0x138/0x128).
+    //  (3) rev32 (granule 4, q=0) — TWO 4B granules: `mov eax,[rbx+0x130]` +
+    //      bswap r32 (`0f c8`, NO 0x48 REX.W) + `mov [rbx+0x120],eax`, then
+    //      granule 1 at 0x134 -> 0x124. The bswap-r32 (0f c8 without 48) vs
+    //      bswap-r64 (48 0f c8) opcode is the 4-vs-8-granule discriminator.
+    //  (4) rev16 (granule 2, q=0) — FOUR 2B granules, each `movzx eax,
+    //      [rbx+0x130+2i]` + rol16 by 8 (`66 c1 c0 08`, rotate-left-by-8 =
+    //      byte-swap a halfword) + the 16-bit `66 89` store at 2-apart dst
+    //      (0x120, 0x122, 0x124, 0x126). The rol-imm8-by-8 (66 c1 c0 08) vs a
+    //      bswap is the 2-granule discriminator.
+    // A wrong granule emits the wrong byte-swap primitive (bswap64 vs bswap32
+    // vs rol16), silently reordering rendered pixel/color bytes.
+    #[test]
+    fn sh443_simdrev_granule8_bswap64_q() {
+        let b = tr_bytes(Inst::SimdRev { rd: 1, rn: 2, granule: 8, q: false });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x83, 0x30, 0x01, 0x00, 0x00, // mov rax,[rbx+0x130]
+            0x48, 0x0f, 0xc8,                         // bswap r64 rax
+            0x48, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00, // mov [rbx+0x120],rax
+        ]);
+        assert!(b.windows(3).any(|w| w == [0x48, 0x0f, 0xc8]),
+            "rev64 must bswap the 64-bit rax (48 0f c8)");
+    }
+
+    #[test]
+    fn sh443_simdrev_granule8_q_cross_lane_whole_register() {
+        let b = tr_bytes(Inst::SimdRev { rd: 1, rn: 2, granule: 8, q: true });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x83, 0x30, 0x01, 0x00, 0x00, // mov rax,[rbx+0x130] granule0 src
+            0x48, 0x0f, 0xc8,                         // bswap rax
+            0x48, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00, // mov [rbx+0x120],rax granule0 dst
+            0x48, 0x8b, 0x83, 0x38, 0x01, 0x00, 0x00, // mov rax,[rbx+0x138] granule1 src (Vn+8)
+            0x48, 0x0f, 0xc8,                         // bswap rax
+            0x48, 0x89, 0x83, 0x28, 0x01, 0x00, 0x00, // mov [rbx+0x128],rax granule1 dst (Vd+8)
+        ]);
+        assert!(b.windows(7).any(|w| w == [0x48, 0x8b, 0x83, 0x38, 0x01, 0x00, 0x00]),
+            "q-mode rev64 must reverse the second 8B granule (Vn+8=0x138)");
+        assert!(b.windows(7).any(|w| w == [0x48, 0x89, 0x83, 0x28, 0x01, 0x00, 0x00]),
+            "q-mode rev64 must store the second granule at Vd+8=0x128");
+    }
+
+    #[test]
+    fn sh443_simdrev_granule4_bswap32_no_rexw() {
+        let b = tr_bytes(Inst::SimdRev { rd: 1, rn: 2, granule: 4, q: false });
+        assert_eq!(b, vec![
+            0x8b, 0x83, 0x30, 0x01, 0x00, 0x00, // mov eax,[rbx+0x130] granule0
+            0x0f, 0xc8,                         // bswap r32 eax (NO 0x48 REX.W)
+            0x89, 0x83, 0x20, 0x01, 0x00, 0x00, // mov [rbx+0x120],eax
+            0x8b, 0x83, 0x34, 0x01, 0x00, 0x00, // mov eax,[rbx+0x134] granule1
+            0x0f, 0xc8,                         // bswap eax
+            0x89, 0x83, 0x24, 0x01, 0x00, 0x00, // mov [rbx+0x124],eax
+        ]);
+        assert!(b.windows(2).any(|w| w == [0x0f, 0xc8]),
+            "rev32 must bswap the 32-bit eax (0f c8)");
+        assert!(!b.windows(3).any(|w| w == [0x48, 0x0f, 0xc8]),
+            "rev32 must NOT emit bswap-r64 (48 0f c8) — 4B granule, no REX.W");
+        assert!(b.windows(6).any(|w| w == [0x8b, 0x83, 0x34, 0x01, 0x00, 0x00]),
+            "rev32 q=0 reverses TWO 4B granules (second src at 0x134)");
+    }
+
+    #[test]
+    fn sh443_simdrev_granule2_rol16_rotate_left_8() {
+        // rev16: byte-swap each 16-bit halfword = rotate-left-by-8.
+        let b = tr_bytes(Inst::SimdRev { rd: 1, rn: 2, granule: 2, q: false });
+        assert_eq!(b, vec![
+            0x0f, 0xb7, 0x83, 0x30, 0x01, 0x00, 0x00, // movzx eax,[rbx+0x130] hw0
+            0x66, 0xc1, 0xc0, 0x08,                   // rol eax,8 (rotate-left-by-8)
+            0x66, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00, // mov [rbx+0x120],ax
+            0x0f, 0xb7, 0x83, 0x32, 0x01, 0x00, 0x00, // movzx eax,[rbx+0x132] hw1
+            0x66, 0xc1, 0xc0, 0x08,                   // rol eax,8
+            0x66, 0x89, 0x83, 0x22, 0x01, 0x00, 0x00, // mov [rbx+0x122],ax
+            0x0f, 0xb7, 0x83, 0x34, 0x01, 0x00, 0x00, // movzx eax,[rbx+0x134] hw2
+            0x66, 0xc1, 0xc0, 0x08,                   // rol eax,8
+            0x66, 0x89, 0x83, 0x24, 0x01, 0x00, 0x00, // mov [rbx+0x124],ax
+            0x0f, 0xb7, 0x83, 0x36, 0x01, 0x00, 0x00, // movzx eax,[rbx+0x136] hw3
+            0x66, 0xc1, 0xc0, 0x08,                   // rol eax,8
+            0x66, 0x89, 0x83, 0x26, 0x01, 0x00, 0x00, // mov [rbx+0x126],ax
+        ]);
+        assert!(b.windows(4).any(|w| w == [0x66, 0xc1, 0xc0, 0x08]),
+            "rev16 must byte-swap each halfword via rol eax,8 (66 c1 c0 08)");
+        assert!(!b.windows(3).any(|w| w == [0x48, 0x0f, 0xc8]),
+            "rev16 must NOT emit bswap-r64");
+        assert!(b.windows(7).any(|w| w == [0x66, 0x89, 0x83, 0x26, 0x01, 0x00, 0x00]),
+            "rev16 must store the 4th halfword (3rd-lane) via a 16-bit store");
+    }
+
     // SH442: hermetic coverage of the scalar FcvtToInt ROUNDING-mode paths
     // (translate.rs FcvtToInt mode 2 fcvtau / mode 3 fcvtpu,ps / mode 4
     // fcvtmu,ms). SH435 pinned mode 0 (fcvtzs/fcvtzu trunc) and SH439 pinned
