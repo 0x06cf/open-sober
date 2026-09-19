@@ -1,5 +1,30 @@
 # Open Sober — Agent Handoff
 
+## SH415 (Sep 22, 2026, hermes-worker): make do-init COMPLETION a first-class observable of the ordered session substrate — the four EXECUTE-DO-INIT-GATES live-DM markers (once-guard [0x106a68410].bit0, DM-root [0x106a68818] + in-image vt, app-DM counter [0x106dca0e88]) are now REPORTED right after the two do-init-reaching atoms (StartLuaAppDM 0x1023efe2c + V2StartAppWithParams 0x10258b144), not guessed from one-off probes
+Single-agent (cone suppressed). recon-v3 deliverables re-verified green at HEAD first
+(capture_taskv4_frame.sh attempt 1: 24 real task frames `present swap Ok(0x1)`, 197 node
+pops, 0 json abort, 0 crash). Production code only in session.rs (off the 1MiB hooks;
+jit.rs/elfjit.rs untouched, byte-unchanged). Workspace green (arm64jit lib 469/0 incl.
+new sh415 hermetic; cargo test --workspace EXIT 0).
+- session.rs: `probe_doinit_completion() -> DoinitCompletion` (page-guarded readout of
+  the four EXECUTE-DO-INIT-GATES markers; `liveness()` = single "live DM owned" bit)
+  wired into `drive_routeb_session_substrate` after StartLuaAppDM + V2StartAppWithParams.
+  Hermetic `sh415_doinit_completion_probe_safe_and_aggregates`: no-live-image reads
+  degrade to 0 without SIGSEGV; liveness aggregates (all four required); the two
+  do-init-reaching atoms stay in the substrate table.
+- MEASURED (real libroblox.so, complete SH400-414 substrate, EXIT clean): substrate
+  11/16 Ok; the probe fires twice and reports the same honest verdict —
+  `once-guard[0x106a68410]=0x101 bit0=1 DM-root=0x0 vt=0x0 counter=0 -> LIVE DM=false`.
+  The genuinely-new datum: under the COMPLETE substrate the FIRST precondition (the
+  once-guard seeded → once-lambda LET to run) is now MET, yet DM-root still stays 0 —
+  direct per-run proof the do-init once-path constructs nothing live (SH381 consistent).
+  Route-B live-DM gate UNCHANGED (DM-root 0, MH_GAME_LOADED false).
+- Honest: NOT a DM; pure readout (no guest byte moved). Turns the do-init completion
+  gate into a reported observable of the runtime — "measure, don't guess." recon-v3
+  deliverables + Rule-1 regression all green at HEAD.
+- Files: docs/frontier-sh415-doinit-completion-observable.md +
+  runs/capture_sh415_doinit_completion.sh. Commit 6ff8a1c.
+
 ## SH414 (Sep 22, 2026, hermes-worker): complete the INPUT runtime axis — the SEP-18 list's last part (session boot, screens, audio, input) was landed latent-but-correct by SH400-413, but the ainput bridge was ORPHANED (zero production callers) and input-wrapper was a DEV-ONLY dependency. SH414 wires them: input-wrapper promoted to a real arm64jit dep; new ainput::from_motion_event/deliver_motion (translated MotionEvent -> guest nativePassInput ABI) + session::drive_host_input_pump (a first-class host-input step, three inert guards, returns delivered count). This is the executable half of the input axis — a real host loop delivering X-window pointer events into the guest input native for a constructed login/home screen
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified
 green first (24 real task frames `present swap Ok(0x1)`, 197 node pops, 0 json abort,

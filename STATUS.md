@@ -1,57 +1,51 @@
 # Open-Sober run status (hermes-worker)
 
-Updated 2026-09-21, this cycle: SH407+SH408 — two probes decisively characterized the do-init
-MAIN-arm terminal. SH407: the app-start MAIN body [0x10258b5d8,0x10258bbb0] now runs END-TO-END
-(biggest app-start reach on record; SH362-404 called it unreachable — all 14 block-entry pcs fire),
-then drains into the SH341 pool-pop persistence lane (190 valid-key pops, SETFIX fired); DMCONT
-0x102bd1d68 = 0 real hits from the MAIN arm (region-watch distinction vs the spec-string count).
-SH408: same env + files-dir/R1 rungs (which did NOT fire — unreached) shows LSM init ADVANCES
-through initStorageManagerNative + crosses the SH285 reader (0x101db1b08 now 0 hits = old fault
-terminal bypassed) then next-faults at fault=0x0 in the opnew/insert band — the standing unbound
-whack-a-mole, one fencepost deeper, not a DM advance. New hermetic sh407 byte-pins the full
-app-start body span + the LSM-init deepen (arm64jit lib 455->456).
+Updated 2026-09-22, this cycle: SH415 — make do-init COMPLETION a first-class
+observable of the ordered session substrate. SH400-414 built the executable
+ordered session-drive (session boot, G3 content, DM binder, app-start, onAppReady
+lifecycle, login gate, input pump), but the EXECUTE-DO-INIT-GATES live-DM markers
+were only ever inferred from scattered probes. SH415 adds session.rs
+`probe_doinit_completion()` (page-guarded readout of once-guard [0x106a68410].bit0,
+DM-root [0x106a68818] + in-image vt, app-DM counter [0x106dca0e88]) wired into the
+substrate right after the two do-init-reaching atoms (StartLuaAppDM +
+V2StartAppWithParams), reporting do-init completion per-atom instead of guessing.
 
 ## Current state
 
-- `dev` HEAD: SH407 (app-start MAIN body full-span hermetic + frontier doc; workspace green,
-  456 arm64jit lib tests; elfjit.rs untouched, jit.rs + hermetic only).
-- Workspace green (cargo test --workspace EXIT 0 re-confirmed this cycle).
-- recon-v3 deliverables green (24 real task frames swap Ok(0x1), producer INERT, JSON fix).
+- `dev` HEAD: SH415. Production code only in session.rs (off the 1MiB hooks);
+  jit.rs/elfjit.rs untouched. Workspace green (arm64jit lib 469/0; cargo test
+  --workspace EXIT 0).
+- recon-v3 deliverables re-verified green at HEAD: capture_taskv4_frame.sh
+  attempt 1 = 24 real task frames `swap Ok(0x1)`, 197 node pops, 0 json abort,
+  0 crash.
 
-## Session's advances (SH406 -> SH407+SH408)
+## This cycle's advance
 
-- **SH406**: extended SH269 GOVFLAG seed to the SH405 MAIN-arm app-start continuation; the
-  0x10258b5d8 body's continuation PASSES the NULL-controller deref (0x1025f501c) and drains into
-  the SH341 persistence lane; DMCONT 0.
-- **SH407** (this cycle): measured the MAIN-arm terminal — the app-start body runs END-TO-END
-  (0x10258b5d8..0x10258bbb0 all 14 block-entry pcs fire, nothing past), then 190 valid-key
-  pool-pops (SETFIX fired) and EXIT 139 (host-side). DMCONT = 0 real hits; the MAIN arm drains to
-  the standing LSM persistence lane, not do-init-completion (closes SH405's frontier question).
-- **SH408** (this cycle): same env + files-dir/R1 rungs (seed unreached) — LSM init ADVANCES
-  through initStorageManagerNative + crosses the SH285 reader (0x101db1b08 = 0) then faults
-  fault=0x0 in opnew/insert band (whack-a-mole one deeper; SH385 node value needs a real LSM ctor).
+- **SH415**: do-init completion is now a REPORTED observable of the runtime.
+  MEASURED on real libroblox.so (complete substrate, EXIT clean): substrate 11/16
+  Ok; the probe fires twice and reports the same honest verdict — once-guard
+  seeded (0x101 bit0=1, the FIRST EXECUTE-DO-INIT-GATES precondition now MET under
+  the full substrate) yet DM-root=0, counter=0, LIVE DM=false. Per-run proof the
+  do-init once-path constructs nothing live (SH381 consistent). Host lifecycle
+  fires (MH_FLAGS/ENGINE_INITIALIZED/APP_READY true, AppBridgeV2 genuine vt).
 
 ## Honest status
 
-- Route-B live-DM structural gate UNCHANGED (DM-root [0x106a68818]=0, MH_* false, AppBridgeV2
-  genuine vt 0x1063a3410 unchanged). No DM manufactured; DMCONT unreached from the MAIN arm
-  (reachable only via the settings-state/SH371 env, where it also terminates at the LSM lane SH372).
-- The app-start MAIN body is now fully cleared end-to-end (the biggest SESSION-CTOR reach on
-  record); the persistence lane is measured-returned at two successive fenceposts (reader crossed,
-  opnew/insert fault). Only a real session ctor (LocalStorageManager, do-init completion) crosses
-  it — the standing SESSION-CTOR / BUILD-THE-RUNTIME deliverable.
+- No DM (DM-root [0x106a68818]=0, no make_shared, MH_GAME_LOADED false). Route-B
+  live-DM structural gate UNCHANGED. The probe moved no guest byte (pure readout) —
+  it makes the completion gate measurable per-run, not a DM advance. The live DM
+  still requires the engine's own session to construct it (SEP-18 cause-not-symptom).
 
 ## Next-forward candidates
 
-1. (standing, TOP — Route B) The persistence lane is measured-returned at two fenceposts (SH407/408).
-   The app-start body is clear; the forward is the real session-compat runtime surface (SH400
-   substrate + a real LSM/EGL/onAppReady host drive) so the engine SELF-constructs its
-   LocalStorageManager + DM. Do NOT re-drive LSM skips (SH349/350/358) or re-manufacture the map
-   (SH396).
-2. DMCONT 0x102bd1d68 = 0 from the MAIN arm; reachable only via the SH371 settings-state env.
-3. R1 content half staged+armed (SH351/352/354); fires the instant a live DM drives the loader.
-4. Do NOT re-tread: setDataModelToCurrent (SH388), LSM crossings/composed (SH385/393/396),
-   SH285/SH341 family (SH349/350/358/373/395-398), EC reader-gate (SH355/356/374), 0x258b5d8/
-   SetInitParams (SH362/375), window-attach real (SH367), ALooper (SH365), governor-gates (SH379),
-   once-lambda store (SH381), app-cmd 1/13/15/17/18 (SH393).
+1. (standing, TOP — Route B) do-init completeness / live-DM: the substrate now
+   REPORTS the completion markers; keep the SEP-18 runtime build (real
+   Activity/AppBridge/JNI-lifecycle/GLES drive) so the engine's own session ctor
+   constructs the DM world.
+2. DMCONT 0x102bd1d68 = 0 from the MAIN arm.
+3. Feed real X-window events into `drive_host_input_pump` on the render/host loop
+   (the natural integration point once a live DM advances).
+4. Do NOT re-tread: setDataModelToCurrent (SH388), LSM crossings (SH385/393/396),
+   SH285/SH341 family, EC reader-gate, window-attach real (SH367), ALooper (SH365),
+   governor-gates (SH379).
 5. Do NOT run the SH174 latch without JIT_DM_ALLOC_CAPTURE_DELEGATE=1 (SH395).

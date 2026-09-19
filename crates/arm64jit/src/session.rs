@@ -180,6 +180,16 @@ pub fn drive_routeb_session_substrate(iimg: &[u8], ib: u64, tpidr: u64, boot_sp:
         if r != 0 {
             ok += 1;
         }
+        // SH415: the EXECUTE-DO-INIT-GATES live-DM completion markers are the
+        // runtime's single source of truth for whether the do-init world-build
+        // owned a live DataModel. Probe them right after the two atoms whose
+        // jit_run bodies reach the do-init — StartLuaAppDM (0x1023efe2c) and
+        // V2StartAppWithParams (0x10258b144) — so do-init completion is a
+        // per-atom REPORTED observable (like MH_* / AppBridgeV2), not a one-off
+        // probe guess. Pure readout, safe on any cell (page-guarded, no SIGSEGV).
+        if atom.guest == 0x1023efe2c || atom.guest == 0x10258b144 {
+            probe_doinit_completion();
+        }
         // recon-routeB step-2 / SEP-18: after the surface is handed over
         // (V2UpdateSurfaceAppWithPlatformParams) and before SendAppEventOnAppReady,
         // a real host drives the ordered NativeHelper `gameActivity_*` lifecycle
@@ -476,6 +486,97 @@ pub fn drive_host_input_pump(
     delivered
 }
 
+/// EXECUTE-DO-INIT-GATES live-DM completion probe (RECON-V3, authoritative).
+///
+/// A real completed do-init owns a live DataModel; the gate spec names four
+/// markers that together prove it. The ordered session substrate drives
+/// StartLuaAppDM (0x1023efe2c) and V2StartAppWithParams (0x10258b144) — the two
+/// atoms whose jit_run bodies reach the do-init — so probing those four markers
+/// right after each makes do-init completion a first-class REPORTED observable
+/// of the runtime (like MH_* / AppBridgeV2), instead of a one-off probe guess.
+///
+/// Markers (EXECUTE-DO-INIT-GATES letter):
+///   [0x106a68410].bit0 == 1            once-guard seeded (let the once-lambda run)
+///   DM-root [0x106a68818] != NULL      holder populated by the once-lambda store
+///   [[0x106a68818]+0x20] vt, [vt+0x30] both readable in-image  (genuine DM vtable)
+///   [0x106dca0e88] counter != 0        app-data-model counter advanced
+/// A live DM is implied only when ALL four hold. Every read is page-guarded via
+/// routeb_ensure_writable (no SIGSEGV on an unmapped cell), read-only otherwise.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DoinitCompletion {
+    pub once_guard_seeded: bool,
+    pub dm_root_nonnull: bool,
+    pub vm_vt_in_image: bool,
+    pub counter_advanced: bool,
+    pub once_guard: u64,
+    pub dm_root: u64,
+    pub vt: u64,
+    pub counter: u64,
+}
+
+impl DoinitCompletion {
+    /// A live DataModel is owned only when every EXECUTE-DO-INIT-GATES marker
+    /// holds. This is the single bit the runtime's session gate should read to
+    /// know whether the engine self-constructed its DM world headlessly.
+    pub fn liveness(&self) -> bool {
+        self.once_guard_seeded
+            && self.dm_root_nonnull
+            && self.vm_vt_in_image
+            && self.counter_advanced
+    }
+}
+
+/// Page-guarded guest-word read: skips non-guest / unaligned / unmapped
+/// addresses and returns 0, so the probe can never SIGSEGV even when the .bss
+/// cell is not mapped in the current process.
+fn probe_rd(a: u64) -> u64 {
+    if a != 0
+        && a >= 0x100000000
+        && a >> 56 == 0
+        && a & 7 == 0
+        && crate::jit::routeb_ensure_writable(a)
+    {
+        unsafe { std::ptr::read_unaligned(a as *const u64) }
+    } else {
+        0
+    }
+}
+
+/// Read the four EXECUTE-DO-INIT-GATES live-DM completion markers and report
+/// whether the do-init world-build produced a live DataModel. Pure readout (no
+/// guest mutation beyond routeb_ensure_writable's page-map-on-demand); safe on
+/// no-live-image harnesses (each read degrades to 0).
+pub fn probe_doinit_completion() -> DoinitCompletion {
+    let once_guard = probe_rd(0x106a68410);
+    let dm_root = probe_rd(0x106a68818);
+    // A genuine DM vtable: DM-root itself is readable, [[root]+0x20] (vt) is a
+    // guest in-image pointer, and the slot it points at (vt+0x30) is readable.
+    let vt = if dm_root != 0 { probe_rd(dm_root + 0x20) } else { 0 };
+    let vm_vt_in_image = vt != 0 && (0x100000000..=0x200000000).contains(&vt) && probe_rd(vt + 0x30) != 0;
+    let counter = probe_rd(0x106dca0e88);
+    let c = DoinitCompletion {
+        once_guard_seeded: once_guard & 1 == 1,
+        dm_root_nonnull: dm_root != 0,
+        vm_vt_in_image,
+        counter_advanced: counter != 0,
+        once_guard,
+        dm_root,
+        vt,
+        counter,
+    };
+    eprintln!(
+        "[session-drive] EXECUTE-DO-INIT live-DM probe: once-guard[0x106a68410]=0x{:x} bit0={} DM-root[0x106a68818]=0x{:x} vt=0x{:x} in-image={} app-DM-counter[0x106dca0e88]=0x{:x} -> LIVE DM = {}",
+        c.once_guard,
+        c.once_guard_seeded as u8,
+        c.dm_root,
+        c.vt,
+        c.vm_vt_in_image as u8,
+        c.counter,
+        c.liveness()
+    );
+    c
+}
+
 /// Whether the host-input delivery path is armed: a real ANativeWindow XID is
 /// registered (shims::set_anativewindow_xid, SH112/SH303) — i.e. the same surface
 /// the EGL window path builds on. Zero = headless/plain run -> input pump inert.
@@ -677,5 +778,58 @@ mod tests {
         // Restore the prior XID (other tests may observe it).
         crate::shims::set_anativewindow_xid(prev_xid);
         unsafe { std::env::remove_var(crate::ainput::AINPUT_BRIDGE_ENV) };
+    }
+
+    /// SH415: the EXECUTE-DO-INIT-GATES live-DM completion probe is a first-class
+    /// substrate observable. On a no-live-image harness every read degrades to 0
+    /// through probe_rd's page-guard (no SIGSEGV), liveness() aggregates the four
+    /// markers to a single "live DM owned" bit, and the per-atom wiring keeps the
+    /// probe attached to the two do-init-reaching atoms (StartLuaAppDM +
+    /// V2StartAppWithParams) so do-init completion is REPORTED, not guessed.
+    #[test]
+    fn sh415_doinit_completion_probe_safe_and_aggregates() {
+        // No live image: every marker read must degrade to 0 and liveness must be
+        // false (NOT a live DM) — and critically the probe must not SIGSEGV on the
+        // possibly-unmapped .bss cells (page-guarded via routeb_ensure_writable).
+        let c = probe_doinit_completion();
+        assert!(!c.liveness(), "no DM => liveness() must be false");
+        assert_eq!(c.dm_root, 0, "no live image => DM-root read degrades to 0");
+        assert_eq!(c.counter, 0, "no live image => app-DM counter degrades to 0");
+
+        // Aggregation: any single failed marker negates liveness (all four required).
+        let partial = DoinitCompletion {
+            once_guard_seeded: true,
+            dm_root_nonnull: true,
+            vm_vt_in_image: false,
+            counter_advanced: false,
+            ..DoinitCompletion::default()
+        };
+        assert!(!partial.liveness(), "missing vt-in-image + counter => NOT live");
+
+        // Exhaustive: only ALL four markers hold => live DM.
+        assert!(
+            DoinitCompletion {
+                once_guard_seeded: true,
+                dm_root_nonnull: true,
+                vm_vt_in_image: true,
+                counter_advanced: true,
+                ..DoinitCompletion::default()
+            }
+            .liveness(),
+            "all four EXECUTE-DO-INIT-GATES markers => live DM"
+        );
+
+        // The two do-init-reaching atoms stay in the substrate table so the probe
+        // wiring can't silently disconnect.
+        let hits: Vec<u64> = ROUTEB_SESSION_SUBSTRATE
+            .iter()
+            .map(|a| a.guest)
+            .filter(|g| *g == 0x1023efe2c || *g == 0x10258b144)
+            .collect();
+        assert_eq!(
+            hits.len(),
+            2,
+            "StartLuaAppDM (0x1023efe2c) + V2StartAppWithParams (0x10258b144) both present in the substrate"
+        );
     }
 }
