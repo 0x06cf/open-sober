@@ -973,6 +973,38 @@ mod tests {
         ];
         let names: Vec<&str> = ROUTEB_SESSION_SUBSTRATE.iter().map(|a| a.name).collect();
         assert_eq!(names, known, "substrate name set drifted from the template table");
+        // Exact name->guest-address pairing (deterministic, no real binary needed).
+        // The elfjit/session drives dispatch by (name, guest); a name-address swap
+        // slips past the names-only set check above AND the jit.rs sh399
+        // prologue-anchor (both run to a valid fn entry), so pin the definitive
+        // <name,guest> map here — silent drift must fail at compile-test time.
+        let addr_pairs: Vec<(&str, u64)> = ROUTEB_SESSION_SUBSTRATE
+            .iter()
+            .map(|a| (a.name, a.guest))
+            .collect();
+        let expected_pairs: &[(&str, u64)] = &[
+            ("nativeInitializeNativeFlags", 0x10232048c),
+            ("nativeGameGlobalInit", 0x102206404),
+            ("setTaskSchedulerBackgroundMode(false,ASMA.start)", 0x102bb2380),
+            ("nativeAppBridgeV2InitWithParams", 0x102365c54),
+            ("nativeAppBridgeStartLuaAppDM", 0x1023efe2c),
+            ("nativeAppBridgeV2StartAppWithParams", 0x10258b144),
+            ("V2UpdateSurfaceAppWithPlatformParams", 0x1025f5fec),
+            ("initAppShellReporter", 0x1021f53b8),
+            ("setActive", 0x1021f5de4),
+            ("nativeSetInitParams", 0x102bcc814),
+            ("nativeInitClientSettings", 0x1022265fc),
+            ("nativeInitClientSettingsSigned", 0x102bb070c),
+            ("nativeActivity_onEngineSettingsReceived", 0x102bd1c38),
+            ("nativeAppBridgeV2SendAppEventOnAppReady(Home in x5)", 0x102bb463c),
+            ("nativeAppBridgeV2SendAppEventOnGameLoaded", 0x102bb429c),
+            ("MessageBus.subscribe(experience-launch)", 0x102ba5bb8),
+        ];
+        assert_eq!(
+            addr_pairs,
+            expected_pairs,
+            "substrate <name,guest> address pairing drifted from the definitive map"
+        );
         // SendAppEventOnAppReady is the ABI-critical one: "Home" must be x5.
         let args = substrate_args("nativeAppBridgeV2SendAppEventOnAppReady(Home in x5)", &h);
         let home_ptr = unsafe { std::ptr::read_unaligned(args[5] as *const u64) };

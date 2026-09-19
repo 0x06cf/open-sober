@@ -1,5 +1,39 @@
 # Open Sober — Agent Handoff
 
+## SH463 (Sep 20, 2026, hermes-worker): 3-axis HEAD re-verification + session-substrate <name,guest> contract pin
+Single-agent (cone suppressed). Recon-v3 immediate-priority deliverables
+re-verified GREEN at HEAD (capture_taskv4_frame.sh: 24 real task-driven frames
+`present swap Ok(0x1)`, 0 json abort, 0 crash, EXIT 0). Workspace green (cargo
+test --workspace 850 passed/0 failed, incl. arm64jit lib 669/0; cargo build
+--workspace + --example elfjit OK).
+- **Independently confirmed the translator heritage lineage is COMPLETE.**
+  Cross-referenced every `Inst::` variant the decoder (decode.rs) produces
+  against translate.rs: the ONLY variant no hermetic constructs is
+  `Inst::Unsupported` (the decode-failure path, not a real instruction family).
+  Real-binary runs (taskv4 + sh415/sh463b) show ZERO Unsupported/illegal decode
+  markers — no new family exists to pin from the client's executed code, so
+  there is no "real-run decode gap" re-entry per STATUS next-forward #5.
+- **Substrate baseline deterministic + the two faulting atoms confirmed
+  pre-existing.** nativeInitializeNativeFlags (0x10232048c) + V2InitWithParams
+  (0x102365c54) both stop with garbage pcs in the session-drive AND identically
+  in a clean boot-only run (which then aborts EXIT 134 at the SH174 latch
+  without JIT_DM_ALLOC_CAPTURE_DELEGATE=1). Same fns, same order, same fault —
+  the run-variable, order/warm-up-dependent nativeInit 'outside image' Route-B
+  lane already recorded in memory. NOT a session-drive defect, NOT a regression
+  (recorded baseline = 11/16 across SH400-462), NOT a re-tread target.
+- **One new deliverable (contract hardening on the SEP-17/18 session-drive):**
+  session.rs `substrate_atom_names_exact_and_no_fallthrough` now pins the
+  definitive 16-atom <name,guest> address map (deterministic, no real binary).
+  The existing names-only set check + jit.rs sh399 prologue-anchor cannot catch
+  a name<->guest swap between two distinct valid fn entries; this closes it.
+  Test-only (extends the existing names test; no new test, arm64jit lib stays
+  669/0). Production code untouched.
+- Honest: NOT a DM / NOT a live-DM step (Route-B gate UNCHANGED; DM-root
+  [0x106a68818]=0, no store reaches it — SH462 store-level structural). This is
+  a re-verification + defensive-pin cycle. No re-treads.
+- Files: docs/frontier-sh463-session-drive-addrpin.md + crates/arm64jit/src/
+  session.rs (test-only). Commit (SH463).
+
 ## SH462 (Sep 20, 2026, hermes-worker): DM-root STORE-watch — dynamic write-site trace of the Route-B DM-holder window (first store-level, not read-level, measurement)
 Single-agent (cone suppressed). The recon-v3 immediate-priority deliverables
 remain green at this HEAD (type4_frame_thunk 24 real task-driven frames + 0 json
