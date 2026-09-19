@@ -34,8 +34,13 @@ pub struct GuestSigAction {
 }
 
 /// Process-wide signal action table, indexed by signal number (1..=64).
-static SIG_ACTIONS: std::sync::Mutex<[GuestSigAction; 65]> =
-    std::sync::Mutex::new([GuestSigAction { handler: 0, flags: 0, mask: [0; 8] }; 65]);
+static SIG_ACTIONS: std::sync::Mutex<[GuestSigAction; 65]> = std::sync::Mutex::new(
+    [GuestSigAction {
+        handler: 0,
+        flags: 0,
+        mask: [0; 8],
+    }; 65],
+);
 
 /// Saved interrupted guest context for an in-flight signal handler, per guest
 /// thread (a process-local stack so nested signals unwind LIFO). The guest
@@ -51,8 +56,8 @@ struct SigFrame {
     /// Guest address to resume at after the handler returns: the instruction
     /// right after the interrupted `svc` (the post-syscall continuation).
     pc: u64,
-    si: [u8; 128],   // guest siginfo buffer (handler x1)
-    uc: [u8; 1024],  // guest ucontext buffer (handler x2)
+    si: [u8; 128],  // guest siginfo buffer (handler x1)
+    uc: [u8; 1024], // guest ucontext buffer (handler x2)
 }
 
 thread_local! {
@@ -62,8 +67,11 @@ thread_local! {
 /// Test/app hook: clear the process-wide action table. silences nothing — just
 /// returns every signal to its default disposition.
 pub fn reset_actions() {
-    *SIG_ACTIONS.lock().unwrap() =
-        [GuestSigAction { handler: 0, flags: 0, mask: [0; 8] }; 65];
+    *SIG_ACTIONS.lock().unwrap() = [GuestSigAction {
+        handler: 0,
+        flags: 0,
+        mask: [0; 8],
+    }; 65];
 }
 
 /// Signal numbers Linux forbids blocking / catching (SIGKILL=9, SIGSTOP=19).
@@ -166,7 +174,9 @@ pub fn sigprocmask(st: &mut CpuState, how: u64, set: u64, oset: u64, sigsetsize:
     // Report the previous mask to oset (if provided).
     if oset != 0 {
         // SAFETY: guest passed a writable 8-byte sigset (sigsetsize >= 8).
-        unsafe { std::ptr::write_unaligned(oset as *mut u64, old); }
+        unsafe {
+            std::ptr::write_unaligned(oset as *mut u64, old);
+        }
     }
     0
 }
@@ -211,7 +221,11 @@ pub fn rt_sigaction(sig: u64, act: u64, oact: u64) -> i64 {
             let flags = (p.add(8) as *const u64).read_unaligned();
             let mut mask = [0u8; 8];
             std::ptr::copy_nonoverlapping(p.add(24), &mut mask as *mut u8, 8);
-            table[sig as usize] = GuestSigAction { handler, flags, mask };
+            table[sig as usize] = GuestSigAction {
+                handler,
+                flags,
+                mask,
+            };
         }
     }
     drop(table);
@@ -316,5 +330,225 @@ pub fn sigreturn(st: &mut CpuState) -> bool {
             true
         }
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jit::CpuState;
+
+    /// A serialization lock for the SIG_ACTIONS table + FRAMES TLS so parallel
+    /// hermetics never race a shared signal-action store (the table is
+    /// process-global; reset_actions + install/query must be mutually owned).
+    static SIG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn sigprocmask_block_unblock_setmask_drops_unblockable_and_osets() {
+        let mut st = CpuState::new();
+        let _g = SIG_TEST_LOCK.lock();
+        reset_actions();
+
+        // An 8-byte set buffer we write into, then hand to sigprocmask.
+        let mut buf = vec![0u8; 8];
+        // Block SIGUSR1(10) + SIGUSR2(12): bits 9, 11.
+        let block = (1u64 << 9) | (1u64 << 11);
+        unsafe { std::ptr::write_unaligned(buf.as_mut_ptr() as *mut u64, block) };
+
+        // SIG_BLOCK from an empty mask.
+        let r = sigprocmask(&mut st, 0, buf.as_mut_ptr() as u64, 0, 8);
+        assert_eq!(r, 0);
+        assert_eq!(st.blocked_mask, block);
+        assert!(is_blocked(&st, 10));
+        assert!(is_blocked(&st, 12));
+        assert!(!is_blocked(&st, 11));
+
+        // oset reports the just-set mask.
+        let mut o = vec![0u8; 8];
+        let r = sigprocmask(
+            &mut st,
+            1,
+            buf.as_mut_ptr() as u64,
+            o.as_mut_ptr() as u64,
+            8,
+        );
+        assert_eq!(r, 0);
+        let oset = unsafe { std::ptr::read_unaligned(o.as_ptr() as *const u64) };
+        assert_eq!(oset, block, "oset carries the previous mask");
+
+        // SIG_UNBLOCK cleared both.
+        assert_eq!(st.blocked_mask, 0, "SIG_UNBLOCK of the whole set clears it");
+        assert!(!is_blocked(&st, 10));
+
+        // Attempting to BLOCK SIGKILL(9)+SIGSTOP(19) must be silently dropped.
+        let killstop = (1u64 << 8) | (1u64 << 18);
+        unsafe { std::ptr::write_unaligned(buf.as_mut_ptr() as *mut u64, block | killstop) };
+        let r = sigprocmask(&mut st, 0, buf.as_mut_ptr() as u64, 0, 8);
+        assert_eq!(r, 0);
+        // Only the blockable bits survive; kill/stop never blocked.
+        assert_eq!(st.blocked_mask, block);
+        assert!(!is_blocked(&st, 9));
+        assert!(!is_blocked(&st, 19));
+
+        // SIG_SETMASK replaces wholesale.
+        let only12 = 1u64 << 11;
+        unsafe { std::ptr::write_unaligned(buf.as_mut_ptr() as *mut u64, only12) };
+        let r = sigprocmask(&mut st, 2, buf.as_mut_ptr() as u64, 0, 8);
+        assert_eq!(r, 0);
+        assert_eq!(st.blocked_mask, only12);
+    }
+
+    #[test]
+    fn sigprocmask_einval_paths() {
+        let mut st = CpuState::new();
+        // sigsetsize < 8 is invalid.
+        assert_eq!(sigprocmask(&mut st, 0, 0, 0, 4), -(libc::EINVAL) as i64);
+        // how > 2 is invalid.
+        assert_eq!(sigprocmask(&mut st, 3, 0, 0, 8), -(libc::EINVAL) as i64);
+        // SIG_SETMASK (2) with a NULL set is invalid.
+        assert_eq!(sigprocmask(&mut st, 2, 0, 0, 8), -(libc::EINVAL) as i64);
+        // A NULL set + NULL oset with SIG_BLOCK is a no-op query that still
+        // returns 0 (Linux permits a pure query with both NULL).
+        assert_eq!(sigprocmask(&mut st, 0, 0, 0, 8), 0);
+    }
+
+    #[test]
+    fn pending_deliverable_ordering_and_blocked_hold() {
+        let mut st = CpuState::new();
+        let _g = SIG_TEST_LOCK.lock();
+        reset_actions();
+
+        // mark 12 then 10 pending; both unblocked.
+        mark_pending(&mut st, 12);
+        mark_pending(&mut st, 10);
+        // Lowest set bit = ascending signal number: 10 before 12.
+        assert_eq!(take_deliverable_pending(&mut st), Some(10));
+        assert_eq!(take_deliverable_pending(&mut st), Some(12));
+        assert_eq!(take_deliverable_pending(&mut st), None, "drained");
+
+        // A blocked signal stays pending and is not delivered.
+        st.blocked_mask = 1u64 << 11; // block 12
+        mark_pending(&mut st, 12);
+        mark_pending(&mut st, 10);
+        assert_eq!(
+            take_deliverable_pending(&mut st),
+            Some(10),
+            "unblocked 10 delivered"
+        );
+        assert_eq!(
+            take_deliverable_pending(&mut st),
+            None,
+            "12 held blocked in pending_mask"
+        );
+        assert!(st.pending_mask & (1u64 << 11) != 0, "12 still pending");
+        // Once unblocked, it becomes deliverable.
+        st.blocked_mask = 0;
+        assert_eq!(
+            take_deliverable_pending(&mut st),
+            Some(12),
+            "12 now delivered"
+        );
+    }
+
+    #[test]
+    fn sigaction_install_query_roundtrip_and_einval() {
+        let _g = SIG_TEST_LOCK.lock();
+        reset_actions();
+
+        // Out-of-range signal is EINVAL.
+        assert_eq!(rt_sigaction(0, 0, 0), -(libc::EINVAL) as i64);
+        assert_eq!(rt_sigaction(65, 0, 0), -(libc::EINVAL) as i64);
+
+        // Install handler 0x1234 with flags on SIGUSR1(10).
+        let mut act = vec![0u8; 32];
+        unsafe {
+            (act.as_mut_ptr() as *mut u64).write_unaligned(0x1234u64); // handler
+            (act.as_mut_ptr().add(8) as *mut u64).write_unaligned(0x4000u64); // flags
+                                                                              // mask @ 24 (8 bytes): block SIGUSR2.
+            std::ptr::copy_nonoverlapping(
+                (1u64 << 11).to_le_bytes().as_ptr(),
+                act.as_mut_ptr().add(24),
+                8,
+            );
+        }
+        let r = rt_sigaction(10, act.as_mut_ptr() as u64, 0);
+        assert_eq!(r, 0);
+
+        // Query it back via oact.
+        let mut oact = vec![0u8; 32];
+        let r = rt_sigaction(10, 0, oact.as_mut_ptr() as u64);
+        assert_eq!(r, 0);
+        let handler = unsafe { (oact.as_ptr() as *const u64).read_unaligned() };
+        let flags = unsafe { (oact.as_ptr().add(8) as *const u64).read_unaligned() };
+        let mut mask = [0u8; 8];
+        unsafe { std::ptr::copy_nonoverlapping(oact.as_ptr().add(24), &mut mask as *mut u8, 8) };
+        assert_eq!(handler, 0x1234);
+        assert_eq!(flags, 0x4000);
+        assert_eq!(mask, (1u64 << 11).to_le_bytes());
+    }
+
+    #[test]
+    fn handler_frame_sigreturn_restores_context() {
+        let mut st = CpuState::new();
+        let _g = SIG_TEST_LOCK.lock();
+        reset_actions();
+
+        // Seed an interrupted context that begin_handler must save + restore.
+        for i in 0..32 {
+            st.x[i] = 0x1000 + i as u64;
+        }
+        st.x[31] = 0x7000_0000; // sp
+        st.x[0] = 0xDEAD; // will be overridden by the syscall-return 0
+        st.pc = 0x402000; // interrupted pc (post-svc continuation)
+        st.tpidr = 0x1234_5678;
+        st.nzcv = 0xABCD;
+
+        // Install a real handler so dispatch_current_thread enters begin_handler
+        // (no default-ignore / default-terminate branch).
+        let mut act = vec![0u8; 32];
+        unsafe {
+            (act.as_mut_ptr() as *mut u64).write_unaligned(0x1234u64);
+        }
+        let r = rt_sigaction(10, act.as_mut_ptr() as u64, 0);
+        assert_eq!(r, 0);
+
+        dispatch_current_thread(&mut st, 10, 0x402004);
+
+        // Handler ABI: x0=signo, x1=siginfo*, x2=ucontext*, x30=SIGRET, pc
+        // unchanged (redirect_request drives the handler run), redirect set.
+        assert_eq!(st.redirect_request, 0x1234, "handler queued to run");
+        assert_eq!(st.x[0], 10, "x0 = signo");
+        assert!(
+            st.x[1] != 0 && st.x[2] != 0,
+            "siginfo/ucontext pointers set ({:#x},{:#x})",
+            st.x[1],
+            st.x[2]
+        );
+        assert_eq!(st.x[30], SIGRET, "x30 = SIGRET");
+        assert!((st.x[1] & 15) == 0, "siginfo pointer naturally aligned");
+
+        // siginfo header: si_signo=10, si_errno=0 (si_code omitted; offset 0/8).
+        let si = unsafe { std::ptr::read_unaligned(st.x[1] as *const i32) };
+        assert_eq!(si, 10, "siginfo.si_signo");
+
+        // sigreturn restores the interrupted context wholesale.
+        let ok = sigreturn(&mut st);
+        assert!(ok, "sigreturn finds a saved frame");
+        assert_eq!(st.pc, 0x402004, "resumes right after the interrupted svc");
+        assert_eq!(st.tpidr, 0x1234_5678);
+        assert_eq!(st.nzcv, 0xABCD);
+        assert_eq!(st.x[31], 0x7000_0000, "sp restored");
+        for i in 1..31 {
+            assert_eq!(
+                st.x[i],
+                0x1000 + i as u64,
+                "x{i} restored (except x0 overridden)"
+            );
+        }
+        // x0 was overridden to 0 (syscall return), not restored to 0xDEAD.
+        assert_eq!(st.x[0], 0, "x0 forced to syscall-return 0");
+
+        // A second sigreturn (no saved frame) is a stray — returns false.
+        assert!(!sigreturn(&mut st), "stray sigreturn detected");
     }
 }

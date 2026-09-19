@@ -1,5 +1,36 @@
 # Open Sober — Agent Handoff
 
+## SH425 (Sep 19, 2026, hermes-worker): hermetic coverage of the guest signal-delivery core (signals.rs) — rt_sigaction/sigprocmask install-query + BLOCK/UNBLOCK/SETMASK with silent SIGKILL/SIGSTOP drop, pending/deliverable ascending-order hold-and-release, and the full installed-handler dispatch → sigreturn context-restore ABI (x0=signo/x1=siginfo/x2=ucontext/x30=SIGRET) had ZERO tests; SH425 pins all of it with 5 deterministic hermetics. The surface a real client leans on for fatal-path diagnostics (SIGTRAP default-terminate exit 133) and cross-thread cooperative signal pickup
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+re-verified green at this exact HEAD first (capture_taskv4_frame.sh attempt 1:
+24 real task-driven frames `present swap Ok(0x1)`, 196 node pops, 0 json abort,
+0 crash). Workspace green (cargo test --workspace EXIT 0; arm64jit lib 490/0
+incl. 5 new sh425 hermetics; cargo build --workspace OK, 0 errors).
+Production code ONLY in signals.rs (off the 1MiB hooks; jit.rs/elfjit.rs
+byte-unchanged). Pure `#[cfg(test)]` addition (+5 hermetics + a SIG_TEST_LOCK
+that serializes the process-global SIG_ACTIONS table against parallel runs), no
+production path / guest byte / JIT-hook-default touched.
+- signals.rs serves the Linux signal contract to translated AArch64 guest code:
+  rt_sigaction(134) records SIG_DFL/1=SIG_IGN/a guest handler; sigprocmask(135)
+  applies SIG_BLOCK/UNBLOCK/SETMASK while silently dropping unblockable
+  SIGKILL(9)/SIGSTOP(19) bits; mark_pending/take_deliverable_pending hold a
+  blocked signal pending and deliver it once unblocked (ascending signal-number
+  order); dispatch_current_thread runs an installed handler via the aarch64
+  signal ABI (x0=signo, x1=siginfo*, x2=ucontext*, x30=SIGRET) and sigreturn
+  restores the interrupted context.
+- Genuine gap: signals.rs had ZERO self-tests — masking/pending/ordering/ABI
+  correctness only exercised via SIGTRAP/fault paths on a full boot. SH425's 5
+  hermetics pin: (1) block/unblock/setmask + unblockable-drop + oset; (2)
+  sigprocmask -EINVAL paths; (3) pending ascending-order delivery + blocked
+  hold/release; (4) sigaction install/query byte-exact round-trip + out-of-range
+  EINVAL; (5) full handler dispatch → sigreturn restore (pc after svc, sp/tpidr/
+  nzcv/x-regs exact, x0 forced to syscall-return 0, stray sigreturn detected).
+  Deterministic, no real binary, no env.
+- Honest: NOT a DM (SH415 probe re-confirms DM-root [0x106a68818]=0x0 under the
+  complete substrate; Route-B live-DM gate unchanged). BUILD-THE-RUNTIME
+  signal-surface coverage completion, not a re-tread.
+- Files: docs/frontier-sh425-signals-hermetics.md + crates/arm64jit/src/signals.rs
+
 ## SH424 (Sep 19, 2026, hermes-worker): hermetic coverage of the guest initial-stack builder (boot.rs) — the module that lays out `[argc][argv][envp][auxv, AT_NULL]` + arg/env strings for a remote-loaded aarch64 ELF and patches a zero AT_RANDOM slot to real entropy fed the glibc stack canary had ZERO tests of its own logic; SH424 fixes that with 3 deterministic hermetics, hardening the load-bearing boot surface (a garbage initial stack makes glibc `_start` IFUNC-dispatch into SVE/SME opcodes the JIT can't decode — the memory-note hole the module's minimal-HWCAP design exists to prevent)
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 re-verified green at this exact HEAD first (capture_taskv4_frame.sh attempt 1:
