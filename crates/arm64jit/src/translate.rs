@@ -108,6 +108,78 @@ extern "C" fn canary_store_watch(
     0
 }
 
+// ---------------------------------------------------------------------------
+// SH4xx-next: host-RETURN leak watch. The canary store-watch NAMES the guest
+// store (0x101d99e70 LSM pool-pop) that writes a foreign host ptr (0x7f...) into
+// a frame canary window; the missing producer side is WHICH host call RETURNED
+// that ptr into guest x0. This probe sits at the host-call return sites
+// (jit.rs s.x[0]=ret) and logs every host fn whose return lands a host ptr in
+// guest x0, so the canary store value correlates to its host producer by the
+// same 0x7f... value. Enabled ONLY by JIT_HOST_RETURN_WATCH=1 (default off =>
+// one AtomicBool load, no logging). Bounded + de-dups consecutive repeats.
+// ---------------------------------------------------------------------------
+static HOST_RETURN_WATCH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static HOST_RETURN_WATCH_TEST_OVERRIDE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Read the JIT_HOST_RETURN_WATCH env once (lazily). Idempotent.
+fn host_return_watch_enabled() -> bool {
+    use std::sync::atomic::Ordering;
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        if !HOST_RETURN_WATCH_TEST_OVERRIDE.load(Ordering::Relaxed) {
+            let on = std::env::var("JIT_HOST_RETURN_WATCH").ok().as_deref() == Some("1");
+            HOST_RETURN_WATCH.store(on, Ordering::Relaxed);
+        }
+    });
+    HOST_RETURN_WATCH.load(Ordering::Relaxed)
+}
+
+/// Test-only override so a hermetic can toggle the flag without touching env.
+#[doc(hidden)]
+pub fn set_host_return_watch_test(on: bool) {
+    use std::sync::atomic::Ordering;
+    HOST_RETURN_WATCH_TEST_OVERRIDE.store(true, Ordering::Relaxed);
+    HOST_RETURN_WATCH.store(on, Ordering::Relaxed);
+}
+
+/// Expose whether the return-watch probe is currently active (for a hermetic).
+#[doc(hidden)]
+pub fn host_return_watch_active() -> bool {
+    HOST_RETURN_WATCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Host-return leak probe: called from the host-call bridge AFTER a host fn
+/// returned `ret` into guest x0 at host-thunk slot `pc`, guest caller `caller`.
+/// NVIDIA -- narrows to the SH103/SH4xx leak signature: `ret` is a FOREIGN HOST
+/// pointer (0x7000_0000_0000..0x8000_0000_0000) — exactly the value the canary
+/// store-watch later sees written into a frame. Logging it names the HOST fn
+/// that produced the canary-smashing pointer. Pure observability, default-inert.
+pub fn host_return_leak_watch(pc: u64, ret: u64, caller: u64) {
+    if !host_return_watch_enabled() {
+        return;
+    }
+    const HOST_HI: u64 = 0x8000_0000_0000;
+    const HOST_LO: u64 = 0x7000_0000_0000;
+    if !(ret >= HOST_LO && ret < HOST_HI) {
+        return; // not a foreign host pointer -> not the leak class
+    }
+    let who = crate::jit::host_call_slot_name(pc)
+        .unwrap_or_else(|| format!("slot{:#x}", pc));
+    static LAST_RET: std::sync::Mutex<Option<(u64, u64)>> =
+        std::sync::Mutex::new(None);
+    if let Ok(mut l) = LAST_RET.lock() {
+        if *l == Some((pc, ret)) {
+            return; // de-dup consecutive identical repeats (hot loops)
+        }
+        *l = Some((pc, ret));
+    }
+    eprintln!(
+        "[host-return-watch] slot={pc:#x} hostfn={who} -> x0={ret:#x} caller={caller:#x}"
+    );
+}
+
 /// Emit (when the watch is enabled) the post-store probe call for a 64-bit
 /// store whose destination is currently in `dest_reg` and value in `val_reg`.
 /// Runs AFTER `mov_store64`, so RDX/RAX are already spent; the call only needs
@@ -7245,5 +7317,33 @@ mod tests {
         CANARY_STORE_WATCH.store(false, Ordering::Relaxed);
         set_canary_store_watch_test(false);
         assert!(buf.len() >= 3, "store+watch must emit at least a mov + call");
+    }
+
+    // SH4xx-next hermetic: the host-RETURN leak watch is byte-safe + gated the
+    // same way as the canary store-watch. OFF: one AtomicBool load, no logging,
+    // no panic on any input. ON: a foreign host pointer (0x7000_0000_0000..0x8000
+    // _0000_0000) return triggers the log path (no panic), a non-host return does
+    // not; the flag is independently pinnable so it never races the store-watch
+    // hermetics.
+    #[test]
+    fn host_return_leak_watch_gated_and_value_classified() {
+        use std::sync::atomic::Ordering;
+        set_host_return_watch_test(true);
+        HOST_RETURN_WATCH.store(true, Ordering::Relaxed);
+        assert!(host_return_watch_active(), "watch active when armed");
+        // Foreign host pointer return (the canary-leak class) -> log path, no panic.
+        crate::translate::host_return_leak_watch(0x7f0000000000, 0x7fd16c014bc0, 0x1029999);
+        // Non-host (small guest) return -> classified out, no panic.
+        crate::translate::host_return_leak_watch(0x7f0000000000, 0x1234, 0x1029999);
+        // Zero / sub-image values -> not the leak class, no panic.
+        crate::translate::host_return_leak_watch(0x1000, 0, 0);
+
+        // OFF: after disabling, calls return immediately (no logging, no panic) —
+        // the disabled path must be a no-op regardless of input.
+        HOST_RETURN_WATCH.store(false, Ordering::Relaxed);
+        set_host_return_watch_test(false);
+        assert!(!host_return_watch_active(), "watch inert when unarmed");
+        crate::translate::host_return_leak_watch(0x7f0000000000, 0x7fd16c014bc0, 0);
+        crate::translate::host_return_leak_watch(0, 0, 0);
     }
 }

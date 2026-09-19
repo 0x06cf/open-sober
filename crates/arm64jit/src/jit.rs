@@ -3084,11 +3084,10 @@ fn routeb_dm_real_ctor_drive_guard(_state: *mut CpuState, pc: u64) {
     }
     const DM_WRAPPER: u64 = 0x1023f5ff8; // wrapper: loads descriptor, bl 0x23f6038, returns obj+0x1f0
     const OBJ_SZ: u64 = 0xb00;
-    // SH187 follow-up (deleg_fa2be765): ctor body 0x1023f6038..0x23f6130 is BRANCH-FREE straight-line;
-    // the drive halts INSIDE `bl 0x23f6b0c` (subobject ctor) at 0x1023f60b8 (opcode 0x94000295) — no
-    // early-return branch. To fall through to the genuine-vptr writes at 0x23f6130, NOP `bl 0x23f6b0c`
-    // (NOP = 0xd503201f). The subobject's vcall path (blr [vt+2]) is cbz/cbnz x20-seeded to 0 (skipped)
-    // and its __stack_chk_fail reads global 0x67d1000+0x6f0 canary — both non-issues once NOP'd.
+    // SH187: ctor 0x1023f6038..0x23f6130 BRANCH-FREE; halts inside `bl 0x23f6b0c` (subobj ctor) at
+    // 0x1023f60b8 (opcode 0x94000295) — no early-return. To reach the genuine-vptr writes at 0x23f6130,
+    // NOP `bl 0x23f6b0c` (0xd503201f); subobj blr/vcall path + __stack_chk_fail(0x67d1000+0x6f0) both
+    // non-issues once NOP'd.
     const NOP_SUBOBJ: u64 = 0x1023f60b8; // `bl 0x23f6b0c` insn slot
     // SH229: opt-in FULL ctor. SH187 only measured the PARTIAL DM (NOP'd bl 0x23f6b0c). That subobject
     // ctor (sh189) builds the DM's internal 361-entry class/instance index (bl 0x2374c90, xo=obj+0x2a0,
@@ -6615,6 +6614,7 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
             let ret = hostf(s.x[0], s.x[1], s.x[2], s.x[3], s.x[4], s.x[5], s.x[6], s.x[7]);
             set_current_guest_pc(0);
             s.x[0] = ret;
+            crate::translate::host_return_leak_watch(pc, ret, s.x[30]);
             s.pc = s.x[30]; // return to the `blr` caller
             continue;
         }

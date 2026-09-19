@@ -1,7 +1,42 @@
 # Open Sober — Agent Handoff
 
-## SH4xx (Sep 19, 2026, hermes-worker): implemented SH106's documented NEXT — a translator STORE-WATCH (default-inert, env-gated JIT_CANARY_STORE_WATCH) that NAMES the exact guest str/stp writers storing foreign host pointers into guest canary windows on the standing canary stack-smash wall (nativeGameGlobalInit/app-shell ctor)
-(fix b5dae34: the two store-watch hermetics flip the shared module-global CANARY_STORE_WATCH static and raced under the isolated `canary_store_watch` filter (parallel tests, 1/2 flake); serialized with a shared test mutex — each test owns the flag exclusively. Isolated filter 5/5, workspace 656/0.)
+## SH4xx-next (Sep 26, 2026, hermes-worker): completed the SH4xx canary forensic's PRODUCER side — a default-inert host-RETURN leak watch (JIT_HOST_RETURN_WATCH=1) wired at the jit.rs integer host-return site (`s.x[0]=ret`) that logs every host fn whose return lands a foreign host pointer (0x7000..0x8000_0000_0000) in guest x0; MEASURED on real libroblox.so it round-trips the canary value by-exact-match and NAMES `boot.mempool_calloc` as the host producer of the canary-smashing pointer at pc=0x101d99e70
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+re-verified green at this HEAD first (capture_taskv4_frame.sh: real task-driven
+frames `present swap Ok(0x1)`, 0 json abort, 0 crash). Workspace green (cargo test
+--workspace EXIT 0; arm64jit lib 476/0 incl. new sh4xx2 hermetic; cargo build
+--example elfjit OK). Production code in translate.rs (off-hook, 498KB) + one
+host-side call in jit.rs (110 B under the 1MiB hook after condensing SH187 prose,
+addresses kept); elfjit.rs untouched.
+- translate.rs: `host_return_leak_watch(pc, ret, caller)` (+ env gate
+  JIT_HOST_RETURN_WATCH + test override `set_host_return_watch_test` +
+  `host_return_watch_active`), same once-lazy AtomicBool pattern as the SH4xx
+  store-watch. Narrows to the same HOST_HI/HOST_LO foreign-ptr leak class, resolves
+  the host fn name via `crate::jit::host_call_slot_name`, de-dups consecutive
+  (slot,ret) repeats. DEFAULT-INERT: unset env => one AtomicBool load, no logging,
+  no guest bytes (a host-side check after the return, not a translated-block edit).
+- jit.rs: `crate::translate::host_return_leak_watch(pc, ret, s.x[30])` at the
+  integer host-return bridge (the resolved libc/libm/JNI/malloc thunk return path).
+- New hermetic `host_return_leak_watch_gated_and_value_classified`: off = no-op on
+  any input; on = foreign host-ptr return takes the log path (no panic), small/zero
+  returns classified out; flag independently pinnable (no race with store-watch).
+- **MEASURED (real libroblox.so, dual-watch runbook, EXIT 134 — standing SH285
+  LSM pool-pop SIGSEGV guestpc=0x101d96868 fault=0x0, no `stack smashing`):** the
+  store-watch names the same writers as SH4xx (0x102b9dee8 event drain,
+  GLES-mempool 0x106251778/a48/a50, 0x102b9def0; terminal store pc=0x101d99e70),
+  and the host-return watch rounds the forensic end-to-end by exact value:
+  `[host-return-watch] slot=0x7f0000000008 hostfn=boot.mempool_calloc(x1=size)
+  -> x0=0x7f0690014bc0 caller=0x101d96848` + `[canary-store-watch] pc=0x101d99e70
+  dst=... val=0x7f0690014bc0 is_canary_slot=true`. **The producer is NAMED:
+  `boot.mempool_calloc` (jit.rs:7497/7530) returns the raw host pointer that the
+  LSM pool-pop stores into the canary-classified window** — the SH103
+  bridge-sanitize direction's exact target. Top named producers overall:
+  mempool_calloc 50x + slot 0x7f0000002488 57x (unresolved-name slots).
+- Honest: NOT a DM (DM-root 0, no make_shared, MH_GAME_LOADED false). Route-B
+  live-DM structural gate UNCHANGED. The watch NAMES the producer; it does not fix
+  the wall (under identity-mapping a mempool host pointer is a valid guest pointer,
+  so the sanitize-vs-leave fix is the follow-up). No re-treads.
+- Files: docs/frontier-sh4xx-host-return-leak-watch.md + runs/capture_host_return_leak_watch.sh.
 
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified green at HEAD first (capture_taskv4_frame.sh attempt 1: real task-driven frames `present swap Ok(0x1)`, 0 json abort, 0 crash). New off-hook code in translate.rs (484KB, well under the 1MiB hook; jit.rs/elfjit.rs untouched, at/near the hook). Workspace green (cargo test --workspace EXIT 0; arm64jit lib 475/0 incl. 2 new hermetics).
 - translate.rs: `canary_store_watch` (post-store host probe, SysV args state/dest/value/pc) + `emit_canary_store_watch`, wired into every 64-bit integer store (LdStrImm, LdStrImmWb, LdStrReg, LdStPair). DEFAULT-INERT: when JIT_CANARY_STORE_WATCH is unset it emits nothing and adds no guest bytes — product path byte-identical (proven by the unchanged green suite). When ON it narrows to the SH103 leak signature (a foreign host pointer 0x7000_0000_0000..0x8000_0000_0000 stored into a lower guest region) and reports pc/dst/val/x29/canary-slot.
