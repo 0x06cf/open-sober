@@ -1,5 +1,23 @@
 # Open Sober — Agent Handoff
 
+## SH404 (Sep 20, 2026, hermes-worker): the do-init FALL-THROUGH arm runs DEEP into the app-shell ctor band; the main dispatch `br x1` is bypassed — corrects SH362's root cause (0x10258b5d8 unreachable by branch-choice, not by a pre-body fault)
+Single-agent (cone suppressed). SH403 reached StartApp boot body -> app-bridge pipe 0x2baeeec ->
+do-init 0x102206c40 DEEP body + post-doinit worker 0x1023eff4c. SH404 answers "where does the
+do-init main-branch actually land": MEASURED (real libroblox.so, 2/2, EXIT 124, 0 crash) the do-init
+MAIN dispatch `br x1` @0x2206e24 (vt[+48]=0x10258b5d8, SH361-read) is BYPASSED (0 block-entry hits);
+the run takes the FALL-THROUGH arm 0x102206e30 bl 0x102206ebc -> 0x102206e34 (operator-new) ->
+nested worker 0x102206fac (`sub sp,#0x60` d10183ff) -> DEEP into the app-shell ctor band
+[0x102207000,0x102209000) (25+ block-entry pcs 0x102207c28..0x102207f58, frame stp a9bd7bfd at
+0x102207df8), then parks cleanly (no guestpc fault). So SH362's "0x10258b5d8 body never entered"
+is the FALL-THROUGH CHOICE (control flows elsewhere), not an SH285 fault before it. DMCONT
+0x102bd1d68 = 0 hits (standing next gate); 0x10258b5d8 body = 0 hits. New real-image hermetic sh404
+(arm64jit lib 452->453) byte-pins br x1 @0x2206e24 (d61f0020) / fallthrough worker (d10183ff) /
+app-shell band frame (a9bd7bfd) / dispatch body prologue (d105c3ff sub sp,#0x170) + capture + frontier
+doc. Honest: no DM (DM-root 0, MH_* false, AppBridgeV2 vt 0x1063a3410). The do-init world-build now
+runs deep from the StartApp path (fall-through app-shell band); DMCONT + 0x10258b5d8 are the two
+un-reached gates. Workspace green (633/0); jit.rs 221 B under the 1MiB hook (condensed SH-prose
+comments, addresses kept, per this session's SH402/403/404 additions).
+
 ## SH403 (Sep 20, 2026, hermes-worker): the StartApp boot body advances into the app-bridge pipe -> do-init chain — the RECON-V3 convergence line now runs headlessly through the SH400 ordered substrate; DMCONT 0x102bd1d68 + the 0x10258b5d8 dispatch body remain the two un-reached do-init construction gates
 Single-agent (cone suppressed). Disasm traced the StartApp boot body interior -> `bl 0x2baeeec`
 @0x10258b2dc = the app-bridge pipe RECON-V3 names ("StartAppWithParams 0x258b144 AND StartLuaAppDM

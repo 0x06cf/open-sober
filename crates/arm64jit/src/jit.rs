@@ -2533,21 +2533,17 @@ fn routeb_doinit_next3_seed_guard(_state: *mut CpuState, pc: u64) {
     }
 }
 
-/// SH253 (opt-in JIT_ROUTEB_SOURCE_SEED): seed the bulk-registrar SOURCE vector so the engine's
-/// OWN in-ladder registrar loop populates the RESOLVER map. SH252 measured (full exec sweep) that
-/// the resolver 0x106dca0e70 (name->classid map the getService walker 0x105e09bc8 resolves via
-/// resolver 0x2373cec) is constructed ONLY inside nativeGameGlobalInit: (a) the 48-byte header
-/// default-construct @0x2208418, (b) the bulk registrar 0x2208ae8. The registrar is DRIVEN by the
-/// in-ladder SOURCE loop @0x22085c4: `adrp x19,6dca000; add x19,#0xea8; ldp x21,x22,[x19]` reads
-/// SOURCE {begin@0x6dca0ea8, end@0x6dca0ea8+8}, `cmp x21,x22; b.eq skip` early-outs when EMPTY
-/// (headless begin==end==0), then per element `ldr x23,[x21],#8` (descriptor), `ldr x8,[x23,#8]`
-/// (descriptor->name SSO ptr) -> decode -> `bl 0x2208ae8` (bulk insert). So seeding the SOURCE
-/// vector with valid class-name descriptors lets the engine's OWN loop build the resolver map —
-/// the SH193/194/252 "missing bridge" (SH192/194 drove 0x2208ae8 standalone against a zeroed
-/// header -> corrupted; nobody let the in-ladder loop drive it). Element=descriptor; [desc+8]=name
-/// ptr; value-copy reads [x25]=resolver header; [resolver-element+16]=classid the walker returns
-/// (walker 0x5e09c24). Fire at the SOURCE-loop block entry 0x1022085c0 BEFORE the `ldp`;
-/// idempotent; default-inert.
+/// SH253 (opt-in JIT_ROUTEB_SOURCE_SEED): seed the bulk-registrar SOURCE vector so the engine's OWN
+/// in-ladder registrar loop populates the RESOLVER map. SH252 measured the resolver 0x106dca0e70
+/// (name->classid map the getService walker 0x105e09bc8 resolves via 0x2373cec) is built only inside
+/// nativeGameGlobalInit: (a) 48-byte header default-construct @0x2208418, (b) bulk registrar 0x2208ae8.
+/// The registrar is DRIVEN by the SOURCE loop @0x22085c4: `adrp x19,6dca000; add x19,#0xea8; ldp
+/// x21,x22,[x19]` reads SOURCE {begin@0x6dca0ea8,end@+8}, `cmp x21,x22; b.eq` early-outs when EMPTY
+/// (headless begin==end==0), then per element `ldr x23,[x21],#8; ldr x8,[x23,#8]` (name SSO) -> decode
+/// -> `bl 0x2208ae8` (bulk insert). Seeding the SOURCE with valid class-name descriptors lets the
+/// engine's OWN loop build the resolver — the SH193/194/252 "missing bridge". Element=descriptor;
+/// [desc+8]=name ptr; value-copy reads [x25]=resolver header; [resolver-element+16]=classid the walker
+/// returns. Fire at SOURCE-loop entry 0x1022085c0 BEFORE the `ldp`; idempotent; default-inert.
 fn routeb_source_vector_seed_guard(_state: *mut CpuState, pc: u64) {
     if std::env::var_os("JIT_ROUTEB_SOURCE_SEED").is_none() {
         return;
@@ -2722,22 +2718,17 @@ fn routeb_tail_dispatch_capture(state: *mut CpuState, pc: u64) {
     );
 }
 
-/// SH164 engine-init (recon task-0, authoritative): the governor-TAIL dispatch derefs
-/// impl[+0x408] (x0) then `ldr x8,[x0]; ldr x8,[x8,#48]; blr x8` calls vt[+0x30] with
-/// x0=x19=impl. On a real session that slot holds a NativeDataModelManager heap
-/// instance whose vt[+0x30]=0x102bd1b98 (the DM engine-init fn `fnB`). fnB has NO
-/// benign-tail and NO [this+0x10] dispatch — it unconditionally derefs
-/// [this+0x40]->[+0x18]->[+0x10] then `bl 0x102bd8ce8` (the engine-init /
-/// continueAfterFlagsLoaded pipeline). A zeroed shell SIGSEGVs at `ldr x8,[x8,#0x18]`
-/// (0x102bd1c08) — that's the standing Route-B wall. This opt-in (JIT_ROUTEB_DMFORCE=1)
-/// guard makes the tail dispatch a FABRICATED NativeDataModelManager instance whose
-/// vt[+0x30]=0x102bd1b98 with the +0x40/+0x18 settings chain pre-seeded, so the tail's
-/// `blr` ACTUALLY ENTERS the real engine-init and reaches `bl 0x102bd8ce8` — a dynamic
-/// trace that surfaces the NEXT empirical fault floor instead of the inert-leaf no-op.
-/// The chain: [shell+0x40]=P1, [P1+0x18]=P2, [P2+0x10]=P3, [shell+0x18]=valid, so fnB
-/// passes its [this+0x40]->[+0x18]->[+0x10] derefs and calls 0x102bd8ce8(P3). Idempotent
-/// (writes the same pointer each entry). Default-inert (env off -> no substitution;
-/// routeb_tail_dispatch_guard still seeds the inert DISPATCH under SETFIX as before).
+/// SH164 engine-init (recon task-0): the governor-TAIL dispatch derefs impl[+0x408] (x0) then
+/// `ldr x8,[x0]; ldr x8,[x8,#48]; blr x8` calls vt[+0x30] with x0=x19=impl. On a real session that
+/// slot holds a NativeDataModelManager whose vt[+0x30]=0x102bd1b98 (engine-init `fnB`). fnB has NO
+/// benign-tail and NO [this+0x10] dispatch — it unconditionally derefs [this+0x40]->[+0x18]->[+0x10]
+/// then `bl 0x102bd8ce8` (engine-init / continueAfterFlagsLoaded pipeline). A zeroed shell SIGSEGVs
+/// at `ldr x8,[x8,#0x18]` (0x102bd1c08) — the standing Route-B wall. This opt-in (JIT_ROUTEB_DMFORCE=1)
+/// guard makes the tail dispatch a FABRICATED NativeDataModelManager whose vt[+0x30]=0x102bd1b98 with
+/// the +0x40/+0x18 settings chain pre-seeded, so the tail's `blr` ACTUALLY ENTERS the real engine-init
+/// and reaches `bl 0x102bd8ce8`. Chain: [shell+0x40]=P1,[P1+0x18]=P2,[P2+0x10]=P3,[shell+0x18]=valid,
+/// so fnB passes its derefs and calls 0x102bd8ce8(P3). Idempotent. Default-inert (env off -> no
+/// substitution; routeb_tail_dispatch_guard still seeds the inert DISPATCH under SETFIX as before).
 fn routeb_dm_force_guard(state: *mut CpuState, pc: u64) {
     if std::env::var_os("JIT_ROUTEB_DMFORCE").is_none() {
         return;
@@ -4466,20 +4457,13 @@ fn dm_capture_worth(bytes: usize, base_ok: bool) -> bool {
     base_ok || (0x1000..=0x4_0000).contains(&bytes)
 }
 
-/// SH167 (recon cone deleg_35857472 task-2 + SH169 delegation-extension task-0, authoritative):
-/// DM ALLOCATION-CAPTURE HOOK.
-/// The engine's CRT operator-new wrapper (guest 0x102a0d9b8, file 0x2a0d9b8) reads the
-/// ACTIVE allocator-hook global [guest 0x1067daaf0] and the DEFAULT hook [guest
-/// 0x1067d0840]; `cmp x8,x9; b.eq` takes an inline fast path when equal, else
-/// `blr x8` calls the active hook. The live RBX::DataModel is created ONLY by the
-/// engine's OWN make_shared driver during a REAL app-launch session (sizeof is an
-/// inlined immediate — not statically recoverable). To capture that pointer the
-/// moment a real session forms (post GPU-host / real-input migration — the
-/// documented gate), this guard seeds the ACTIVE global with a host-call trail that
-/// (a) performs the real allocation and (b) LOGS/captures the returned base for DM-plausible
-/// sizes. Fires at the operator-new wrapper block entry under JIT_DM_ALLOC_CAPTURE=1.
-/// Default-inert (env off -> no seed, no trailing; the fast/live allocator path is
-/// byte-identical). Idempotent.
+/// SH167 (deleg_35857472 task-2 + SH169 delegation-extension task-0): DM ALLOCATION-CAPTURE HOOK.
+/// The engine's CRT operator-new wrapper (0x102a0d9b8) reads ACTIVE hook [0x1067daaf0] + DEFAULT
+/// [0x1067d0840]; `cmp x8,x9; b.eq` fast-path when equal, else `blr x8` calls the active hook. The
+/// live RBX::DataModel is created ONLY by the engine's OWN make_shared during a real session (sizeof
+/// is an inlined immediate). To capture that pointer when a real session forms, seed ACTIVE with a
+/// host-call trail that (a) performs the real alloc + (b) captures the base for DM-plausible sizes.
+/// Fires at operator-new wrapper entry under JIT_DM_ALLOC_CAPTURE=1. Default-inert / idempotent.
 ///
 /// SH169 DELEGATION: replacing a nonzero engine ACTIVE hook with host-calloc guest-SIGABRTs the
 /// free-path (EXIT 134, SH167) — engine allocs come from its own pool. So SAVE ACTIVE to
@@ -4952,14 +4936,11 @@ fn host_jni_f32_call_at(pc: u64) -> Option<(HostJniF32, usize)> {
     hc.get(i).copied().flatten().map(|f| (f, i))
 }
 
-/// Supervisor-call dispatcher. AArch64 uses x8 as the syscall number and x0-x5
-/// as args (AArch64 Linux ABI: x8=number, x0..x5 args, return in x0, negative =
-/// -errno). The guest (Roblox on the Android aarch64 ABI) issues AArch64 syscall
-/// numbers, but we run on x86-64, whose syscall number table is entirely
-/// different. So we map each AArch64 nr -> x86-64 nr and forward the first 3-5
-/// args to `libc::syscall` (the raw kernel path). `libc::syscall` already
-/// returns the kernel's -errno encoding, which we re-package as the u64 the
-/// guest expects (high bits set for errors).
+/// Supervisor-call dispatcher. AArch64 uses x8=syscall number, x0..x5=args, return x0 (negative = -errno).
+/// The guest (Roblox Android aarch64 ABI) issues AArch64 syscall numbers, but we run on x86-64 whose
+/// table is entirely different, so we map each AArch64 nr -> x86-64 nr and forward the first 3-5 args
+/// to `libc::syscall` (raw kernel path; libc already returns the -errno encoding, re-packaged to the
+/// u64 the guest expects).
 ///
 /// Common mappings (AArch64 -> x86-64, Linux):
 ///   read 63->0, write 64->1, openat 56->257, close 57->3, fstat 79->4,
@@ -7898,28 +7879,22 @@ fn body_contains_svc(image: &[u8], base: u64, entry: u64) -> bool {
     false
 }
 
-/// Detect whether the body reachable from guest `entry` contains a `blr` or
-/// `br` (an *indirect* branch/call, transitively following guest `bl`/`b`).
+/// Detect whether the body reachable from guest `entry` contains a `blr`/`br` (an *indirect*
+/// branch/call, transitively following guest `bl`/`b`).
 ///
-/// This is the inlining-safety core for the JNI / import-dispatched boot path.
-/// `blr`/`br` are translated to `mov_store64(pc_off, target); ret` — they hand
-/// the target to `jit_run`'s dispatcher so a *hostcall* (GetEnv, a bound PLT
-/// import) or a guest-indirect callee can be dispatched. That is only valid
-/// when the `blr`/`br` runs at **top-level block scope**. If its containing
-/// guest function is inlined via `bl` into a larger block, the `ret` pops the
-/// inlined-call return address and returns into the caller block instead of
-/// `jit_run` — so the hostcall is silently skipped (its `*penv`/result never
-/// written) AND the inlined callee's epilogue that restores callee-saved
-/// registers (x19-x28) never runs, leaving stale corrupt guest registers. The
-/// existing divert machinery (`body_contains_host_plt_bl`, `body_contains_svc`)
-/// catches direct `bl` to a PLT stub and `svc`, but a C++ vtable dispatch /
-/// `GetEnv` is a `blr` to a *runtime-computed* address, which neither catches.
+/// This is the inlining-safety core for the JNI / import-dispatched boot path. `blr`/`br` translate
+/// to `mov_store64(pc_off, target); ret` — handing the target to `jit_run`'s dispatcher so a hostcall
+/// (GetEnv, bound PLT import) or guest-indirect callee is dispatched. Valid only when the `blr`/`br`
+/// runs at TOP-LEVEL block scope: if its containing function is inlined via `bl`, the `ret` pops the
+/// inlined return address and returns into the caller block instead of `jit_run` — the hostcall is
+/// silently skipped (its result never written) AND the inlined callee's x19-x28 restore never runs,
+/// leaving stale registers. The existing divert machinery (`body_contains_host_plt_bl`,`body_contains_svc`)
+/// catches direct `bl`-to-PLT and `svc`, but a C++ vtable dispatch / `GetEnv` is a `blr` to a
+/// runtime-computed address — neither catches.
 ///
-/// Following guest `bl` transitively is conservative-but-correct: diverting a
-/// `bl` is semantically identical (set x30, pc=callee, dispatcher re-enters at
-/// the callee), just a few more dispatcher round-trips. We follow into callees
-/// because an outer inlined function pulls its inner `bl`-target (which `blr`s)
-/// into the same block, re-triggering the bug.
+/// Following `bl` transitively is conservative-but-correct (set x30, pc=callee, dispatcher re-enters;
+/// a few extra round-trips), needed because an outer inlined function pulls its inner `bl`-target
+/// (which `blr`s) into the same block, re-triggering the bug.
 fn body_contains_indirect(image: &[u8], base: u64, entry: u64) -> bool {
     let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut frontier: Vec<u64> = vec![entry];
@@ -8370,25 +8345,16 @@ pub(crate) fn env_test_remove(key: &str) {
 mod tests {
     use super::*;
 
-    /// SH179: the DM-allocation-capture hermetic tests (sh167 guard + sh169 trail) mutate
-    /// process-global state that is shared across test threads — the PREV_DM_ALLOC_HOOK
-    /// static and the JIT_DM_ALLOC_CAPTURE[_DELEGATE] process env — and the Rust test
-    /// harness runs them on parallel threads, so sh167 could read a PREV or DELEGATE state
-    /// mid-mutation by sh169 and fail at a run-variable assert line (observed 550/0 ->
-    /// 371/1 flake at jit.rs:5068/5085). Serializing the two shared-state tests makes the
-    /// suite deterministic; production (single jit_run thread per run) is untouched.
-    ///
-    /// SH357: consolidated the four separate family locks (DM_CAPTURE / DM_INSTANCE /
-    /// CONT_MGR / DM_MANAGER) into ONE shared process-state lock. Each family mutates
-    /// process-global state the others also touch — the SAME fixed guest-.bss pages
-    /// (e.g. 0x1067333000 is shared by the doinit-next3, SH156-ctor and manager suites)
-    /// and the SAME process env (JIT_ROUTEB_DMFORCE is set/removed by sh164, sh165 AND
-    /// sh243 under three different families). Separate per-family locks let two families
-    /// run concurrently on one process-global page/env -> a precondition assert sees
-    /// another family's page already mapped, or env state mid-toggle (observed sh165
-    /// "precondition: holder page genuinely absent" failing, and sh167 env race). A
-    /// single lock makes every family's page/env mutation atomic against every other;
-    /// production is untouched (single jit_run thread).
+    /// SH179+SH357: the DM-allocation-capture hermetic tests (sh167 guard + sh169 trail) mutate
+    /// process-global state shared across test threads — PREV_DM_ALLOC_HOOK + the JIT_DM_ALLOC_CAPTURE
+    /// env — so sh167 could see a mid-mutation PREV/DELEGATE from sh169 and fail (550/0 -> 371/1 flake
+    /// at jit.rs:5068/5085). Serializing them makes the suite deterministic. SH357 consolidated the
+    /// four family locks (DM_CAPTURE/DM_INSTANCE/CONT_MGR/DM_MANAGER) into ONE shared-process lock:
+    /// the families share fixed guest-.bss pages (0x1067333000 across doinit-next3/sh156/manager
+    /// suites) and the same process env (JIT_ROUTEB_DMFORCE toggled by sh164/165/243). Separate locks
+    /// let two families race one page/env -> precondition sees another family's page mapped or env
+    /// mid-toggle (sh165 "holder page genuinely absent", sh167 env race). One lock makes every family's
+    /// page/env mutation atomic. Production untouched (single jit_run thread).
     static ROUTEB_PROC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// SH347 (JIT_ROUTEB_BUSRECV): the receive-side probe guard is read-only and gated on the
@@ -17780,6 +17746,31 @@ mod fp16_and_fabd_fccmp_exec {
             eprintln!("[abi] sh403 StartApp boot body -> pipe 0x2baeeec -> do-init 0x2206c40 -> post-doinit 0x1023eff4c pinned");
         } else {
             eprintln!("sh403 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
+    fn sh404_doinit_fallthrough_appshell_band_reach_pinned() {
+        // SH404: do-init MAIN dispatch `br x1` @0x2206e24 is BYPASSED (0 hits) even though SH361 reads the
+        // dispatch target vt[+48]=0x10258b5d8 — the run takes the FALL-THROUGH arm 0x102206e30 bl 0x102206ebc
+        // -> 0x102206e34 (opnew) -> nested worker 0x102206fac -> DEEP into the app-shell ctor band
+        // [0x102207000,0x102209000) (25+ pcs 0x102207c28..0x102207f58, 2/2, EXIT 124, 0 crash). So SH362's
+        // "0x10258b5d8 never entered" is the fall-through CHOICE, not an SH285 fault. DMCONT still 0.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let word_at = |vaddr: u64| -> u32 {
+                let off = (vaddr & 0xffff_ffff) as usize;
+                let b = &img[off..off + 4];
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            };
+            assert_eq!(word_at(0x102206e24), 0xd61f_0020, "sh404 do-init MAIN dispatch br x1");
+            assert_eq!(word_at(0x102206fac), 0xd101_83ff, "sh404 fall-through nested worker prologue");
+            assert_eq!(word_at(0x102207df8), 0xa9bd_7bfd, "sh404 app-shell band frame stp");
+            assert_eq!(word_at(0x10258b5d8), 0xd105_c3ff, "sh404 main dispatch body prologue (sub sp,#0x170)");
+            eprintln!("[abi] sh404 do-init FALL-THROUGH (br x1 @0x2206e24 bypassed) -> app-shell band [0x102207000..0x102209000) deep reach pinned");
+        } else {
+            eprintln!("sh404 real-image guard: no real libroblox.so, skipping anchors");
         }
     }
 
