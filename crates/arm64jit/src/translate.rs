@@ -8713,4 +8713,70 @@ mod tests {
         let d1 = b1.windows(7).position(|w| w == [0x48, 0x89, 0x83, 0x10, 0x01, 0x00, 0x00]).expect("Vd store");
         assert!(d0 < b0.len() && d1 < b1.len(), "dest disp fixed at VECTOR_BASE+rd*16");
     }
+
+    // SH438: hermetic coverage of the STRUCTURE-LOAD/STORE codegen family
+    // (translate.rs Ld2 / St2 — ld2/st2 {Vt, Vt1}, [Xn]): the interleaved
+    // vertex-attribute / structure pair moves (RG/z+texcoord style data, and
+    // 2-vector register list loads). Memory holds the DEINTERLEAVED
+    // {V0.e0,V1.e0, V0.e1,V1.e1, ...} layout: element i of reg j (j in 0..2) is
+    // at byte offset i*(2*es) + j*es. Ld2 writes reg j's element i to
+    // VECTOR_BASE+(rd+j)*16 + i*es (rd+j = the 2nd structure reg), St2 reads
+    // them back. A byte offset flub here misdelivers which attribute/register
+    // lane goes where — the whole point of the family.
+    // [RBX]=CpuState, vector slot v[t]=VECTOR_BASE(0x110)+t*16, Xn loaded by
+    // ldg into RDX (mov rdx,[rbx+rn*8]). Case: esize=4, q=false (8B, nelems=2),
+    // rd=0, rn=1 -> ldg = `48 8B 53 08`; loop j∈{0,1}, i∈{0,1}, b∈{0..3}.
+    // Ld2 load (mem, base RDX): off = i*2*es + j*es + b = i*8 + j*4 + b
+    //   (i,j)=(0,0)->mem 0 ; (0,1)->mem 4 ; (1,0)->mem 8 ; (1,1)->mem 0xc
+    //     => `0F B6 42 <off>` (movzx eax, byte [rdx+off], disp8 mod=1)
+    // Ld2 store (Vd slot, base RBX): vslot(rd+j)+i*es+b = 0x110+j*16+i*4+b
+    //   (0,0)->0x110 ; (0,1)->0x120 ; (1,0)->0x114 -> `88 83 <u32>` (mod=2)
+    #[test]
+    fn sh438_ld2_deinterleaves_j_to_second_structure_reg() {
+        let b = tr_bytes(Inst::Ld2 { rd: 0, rn: 1, q: false, post: 0, esize: 4 });
+        // loads: j advances mem by es=4, i advances mem by 2*es=8
+        assert!(b.windows(3).any(|w| w == [0x0f, 0xb6, 0x02]), "V0.elt0 read mem+0 (i0,j0)");
+        assert!(b.windows(4).any(|w| w == [0x0f, 0xb6, 0x42, 0x04]), "V1.elt0 read mem+4 (j=1 -> +es)");
+        assert!(b.windows(4).any(|w| w == [0x0f, 0xb6, 0x42, 0x08]), "V0.elt1 read mem+8 (i=1 -> +2*es)");
+        // stores: reg j lands at Vd + j*16, element i advances by es=4
+        // (the store is 6 bytes: 0x88 0x83 + disp32)
+        assert!(b.windows(6).any(|w| w == [0x88, 0x83, 0x10, 0x01, 0x00, 0x00]), "V0.elt0 -> [0x110]");
+        assert!(b.windows(6).any(|w| w == [0x88, 0x83, 0x20, 0x01, 0x00, 0x00]), "V1.elt0 -> [0x120] (2nd structure reg at +16)");
+        assert!(b.windows(6).any(|w| w == [0x88, 0x83, 0x14, 0x01, 0x00, 0x00]), "V0.elt1 -> [0x114] (i+es)");
+        // no outstanding post-increment write (post=0)
+        assert!(!b.windows(5).any(|w| w == [0x48, 0x89, 0x43, 0x08, 0x00]) && !b.windows(4).any(|w| w == [0x48, 0x83, 0xc0, 0x00]), "post=0 emits no reg +0 increment");
+    }
+
+    // St2 is the INVERSE: it READS the vector slots ([rbx+0x110..]) and STORES
+    // to memory ([rdx+off]). Same deinterleave mapping; the discriminator vs
+    // Ld2 is that the movzx source becomes [rbx+Vd-slot] and the store becomes
+    // `88` to [rdx+mem-off] (Ld2's store was 88 to [rbx], St2's store is 88 to
+    // [rdx]).
+    #[test]
+    fn sh438_st2_inverse_reads_slots_stores_to_memory_deinterleave() {
+        let b = tr_bytes(Inst::St2 { rd: 0, rn: 1, q: false, post: 0, esize: 4 });
+        // loads now from Vd slots (base RBX): V0.elt0 at 0x110, V1.elt0 at 0x120
+        assert!(b.windows(7).any(|w| w == [0x0f, 0xb6, 0x83, 0x10, 0x01, 0x00, 0x00]), "V0.elt0 read from [rbx+0x110]");
+        assert!(b.windows(7).any(|w| w == [0x0f, 0xb6, 0x83, 0x20, 0x01, 0x00, 0x00]), "V1.elt0 read from [rbx+0x120]");
+        // stores to memory (base RDX): V0.elt0 -> mem+0, V0.elt1 -> mem+8 (i+2*es)
+        assert!(b.windows(3).any(|w| w == [0x88, 0x02, 0x00]) || b.windows(2).any(|w| w == [0x88, 0x02]), "V0.elt0 -> [rdx+0] (0x88 store to mem)");
+        assert!(b.windows(4).any(|w| w == [0x88, 0x42, 0x08, 0x00]) || b.windows(3).any(|w| w == [0x88, 0x42, 0x08]), "V0.elt1 -> [rdx+8] (i+2*es)");
+        assert!(b.windows(4).any(|w| w == [0x88, 0x42, 0x04, 0x00]) || b.windows(3).any(|w| w == [0x88, 0x42, 0x04]), "V1.elt0 -> [rdx+4] (j+es)");
+    }
+
+    // SH438-3: q=true (16B) Ld2 doubles the element count per structure vector
+    // (nelems = 16/es = 4 for esize=4), so element i in {0..3} lands at
+    // Vd + i*es = [0x110,0x114,0x118,0x11c]; the q-bit distinguishes 2 vs 4
+    // deinterleaved elements. Also pins the post-increment write-back when
+    // post != 0 (mov_load64 + add + store of rn's guest slot).
+    #[test]
+    fn sh438_ld2_q16_has_four_elements_and_post_increments_rn() {
+        let b = tr_bytes(Inst::Ld2 { rd: 0, rn: 1, q: true, post: 0x20, esize: 4 });
+        // 4th element of structure reg 0 -> Vd + 3*es = [0x11c]
+        assert!(b.windows(6).any(|w| w == [0x88, 0x83, 0x1c, 0x01, 0x00, 0x00]), "V0.elt3 -> [0x11c] (q->4 elements)");
+        // post=0x20: rn slot reloaded (48 8B 43 08), +0x20 via imm32 form
+        // (48 81 C0 20 00 00 00), written back to [rbx+8] (48 89 43 08).
+        let post_seq = [0x48, 0x8b, 0x43, 0x08, 0x48, 0x81, 0xc0, 0x20, 0x00, 0x00, 0x00, 0x48, 0x89, 0x43, 0x08];
+        assert!(b.windows(post_seq.len()).any(|w| w == post_seq), "post-increment mov-load + add imm32 + store-back of rn slot [rbx+8]");
+    }
 }
