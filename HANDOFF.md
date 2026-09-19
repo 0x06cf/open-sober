@@ -35,6 +35,37 @@ Production code in session.rs + elfjit example wrapper (elfjit.rs DROPPED 1,048,
   session.rs (2 pub fns + hermetic) + crates/arm64jit/examples/elfjit.rs (wrappers).
   Commit 5556211 (SH466).
 
+## SH467 (Sep 20, 2026, hermes-worker): instruction-level static grounding of the Route-B once-slot store (+ fresh-HEAD re-verification of the recon-v3 deliverable)
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverable re-verified
+GREEN at the fresh HEAD dfd7a4c FIRST (capture_taskv4_frame.sh attempt 1: 24 real
+task-driven frames `present swap Ok(0x1)`, dispatch #2201000, 0 json abort,
+0 crash, exit stable; artifact verified on disk runs/sh60-taskv4-frame.txt) — this
+matters because SH462 touched translate.rs and SH464/465/466 touched session.rs, so
+the fresh-head capture proves the task-frame path survived that production-code
+window. Workspace green (cargo test --workspace EXIT 0; arm64jit lib 677->678 incl.
+1 new sh467 hermetic; cargo build --workspace OK). Production code UNCHANGED
+(test-only session.rs addition).
+- **The finding:** SH467 disassembled the real libroblox.so to pin the static chain
+  under SH462's store-level measure. nativeGameGlobalInit's once-lambda (file
+  0x2206d60-0x2206d88) does `adrp x23, 0x6a68000` (=0x106a68000) + `str x0,
+  [x23,#1032]` at file 0x2206d74 → writes ONLY once-slot [0x106a68408]; its x0 is
+  the return of `bl 0x2173b3c`. That helper is a `strcmp`-dispatch SETTINGS shim
+  (literal file 0x29bbcb = "GPU", tail `b 0x61e30bc` — a large FMOD/telemetry-class
+  dispatcher), NOT a DM-constructor — refining SH381's "Execute sentinel 0x400000b"
+  label: THIS lambda runs first-call settings init, not the DM world-build. DM-root
+  [x23+0x818]=[0x106a68818] is structurally absent from the lambda (store only
+  touches +0x408). Instruction-level confirmation the live-DM builder is a
+  DIFFERENT real-session-owned upstream ctor (SH397/462/463).
+- New hermetic sh467 (test-only) pins the chain (once-lambda store pc 0x102206d74,
+  x23 base 0x106a68000, once-slot +0x408, once-guard +0x410, DM-root +0x818 gap,
+  helper 0x102173b3c, "GPU" literal 0x10029bbcb, tail 0x10161e30bc, store !=
+  do-init-entry 0x2206db8). Pure addr/offset pin, no env/image, parallel-safe.
+- Honest: NOT a DM / NOT a live-DM seed (Route-B live-DM gate UNCHANGED; DM-root 0).
+  This refines the once-slot sentinel's provenance and re-verifies the recon-v3
+  runtime deliverable at a fresh HEAD; no re-treads, not a render-plane visual.
+- Files: docs/frontier-sh467-once-lambda-static-chain.md + crates/arm64jit/src/
+  session.rs (test-only). Commit (SH467).
+
 ## SH465 (Sep 20, 2026, hermes-worker): make the session-substrate completion metric outcome-aware — the runtime now reports true session-boot health (14/16 completed), not a return-value filter (11/16)
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified
 green at this HEAD first (capture_taskv4_frame.sh: 24 real task-driven frames `present

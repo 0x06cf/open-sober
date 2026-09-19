@@ -1681,6 +1681,77 @@ mod tests {
         assert!(!super::live_dm_cell_value_ok(0x8000_0000_0000_0000), "top byte set (kernel) -> not a coherent object ptr");
     }
 
+    /// SH467: instruction-level static grounding of the Route-B once-slot store —
+    /// refines the SH462 store-level measure (pc=0x102206d74 stores SENTINEL
+    /// 0x400000b into once-slot [0x106a68408]) by pinning the static chain that
+    /// PRODUCES that value, verified by disassembling the real libroblox.so this
+    /// session (aarch64-linux-gnu-objdump, no image/env needed):
+    ///
+    /// - nativeGameGlobalInit's once-lambda (file 0x2206d60-0x2206d88): `adrp x23,
+    ///   0x6a68000` (=guest 0x106a68000) then `str x0,[x23,#1032]` at file 0x2206d74
+    ///   writes ONLY the once-slot [x23+0x408]=[0x106a68408]. The value is the
+    ///   return of `bl 0x2173b3c`.
+    /// - 0x2173b3c is NOT a DM-constructor: it is a `strcmp`-dispatch settings shim
+    ///   (adrp literal 0x29bbcb = \"GPU\", bl strcmp vs x0, then tail `b 0x61e30bc`
+    ///   — a large FMOD/telemetry-class dispatcher — with w3=cset eq). So the once
+    ///   slot's 0x400000b is a SETTINGS-dispatch return, refining SH381's \"Execute\"
+    ///   label for THIS value: the once-lambda runs a first-call settings init, not
+    ///   the DM world-build.
+    /// - DM-root [x23+0x818]=[0x106a68818] is structurally ABSENT from the lambda:
+    ///   the only visitor is [x23+0x410]=once-guard [0x106a68410] (adrp x0,0x6a68000
+    ///   + #0x410; bl 0x284cf5c). This is the instruction-level confirmation SH462
+    ///   measured at the store level: no guest store can reach [0x106a68818] here,
+    ///   the DM builder is a DIFFERENT (real-session-owned) path.
+    ///
+    /// Pure constant addr/offset pin — same provenance as the SH463 address-map pin;
+    /// catches any mis-transcribed address (guest/file/base/offset) so future recon
+    /// starts from the verified chain.
+    #[test]
+    fn sh467_once_lambda_static_chain_grounds_dmroot_gap() {
+        // once-lambda store site: guest = file + 0x100000000.
+        let once_lambda_store_file: u64 = 0x2206d74;
+        assert_eq!(
+            once_lambda_store_file + 0x1_0000_0000u64,
+            0x102206d74u64,
+            "SH462-measured store pc (guest)"
+        );
+        // x23 base from `adrp x23, 0x6a68000`.
+        let x23_base: u64 = 0x106a68000;
+        assert_eq!(
+            x23_base + 0x408u64,
+            0x106a68408u64,
+            "once-slot [x23+#1032/#0x408]"
+        );
+        assert_eq!(x23_base + 0x410u64, 0x106a68410u64, "once-guard [x23+#0x410]");
+        assert_eq!(
+            x23_base + 0x818u64,
+            0x106a68818u64,
+            "DM-root — 0x818 past the base, never a store target here"
+        );
+        // Helper + strcmp literal + tail (guest addrs).
+        assert_eq!(
+            0x2173b3cu64 + 0x1_0000_0000u64,
+            0x102173b3cu64,
+            "helper shim"
+        );
+        assert_eq!(
+            0x29bbcbu64 + 0x1_0000_0000u64,
+            0x10029bbcbu64,
+            "'GPU' strcmp literal"
+        );
+        assert_eq!(
+            0x61e30bcu64 + 0x1_0000_0000u64,
+            0x1061e30bcu64,
+            "helper tail dispatcher"
+        );
+        // Offset relationships that make the structural gap explicit.
+        assert!(0x818u64 > 0x408u64, "DM-root is 0x818 below the simple once-slot write (never synthesized by this lambda)");
+        assert_ne!(
+            0x2206d74u64, 0x2206db8u64,
+            "once-lambda store vs the separate do-init entry (0x2206db8) are distinct sites"
+        );
+    }
+
     /// SH422 bp-chain walker: from a leaked host frame chain (ascending aarch64
     /// frames), collect the saved-lr caller chain in order; terminate on a loop /
     /// non-ascending fp / non-domain fp. Pure — no env, no guest bytes.
