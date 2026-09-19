@@ -1,5 +1,31 @@
 # Open Sober — Agent Handoff
 
+## SH391 (Sep 20, 2026, hermes-worker): deterministic fix for the SH345/SH390 render-plane flake — guard the pinned memcpy16 leaf's no-op self-copy when its dest is non-writable, turning the ~1/25 retry-hidden SIGSEGV into an instrumented, always-green artifact
+Single-agent (cone suppressed). SH390 byte-anchored the SH345 fault leaf (guest
+0x102859fd0, file 0x2859fd0, `str q0,[x0]` @0x2859fe4) but deliberately left the fix for
+"a future guard" — the capture script still retry-hardened (coin-flip, up to 6 attempts).
+SH391 delivers option *b* the frontier doc prescribes. **The store ONLY executes when
+x0==x1** (the leaf's `cmp x0,x1; b.ne out` guarantees a real copy exits before the
+store), so the leaf is always a 16-byte SELF-COPY = semantic no-op; it faults only when
+that (self,same) dest is non-writable (PROT_EXEC guest .text in the drain divergence
+arm). NEW default-inert opt-in guard `routeb_render_memcpy16_guard`
+(JIT_ROUTEB_RENDER_MEMCPY16_GUARD, wires into the per-block-entry guard dispatch) fires
+at leaf-entry pc 0x102859fd0: when x0==x1 && x0!=0 && !page_is_writable(x0) it zeroes x1
+so the block's `cbz x1` exits BEFORE the store. Provably cannot mask a real walker copy
+(a real copy is x0!=x1, already `b.ne`-exited). +hermetic `sh391` (arm64jit lib
+444->445; PROT_NONE mmap = deterministic non-writable dest; asserts guard leaves real
+copies + writable self-copies alone, inert off-env and on non-entry pc) + frontier doc.
+No production path / guest byte permanently touched, no test weakened.
+**LIVE real-binary run (real libroblox.so, completing taskv4-frame ladder) with the
+guard armed: confirmed-green attempt 1 — 24 real task-driven frames `present swap Ok(0x1)`,
+197 node pops, 0 SIGSEGV/ABRT, EXIT 124; guard-firings=0 (inert on the clean run —
+correct).** Workspace green (cargo test --workspace EXIT 0; arm64jit lib 445/0).
+Route-B live-DM structural gate UNCHANGED (DM-root [0x106a68818]=0, MH_* false,
+AppBridgeV2 0). SH174 capture-latch stays the single forward observer. Do-not-re-tread
+unchanged (LSM skips, setDataModelToCurrent SH388, EC reader-gate, 0x258b5d8/SetInitParams,
+window-attach real, ALooper, governor gates, -9 string, map-header repair, once-lambda store,
+SH267 node-cell).
+
 ## SH390 (Sep 20, 2026, hermes-worker): byte-anchor the SH345 render-plane flake's exact fault leaf (memcpy16 into guest .text 0x102859fd0) — a real determinism fix target for the HARD-GATE reproducible artifact, replacing the retry-hide coin-flip
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified
 green LIVE at this exact HEAD (capture_taskv4_frame.sh attempt 1 = 24 real task-driven

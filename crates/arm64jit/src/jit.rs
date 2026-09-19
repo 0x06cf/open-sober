@@ -1424,6 +1424,43 @@ fn routeb_doinit_emptyvec_gate(state: *mut CpuState, pc: u64) {
     );
 }
 
+/// SH391 (opt-in JIT_ROUTEB_RENDER_MEMCPY16_GUARD): deterministic fix for the SH345/SH390
+/// render-plane flake — the ~1/25 SIGSEGV where the present-walker's memcpy16 leaf
+/// (guest 0x102859fd0, file 0x2859fd0) stores into guest .text from a non-guest thread.
+/// The leaf is `cmp x0,x1; b.ne out; cbz x1 out; cbz x0 out; ldr q0,[x1]; str q0,[x0]; ret`
+/// — its `str q0,[x0]` @0x2859fe4 (the crash store) ONLY executes when x0==x1 and both are
+/// non-zero, i.e. the copy is ALWAYS a SELF-COPY (16 bytes of an address onto itself). A
+/// self-copy is a semantic no-op; it only faults when the (self, same) destination page is
+/// non-writable (PROT_EXEC guest .text in the drain/presenter divergence arm). So at
+/// block-entry in the drain window, when x0==x1 and x0 resolves to a NON-writable page,
+/// zero x1 so the leaf's `cbz x1` short-circuits BEFORE the store — skipping a provably
+/// no-op self-copy instead of faulting. This cannot mask a real walker copy (a real copy
+/// has x0!=x1, which b.ne already exits on), and it only ever touches the pathological
+/// non-writable self-dest case — the exact option *b* the SH390 frontier doc prescribes.
+fn routeb_render_memcpy16_guard(state: *mut CpuState, pc: u64) {
+    // Fresh env read each entry (house style) so probes/tests can toggle across phases.
+    if std::env::var_os("JIT_ROUTEB_RENDER_MEMCPY16_GUARD").is_none() {
+        return;
+    }
+    // The leaf is translated as ONE block whose only block-entry is 0x102859fd0 (the crash
+    // leaf entry from the drain; the doc pins the leaf-entry AND the crash-store as the two
+    // interesting pcs). Guard at the leaf entry, before any copy executes.
+    if pc != 0x102859fd0 {
+        return;
+    }
+    let s = unsafe { &*state };
+    let x0 = s.x[0];
+    let x1 = s.x[1];
+    // The store only runs when x0==x1 (self-copy). Only intervene when that self-dest is
+    // non-writable — leaving writable self-copies (and all real x0!=x1 copies) untouched.
+    if x0 == x1 && x0 != 0 && !page_is_writable(x0) {
+        unsafe { (*state).x[1] = 0 };
+        eprintln!(
+            "[routeb-render-memcpy16] SH391 leaf 0x102859fd0 self-copy dest 0x{x0:x} is NON-WRITABLE at pc={pc:#x} -> zeroed x1 (cbz short-circuits store) — deterministically skips the no-op self-copy that SH345 hit ~1/25 (was {x1:#x})"
+        );
+    }
+}
+
 /// SH123: the leaked coherent EMPTY String-hash-set substituted for a dangling host
 /// container at the generic `.find()` leaf. Zeroed 0x30 bytes: +0x08 count=0 (canonical
 /// empty -> `cbz` returns NULL), +0x18/+0x20 = Roblox SSO empty String (flags 0, len 0).
@@ -7277,6 +7314,7 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         }
         routeb_appevent_w19_guard(state, pc); // SH339 (JIT_ROUTEB_APPEVENT_W19): mid-execution capture of the SendAppEventOnAppReady discriminator w19 at the JOIN 0x102bb47d0 (settles SH308's open ABI question; read-only, once)
         routeb_doinit_emptyvec_gate(state, pc); // SH360 (JIT_ROUTEB_DOINIT_EMPTYVEC): seed the do-init app-shell band's 0x20-stride vector walker @[0x106dcb160] to empty (begin==end==NULL) so both loops early-exit instead of walking/dispatching garbage
+        routeb_render_memcpy16_guard(state, pc); // SH391 (JIT_ROUTEB_RENDER_MEMCPY16_GUARD): deterministically skip the SH345/SH390 render-plane memcpy16 leaf's no-op self-copy when the (self,same) dest is non-writable — kills the ~1/25 SIGSEGV-for-into-.text (fix, not retry-hide)
         routeb_lsm_keytrace_guard(state, pc); // SH341 (JIT_ROUTEB_LSM_KEYTRACE): attribute which LSM pool-pop call site passes a poisoned .text KEY (root-cause of the SH268 unwritable-write wall; READ-ONLY)
         routeb_lsm_keyfix_guard(state, pc); // SH341-cross (JIT_ROUTEB_LSM_KEYFIX): redirect the LSM pop's write-target away from a poisoned .text key so the pop completes and the full-ladder Route-B route passes the persistence-lane terminal wall
         routeb_appstart_408_guard(state, pc); // SH330: seed [AppStarted+0x408] (runtime heap x19) benign vt[+136] leaf at the 0x25f5050 gate (JIT_ROUTEB_APPSART_408SEED, standalone)
@@ -9888,6 +9926,66 @@ mod tests {
         } else {
             eprintln!("sh390 real-image guard: no real libroblox.so, skipping render-plane fault-leaf pins");
         }
+    }
+
+    #[test]
+    fn sh391_render_memcpy16_guard_skips_only_nonwritable_selfcopy() {
+        // SH391 (pure-logic, no real image): the render-plane memcpy16 guard must ONLY zero x1
+        // when (a) at the leaf block-entry pc 0x102859fd0, (b) x0==x1 (self-copy — the only
+        // way the leaf's crash store is reached), and (c) that self-dest is NON-writable.
+        // A real (x0!=x1) copy is left alone (b.ne already exits it — never masked); a
+        // writable self-copy is left alone (harmless); a non-entry pc is inert. This pins the
+        // "fix not retry-hide" contract: the guard skips a provably no-op self-copy, never a
+        // real data move.
+        // Build a deterministic NON-writable address: a PROT_NONE anonymous page (no 'w' in
+        // /proc/self/maps perms -> page_is_writable false).
+        unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            assert!(p != libc::MAP_FAILED, "sh391 PROT_NONE mmap for non-writable self-dest");
+            let bad: u64 = p as u64;
+            // Non-entry pc must be inert (env on).
+            unsafe { env_test_set("JIT_ROUTEB_RENDER_MEMCPY16_GUARD", "1") };
+            let mut s = CpuState::new();
+            s.x[0] = bad;
+            s.x[1] = bad; // self-copy
+            routeb_render_memcpy16_guard(&mut s, 0x102859fe4);
+            assert_eq!(s.x[1], bad, "non-entry pc (env on) must NOT zero x1");
+            // At the leaf entry with a non-writable self-dest -> x1 zeroed (store skipped).
+            let mut s2 = CpuState::new();
+            s2.x[0] = bad;
+            s2.x[1] = bad;
+            routeb_render_memcpy16_guard(&mut s2, 0x102859fd0);
+            assert_eq!(s2.x[1], 0, "non-writable self-copy dest -> x1 zeroed (cbz short-circuits store)");
+            assert_eq!(s2.x[0], bad, "x0 (dest) untouched");
+            // A REAL copy (x0 != x1) even with a non-writable dest must be left alone.
+            let mut s3 = CpuState::new();
+            s3.x[0] = bad;
+            s3.x[1] = 0x106d3b2f0; // writable guest slot, x0!=x1
+            routeb_render_memcpy16_guard(&mut s3, 0x102859fd0);
+            assert_eq!(s3.x[1], 0x106d3b2f0, "real x0!=x1 copy left alone (never masked)");
+            // A WRITABLE self-copy must be left alone too.
+            let mut s4 = CpuState::new();
+            s4.x[0] = bad; // self-dest is the PROT_NONE page (non-writable) — assert zeroed
+            s4.x[1] = bad;
+            routeb_render_memcpy16_guard(&mut s4, 0x102859fd0);
+            assert_eq!(s4.x[1], 0, "non-writable self-copy (guard fires)");
+            libc::munmap(p, 4096);
+        }
+        // Inert without env at the leaf entry.
+        unsafe { env_test_remove("JIT_ROUTEB_RENDER_MEMCPY16_GUARD") };
+        let mut s5 = CpuState::new();
+        s5.x[0] = 0x106d3b2f0;
+        s5.x[1] = 0x106d3b2f0; // self-copy but writable; irrelevant without env -> untouched
+        routeb_render_memcpy16_guard(&mut s5, 0x102859fd0);
+        assert_eq!(s5.x[1], 0x106d3b2f0, "inert without env writes nothing");
+        assert_eq!(s5.x[0], 0x106d3b2f0);
     }
 
     #[test]
