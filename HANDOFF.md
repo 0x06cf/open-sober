@@ -1,5 +1,49 @@
 # Open Sober — Agent Handoff
 
+## SH371 (Sep 20, 2026, hermes-worker): MEASURED — continueAfterFlagsLoaded_ now EXECUTES DEEP headlessly (corrects the SH226/228 "never fires" map) + hermetic proving the engine-init dispatcher body is STRAIGHT-LINE (the only runtime exits are the two leaf blr returns and the bl sub)
+Single-agent (cone suppressed). recon-v3 deliverables independently re-verified green at
+HEAD (capture_taskv4_frame.sh attempt 1: 24 real task-driven frames `present swap Ok(0x1)`,
+197 node pops, 0 json abort, 0 crash; JIT_JSON_ZERO_FIX len-clamp at 0x102355d40 present).
+New real-image hermetic `sh371_engineinit_dispatcher_body_straightline_to_sub` (arm64jit
+lib 433; scans dispatcher body [0x2bd8ce8,0x2bd8d64) + sub_2bd8dac body [0x2bd8dac,0x2bd8e28)
+for any control-flow word, rejecting all but the 4 known sites — bl getter 0x2bd8d14, blr
+vt+0xf8 @0x2bd8d2c, blr vt+0x108 @0x2bd8d50, bl sub @0x2bd8d60, and sub's blr vt+0x1f0
+@0x2bd8e28 — both STRAIGHT-LINE, so SH228's "diverge at a leaf" narrows to "a leaf's
+return never lands back in-image (host landing)" with NO benign body branch) + probe
+runs/capture_sh371_dispatcher_body.sh + docs/frontier-sh371-....md. Workspace green
+(cargo test --workspace EXIT 0; elfjit 159/0, jit lib 433/0).
+
+### The forward this cycle
+A genuinely-new measurement, not a re-tread: with the FULL Route-B env (capture_sh344's
+DMCONT + DM_CONT_M48_SEED + CONT_APPNAME_SEED seed set), region-watching [0x102bd8ce8,
+0x102bd8e30] ∪ [0x102bd1d68,0x102bd2600] on the completing ladder shows:
+- dispatcher 0x2bd8ce8 + sub_2bd8dac BOTH fire (1 each) — the dispatcher body runs through
+  its getter + the two leaf blr returns and reaches `bl sub`, contradicting SH228's
+  "sub never fires" on the fuller env.
+- **continueAfterFlagsLoaded_ (0x102bd1d68) FIRES and runs DEEP — 25+ block-entry pcs
+  0x102bd1d68 .. 0x102bd1f64 (its app-name guard, SH245/SH248c-seeded)**. This overturns
+  the SH226/SH228 blanket "continueAfterFlagsLoaded_ is never entered" — with the full
+  seed env it executes deep past its app-name guard.
+- Terminal: guestpc=0x101db1b08 fault=0xff..ff — the standing SH285 LSM reader/pop
+  live-object wall, reached now from the DM-creator continuation path; the F+0x18
+  post-app-start controller floor (routeb_dm_manager_cont comment) is never reached
+  because SH285 fires first (one fencepost EARLIER than that predicted floor).
+
+### Honest
+Does NOT manufacture a DataModel (DM-root [0x106a68818]=0, MH_* false, Route-B live-DM
+structural gate UNCHANGED). SH371 corrects the map (the continuation is env-reachable deep,
+not "never entered") but the continuation immediately dives into the measured-closed SH285
+persistence lane (SH349/350 — do NOT re-drive LSM sub-call skips). SH174 capture-latch
+stays the single forward hook.
+
+### Next (unchanged, authoritative)
+Route-B live-DM structural gate stands (SESSION-CTOR / do-init; REG_LIVE SH352). The two
+measured dead-ends from the now-reached continuation are (a) the SH285 live-object wall and
+(b) the F+0x18 controller floor behind it — both measured-closed. R1 content half staged +
+armed + serviceable (SH351/352/354). Do NOT re-arm the window-attach once-guard (SH367);
+do NOT re-enter the ALooper loop (SH365); bounded process_cmd stays the guarded entry
+(SH366/368); do NOT re-drive LSM sub-call skips (SH349/350/358).
+
 ## SH370 (Sep 20, 2026, hermes-worker): SH357-consolidation completion — lock the sh323 cookie-jar/settings guard test under the shared ROUTEB_PROC_TEST_LOCK (determinism hardening); recon-v3 deliverables re-verified green at HEAD
 Single-agent (cone suppressed). One-line test-harness fix (arm64jit/src/jit.rs): `sh323_settings_sso_seed_guard`
 was the one routeb-family cookie-jar test that did NOT hold the consolidated ROUTEB_PROC_TEST_LOCK all its

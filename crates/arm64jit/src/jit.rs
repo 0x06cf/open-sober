@@ -9340,6 +9340,73 @@ mod tests {
         }
     }
 
+    /// SH371: the engine-init dispatcher 0x2bd8ce8 body [..,0x2bd8d64) and sub_2bd8dac
+    /// body [0x2bd8dac,0x2bd8e28) are STRAIGHT-LINE — the only control-flow words are
+    /// bl getter 0x2bd8d14, blr vt+0xf8 @0x2bd8d2c, blr vt+0x108 @0x2bd8d50, bl sub
+    /// @0x2bd8d60, and sub's blr vt+0x1f0 @0x2bd8e28. => SH228's "diverge at a leaf"
+    /// narrows to "a leaf's return never lands back in-image (host landing) or a fault
+    /// before 0x2bd8d2c" — there is NO benign body branch. (Measured: with the full
+    /// Route-B env continueAfterFlagsLoaded_ now EXECUTES DEEP; see frontier-sh371.)
+    #[test]
+    fn sh371_engineinit_dispatcher_body_straightline_to_sub() {
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let word_at = |vaddr: u64| -> u32 {
+                let off = vaddr as usize;
+                let b = &img[off..off + 4];
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            };
+            // Self-contained AArch64 control-flow bit-mask detector (BR/BLR/RET/REGS).
+            fn is_cf(w: u32) -> bool {
+                (w & 0xFC00_0000) == 0x1400_0000 // B / BL
+                    || (w & 0x7E00_0000) == 0x3400_0000 || (w & 0x7E00_0000) == 0x3500_0000 // CBZ/CBNZ
+                    || (w & 0xFF00_0010) == 0x5400_0000 // B.cond
+                    || (w & 0x7E00_0000) == 0x3600_0000 || (w & 0x7E00_0000) == 0x3700_0000 // TBZ/TBNZ
+                    || (w & 0xFFFF_FC1F) == 0xD61F_0000 // BR
+                    || (w & 0xFFFF_FC1F) == 0xD63F_0000 // BLR
+                    || (w & 0xFFFF_FC1F) == 0xD65F_03C0 // RET
+            }
+            // [1] Known control-flow words (file = guest - 0x100000000).
+            assert_eq!(word_at(0x2bd8d14), 0x97d66fbc, "sh371 dispatcher bl getter 0x2174c04");
+            assert_eq!(word_at(0x2bd8d2c), 0xd63f0100, "sh371 dispatcher blr x8 (vt+0xf8 leaf)");
+            assert_eq!(word_at(0x2bd8d50), 0xd63f0100, "sh371 dispatcher blr x8 (vt+0x108 leaf)");
+            assert_eq!(word_at(0x2bd8d60), 0x94000013, "sh371 dispatcher bl sub 0x2bd8dac");
+            assert_eq!(word_at(0x2bd8dac), 0xd104c3ff, "sh371 sub_2bd8dac entry sub sp,#0x130");
+            assert_eq!(word_at(0x2bd8e28), 0xd63f0100, "sh371 sub blr x8 (vt+0x1f0 dispatch)");
+            // [2] Scan the dispatcher body [0x2bd8ce8, 0x2bd8d64): no CF word beyond the
+            // four known (getter bl + two leaf blr + bl sub).
+            let known: std::collections::HashSet<u64> =
+                [0x2bd8d14u64, 0x2bd8d2cu64, 0x2bd8d50u64, 0x2bd8d60u64].into();
+            let mut cf: Vec<(u64, u32)> = Vec::new();
+            for g in (0x2bd8ce8u64..0x2bd8d64u64).step_by(4) {
+                if known.contains(&g) { continue; }
+                let w = word_at(g);
+                if is_cf(w) { cf.push((g, w)); }
+            }
+            assert!(cf.is_empty(), "sh371 dispatcher body has unexpected control-flow: {cf:?}");
+            // [3] Scan sub_2bd8dac body [0x2bd8dac, 0x2bd8e28): no CF word before the
+            // terminal blr vt+0x1f0 (which sits at 0x2bd8e28, outside this window).
+            let mut subcf: Vec<(u64, u32)> = Vec::new();
+            for g in (0x2bd8dacu64..0x2bd8e28u64).step_by(4) {
+                let w = word_at(g);
+                if is_cf(w) { subcf.push((g, w)); }
+            }
+            assert!(subcf.is_empty(), "sh371 sub_2bd8dac body has unexpected control-flow: {subcf:?}");
+            // [4] The five sites must be in-image + 4-aligned (file offsets).
+            for (g, name) in [
+                (0x2bd8d2cu64, "blr vt+0xf8"), (0x2bd8d50u64, "blr vt+0x108"),
+                (0x2bd8d60u64, "bl sub"), (0x2bd8e28u64, "blr vt+0x1f0"),
+                (0x2bd8dacu64, "sub entry"),
+            ] {
+                assert!(g & 3 == 0, "sh371 {name} {g:#x} 4-aligned");
+            }
+            eprintln!("sh371 dispatcher + sub bodies STRAIGHT-LINE (diverge = a leaf return/host-landing, not a benign body branch)");
+        } else {
+            eprintln!("sh371 real-image guard: no real libroblox.so, skipping straight-line pins");
+        }
+    }
+
     #[test]
     fn sh367_window_attach_real_path_pinned_and_guard() {
         // SH367 (real-image): pin the REAL window-attach GL-surface path so the --v2boot-glue-cmd
