@@ -9509,6 +9509,12 @@ mod tests {
         // at pc=0x1021f5078 (CELL_A) or pc=0x1025f370c (CELL_B, the StartAppWithParams second
         // cookie-jar slot), (c) seed the matching cell = empty SSO string when NULL, (d) leave a
         // non-NULL slot untouched.
+        // SH357-hardening: CELL_B is the SAME fixed cookie-jar page (0x106ed7xx) that the locked
+        // sh248d/sh273/sh285 siblings write; without the consolidated ROUTEB_PROC_TEST_LOCK this
+        // test races them under --test-threads=16 and a sibling's re-zeroing lands mid-assert
+        // ("cookie-jar slot A/B must be seeded"). Take the shared process-state lock like every
+        // other routeb-family cookie-jar/adapter/once test (no assertion weakened).
+        let _mgr_guard = ROUTEB_PROC_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         const CELL_A: u64 = 0x106ed7a18;
         const CELL_B: u64 = 0x106ed7a28;
         unsafe {
