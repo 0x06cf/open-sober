@@ -9719,6 +9719,44 @@ mod tests {
     }
 
     #[test]
+    fn sh387_dmservices_current_dm_getter_abi_pinned() {
+        // SH387 (real-image): byte-anchor the DataModelServices current-DM accessor ABI — the
+        // door the operator's SEP-15 re-attack cone named (ExperienceController /
+        // DataModelServices::setDataModelToCurrent / setDataModelToCurrent path, SH163 flagged
+        // "next seed must target ExperienceController") and which SH172/178/180 documented in
+        // PROSE but NO hermetic ever pinned. 0x2dbcc10 (guest 0x102dbcc10) is a pure leaf
+        // GETTER: `adrp x0,6391000; add x0,x0,#0x908; ret` -> returns the guest ADDRESS of the
+        // current-DM holder 0x106391908 (= file 0x6391908 +0x1_0000_0000), which the harness's
+        // CUR_DM_HOLDER (jit.rs:0x106391908) already plants a manufactured DM into (SH180/181).
+        // The real BODY 0x2dbcc1c (`sub sp,#0x40`, DEBUG-stack real stp+adrp x20,67d1000 got) is
+        // a state-setter that reads the same canary-global [x20] (=0x67d1000+0x6f0=0x67d16f0)
+        // and dispatches through bl 0x24e3e98 / 0x2417d58 — NOT a DataModel ctor. Pins make the
+        // current-DM holder relationship reproducible so any re-attack knows the exact getter ->
+        // 0x106391908 mapping. Index by FILE OFFSET (guest-0x100000000, ELF file-offset==vaddr).
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let word_at = |vaddr: u64| -> u32 {
+                let off = vaddr as usize;
+                let b = &img[off..off + 4];
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            };
+            // GETTER 0x2dbcc10: adrp x0,6391000 / add x0,x0,#0x908 / ret = &current-DM holder.
+            assert_eq!(word_at(0x2dbcc10), 0xb001aea0, "sh387 getter adrp x0,6391000");
+            assert_eq!(word_at(0x2dbcc14), 0x91242000, "sh387 getter add x0,x0,#0x908 (-> 0x106391908)");
+            assert_eq!(word_at(0x2dbcc18), 0xd65f03c0, "sh387 getter ret (pure leaf)");
+            // BODY 0x2dbcc1c: real state-setter frame (sub sp,#0x40 + saved stp + adrp 67d1000 -> got).
+            assert_eq!(word_at(0x2dbcc1c), 0xd10103ff, "sh387 body sub sp,#0x40");
+            assert_eq!(word_at(0x2dbcc20), 0xa9027bfd, "sh387 body stp x29,x30,[sp,#32]");
+            assert_eq!(word_at(0x2dbcc2c), 0xb001d0b4, "sh387 body adrp x20,67d1000 (canary got)");
+            assert_eq!(word_at(0x2dbcc34), 0xf9437a94, "sh387 body ldr x20,[x20,#1776] (=0x67d16f0)");
+            eprintln!("sh387 DataModelServices current-DM getter ABI pinned (0x2dbcc10 pure leaf -> holds 0x106391908 file 0x6391908; body 0x2dbcc1c real state-setter, canary got 0x67d16f0, NOT a DM ctor) — grounding the SEP-15 ExperienceController/setDataModelToCurrent re-attack cone");
+        } else {
+            eprintln!("sh387 real-image guard: no real libroblox.so, skipping current-DM getter pins");
+        }
+    }
+
+    #[test]
     fn sh385_lsm_reader_value_slot_and_poolmove_base_pinned() {
         // SH385 (real-image): byte-anchor the FULL SH285 reader/pool-move mechanism that the
         // persistence-lane terminal (guestpc=0x101db1b08) faults on, refining SH285's "reader/pop
