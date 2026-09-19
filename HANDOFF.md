@@ -1,5 +1,26 @@
 # Open Sober — Agent Handoff
 
+## SH387 (Sep 20, 2026, hermes-worker): byte-anchor the DataModelServices current-DM getter ABI (the SEP-15 re-attack cone door), arm64jit lib 441->442
+Single-agent (cone suppressed). The operator's SEP-15 ROUTE-B directive names
+ExperienceController / DataModelServices::setDataModelToCurrent (SH163 flagged 'next
+seed must target ExperienceController') as the FRESH re-attack cone, but that door was
+only ever documented in PROSE (SH172/178/180 CUR_DM_HOLDER) — no hermetic pinned
+0x2dbcc10 on the real binary. New real-image hermetic
+`sh387_dmservices_current_dm_getter_abi_pinned` (arm64jit lib 441->442) pins: the
+pure-leaf GETTER 0x2dbcc10 (`adrp x0,6391000`/`add #0x908`/`ret` -> returns guest
+0x106391908, the current-DM holder the harness's CUR_DM_HOLDER already plants a
+manufactured DM into) AND the real BODY 0x2dbcc1c (sub sp,#0x40 real DEBUG-stack frame,
+canary got 0x67d16f0, dispatch bl 0x24e3e98/0x2417d58 = persistence family, NOT a DM
+ctor). Grounds the one cone the operator explicitly wants re-attacked on verified bytes.
+recon-v3 immediate-priority deliverables re-verified green at HEAD (24 real task-driven
+frames `present swap Ok(0x1)`, 196-197 node pops, 0 json abort, 0 crash, EXIT 0; JSON
+len-clamp present; session-gated producer INERT on bare boot). No production path / JIT
+hook default / guest byte touched (pure pin + hermetic). Route-B live-DM structural gate
+UNCHANGED (DM-root [0x106a68818]=0, MH_* false, AppBridgeV2 0). Workspace green
+(cargo test --workspace EXIT 0, 622/0; arm64jit lib 442/0). Do-not-re-tread stands:
+setDataModelToCurrent BODY is persistence-family, do NOT re-drive it expecting a ctor
+(the cone door remains OPEN for a real re-attack armed with these pins).
+
 ## SH386 (Sep 19, 2026, hermes-worker): recon-v3 §A END-STATE byte-anchored — pin the engine-producer self-drive contract (producer 0x10285682c / drain 0x102856e40 / pop + tag-guard) that the SESSION PRODUCER HANDOFF fires through the instant a live session advances (was pinned nowhere: --deque-node code was comment-anchored only)
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified green at
 HEAD: (1) capture_taskv4_frame.sh = 24 real task-driven frames `present swap Ok(0x1)`, 197 node
