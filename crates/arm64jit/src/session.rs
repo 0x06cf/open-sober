@@ -982,6 +982,33 @@ pub fn taskv4_seed_rejected(addr: u64) -> bool {
     matches!(addr, 0x10285371c | 0x102856e40 | 0x10285682c)
 }
 
+// --- SESSION PRODUCER HANDOFF (recon-selfdrive-seed-jsonfix.md §A END-STATE /
+// SEP-17 directive): the recon-v3 self-driven-frame deliverable's POST-harness
+// handoff. A type-4 dispatch may only emit REAL task-driven frames once a REAL
+// session owns a live DataModel (MH_APP_READY AND live-DM); until then the
+// --taskv4-seed frame harness seed is used. The gate + the sentinel-rejection
+// classifier below are the load-bearing pure logic of that handoff (they can
+// never be bytes of the guest image — they are HOST decisions about guest cell
+// values). SH466 promotes them from the untested elfjit example into the testable
+// library so drift fails a workspace test, not an --example-only one. ---
+
+/// Session-producer gate: type-4 self-drive may only emit frames when a real
+/// session owns a live DataModel (MH_APP_READY && live-DM). Pure, deterministic.
+/// GATED = self-drive present; UNGATED = inert (bounded log), frame path stays
+/// on the harness seed until the engige session materializes.
+pub fn session_producer_gate(mh_app_ready: bool, live_dm: bool) -> bool {
+    mh_app_ready && live_dm
+}
+
+/// A guest cell value looks like a coherent live-DataModel holder iff it is a
+/// guest-visible pointer (>= 2^32), not a host/stack address (top-16 cleared),
+/// and non-zero. Rejects the SH381-measured do-init once-lambda "Execute"
+/// service-handle sentinel 0x400000b (SH155/311/316, < 2^32) so the
+/// session-gated producer never mistakes a sentinel for a live DM.
+pub fn live_dm_cell_value_ok(v: u64) -> bool {
+    v >= 0x100000000 && v >> 56 == 0 && v != 0
+}
+
 // --- SH422: name the caller CHAIN into the standing SH285/SH341 persistence lane ---
 //
 // Every do-init / app-start arm (SH404/405/407/408) drains into the LSM persistence
@@ -1619,6 +1646,39 @@ mod tests {
         assert!(super::taskv4_seed_rejected(0x10285682c), "producer = re-entrant push into the vector");
         assert!(!super::taskv4_seed_rejected(0x7f0000000000), "host-thunk base is the sanctioned non-recursive leaf");
         assert!(!super::taskv4_seed_rejected(0x105b32c00), "engine frame-fn is called FROM the thunk, never seeded as the vector entry");
+    }
+
+    /// SH466: the SESSION PRODUCER HANDOFF gate (recon-v3 §A END-STATE / SEP-17).
+    /// A type-4 dispatch may only self-drive frames once a REAL session owns a
+    /// live DataModel (MH_APP_READY AND live-DM); and the classifier must reject
+    /// the SH381 do-init once-lambda "Execute" sentinel 0x400000b (< 2^32) so the
+    /// session-gated producer never mistakes a sentinel for a session. Promoted
+    /// from the elfjit-only example into the library — drift now fails a workspace
+    /// test. Pure logic, no env, no guest bytes.
+    #[test]
+    fn sh466_session_producer_handoff_gate_and_sentinel_rejection() {
+        // (1) The gate is exactly app-ready AND live-DM (closed unless both).
+        assert!(!super::session_producer_gate(false, false), "no app-ready, no DM -> ungated");
+        assert!(!super::session_producer_gate(false, true), "no app-ready, live-DM -> ungated");
+        assert!(!super::session_producer_gate(true, false), "app-ready, NO live DM -> ungated");
+        assert!(super::session_producer_gate(true, true), "app-ready AND live-DM -> gated (self-drive)");
+        // (2) Sentinel rejection — the load-bearing SH381 classifier.
+        // The once-lambda's DM-ctor 0x2173b3c returns 0x400000b "Execute" into
+        // once-slot [0x106a68408]; that is NOT a live DM (< 2^32).
+        assert!(!super::live_dm_cell_value_ok(0x400000b), "Execute sentinel != live DM");
+        assert!(!super::live_dm_cell_value_ok(0), "zero holder != live DM");
+        assert!(!super::live_dm_cell_value_ok(0x1000_0000), "just-below-2^32 boundary rejected");
+        // Coherent guest/host pointers (> 2^32, top byte 0) are live.
+        assert!(super::live_dm_cell_value_ok(0x1067162e8), "genuine guest DM vtable is live");
+        assert!(super::live_dm_cell_value_ok(0x106a68408), "a DM written to once-slot counts");
+        assert!(super::live_dm_cell_value_ok(0x7f7b40110a00), "coherent pointer-valued holder >=1<<32 counts (host/guest indistinguishable by this coarse predicate)");
+        // (3) Boundary precision: only values >= 2^32 with a clear top byte and
+        //    non-zero qualify. A host user pointer and a guest vtable both satisfy;
+        //    the discriminator is (>=2^32, top-16 clear, !=0) — never the low 32-bit
+        //    sentinel/0 the once-path writes.
+        assert!(!super::live_dm_cell_value_ok(0x7fff_ffff), "max below-2^32 rejected");
+        assert!(super::live_dm_cell_value_ok(0x1_0000_0000), "exact 2^32 boundary accepted (min coherent ptr)");
+        assert!(!super::live_dm_cell_value_ok(0x8000_0000_0000_0000), "top byte set (kernel) -> not a coherent object ptr");
     }
 
     /// SH422 bp-chain walker: from a leaked host frame chain (ascending aarch64

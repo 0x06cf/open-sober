@@ -315,19 +315,15 @@ extern "C" fn type4_frame_thunk(
     0
 }
 
-/// SESSION PRODUCER GATE (recon §B / SH303): a type-4 dispatch may only emit frames
-/// once a REAL session owns a live DataModel (MH_APP_READY AND live-DM). Pure.
+/// SESSION PRODUCER GATE (recon §B / SH303): frames only when app-ready AND live-DM.
+/// SH466 lib copy: [`arm64jit::session::session_producer_gate`].
 fn session_producer_gate(mh_app_ready: bool, live_dm: bool) -> bool {
-    mh_app_ready && live_dm
+    arm64jit::session::session_producer_gate(mh_app_ready, live_dm)
 }
-
-/// A guest cell value looks like a coherent live-DataModel holder iff it is a
-/// guest-visible pointer (>= 0x100000000), not a host/stack address (top-16
-/// cleared), and non-zero. This rejects the SH381-measured do-init once-lambda
-/// "Execute" service-handle sentinel 0x400000b (SH155/311/316, < 0x100000000) so
-/// the session-gated producer never mistakes it for a live DM.
+/// reject SH381 "Execute" sentinel 0x400000b (< 2^32) so producer never mistakes it for a DM.
+/// SH466 lib copy.
 fn live_dm_cell_value_ok(v: u64) -> bool {
-    v >= 0x100000000 && v >> 56 == 0 && v != 0
+    arm64jit::session::live_dm_cell_value_ok(v)
 }
 
 /// Guest holds a live DataModel: current-DM holder [0x106391908] (SH172), do-init
