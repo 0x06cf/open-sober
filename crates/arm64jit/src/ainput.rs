@@ -175,6 +175,50 @@ pub fn translate_motion(x: f32, y: f32) -> TouchAction {
     }
 }
 
+// ---------------------------------------------------------------------------
+// input-wrapper wiring: SH414 — the missing executable half of the input axis.
+// `fire_touch` was latent (SH413) with zero production callers; `input-wrapper`
+// (the X11 pump + PointerTracker translation) was a dev-only orphan. This bridge
+// is the cause-not-symptom runtime surface: it takes the already-built
+// input-wrapper translation (a `MotionEvent` stream) and marshals EACH event
+// into the guest `nativePassInput` ABI via `fire_touch`, so a real host loop
+// (the Xvfb/desktop window whose XID shims.rs registers as the ANativeWindow) can
+// deliver real pointer input to a constructed login/home screen once a live
+// session advances. Env-gated (JIT_AINPUT_BRIDGE) → inert on the product path.
+// ---------------------------------------------------------------------------
+
+/// Convert an `input-wrapper::input::MotionEvent` (the translated desktop-pointer
+/// stream) into the guest-facing [`TouchAction`] ABI. Preserves the real pointer
+/// id so multi-touch (pinch) survives the bridge; action codes are already the
+/// Android MotionEvent codes the guest consumer expects (input-wrapper defines
+/// the same ACTION_DOWN/UP/MOVE semantics).
+pub fn from_motion_event(ev: &input_wrapper::input::MotionEvent) -> TouchAction {
+    TouchAction {
+        action: ev.action,
+        pointer_id: ev.pointer_id,
+        x: ev.x,
+        y: ev.y,
+    }
+}
+
+/// Drive a translated `input-wrapper` motion event into the guest input native.
+/// Latent-but-correct: NOP/Ok(0) when the bridge is disabled or the event is a
+/// non-touch action it must not forward (CANCEL is preserved; anything with a
+/// pointer index in the high byte is passed through as-is for multi-touch).
+pub fn deliver_motion(
+    img: &[u8],
+    base: u64,
+    tpidr: u64,
+    boot_sp: u64,
+    ev: &input_wrapper::input::MotionEvent,
+) -> Result<u64, String> {
+    if !bridge_enabled() {
+        return Ok(0);
+    }
+    let ta = from_motion_event(ev);
+    fire_touch(img, base, tpidr, boot_sp, ta)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,5 +364,64 @@ mod tests {
         assert_eq!(st.v[2] >> 32, 0);
         assert_eq!((st.v[0] & 0xffff_ffff) as u32, (-5.0f32).to_bits());
         assert_eq!((st.v[2] & 0xffff_ffff) as u32, 0.5f32.to_bits());
+    }
+
+    #[test]
+    fn sh414_from_motion_event_preserves_pointer_and_pos() {
+        // A real input-wrapper translated event (the stream the X11 pump emits)
+        // must map to the guest ABI without losing pointer id or coordinates.
+        use input_wrapper::input::{action as iw_action, MotionEvent};
+        let down = from_motion_event(&MotionEvent {
+            action: iw_action::ACTION_DOWN,
+            pointer_index: 0,
+            pointer_id: 3,
+            x: 640.5,
+            y: 360.25,
+        });
+        assert_eq!(down.action, iw_action::ACTION_DOWN);
+        assert_eq!(down.pointer_id, 3);
+        assert_eq!(down.x, 640.5);
+        assert_eq!(down.y, 360.25);
+        // Marshalling that TouchAction places pointer_id in x3 (== w19) and the
+        // floats in the v-lanes the JIT's fmov s8,s1 / s9,s0 reads.
+        let st = marshal_touch(down, 0xE, 0xF, 0, 0);
+        assert_eq!(st.x[3], 3);
+        assert_eq!((st.v[0] & 0xffff_ffff) as u32, 640.5f32.to_bits());
+        assert_eq!((st.v[2] & 0xffff_ffff) as u32, 360.25f32.to_bits());
+        // Multi-touch: a distinct pointer index/id survives untouched.
+        let up2 = from_motion_event(&MotionEvent {
+            action: iw_action::ACTION_POINTER_UP,
+            pointer_index: 1,
+            pointer_id: 5,
+            x: 1.0,
+            y: 2.0,
+        });
+        assert_eq!(up2.pointer_id, 5);
+        assert_eq!(up2.y, 2.0);
+    }
+
+    #[test]
+    fn sh414_deliver_motion_inert_without_env() {
+        // The delivery path must be inert when the bridge env is unset: Ok(0),
+        // no guest call, even with a would-be-valid translated event.
+        unsafe { std::env::remove_var(AINPUT_BRIDGE_ENV) };
+        use input_wrapper::input::{action as iw_action, MotionEvent};
+        assert_eq!(
+            deliver_motion(
+                &[0u8; 16],
+                0x100000000,
+                0,
+                0x200000,
+                &MotionEvent {
+                    action: iw_action::ACTION_DOWN,
+                    pointer_index: 0,
+                    pointer_id: 0,
+                    x: 10.0,
+                    y: 20.0,
+                }
+            )
+            .unwrap(),
+            0
+        );
     }
 }

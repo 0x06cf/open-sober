@@ -423,6 +423,71 @@ pub fn drive_nativehelper_lifecycle() {
     );
 }
 
+/// SH414 — the host-input axis wired to a real event source.
+///
+/// This is the executable half that SH413 left latent: `fire_touch`/`deliver_motion`
+/// had zero production callers and `input-wrapper` was a dev-only orphan. This step
+/// is the cause-not-symptom runtime surface — a host loop that connects the real
+/// X11 window (its XID registered via shims::set_anativewindow_xid by the same
+/// layer that builds the EGL surface) to the guest `nativePassInput` input native.
+/// Each real pointer event is translated by input-wrapper's `PointerTracker` and
+/// delivered through the SH414 motion bridge.
+///
+/// Latent-but-correct like every runtime axis: it only matters once a live session
+/// owns a screen (input is delivered to a constructed login/home), so on the
+/// current boot path it is a no-op (returns the events it did NOT deliver because
+/// it is gated on `JIT_AINPUT_BRIDGE` + a non-zero registered window XID + a live
+/// input image). Env-gated -> default product path unchanged. The caller supplies
+/// the guest input image + base so delivery is a real `jit_run` into the guest when
+/// armed; passing an empty image means "not armed" -> inert.
+pub fn drive_host_input_pump(
+    iimg: &[u8],
+    ib: u64,
+    tpidr: u64,
+    boot_sp: u64,
+    events: &[input_wrapper::input::MotionEvent],
+) -> usize {
+    if !crate::ainput::bridge_enabled() {
+        eprintln!("[session-drive] host-input pump: JIT_AINPUT_BRIDGE unset — inert (no guest call)");
+        return 0;
+    }
+    if !open_delivery_armed() {
+        eprintln!(
+            "[session-drive] host-input pump: window/clipboard not armed — inert (deliver to a live screen only)"
+        );
+        return 0;
+    }
+    if iimg.len() < 16 {
+        eprintln!("[session-drive] host-input pump: no live input image — inert");
+        return 0;
+    }
+    let mut delivered = 0usize;
+    for ev in events {
+        match crate::ainput::deliver_motion(iimg, ib, tpidr, boot_sp, ev) {
+            Ok(_) => delivered += 1,
+            Err(e) => eprintln!("[session-drive] host-input pump: deliver error: {e}"),
+        }
+    }
+    eprintln!(
+        "[session-drive] host-input pump: delivered {delivered}/{} translated events -> nativePassInput (window xid={:#x})",
+        events.len(),
+        window_xid()
+    );
+    delivered
+}
+
+/// Whether the host-input delivery path is armed: a real ANativeWindow XID is
+/// registered (shims::set_anativewindow_xid, SH112/SH303) — i.e. the same surface
+/// the EGL window path builds on. Zero = headless/plain run -> input pump inert.
+fn open_delivery_armed() -> bool {
+    window_xid() != 0
+}
+
+/// The current real desktop X11 window XID backing the guest ANativeWindow.
+fn window_xid() -> u64 {
+    crate::shims::anativewindow_xid()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,5 +632,50 @@ mod tests {
             1,
             "no-live-image: files-dir cell mapped by ensure_writable, drive must seed it (1), no SIGSEGV"
         );
+    }
+
+    /// SH414: the host-input pump is the executable half of the input axis — it
+    /// must stay inert (return 0) when (a) the bridge env is unset, (b) no real
+    /// window XID is registered, or (c) no live input image is present. This
+    /// hermetic (no real binary, no X server) proves all three inert guards fire
+    /// in order and the pump NEVER touches the guest path when any guard trips.
+    /// Reuse of the input-wrapper MotionEvent type also pins the promoted
+    /// dependency (input-wrapper is now a real arm64jit dep, not dev-only).
+    #[test]
+    fn sh414_host_input_pump_inert_without_arm() {
+        use input_wrapper::input::{action as iw_action, MotionEvent};
+        let ev = [MotionEvent {
+            action: iw_action::ACTION_DOWN,
+            pointer_index: 0,
+            pointer_id: 0,
+            x: 10.0,
+            y: 20.0,
+        }];
+        // (a) bridge env unset -> inert regardless of window/image.
+        unsafe { std::env::remove_var(crate::ainput::AINPUT_BRIDGE_ENV) };
+        assert_eq!(
+            crate::session::drive_host_input_pump(&[0u8; 64], 0x100000000, 0, 0x200000, &ev),
+            0,
+            "bridge disabled -> inert (0 delivered)"
+        );
+        // (b) even WITH the bridge env, no real window XID armed -> inert.
+        unsafe { std::env::set_var(crate::ainput::AINPUT_BRIDGE_ENV, "1") };
+        let prev_xid = crate::shims::anativewindow_xid();
+        crate::shims::set_anativewindow_xid(0);
+        assert_eq!(
+            crate::session::drive_host_input_pump(&[0u8; 64], 0x100000000, 0, 0x200000, &ev),
+            0,
+            "no real window XID -> inert"
+        );
+        // (c) window armed but no live input image -> inert.
+        crate::shims::set_anativewindow_xid(crate::jit::HOST_THUNK_BASE | 0x2000);
+        assert_eq!(
+            crate::session::drive_host_input_pump(&[], 0x100000000, 0, 0x200000, &ev),
+            0,
+            "no live input image -> inert"
+        );
+        // Restore the prior XID (other tests may observe it).
+        crate::shims::set_anativewindow_xid(prev_xid);
+        unsafe { std::env::remove_var(crate::ainput::AINPUT_BRIDGE_ENV) };
     }
 }

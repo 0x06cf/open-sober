@@ -1,5 +1,34 @@
 # Open Sober — Agent Handoff
 
+## SH414 (Sep 22, 2026, hermes-worker): complete the INPUT runtime axis — the SEP-18 list's last part (session boot, screens, audio, input) was landed latent-but-correct by SH400-413, but the ainput bridge was ORPHANED (zero production callers) and input-wrapper was a DEV-ONLY dependency. SH414 wires them: input-wrapper promoted to a real arm64jit dep; new ainput::from_motion_event/deliver_motion (translated MotionEvent -> guest nativePassInput ABI) + session::drive_host_input_pump (a first-class host-input step, three inert guards, returns delivered count). This is the executable half of the input axis — a real host loop delivering X-window pointer events into the guest input native for a constructed login/home screen
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified
+green first (24 real task frames `present swap Ok(0x1)`, 197 node pops, 0 json abort,
+0 crash). Production code only in ainput.rs + session.rs (both off the 1MiB hooks;
+jit.rs/elfjit.rs untouched, both at/near the hook). input-wrapper promoted
+dev-dep -> real dep (Cargo.toml). Workspace green (arm64jit lib 468/0 incl. 3 new
+SH414 hermetics; cargo test --workspace EXIT 0).
+- ainput.rs: `from_motion_event(&input_wrapper::input::MotionEvent) -> TouchAction`
+  (preserves real pointer id for multi-touch + coords) + `deliver_motion(img, base,
+  tpidr, boot_sp, ev)` — production delivery of one translated motion event into
+  guest nativePassInput via the existing fire_touch (env-gated, inert without
+  JIT_AINPUT_BRIDGE).
+- session.rs: `drive_host_input_pump(...) -> usize` — a first-class host-input step:
+  delivers each translated MotionEvent through the SH414 bridge. Inert (returns 0,
+  no guest path) unless JIT_AINPUT_BRIDGE AND a real window XID is registered AND a
+  live input image is present — all three guards tested explicitly
+  (sh414_host_input_pump_inert_without_arm).
+- 3 new hermetics (2 in ainput, 1 in session). MEASURED (real libroblox.so, SH400
+  env): recon-v3 type4 re-verified green with the promoted dep (no regression);
+  real-image pin byte-exact (nativePassInput 0x2bbba88 sub 0xd10143ff, bl consumer
+  0x940a4aed @+0x50).
+- Honest: latent-but-correct exactly like SH132/SH413 — input only lands once a live
+  session owns a screen (guest consumer 0x2e4e68c gate); on the current boot path
+  the pump is three-guard inert, product path byte-identical. Route-B live-DM
+  structural gate UNCHANGED (DM-root 0, no make_shared, MH_GAME_LOADED false). No
+  re-treads.
+- Files: docs/frontier-sh414-input-axis.md + runs/capture_sh414_input_axis.sh.
+  Commit (pending).
+
 ## SH413 (Sep 22, 2026, hermes-worker): land the INPUT runtime axis — the SEP-18 BUILD-THE-RUNTIME surface the operator names last ("session boot, then screens, then audio, then input"); audio (SH132) was done, input had ZERO guest-facing wiring (input-wrapper crate orphaned dead code + no host path into the guest's GameActivity input natives). New off-hook module ainput.rs mirrors the SH132 fake-AAudio pattern: env-gated (JIT_AINPUT_BRIDGE), latent-but-correct, hermetic-ABI + real-image-pinned to the actual instruction bytes
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified green first
 (capture_taskv4_frame.sh attempt 1: 24 real task-driven frames `present swap Ok(0x1)`, 197 node pops,
