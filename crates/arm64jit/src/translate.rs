@@ -10077,6 +10077,74 @@ mod tests {
     }
 
     #[test]
+    fn sh459_satnarrow_sqshrn_signed_lane0_full_emit() {
+        // sqshrn v1.4H, v2.4S, #6 (src_esize=4 dst_esize=2 shift=6 src_signed=
+        // dst_signed=true q=false): shift each 32-bit src right by 6 then
+        // SATURATING-narrow to a signed 16-bit (clamp to [-0x8000,0x7fff]).
+        // EMIT per lane: mov_load32 + `shl rax,32` (48 c1 e0 20) + `sar rax,32`
+        // (48 c1 f8 20 = the 32-bit SIGN-EXTEND) + `sar rax,6` (48 c1 f8 06,
+        // arithmetic — signed src) + min clamp cmp rax,0xffff...8000 (48 39 c8 +
+        // cmovl 48 0f 4c c1) + max clamp cmp 0x7fff + cmovg 48 0f 4f c1) +
+        // 16-bit store (66 89). rd=1 rn=2 -> src@0x130 dst@0x120. The
+        // shl+shr-r64-then-sar borrows the SAR-r64 to sign-extend.
+        let b = tr_bytes(Inst::SatNarrowShift { rd: 1, rn: 2, src_esize: 4, dst_esize: 2, shift: 6, src_signed: true, dst_signed: true, q: false });
+        assert_eq!(b[..35].to_vec(), vec![
+            // lane 0
+            0x8b, 0x83, 0x30, 0x01, 0x00, 0x00,                         // mov eax,[rbx+0x130] src
+            0x48, 0xc1, 0xe0, 0x20,                                     // shl rax,32
+            0x48, 0xc1, 0xf8, 0x20,                                     // sar rax,32 (sign-extend)
+            0x48, 0xc1, 0xf8, 0x06,                                     // sar rax,6 (arith shift, signed src)
+            0x48, 0xb9, 0x00, 0x80, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // mov rcx,0xffffffffffff8000 (=-0x8000)
+            0x48, 0x39, 0xc8,                                           // cmp rax,rcx
+            0x48, 0x0f, 0x4c, 0xc1,                                     // cmovl rax,rcx (clamp low)
+        ]);
+        // max clamp + 16-bit store
+        assert!(b.windows(8).any(|w| w == [0x48, 0xb9, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00]), "sqshrn .2s max clamp = 0x7fff (mov rcx,0x7fff)");
+        assert!(b.windows(4).any(|w| w == [0x48, 0x0f, 0x4f, 0xc1]), "sqshrn clamps high via cmovg (48 0f 4f c1)");
+        assert!(b.windows(7).any(|w| w == [0x66, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00]), "2-byte dst store (66 89) to 0x120");
+        // q=false zeroes the upper 8 bytes of Vd (0x128).
+        assert!(b.windows(10).any(|w| w == [0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]), "q=false materializes 0 for the upper half");
+        assert!(b.windows(7).any(|w| w == [0x48, 0x89, 0x83, 0x28, 0x01, 0x00, 0x00]), "q=false zeroes Vd upper 64 (mov [0x128],rax)");
+    }
+
+    #[test]
+    fn sh459_satnarrow_uqshrn_vs_sqshrn_shift_and_clamp() {
+        // The signed-vs-unsigned src/dst pair drives BOTH the shift opcode and
+        // the clamp bounds. uqshrn (unsigned): NO 32-bit sign-extend + `shr
+        // rax,6` (48 c1 e8 06, logical) + clamp [0, 0xffff]. sqshrn (signed):
+        // shl+`sar rax,6` (48 c1 f8 06, arithmetic) + clamp [-0x8000, 0x7fff].
+        // The E8-vs-F8 shift byte + the 0/0xffff vs -0x8000/0x7fff clamp consts
+        // are the semantic discriminators — a flub clamps to the wrong bound or
+        // shifts the wrong direction, silently corrupting every narrowed lane.
+        let u = tr_bytes(Inst::SatNarrowShift { rd: 1, rn: 2, src_esize: 4, dst_esize: 2, shift: 6, src_signed: false, dst_signed: false, q: false });
+        assert!(u.windows(4).any(|w| w == [0x48, 0xc1, 0xe8, 0x06]), "uqshrn = shr rax,6 (48 c1 e8 06, logical)");
+        assert!(!u.windows(8).any(|w| w == [0x48, 0xc1, 0xe0, 0x20]), "unsigned src must NOT shl rax,32 (no sign-extend)");
+        assert!(u.windows(8).any(|w| w == [0x48, 0xb9, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00]), "uqnshrn max clamp = 0xffff");
+        // signed control
+        let s = tr_bytes(Inst::SatNarrowShift { rd: 1, rn: 2, src_esize: 4, dst_esize: 2, shift: 6, src_signed: true, dst_signed: true, q: false });
+        assert!(s.windows(4).any(|w| w == [0x48, 0xc1, 0xf8, 0x06]), "sqshrn = sar rax,6 (48 c1 f8 06, arithmetic)");
+        assert!(!s.windows(4).any(|w| w == [0x48, 0xc1, 0xe8, 0x06]), "signed must NOT emit shr");
+        assert!(s.windows(6).any(|w| w == [0x48, 0xb9, 0x00, 0x80, 0xff, 0xff]), "sqshrn min clamp = -0x8000");
+    }
+
+    #[test]
+    fn sh459_satnarrow_q_true_no_upper_zero_and_byte_store() {
+        // uqshrn v1.16B, v2.8H, #4 (src_esize=2 dst_esize=1 q=true): 16 lanes
+        // (no upper-half zero — q=true fills the full 16B), unsigned: zero-extend
+        // word (movzx 0f b7 83) + `shr rax,4` (48 c1 e8 04) + clamp [0,0xff] +
+        // BYTE store (88 83) at every Vd byte (0x120..0x12f). The Q distinction
+        // is the ABSENCE of the q=false upper-half-zero store, and the byte-vs-
+        // word store width is the dst_esize discriminator.
+        let b = tr_bytes(Inst::SatNarrowShift { rd: 1, rn: 2, src_esize: 2, dst_esize: 1, shift: 4, src_signed: false, dst_signed: false, q: true });
+        assert!(b.windows(7).any(|w| w == [0x0f, 0xb7, 0x83, 0x30, 0x01, 0x00, 0x00]), "uqshrn .2h src zero-extends via movzx (0f b7 83)");
+        assert!(b.windows(4).any(|w| w == [0x48, 0xc1, 0xe8, 0x04]), "uqshrn = shr rax,4");
+        assert!(b.windows(8).any(|w| w == [0x48, 0xb9, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00]), "uqshrn .1b max clamp = 0xff");
+        assert!(b.windows(6).any(|w| w == [0x88, 0x83, 0x2f, 0x01, 0x00, 0x00]), "byte store to Vd lane15 at 0x12f (88 83, 16th lane)");
+        // q=true: NO upper-half zero store.
+        assert!(!b.windows(7).any(|w| w == [0x48, 0x89, 0x83, 0x28, 0x01, 0x00, 0x00]), "q=true must NOT zero the upper half (full 16B written)");
+    }
+
+    #[test]
     fn sh458_lanes_esize8_index0_full_buffer() {
         // mov D1.1D, v2.1D[0] (esize=8 index=0): copy a 64-bit element to the
         // DEST FP slot's low bytes. EMIT: mov rax,[0x130] (48 8b 83, src =
