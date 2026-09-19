@@ -9578,4 +9578,78 @@ mod tests {
         assert!(b.windows(6).any(|w| w == [0x89, 0x83, 0x28, 0x01, 0x00, 0x00]), "lane2 store 0x128");
         assert!(b.windows(6).any(|w| w == [0x89, 0x83, 0x2c, 0x01, 0x00, 0x00]), "lane3 store 0x12c");
     }
+
+    #[test]
+    fn sh448_arithunary_neg_2s_full_buffer_neg_rax_32bit_loadstore() {
+        // neg V1.2s, V2.2s (rd=1 rn=2 esize=4 q=false op=0): per-lane a 32-bit
+        // zero-extending load (8b 83), then `neg rax` (48 f7 d8), then a 32-bit
+        // store (89 83). Full-buffer exact.
+        let b = tr_bytes(Inst::SimdArithUnary { rd: 1, rn: 2, esize: 4, q: false, op: 0 });
+        assert_eq!(b, vec![
+            0x8b, 0x83, 0x30, 0x01, 0x00, 0x00, // mov eax,[0x130] Vn lane0
+            0x48, 0xf7, 0xd8,                   // neg rax
+            0x89, 0x83, 0x20, 0x01, 0x00, 0x00, // mov [0x120],eax Vd lane0
+            0x8b, 0x83, 0x34, 0x01, 0x00, 0x00, // mov eax,[0x134] lane1
+            0x48, 0xf7, 0xd8,                   // neg rax
+            0x89, 0x83, 0x24, 0x01, 0x00, 0x00, // mov [0x124],eax lane1
+        ]);
+        // neg never emits the abs sign-extend (48 63 c0 movsxd).
+        assert!(!b.windows(3).any(|w| w == [0x48, 0x63, 0xc0]), "neg must not movsxd");
+    }
+
+    #[test]
+    fn sh448_arithunary_abs_2s_signextend_sar_xor_sub_idiom() {
+        // abs V1.2s V2.2s (op=1): the (x ^ (x ar>> w-1)) - (x ar>> w-1) idiom.
+        // esize=4 must movsxd (48 63 c0) the 32-bit lane FIRST, then mov rcx,rax
+        // (48 89 c1) + sar rcx,31 (48 c1 f9 1f) + xor abs,xmm... xor rax,rcx
+        // (48 31 c8) + sub rax,rcx (48 29 c8), 32-bit store (89 83).
+        let b = tr_bytes(Inst::SimdArithUnary { rd: 1, rn: 2, esize: 4, q: false, op: 1 });
+        assert_eq!(b, vec![
+            0x8b, 0x83, 0x30, 0x01, 0x00, 0x00, // mov eax,[0x130]
+            0x48, 0x63, 0xc0,                   // movsxd rax,eax (signed lane)
+            0x48, 0x89, 0xc1,                   // mov rcx,rax
+            0x48, 0xc1, 0xf9, 0x1f,             // sar rcx,31  (w-1 = 4*8-1)
+            0x48, 0x31, 0xc8,                   // xor rax,rcx
+            0x48, 0x29, 0xc8,                   // sub rax,rcx (|x|)
+            0x89, 0x83, 0x20, 0x01, 0x00, 0x00, // mov [0x120],eax
+            0x8b, 0x83, 0x34, 0x01, 0x00, 0x00,
+            0x48, 0x63, 0xc0,
+            0x48, 0x89, 0xc1,
+            0x48, 0xc1, 0xf9, 0x1f,
+            0x48, 0x31, 0xc8,
+            0x48, 0x29, 0xc8,
+            0x89, 0x83, 0x24, 0x01, 0x00, 0x00,
+        ]);
+        // abs must NOT be a bare neg (48 f7 d8).
+        assert!(!b.windows(3).any(|w| w == [0x48, 0xf7, 0xd8]), "abs uses the sar/xor/sub idiom, never neg");
+    }
+
+    #[test]
+    fn sh448_arithunary_width_discriminator_esize_load_sar_store() {
+        // neg 2d q=true: full 64-bit load (48 8b 83) + neg (48 f7 d8) + 64-bit
+        // store (48 89 83), 2 lanes at +8. The abs sar imm = esize*8-1 (double ->
+        // 63, byte -> 7). esize=1 abs loads via movsx_byte_mem (48 0f be) and
+        // stores byte (88 83), lanes advance +1.
+        let d = tr_bytes(Inst::SimdArithUnary { rd: 1, rn: 2, esize: 8, q: true, op: 0 });
+        assert!(d.windows(7).any(|w| w == [0x48, 0x8b, 0x83, 0x30, 0x01, 0x00, 0x00]), "2d loads 64-bit (48 8b 83) lane0");
+        assert!(d.windows(7).any(|w| w == [0x48, 0x89, 0x83, 0x28, 0x01, 0x00, 0x00]), "2d stores 64-bit (48 89 83) lane1 at +8 0x128");
+
+        let h = tr_bytes(Inst::SimdArithUnary { rd: 1, rn: 2, esize: 1, q: false, op: 1 });
+        assert!(h.windows(7).any(|w| w == [0x48, 0x0f, 0xbe, 0x83, 0x30, 0x01, 0x00]), "abs byte loads via movsx_byte_mem (48 0f be)");
+        assert!(h.windows(4).any(|w| w == [0x48, 0xc1, 0xf9, 0x07]), "abs byte sar imm = 7 (esize*8-1)");
+        assert!(h.windows(6).any(|w| w == [0x88, 0x83, 0x21, 0x01, 0x00, 0x00]), "byte store lane1 at 0x121 (advance +1)");
+    }
+
+    #[test]
+    fn sh448_arithunary_abs_neg_discriminator_movsxd_vs_bare_neg_never_cross() {
+        // The load-extend is THE discriminator: abs(32-bit) sign-extends
+        // (48 63 c0 movsxd), neg MUST NOT; neg always emits 48 f7 d8, abs MUST
+        // NOT. A cross silently abs()'s a neg or negates an abs.
+        let neg = tr_bytes(Inst::SimdArithUnary { rd: 1, rn: 2, esize: 4, q: true, op: 0 });
+        assert_eq!(neg.windows(3).filter(|w| *w == [0x48, 0xf7, 0xd8]).count(), 4, "4-lane neg has 4 neg rax");
+        assert_eq!(neg.windows(3).filter(|w| *w == [0x48, 0x63, 0xc0]).count(), 0, "neg never movsxd");
+        let abs = tr_bytes(Inst::SimdArithUnary { rd: 1, rn: 2, esize: 4, q: true, op: 1 });
+        assert_eq!(abs.windows(3).filter(|w| *w == [0x48, 0x63, 0xc0]).count(), 4, "4-lane abs has 4 movsxd");
+        assert_eq!(abs.windows(3).filter(|w| *w == [0x48, 0xf7, 0xd8]).count(), 0, "abs never neg rax");
+    }
 }
