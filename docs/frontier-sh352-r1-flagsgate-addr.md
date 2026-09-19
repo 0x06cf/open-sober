@@ -66,3 +66,18 @@ deep app-start continuation is re-driven (i.e. a partial flag set without skip-a
 loop-completion). This matches SH340/SH308/SH342: the app-shell ctor runs but the session half
 (governor -> Lua) stays gated on a live DM. No Route-B advance beyond the SH352-measured completing
 ladder (app-events return, R1 stages, gates arm, once-slot "Execute" handle). DM-root 0, MH_* false.
+
+## Addendum 2 — decisive REG_LIVE answer: the completing ladder NEVER registers "App" (SH332/333 closed with measured evidence)
+JIT_ROUTEB_REG_LIVE=1 (SH334) on the completing ladder snapshots the service registry at the DM-ctor
+name->service lookup (fn 0x2168798) on EVERY count transition. Measured (real so, EXIT 124 clean):
+- count 0..11 walks the task-scheduler family (Thread/Spawn/Yield/Close BG+FG, Sleep, Sched, UNKNOWN0);
+- the 12th entry is "Execute"; the ctor fast-path (cbnz x0 @0x61e3124) MATCHES it -> once-slot
+  [0x106a68408]=0x400000b ("Execute" service handle, no live DM);
+- the tier-2 controller-name cell [0x106fe4f78] reads "Runtime0" AT EVERY count (invariant, SH317/318)
+  — "App" is NEVER registered on the completing headless ladder.
+This closes SH332/333's open "does app-start register 'App'?" question with the strongest possible
+headless evidence: even with the do-init once-lambda COMPLETING (once-slot populated) and the full
+12-entry registry available, the DM-ctor fast-path returns the "Execute" handle, not a live
+DataModel-controller, because "App" is a live-session-ctor-only registration (SH313/316 propped). The
+Route-B lever is unchanged and now sharper: the gate is a live-session "App" service registration,
+not reachable by any headless seed. DM-root 0, MH_* false.
