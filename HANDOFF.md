@@ -1,5 +1,39 @@
 # Open Sober — Agent Handoff
 
+## SH345 (Sep 19, 2026, hermes-worker): recon-v3 render plane measured RUN-VARIABLE, artifact made reproducible
+Single-agent (cone suppressed). Repro-only hardening (no Rust change: elfjit.rs / jit.rs
+byte-identical). Workspace green (594 passed / 0 fail).
+
+### Measured this cycle (strict-serial, one elfjit at a time)
+- recon-v3 self-driven frame plane is **NOT the "stable green" the single-run docs
+  stamps implied**: ~23/25 runs = 24 real task frames (`present #0..#23 swap Ok(0x1)`,
+  EXIT 124); ~2/25 = **0 frames + SIGSEGV->SIGABRT** at `fault=0x102859fd0` (a guest
+  .text addr in the JNIActivityLifecycleCallbacks nativeOnDestroyed region) from a
+  non-guest presenter thread (tid not in GUEST_THREADS, host `mov [rax],rcx` with rax =
+  the .text addr). Same run-variable activity-lifecycle divergence class SH344b/344c
+  documented on the full ladder; **not** a new regression, and **not** the zeroed-node
+  fallback (green runs hit it too).
+- **Fix (repro-only):** `runs/capture_taskv4_frame.sh` now retries
+  (`TASKFRAME_RETRY_MAX`=6) to a confirmed >=`TASKFRAME_MIN_FRAMES`/0-signal capture and
+  reports which attempt won — so the reproduce artifact the runbook / HARD GATE depend
+  on is a real 24-frame capture on every invocation, not a coin-flip. Verified 5/5.
+- **futex_requeue_actually_moves_waiter** failed once under the earlier full-workspace run
+  while render captures were live on the box; it is a pure-syscall passthrough, passed
+  5/5 isolated, and the full suite passed clean on the idle box — load-induced flake,
+  no test weakened, no production fix needed.
+
+### Honest status (unchanged Route-B)
+- Route-B live-DM structural gate UNCHANGED (DM-root 0x106a68818=0, MH_* false). No seed
+  produces a live DataModel; every SESSION-CTOR receive rung (OnAppReady/OnGameLoaded/
+  MessageBus.subscribe/initAppShellReporter/setActive/setInitParams/client-settings/
+  engine-settings SH276-284) is wired-latent behind the SH285 LSM reader/pop live-object
+  wall. SH174 capture-latch stays the single forward hook (arms, stays silent headlessly).
+- recon-v3 deliverables (type4_frame_thunk + JIT_JSON_ZERO_FIX) present + green; the new
+  script makes the self-driven-frame artifact reproducible.
+- onAppLuaWillStart is the sole SEP-17-named dataModel-bindings receive never wired; it
+  is the same migration-gated class as its measured-latent siblings (SH184/185) — NOT
+  re-tread.
+
 ## SH344c (Sep 19, 2026, hermes-worker): CORRECTION to SH344b + continuation cap pinned
 Single-agent (cone suppressed). Measurement-only. Workspace green (594 passed).
 
