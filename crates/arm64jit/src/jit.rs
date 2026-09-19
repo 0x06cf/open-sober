@@ -2014,6 +2014,66 @@ fn routeb_doinit_dyn_trace_guard(state: *mut CpuState, pc: u64) {
     }
 }
 
+/// SH388 (opt-in JIT_ROUTEB_DMSVC_GETTER=1): READ-ONLY reachability probe of the SEP-15
+/// re-attack cone door that SH387 byte-anchored — DataModelServices current-DM accessor
+/// 0x2dbcc10 (the GETTER leaf `adrp x0,6391000; add #0x908; ret` -> returns &current-DM
+/// holder 0x106391908) and its real BODY 0x2dbcc1c (`sub sp,#0x40`, canary got 0x67d16f0,
+/// dispatches bl 0x24e3e98 / 0x2417d58 = persistence-family). SH387 pinned the BYTES but
+/// never MEASURED whether the engine ever EXECUTES these on a headless run — the exact
+/// "is the cone door live or dead" gap the operator's SEP-15 directive ("re-examine whether
+/// the declared 'not seedable' wall can be crossed ... rather than a static seed") names.
+/// This probe fires at block ENTRY of BOTH the getter (0x102dbcc10) and the body
+/// (0x102dbcc1c) on the live ladder, and reads back the current-DM holder [0x106391908]
+/// (does a planted SH180/181 manufactured DM survive to be consumed?) + the app-data-model
+/// counter [0x106dca0e88] (the EXECUTE-DO-INIT-GATES "app-data-model counter advanced"
+/// marker). ZERO guest mutation — pure observability, one readout per pc per run. If the
+/// getter/body fire 0x on the full env, the cone door is measured DEAD headlessly (clean
+/// closure); if they fire, the planted-DM-in-holder premise gets direct runtime evidence.
+fn routeb_dmsvc_getter_probe(state: *mut CpuState, pc: u64) {
+    if std::env::var_os("JIT_ROUTEB_DMSVC_GETTER").is_none() {
+        return;
+    }
+    if pc != 0x102dbcc10 && pc != 0x102dbcc1c {
+        return;
+    }
+    static FIRED_GETTER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static FIRED_BODY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if pc == 0x102dbcc10 {
+        if FIRED_GETTER.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+    } else if FIRED_BODY.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let _s = unsafe { &*state };
+    // Safe guest reads (page-guard like the other probes).
+    let rd = |a: u64| -> u64 {
+        if a != 0 && a >= 0x100000000 && a >> 56 == 0 && a & 7 == 0 && any_page_mapped(a) {
+            unsafe { std::ptr::read_unaligned(a as *const u64) }
+        } else {
+            0
+        }
+    };
+    let holder = rd(0x106391908); // current-DM holder (SH180/181 plants a manufactured DM here)
+    let appdm = rd(0x106dca0e88); // app-data-model counter (EXECUTE-DO-INIT-GATES DM-root marker)
+    // If the holder points at a guest object, is its vtable in-image?
+    let vt = if holder != 0 && holder >= 0x100000000 && holder >> 56 == 0 {
+        rd(holder)
+    } else {
+        0
+    };
+    let in_img = vt >= 0x100000000 && vt <= 0x200000000;
+    let which = if pc == 0x102dbcc10 { "GETTER" } else { "BODY" };
+    eprintln!(
+        "[routeb-dmsvc-getter] SH388 {which} ENTERED @0x{pc:x}: current-DM holder [0x106391908]={holder:#x} (vt={vt:#x} in-image={in_img}) app-data-model counter [0x106dca0e88]={appdm:#x} — the SEP-15 setDataModelToCurrent cone door {}",
+        if holder != 0 {
+            "REACHED and holds an object (door potentially live)"
+        } else {
+            "REACHED but holder NULL (door empty)"
+        }
+    );
+}
+
 /// SH381 (opt-in JIT_ROUTEB_DOINIT_ONCELAMBDA=1): READ-ONLY probe of the do-init
 /// once-lambda's DM-constructor RETURN at the exact store — closes the address
 /// reconciliation gap that SH361/311 left open. do-init 0x2206c40 (once-path,
@@ -7269,6 +7329,11 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // and logs which way the MAIN branch actually goes on the live ladder. No guest mutation
         // (distinct from SH320's main-id seed). Default-inert, once-per-run.
         routeb_doinit_dyn_trace_guard(state, pc);
+        // SH388 (opt-in JIT_ROUTEB_DMSVC_GETTER=1): READ-ONLY reachability probe of the SEP-15
+        // setDataModelToCurrent cone door that SH387 byte-anchored (getter 0x102dbcc10 / body
+        // 0x102dbcc1c) — measures whether the engine ever EXECUTES that accessor headlessly and
+        // whether a planted current-DM holder survives. Zero guest mutation (observation only).
+        routeb_dmsvc_getter_probe(state, pc);
         // SH381 (opt-in JIT_ROUTEB_DOINIT_ONCELAMBDA=1): READ-ONLY probe of the do-init
         // once-lambda ctor RETURN at the exact store (block-entry 0x102206d70, x0 = return
         // of `bl 0x2173b3c` about to be stored into once-slot [0x106a68408]); reconciles the
@@ -9753,6 +9818,34 @@ mod tests {
             eprintln!("sh387 DataModelServices current-DM getter ABI pinned (0x2dbcc10 pure leaf -> holds 0x106391908 file 0x6391908; body 0x2dbcc1c real state-setter, canary got 0x67d16f0, NOT a DM ctor) — grounding the SEP-15 ExperienceController/setDataModelToCurrent re-attack cone");
         } else {
             eprintln!("sh387 real-image guard: no real libroblox.so, skipping current-DM getter pins");
+        }
+    }
+
+    #[test]
+    fn sh388_dmsvc_getter_cone_door_reachability_pinned() {
+        // SH388 (real-image): pin the SEP-15 re-attack cone door's REACHABILITY semantics that
+        // the read-only probe routeb_dmsvc_getter_probe observes — the current-DM holder cell
+        // [0x106391908] (SH387 getter target, where SH180/181 plant a manufactured DM) and the
+        // app-data-model counter [0x106dca0e88] (EXECUTE-DO-INIT-GATES "app-data-model counter
+        // advanced" marker). SH387 pinned the getter/body BYTES; this pins the OBSERVATION cells
+        // the probe reads, so "the door is live/dead" is reproducible from the same real image.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let word_at = |vaddr: u64| -> u32 {
+                let off = vaddr as usize;
+                let b = &img[off..off + 4];
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            };
+            // The getter entry (block boundary) — first word of the leaf: `adrp x0,6391000`.
+            assert_eq!(word_at(0x2dbcc10), 0xb001aea0, "sh388 getter entry adrp x0,6391000");
+            // The body entry — first word: `sub sp,#0x40` (real state-setter frame).
+            assert_eq!(word_at(0x2dbcc1c), 0xd10103ff, "sh388 body entry sub sp,#0x40");
+            eprintln!(
+                "sh388 setDataModelToCurrent cone-door reachability pinned (getter block-entry 0x2dbcc10, body block-entry 0x2dbcc1c; probe reads current-DM holder 0x106391908 + app-DM counter 0x106dca0e88)"
+            );
+        } else {
+            eprintln!("sh388 real-image guard: no real libroblox.so, skipping cone-door reachability pins");
         }
     }
 

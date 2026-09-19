@@ -1,5 +1,26 @@
 # Open Sober — Agent Handoff
 
+## SH388 (Sep 20, 2026, hermes-worker): MEASURED — the SEP-15 setDataModelToCurrent cone door is DEAD headlessly (getter 0x102dbcc10 / body 0x102dbcc1c never EXECUTED, whole 0x102dbcc region 0 JIT hits, even with a manufactured DM planted in the holder) — closing SH387's "cone door remains OPEN" with execution evidence
+Single-agent (cone suppressed). SH387 byte-anchored the operator's SEP-15 re-attack cone
+door (DataModelServices current-DM GETTER 0x102dbcc10 leaf / BODY 0x2dbcc1c persistence
+state-setter) but never measured whether the engine EXECUTES it headlessly. New READ-ONLY
+probe `routeb_dmsvc_getter_probe` (jit.rs, opt-in JIT_ROUTEB_DMSVC_GETTER=1, fires at block
+entry of getter+body, reads current-DM holder [0x106391908] + app-DM counter [0x106dca0e88],
+ZERO guest mutation) + hermetic `sh388_dmsvc_getter_cone_door_reachability_pinned`
+(arm64jit lib 442->443) + probe runs/capture_sh388_dmsvc_getter.sh + frontier doc.
+MEASURED (real libroblox.so, full --v2boot reaching env + JIT_ROUTEB_DM_MANUFACTURE=1):
+GETTER fires 0, BODY fires 0, [0x102dbcc10,0x102dbcd40) = 0 JIT region hits — the accessor
+is NEVER entered headlessly; the manufactured genuine-vptr DM WAS planted (holder already
+held in-image obj 0x106358d40) but no path consumes it through this accessor. Terminal
+drains to the standing SH285 persistence-lane wall guestpc=0x101d9a528 (EXIT 134), the
+measured-closed family every ladder arm converges on. Interpretation: the setDataModelToCurrent
+cone is measured-not-executed, so re-attacking it (plant-DM / arm) cannot advance Route B
+headlessly — a clean closure of the last explicitly-named re-attack cone (consistent with
+SH379 path-specific gates). No DataModel; Route-B live-DM gate UNCHANGED (DM-root 0, MH_*
+false). Workspace green (cargo test --workspace EXIT 0, 622/0; arm64jit lib 443/0). Do-not-
+re-tread updated: do NOT re-attack setDataModelToCurrent expecting the accessor to fire.
+recon-v3 deliverables unchanged-green. SH174 capture-latch stays the single forward observer.
+
 ## SH387 (Sep 20, 2026, hermes-worker): byte-anchor the DataModelServices current-DM getter ABI (the SEP-15 re-attack cone door), arm64jit lib 441->442
 Single-agent (cone suppressed). The operator's SEP-15 ROUTE-B directive names
 ExperienceController / DataModelServices::setDataModelToCurrent (SH163 flagged 'next
