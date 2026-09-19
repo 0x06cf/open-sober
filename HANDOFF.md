@@ -1,5 +1,28 @@
 # Open Sober — Agent Handoff
 
+## SH412 (Sep 19, 2026, hermes-worker): promote the G3 CONTENT surface — the engine's own files-dir libc++ string [0x10726d600] + the R1 CoreScript stage — into the ordered session substrate as a first-class driven runtime step (SH407/408 measured the equivalent --v2boot-set-filesdir/--v2boot-r1-stage rungs NEVER fire on reaching envs; wiring it into drive_routeb_session_substrate right after the MessageBus.subscribe atom makes it a driven step, exactly as SH411/411b promoted the binder + app-start)
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified green first
+(capture_taskv4_frame.sh attempt 1: 24 real task frames `present swap Ok(0x1)`, 197 pops, 0 json
+abort, 0 crash; JIT_JSON_ZERO_FIX present). Production code only in session.rs (off the 1MiB hooks;
+jit.rs/elfjit.rs untouched, both at/near the hook, byte-unchanged). Workspace green (arm64jit lib
+459/0 incl. new sh412 hermetic; cargo test --workspace 639/0 canonical green).
+- session.rs: +`drive_content_surface()` (seeds engine files-dir libc++ string @ 0x10726d600 =
+  "/data/user/0/com.roblox.client/files", read-back-verified, wrapped in routeb_ensure_writable;
+  then stages the R1 CoreScript via `jit::stage_r1_core_scripts`) wired into
+  `drive_routeb_session_substrate` right after the MessageBus.subscribe atom (the post-bus step
+  that drives the binder + app-start) — recon-routeB G3 is now a driven runtime step. New hermetic
+  sh412 (compile-pins the signature, asserts the bus trigger stays in the table, proves the drive
+  seeds on a no-image harness).
+- MEASURED (real libroblox.so, SH400 env, EXIT 124, 0 crash): substrate completes 11/16 Ok
+  (no regression from the new step); `SH412 G3 files-dir: ... [0x10726d600] SEEDED`; `SH412 R1
+  content surface: staged 2 candidates (STAGED AppShell.lua, STAGED CoreScripts.lua)` — the
+  content gate now FIRES headlessly in a driven run (was measured-never-firing as a rung, SH408).
+- Honest: NOT a DM (DM-root [0x106a68818]=0, no make_shared, MH_GAME_LOADED false). Route-B
+  live-DM structural gate UNCHANGED. The content surface is what the engine draws FROM the instant
+  a completed do-init owns a live DM (latent-but-correct). No re-treads.
+- Files: docs/frontier-sh412-content-surface-substrate-step.md + runs/capture_sh412_content_surface.sh;
+  log /tmp/cap_sh412.out (outside repo). Commit (pending).
+
 ## SH411 (Sep 19, 2026, hermes-worker): promote the SEP-17 dataModel-bindings LIVE BINDER into the ordered session substrate as a first-class driven runtime step — the messageBus publish-RECEIVE half (publishRaw 0x102334684 -> cb [DataModelBindings+16]) now runs on the ladder thread right after MessageBus.subscribe, not just as an opt-in SH347/364 probe rung
 (SH411b extends this: SEP-17 **nativeAppBridgeAppStart** V1 0x102338510 is also
 now a first-class post-substrate step — `session::drive_native_app_start` runs it

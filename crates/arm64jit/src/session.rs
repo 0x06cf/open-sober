@@ -212,6 +212,22 @@ pub fn drive_routeb_session_substrate(iimg: &[u8], ib: u64, tpidr: u64, boot_sp:
             // a probe rung (the sh399 abi_slots<=5 hermetic keeps it out of the
             // substrate table; it needs x2..x7 = 6 jstrings + jbool, abi_slots 7).
             drive_native_app_start(iimg, ib, tpidr, boot_sp, h.env, h.thiz);
+            // SH412: the G3 content surface — seed the ENGINE's OWN files-dir
+            // libc++ std::string at [0x10726d600] (recon-routeB G3: "the structural
+            // content gate that turns a nonzero probe into rendered home UI") and
+            // stage the R1 CoreScript module into the fsmap mirror. The operator's
+            // named ordered gate is G1(surface XID) -> G2(onAppReady/\"Home\") ->
+            // G3(files-dir + R1 content). The SH400 substrate drove G1 (V2UpdateSurface
+            // atom) + G2 (SendAppEventOnAppReady + driven onAppReady lifecycle), but
+            // G3 was only ever reachable via the --v2boot-set-filesdir/--v2boot-r1-stage
+            // elfjit rungs, which SH407/408 MEASURED never fire on the reaching full-ladder
+            // env (the run faults into the LSM lane before those rung lines execute). Wiring
+            // it here makes the content surface a first-class driven runtime step on the SAME
+            // ladder thread, exactly the SEP-18 "build the runtime, not the DM" deliverable —
+            // the engine's rbxasset://scripts/CoreScripts resolver reads the R1 module the
+            // instant a completed do-init owns a live DM (latent-but-correct, fires on the
+            // session at the right time).
+            drive_content_surface();
         }
     }
     eprintln!("[session-drive] substrate complete: {ok}/{total} atoms returned non-zero Ok");
@@ -292,6 +308,76 @@ pub fn drive_data_model_binder(
     let r = crate::jit::drive_messagebus_publish_receive(iimg, ib, tpidr, boot_sp, env_ptr, thiz);
     eprintln!("[session-drive] dataModel-bindings live binder: publishRaw experience-launch -> {r:#x}");
     r
+}
+
+/// G3 CONTENT SURFACE (recon-routeB G3 + SEP-18 BUILD-THE-RUNTIME) as a
+/// first-class driven substrate step. Two pieces a real host provides so the
+/// engine can SELF-construct UI content once a completed do-init owns a live DM:
+///
+/// 1. Seed the ENGINE's OWN files-dir libc++ std::string at [0x10726d600]
+///    (guest 0x10726d600, file 0x76d600; nativeSetFilesDirectory 0x1021f7654 is
+///    the real writer). This is recon-routeB G3's "structural content gate":
+///    it re-roots rbxasset://scripts/CoreScripts resolution to the guest files
+///    dir. SH407/408 MEASURED the equivalent --v2boot-set-filesdir rung never
+///    fires on the reaching full-ladder env; wiring it here (not a separate
+///    rung) is what makes the content gate a driven runtime step.
+/// 2. Stage the R1 synthetic CoreScript module (a ~20-line Luau that builds a
+///    ScreenGui + TextLabel under CoreGui) into the fsmap mirror via
+///    `jit::stage_r1_core_scripts`, so the engine's resolver serves it the
+///    moment a live DM drives the Lua loader — the exact Route-B marker
+///    (engine SELF-constructs real GuiObjects, host does ZERO layout).
+///
+/// Inert-by-construction: it does NOT manufacture a DataModel (a live DM is
+/// still the output of a real do-init); it makes the content surface the engine
+/// will draw FROM available when the session owns one. Deterministic + default
+/// safe: the files-dir write is wrapped in routeb_ensure_writable (so a
+/// no-live-image / unmapped cell is skipped, no SIGSEGV), and the R1 staging is
+/// itself guarded by page_writable_rw.
+pub fn drive_content_surface() -> usize {
+    // (1) G3 files-dir: guest 0x10726d600 (fix SH114's typo'd 0x1026d600).
+    const FILES_DIR_GLOBAL: u64 = 0x10726d600;
+    const DIR: &[u8] = b"/data/user/0/com.roblox.client/files";
+    let mut seeded = 0usize;
+    if routeb_ensure_writable(FILES_DIR_GLOBAL) {
+        // A leaked host buffer is guest-visible (guest==host identity maps).
+        let buf = Box::leak(vec![0u8; DIR.len() + 1].into_boxed_slice()).as_mut_ptr() as u64;
+        unsafe {
+            std::ptr::copy_nonoverlapping(DIR.as_ptr(), buf as *mut u8, DIR.len());
+            *(buf as *mut u8).add(DIR.len()) = 0;
+            let gp = FILES_DIR_GLOBAL as *mut u64;
+            gp.add(0).write_volatile(buf); // __data_ = path ptr
+            gp.add(1).write_volatile(DIR.len() as u64); // __size_
+            gp.add(2).write_volatile(DIR.len() as u64); // __cap_ (bit0=0 => long)
+        }
+        let ptr = unsafe { *(FILES_DIR_GLOBAL as *const u64) };
+        let size = unsafe { *((FILES_DIR_GLOBAL as *const u64).add(1)) };
+        let mut s = String::new();
+        for i in 0..size.min(4096) as usize {
+            let c = unsafe { *(ptr as *const u8).add(i) };
+            if c == 0 {
+                break;
+            }
+            s.push(c as char);
+        }
+        let ok = ptr != 0 && size == DIR.len() as u64 && s == String::from_utf8_lossy(DIR);
+        eprintln!(
+            "[session-drive] SH412 G3 files-dir: seeded libc++ string @ [0x{FILES_DIR_GLOBAL:x}] = \\\"{s}\\\" {}",
+            if ok { "SEEDED" } else { "MISMATCH" }
+        );
+        seeded = if ok { 1 } else { 0 };
+    } else {
+        eprintln!(
+            "[session-drive] SH412 G3 files-dir @ [0x{FILES_DIR_GLOBAL:x}] not writable — skipped (no live image / unmapped cell)"
+        );
+    }
+    // (2) R1 content staging (guarded inside stage_r1_core_scripts itself).
+    let wrote = crate::jit::stage_r1_core_scripts();
+    eprintln!(
+        "[session-drive] SH412 R1 content surface: staged {} candidates ({})",
+        wrote.len(),
+        wrote.join(", ")
+    );
+    seeded
 }
 
 /// Host-driven NativeHelper lifecycle milestone sequence (recon-routeB step-2 /
@@ -449,5 +535,37 @@ mod tests {
         // hermetic); it must be callable through the SessionHandles the drive builds.
         let h = SessionHandles::build();
         let _ = (h.env, h.thiz);
+    }
+
+    /// SH412: the G3 content surface is a first-class driven substrate step. Compile-pin
+    /// the drive signature (no-arg, returns usize = files-dir seed verdict), assert the
+    /// trigger site (MessageBus.subscribe atom) stays in the substrate table so the wiring
+    /// can't silently disconnect. Then call `drive_content_surface` on a no-live-image
+    /// harness: `routeb_ensure_writable` maps the fixed files-dir cell [0x10726d600] even
+    /// with no image, so the drive must SEED it (return 1 = the libc++ string read-back
+    /// verifies) — NOT SIGSEGV. The R1 staging half degrades gracefully to 0 candidates
+    /// with no persistence root armed (its own guard logs the WARN, no crash). The R1
+    /// staging/serve correctness itself is pinned by sh351/sh354 (jit.rs); this hermetic
+    /// pins the substrate WIRING + files-dir seed.
+    #[test]
+    fn sh412_content_surface_is_first_class_substrate_step() {
+        // Compile-level pin: no-arg drive returning a seed-verdict usize.
+        let _sig: fn() -> usize = crate::session::drive_content_surface;
+        let _ = _sig;
+        // The trigger site stays in the ordered substrate: MessageBus.subscribe.
+        assert!(
+            ROUTEB_SESSION_SUBSTRATE
+                .iter()
+                .any(|a| a.guest == 0x102ba5bb8),
+            "MessageBus.subscribe atom present (the content-surface trigger site)"
+        );
+        // No live image: the cell is mapped by routeb_ensure_writable, so the drive must
+        // SEED the files-dir string (return 1, read-back verified) — and must not SIGSEGV.
+        // R1 staging with no root armed degrades to 0 candidates but must not crash.
+        assert_eq!(
+            crate::session::drive_content_surface(),
+            1,
+            "no-live-image: files-dir cell mapped by ensure_writable, drive must seed it (1), no SIGSEGV"
+        );
     }
 }
