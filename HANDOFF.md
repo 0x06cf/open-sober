@@ -1,5 +1,49 @@
 # Open Sober — Agent Handoff
 
+## SH450 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD FP COMPARE-TO-LITERAL-ZERO codegen family (translate.rs VecFpCmpZero — fcmeq/fcmgt/fcmge/fcmlt/fcmle Vd.T, Vn.T, #0.0) — 4 exact-byte pins
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+unchanged-green (the change is `#[cfg(test)]`-only, so the runtime deliverable
+is byte-identical — SH445 capture baseline 24 real task-driven frames `present
+swap Ok(0x1)`, 0 json abort, 0 crash, EXIT 0). Workspace green (cargo test
+--workspace EXIT 0; arm64jit lib 630/0 incl. 4 new sh450 pins, was 626; cargo
+build --workspace + --example elfjit OK). Production code ONLY in translate.rs
+`#[cfg(test)]` addition (translator core body byte-untouched; jit.rs
+1,048,390 B < 1MiB hook unchanged; elfjit.rs/session.rs unchanged). Commit
+7a75a4f +1.
+- VecFpCmpZero (the per-lane FP compare-to-literal-#0.0 mask builder — the
+  zero-comparison cousin of SH445's two-operand VecFpCmp; a lane becomes all-
+  ones if Vn op 0.0 holds, else 0) had zero direct byte tests. SH450 pins the
+  exact emit (rd=1 rn=2; Vn@0x130 Vd@0x120) with 4 exact-byte pins:
+  (1) THE zero-operand discriminant (load-bearing): each lane FIRST materializes
+  the +0.0 second operand with `pxor xmm1,xmm1` (66 0f ef c9) — a FRESH zero
+  every lane — then mov_load32 (8b 83) + `movd xmm0,eax` (66 0f 6e c0) + comiss
+  (40 0f 2f c1) + setcc + movzx (0f b6 c0) + `neg rax` (48 f7 d8) + 32-bit store
+  (89 83). This is what separates it from SH445, which LOADS Vm — a lone setcc
+  byte cannot tell the two forms apart (same comiss, same cc), so the per-lane
+  pxor is the ONLY reliable differentiator; a flub reusing a stale register
+  compares against garbage;
+  (2) the cc-map IS the semantic: op 0 fcmeq = sete 0f 94 / op 1 fcmgt = seta 0f
+  97 / op 2 fcmge = setae 0f 93 / op 3 fcmlt = setb 0f 92 / op 4 fcmle = setbe
+  0f 96 (a wrong cond silently picks the wrong comparison), negative-asserted;
+  (3) double-path width (op 0, esize=8): 1 lane via movq_load (f3 48 0f 7e) +
+  comisd (66 40 0f 2f c1) + 64-bit store (48 89 83), must NOT emit movd
+  (66 0f 6e c0); (4) full 4s q=true lane math: 4 lanes Vd@0x120/0x124/0x128/
+  0x12c, Vn@0x130/0x134/0x138/0x13c, 4 pxor xmm1,xmm1 counted, stays single-path
+  (no movq).
+- Deterministic: synthetic Inst -> translate() -> CodeBuf.as_slice() (zero-pc
+  0x1000); [RBX]=CpuState, vector slot v[t]=VECTOR_BASE(0x110)+t*16. Emission
+  captured precisely with a one-off probe test (eprintln dump, removed before
+  commit) — the pxor-per-lane + exact cc bytes came from that capture, and the
+  2s full-buffer assert_eq matched first try. 4 exact-byte + window + cc-map +
+  count/negative asserts. No image, no env, parallel-safe.
+- Honest: NOT a DM (SH415 probe re-confirms DM-root [0x106a68818]=0x0 under the
+  complete substrate; Route-B live-DM gate UNCHANGED). BUILD-THE-RUNTIME
+  codegen-surface coverage completion on the compare-vs-literal-zero family,
+  adjacent to SH445 (two-operand VecFpCmp) and SH449 (integer SimdCmpZero). No
+  re-treads (distinct form).
+- Files: docs/frontier-sh450-translator-vfpczoro.md + crates/arm64jit/src/
+  translate.rs (`#[cfg(test)]` only). Commit 7a75a4f +1.
+
 ## SH449 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD COMPARE-TO-ZERO mask codegen family (translate.rs SimdCmpZero — cmeq/cmgt/cmge/cmlt/cmle Vd.T, Vn.T, #0) — 4 exact-byte pins
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 unchanged-green (the change is `#[cfg(test)]`-only, so the runtime deliverable
