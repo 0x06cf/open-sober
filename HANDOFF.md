@@ -1,5 +1,42 @@
 # Open Sober — Agent Handoff
 
+## SH476 (Sep 20, 2026, hermes-worker): wire the PlatformParams viewport{Width,Height}Mm display surface — getScreenPhysicalSizeInMillimeters (Java static) -> Point -> x/y int FIELDS, scoped to a dedicated Point object
+Single-agent (cone suppressed). Workspace green (arm64jit lib 681->682 incl. 1
+new SH476 hermetic; cargo test --workspace EXIT 0; cargo build --workspace +
+--example elfjit OK). recon-v3 immediate-priority deliverables re-verified GREEN at
+this HEAD first (capture_taskv4_frame.sh attempt 1: 24 real task-driven frames
+`present swap Ok(0x1)`, 197 node pops, 0 json abort, 0 crash, EXIT 124 = stable
+idle). Production code ONLY in jni.rs (off the 1MiB hooks; jit.rs/elfjit.rs
+untouched).
+- **The gap closed (STATUS #4, the last unclosed recon-named display value):**
+  PlatformParams.viewport{Width,Height}Mm=338/190 is reached by the engine via a JAVA
+  STATIC `DeviceUtils.getScreenPhysicalSizeInMillimeters()` (returns android/graphics/Point),
+  then reads the Point's `x`/`y` int FIELDS. The harness serviced CallStaticObjectMethod
+  (slot 114) with the shared NULL stub, so the static returned NULL and the whole chain died
+  before any field read (the same defect class SH469 closed for DisplayMetrics). SH476 adds:
+  `viewport_point_handle()` — a DEDICATED fake Point object (OnceLock<new_fake_object>);
+  `jni_call_static_object_method` (slot 114, replaces the dead NULL stub) returning that Point
+  for getScreenPhysicalSizeInMillimeters (other statics stay honest NULL); `jni_get_int_field`
+  serving `x`->338 / `y`->190 ONLY when obj==the viewport Point (a plain x/y on any OTHER
+  object stays 0 — the load-bearing SCOPING decision, since x/y are generic names and a
+  name-only dispatch would wrongly return Mm for unrelated objects).
+- New hermetic `viewport_point_mm_surface_resolves_through_dispatch` pins the REAL dispatch
+  end-to-end: GetStaticMethodID -> CallStaticObjectMethod (slot 114, real returned Point,
+  stable identical to viewport_point_handle) -> GetFieldID x/y/z -> GetIntField (slot 100) =
+  338/190/0; THE SAME x/y field IDs read on a generic fake object = 0 (proves the scoping
+  holds, no Mm collapse); unrecognized static -> NULL. Real descriptors MEASURED in the .so
+  (DeviceUtils, getScreenPhysicalSizeInMillimeters, viewport{Width,Height}Mm, the
+  `(in millimeters): x = {}, y = {}` log) — literal, not assumed. Pure host logic, no
+  image/env, parallel-safe.
+- Honest: NOT a DM / NOT a live-DM step (Route-B live-DM gate UNCHANGED; DM-root
+  [0x106a68818]=0 structural per SH462/467). BUILD-THE-RUNTIME session-content completion —
+  when a live session advances and the engine requests its physical size in mm it reads
+  338x190 instead of a 0 collapse. Latent-but-correct like every axis. No re-treads (SH469
+  covered the DisplayMetrics/Configuration INSTANCE-object+field chain; this is the STATIC
+  -> Point -> field chain, distinct).
+- Files: docs/frontier-sh476-viewport-mm-static-point-surface.md + crates/arm64jit/src/
+  jni.rs (viewport Point + static-object + int-field dispatch + hermetic). Commit (SH476).
+
 ## SH475 (Sep 20, 2026, hermes-worker): pin the SendAppEventOnAppReady event-name discriminator DECODE as a tested contract (the operator's "confirm w19-event=0x4"), + stage the real APK assets for the engine's own content reads
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified
 GREEN at this fresh HEAD first (capture_taskv4_frame.sh attempt 1: 24 real task-driven

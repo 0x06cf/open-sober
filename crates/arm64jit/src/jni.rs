@@ -96,6 +96,11 @@ const CALL_LONG_METHOD: usize = 52;
 const CALL_FLOAT_METHOD: usize = 55;
 const CALL_VOID_METHOD: usize = 61;
 const CALL_STATIC_OBJECT_METHOD: usize = 114;
+/// PlatformParams.viewport{Width,Height}Mm (recon-framework-boot-order): the
+/// android.graphics.Point returned by DeviceUtils.getScreenPhysicalSizeInMillimeters()
+/// carries the physical screen size in millimeters — x=338 (width), y=190 (height).
+const VIEWPORT_WIDTH_MM: u32 = 338;
+const VIEWPORT_HEIGHT_MM: u32 = 190;
 const CALL_STATIC_BOOLEAN_METHOD: usize = 117;
 const CALL_STATIC_INT_METHOD: usize = 129;
 const CALL_STATIC_VOID_METHOD: usize = 141;
@@ -949,10 +954,23 @@ extern "C" fn jni_call_float_method(state: *mut crate::jit::CpuState) -> u32 {
 // correctly-sized login/home. Return the recon's real session geometry so the
 // engine lays out its own GuiObjects over a live-sized surface.
 
-/// GetIntField(env,obj,fieldID): DisplayMetrics/Configuration int fields.
+/// GetIntField(env,obj,fieldID): DisplayMetrics/Configuration int fields, plus
+/// the android/graphics/Point x/y Mm fields (PlatformParams viewport). The
+/// Point x/y are served ONLY when the object is the viewport Point (STATUS #4):
+/// a plain `x`/`y` read on any OTHER object must remain 0, so the generic
+/// names never collapse into Mm values for unrelated objects.
 extern "C" fn jni_get_int_field(
-    _e: u64, _obj: u64, fid: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+    _e: u64, obj: u64, fid: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
 ) -> u64 {
+    // The viewport Point: the two recon-named int fields are x/y in millimeters
+    // (338 wide x 190 tall — PlatformParams.viewport{Width,Height}Mm).
+    if obj == viewport_point_handle() {
+        match method_id_name(fid).as_deref() {
+            Some(b"x") => return VIEWPORT_WIDTH_MM as u64,
+            Some(b"y") => return VIEWPORT_HEIGHT_MM as u64,
+            _ => return 0,
+        }
+    }
     match method_id_name(fid).as_deref() {
         Some(b"widthPixels") => 1280,
         Some(b"heightPixels") => 720,
@@ -974,6 +992,34 @@ extern "C" fn jni_get_long_field(
     _e: u64, _obj: u64, _fid: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
 ) -> u64 {
     0
+}
+
+/// The distinct fake `android/graphics/Point` object that
+/// `DeviceUtils.getScreenPhysicalSizeInMillimeters()` returns (STATUS #4 — the
+/// PlatformParams viewport{Width,Height}Mm=338/190 path). The engine logs
+/// `getViewportDisplaySize: (in millimeters): x = {}, y = {}`. This object is a
+/// DEDICATED handle (not the generic fake object) so the generic `x`/`y` int
+/// fields of Point are served only for THIS object — a plain `x`/`y` read on any
+/// other fake object must stay 0 (never a Mm value), which a name-only dispatch
+/// would wrongly collapse.
+fn viewport_point_handle() -> u64 {
+    static P: OnceLock<u64> = OnceLock::new();
+    *P.get_or_init(new_fake_object)
+}
+
+/// CallStaticObjectMethod(env, cls, methodID, ...): the one statically-reached
+/// object return is `DeviceUtils.getScreenPhysicalSizeInMillimeters()` (returns
+/// android/graphics/Point). Every other static-object call keeps the honest 0
+/// (no real Java static to back it).
+extern "C" fn jni_call_static_object_method(
+    _e: u64, _cls: u64, mid: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    match method_id_name(mid).as_deref() {
+        Some(
+            b"getScreenPhysicalSizeInMillimeters" | b"getScreenPhysicalSizeMm",
+        ) => viewport_point_handle(),
+        _ => 0,
+    }
 }
 
 /// GetFloatField(env,obj,fieldID): DisplayMetrics float fields (HostJniF32,
@@ -1225,7 +1271,7 @@ pub fn build_jni() -> (u64, u64) {
         functions[CALL_LONG_METHOD] = reg(jni_call_long_method);
         functions[CALL_FLOAT_METHOD] = reg_jni_f32(jni_call_float_method);
         functions[CALL_VOID_METHOD] = reg(jni_call_void_method); // NativeHelper gameActivity_* callbacks
-        functions[CALL_STATIC_OBJECT_METHOD] = reg(jni_voidp_0);
+        functions[CALL_STATIC_OBJECT_METHOD] = reg(jni_call_static_object_method);
         functions[CALL_STATIC_BOOLEAN_METHOD] = reg(jni_voidp_0);
         functions[CALL_STATIC_INT_METHOD] = reg(jni_voidp_0);
         functions[CALL_STATIC_VOID_METHOD] = reg(jni_call_void_method);
@@ -2267,6 +2313,90 @@ mod tests {
 
             // GetLongField -> honest 0 (no known long display fields).
             assert_eq!(super::jni_get_long_field(env, 0x999, field_id(b"anyField"), 0, 0, 0, 0, 0), 0);
+        }
+    }
+
+    /// PlatformParams viewport{Width,Height}Mm (STATUS #4) — the android/graphics/Point
+    /// returned by DeviceUtils.getScreenPhysicalSizeInMillimeters() through the REAL
+    /// JNI dispatch (CallStaticObjectMethod slot 114 -> a dedicated Point object -> its
+    /// x/y int FIELDS via GetIntField slot 100). This is the only statically-reached
+    /// object return; the x/y names are generic so they must be SCOPED to the Point —
+    /// a plain x/y read on any other object stays 0 (never a Mm value). Hermetic, no
+    /// image/env, byte-of-the-dispatch (resolves the slot thunks from the fn table).
+    #[test]
+    fn viewport_point_mm_surface_resolves_through_dispatch() {
+        let (env, _vm) = build_jni();
+        unsafe {
+            let functions = *(env as *const u64);
+            let get = |i: usize| -> u64 { *(functions as *const u64).add(i) };
+
+            // GetStaticMethodID(..,"getScreenPhysicalSizeInMillimeters",..) -> mid (name handle).
+            let (g_smid, _) =
+                host_call_at(get(GET_STATIC_METHOD_ID)).expect("GetStaticMethodID thunk");
+            let mid_h = g_smid(
+                env,
+                0x1234,
+                {
+                    let b = unsafe { alloc_zeroed(Layout::array::<u8>(48).unwrap()) };
+                    unsafe { std::ptr::copy_nonoverlapping(
+                        b"getScreenPhysicalSizeInMillimeters".as_ptr(), b,
+                        b"getScreenPhysicalSizeInMillimeters".len()); }
+                    b as u64
+                },
+                0, 0, 0, 0, 0,
+            );
+            assert_ne!(mid_h, 0, "GetStaticMethodID resolves (readable name handle)");
+
+            // CallStaticObjectMethod -> the dedicated viewport Point (non-zero, distinct
+            // from the generic fake object).
+            let (g_som, _) =
+                host_call_at(get(CALL_STATIC_OBJECT_METHOD)).expect("CallStaticObjectMethod thunk");
+            let pt = g_som(env, 0x1234, mid_h, 0, 0, 0, 0, 0);
+            assert_ne!(pt, 0, "getScreenPhysicalSizeInMillimeters returns a real Point handle");
+            assert_eq!(super::viewport_point_handle(), pt, "stable identical Point");
+
+            // GetFieldID(Point, "x"/"y") -> field name handles, then GetIntField on the
+            // Point -> the Mm geometry.
+            let (g_fid, _) = host_call_at(get(GET_FIELD_ID)).expect("GetFieldID thunk");
+            let fid = |name: &[u8]| -> u64 {
+                g_fid(
+                    env, pt,
+                    {
+                        let b = unsafe { alloc_zeroed(Layout::array::<u8>(name.len() + 1).unwrap()) };
+                        unsafe { std::ptr::copy_nonoverlapping(name.as_ptr(), b, name.len()); }
+                        b as u64
+                    },
+                    0, 0, 0, 0, 0,
+                )
+            };
+            let (g_gif, _) = host_call_at(get(GET_INT_FIELD)).expect("GetIntField thunk");
+            let fx = fid(b"x");
+            let fy = fid(b"y");
+            let fz = fid(b"z"); // unrelated Point field -> honest 0
+            assert_eq!(g_gif(env, pt, fx, 0, 0, 0, 0, 0), VIEWPORT_WIDTH_MM as u64, "Point.x = viewport width Mm (338)");
+            assert_eq!(g_gif(env, pt, fy, 0, 0, 0, 0, 0), VIEWPORT_HEIGHT_MM as u64, "Point.y = viewport height Mm (190)");
+            assert_eq!(g_gif(env, pt, fz, 0, 0, 0, 0, 0), 0, "unrelated Point field -> 0");
+
+            // CRITICAL SCOPING: a generic fake object's x/y MUST stay 0 — a name-only
+            // dispatch would wrongly return Mm for any object named x/y.
+            let other = super::new_fake_object();
+            assert_ne!(other, pt, "generic fake object is distinct from the viewport Point");
+            assert_eq!(g_gif(env, other, fx, 0, 0, 0, 0, 0), 0, "generic object 'x' stays 0");
+            assert_eq!(g_gif(env, other, fy, 0, 0, 0, 0, 0), 0, "generic object 'y' stays 0");
+
+            // An unrelated static-object method keeps the honest NULL/0.
+            let (g_som2, _) =
+                host_call_at(get(CALL_STATIC_OBJECT_METHOD)).expect("CallStaticObjectMethod thunk");
+            let other_mid = g_smid(
+                env, 0x1234,
+                {
+                    let b = unsafe { alloc_zeroed(Layout::array::<u8>(32).unwrap()) };
+                    unsafe { std::ptr::copy_nonoverlapping(b"someOtherStatic".as_ptr(), b, 14); }
+                    b as u64
+                },
+                0, 0, 0, 0, 0,
+            );
+            assert_eq!(g_som2(env, 0x1234, other_mid, 0, 0, 0, 0, 0), 0, "unrecognized static -> NULL");
         }
     }
 }
