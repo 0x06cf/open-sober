@@ -789,7 +789,7 @@ sc.Parent = CG
     // the write itself is idempotent. Borrows the pattern from elfjit's guest_page_mapped guard.
     let mut gate_state = Vec::new();
     let gates: [(u64, u8); 5] = [
-        (0x10672739d4, 1), // flags-loaded [bit0]=1
+        (0x1072739d4, 1), // flags-loaded [0x72739d4].bit0=1 (file vaddr 0x72739d4; fix SH352: was 0x10672739d4=file 0x672739d4, a read-only cell, so this gate silently never armed)
         (0x106a683e8, 1),  // flags-latch [bit0]=1
         (0x106a63da0, 0),  // governor union-init guard = 0
         (0x106a63d70, 0),  // governor union-init guard = 0

@@ -1016,11 +1016,10 @@ pub fn routeb_seed_pb_registry_map(image: &[u8], base: u64) -> u64 {
             *((map + 0x60) as *mut u32) = 0;
         }
         // Install pb_defaults BSS registry slots (idempotent data seed).
-        // NOTE (SH95): 0x106838378 pthread_rwlock POINTER slot (registrar tail `ldr x0,[x20,#888]`
-        // =+888=0x378 unlocks it) - do NOT seed it w/ the map ptr or do-init's rwlock_unlock crashes
-        // (SH94-trace crash guestpc 0x102a1ce5c, garbage lock word). .bss zeroed -> 0x378 is already
-        // a valid UNLOCKED rwlock - leave it. Seed only registry-MAP slots the registrar reads
-        // (0x106838380 @offs896 + 0x106838368 used by find-op registration).
+        // NOTE (SH95): 0x106838378 rwlock POINTER slot (registrar `ldr x0,[x20,#888]` =+888=0x378) -
+        // do NOT seed w/ map ptr or do-init's rwlock_unlock crashes (SH94 guestpc 0x102a1ce5c, garbage
+        // lock word). .bss zeroed -> 0x378 already a valid UNLOCKED rwlock - leave. Seed only the
+        // registry-MAP slots (0x106838380 @896 + 0x106838368, find-op registration).
         for slot in [0x106838368u64, 0x106838380] {
             unsafe { *(slot as *mut u64) = map };
         }
@@ -1332,10 +1331,9 @@ fn routeb_patch_startapp_init3_gates() {
     arm64jit::jit::block_cache_drop_region(0x102e9fcb0, 0x102ea3b40); // widen: whole governor tail + validator (SH160+ 0x102e9fcc4 block-cache race)
 }
 
-/// SH348 (opt-in JIT_ROUTEB_LSM_INIT_SKIP=1, default-INERT): leaf `ret` LocalStorageManager
-/// initStorageManagerNative (entry 0x101d9d8b0) so the Session-CTOR continuation skips the SH285
-/// persistence-lane wall (byte-copy @0x101db1b08) toward app-start 0x2bd2058. CAUSE-level skip
-/// (SH117), NOT a live-object repair (SH248h). Caller's bl returns w0=manager this (nonzero=ok).
+/// SH348 (opt-in JIT_ROUTEB_LSM_INIT_SKIP=1, default-INERT): leaf `ret` initStorageManagerNative
+/// (0x101d9d8b0) so the Session-CTOR continuation skips the SH285 persistence wall (0x101db1b08)
+/// toward app-start 0x2bd2058. CAUSE-level (SH117), not SH248h. Caller returns w0=this (nonzero=ok).
 fn routeb_patch_lsm_init_skip() {
     if std::env::var_os("JIT_ROUTEB_LSM_INIT_SKIP").is_none() {
         return;
@@ -1366,8 +1364,8 @@ fn routeb_patch_lsm_init_skip() {
 }
 
 /// SH349 (opt-in JIT_ROUTEB_LSM_APPEND_SKIP=1, default-INERT): RET the faulty byte-copy sub-call
-/// 0x101d9a15c (SH285 fault body). SH348 showed the fault survives a whole-init leaf-ret (caller
-/// block reached by a mid-function direct jump); a pure-memcpy leaf stubs every path in. SH117, not SH248h.
+/// 0x101d9a15c (SH285 fault body). SH348: fault survives a whole-init leaf-ret (mid-jump reach);
+/// a pure-memcpy leaf stubs every path. SH117, not SH248h.
 fn routeb_patch_lsm_append_skip() {
     if std::env::var_os("JIT_ROUTEB_LSM_APPEND_SKIP").is_none() {
         return;
@@ -1398,9 +1396,8 @@ fn routeb_patch_lsm_append_skip() {
 }
 
 /// SH350 (opt-in JIT_ROUTEB_LSM_PACK_SKIP=1, default-INERT): RET the single-caller name-pack
-/// helper 0x101d9a708 (SH349+1 terminal); ONE caller (BL scan), BOUNDED vs the hundreds-of-callers
-/// bl 0x1d9d8b0 family. RET -> caller's benign index-0 path (tst x0;b.eq), not the faulty
-/// byte-copy of the caller's garbage source string. Pure helper; CAUSE-level (SH117), not SH248h.
+/// helper 0x101d9a708 (SH349+1); ONE caller -> caller's benign index-0 path (not the garbage
+/// byte-copy). CAUSE-level (SH117), not SH248h.
 fn routeb_patch_lsm_pack_skip() {
     if std::env::var_os("JIT_ROUTEB_LSM_PACK_SKIP").is_none() {
         return;
@@ -6301,13 +6298,10 @@ fn main() {
     let singleton_slot = link_to_guest(&el, 0x7333000 + 0x948); // [ptr] slot
     let singleton_obj = link_to_guest(&el, 0x7333000 + 0x950); // object base
     unsafe { *((singleton_slot) as *mut u64) = singleton_obj };
-    // SH82b: the GlobalInit do-init funnels an intern/hash lookup through this
-    // singleton's +0x30 word (table base, read at file 0x21db014 `ldr x10,[x19]`
-    // then `ldr x10,[x10,x24,lsl#3]`). The object is zeroed bss so +0x30 == 0 ->
-    // the table deref reads [0 + x24*8] -> SIGSEGV fault=0x0 at guestpc
-    // 0x1021daf78. Seed +0x30 = a zeroed bucket array (mirrors seed_static_empty_map)
-    // lookup reads bucket->0 (cbz -> "not found -> insert new"), and +0x8
-    // (size/capacity) = a non-zero small value hashing path is coherent.
+    // SH82b: the do-init funnels an intern/hash lookup through this singleton's +0x30 (table base,
+    // file 0x21db014 `ldr x10,[x19]` then `ldr x10,[x10,x24,lsl#3]`). +0x30==0 (bss) -> [0+x24*8]
+    // SIGSEGV at 0x1021daf78. Seed +0x30=a zeroed bucket array (mirrors seed_static_empty_map:
+    // lookup reads bucket->0 cbz -> "not found -> insert new"), and +0x8 (size/capacity) non-zero.
     unsafe {
         let bucket_arr = Box::leak(vec![0u8; 0x2000].into_boxed_slice());
         let base = bucket_arr.as_mut_ptr() as u64;
@@ -6468,13 +6462,10 @@ fn main() {
     }
     std::thread::sleep(std::time::Duration::from_millis(50));
 
-    // --startapp <link-addr>: after JNI_OnLoad completes, drive the next real
-    // boot stage - the Java side's `nativeAppBridgeV2StartAppWithParams` (the
-    // entry that creates the engine main loop + EGL/GLES context). We chain it
-    // fresh guest entry after the registration phase, giving it the same
-    // JNIEnv in x0 plus fake but VALID (non-null, dereferenceable) jobject /
-    // jstring handles, exactly as the real JVM would. Captures how far the real
-    // binary gets into StartApp (main-loop / graphics init) before the next wall.
+    // --startapp <link-addr>: after JNI_OnLoad, drive the Java side's
+    // nativeAppBridgeV2StartAppWithParams (engine main loop + EGL/GLES). Fresh guest entry with the
+    // same JNIEnv in x0 + fake-but-valid jobject/jstring handles, exactly as the real JVM. Captures
+    // how far StartApp gets (main-loop / graphics init) before the next wall.
     if let Some(hex) = {
         let args: Vec<String> = std::env::args().collect();
         args.iter()
@@ -7043,12 +7034,10 @@ fn main() {
                     }
                 }
                 // Final: drive the V1 6-jstring AppStart fallback so the
-                // session/home-screen renderer can start even if the V2 path
-                // stays gated (reads params as individual jstrings, not the
-                // AutoValue getters). nativeAppBridgeAppStart__ (0x102338510).
-                // SH269: under --v2boot-skip-appstart we skip these app-start
-                // self-drivers too (they walk LSM/app-start live-object
-                // wall) loop cleanly reaches the session-ctor rungs.
+                // session/home-screen renderer can start even if the V2 path stays gated (reads params as
+                // individual jstrings, not AutoValue getters). nativeAppBridgeAppStart__ (0x102338510).
+                // SH269: --v2boot-skip-appstart skips these too (they walk the live-object wall); loop
+                // reaches the session-ctor rungs cleanly.
                 if !std::env::args().any(|a| a == "--v2boot-skip-appstart") {
                 eprintln!("[elfjit:v2boot] driving V1 AppStart__ (fallback)");
                 let mut sv = arm64jit::jit::CpuState::new();
@@ -8383,12 +8372,11 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                 }
             });
         }
-        // Host-side task-deque PRODUCER (--deque-node <vtable-hex>): SH5 parked threads are
-        // CONSUMERS of a per-CPU lock-free task-deque (0x285682c/0x2856e40) parked in the epoch futex
-        // wait 0x10284d018 because head ([0x10682a638]/0x10682b338) is the self-ref SENTINEL. CAS a
-        // fresh NODE head linking to old sentinel, set [node+112]=<vtable> so drain ([node+112]&~0x3f
-        // -> [vt+40]) reaches a real handler, then bump [Q']>>32 + FUTEX_WAKE Q'+4. Zeroed node trips
-        // drain at [vt+40]; sentinel vt 0x106829f00 -> 0x10285371c.
+        // Host task-deque PRODUCER (--deque-node <vtable-hex>): SH5 parked threads CONSUME a per-CPU
+        // lock-free deque (0x285682c/0x2856e40) parked in the epoch futex 0x10284d018 because head
+        // ([0x10682a638]/0x10682b338) is the self-ref SENTINEL. CAS fresh NODE linked to old sentinel,
+        // [node+112]=<vtable> (drain [node+112]&~0x3f -> [vt+40]), bump [Q']>>32 + FUTEX_WAKE Q'+4.
+        // Zeroed node trips drain at [vt+40]; sentinel vt 0x106829f00 -> 0x10285371c.
         if let Some(vt) = {
             let args: Vec<String> = std::env::args().collect();
             args.iter()
@@ -8770,11 +8758,10 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                     // node on pop.
                     let tag = unsafe { *(root as *const u64).add(1) }; // [root+8]
                     // Bind the dispatch handler: [node+112]&~0x3f -> vt, [vt+40]=handler.
-                    // CLONE the live head node's coherent payload drain's post-dispatch
-                    // RE-ENQUEUE (producer 0x285682c) walks valid link/refcount fields, not zeroed
-                    // garbage. The live head (idle sentinel, `low48(headcell[0])`) ideal
-                    // template the drain already pops+re-enqueues. (SH9's "[consumer+104]" indexing
-                    // is unreliable - consumer x19 rarely snapshotted - so use the guaranteed head.)
+                    // CLONE the live head node's coherent payload drain's post-dispatch RE-ENQUEUE
+                    // (producer 0x285682c) walks valid link/refcount fields, not zeroed garbage; the live
+                    // head (idle sentinel, low48(headcell[0])) is the template the drain pops+re-enqueues.
+                    // (SH9's "[consumer+104]" indexing is unreliable - x19 rarely snapshots - use the head.)
                     let node: *mut u8 = {
                         let mut sentinel = 0u64;
                         let hn = old & 0xffff_ffff_ffff;
@@ -9044,13 +9031,10 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                 eprintln!("[elfjit:deque-probe] gave up (probe count={}, repointed={})", PROBE_COUNT.load(Ordering::Relaxed), repointed.len());
             });
         }
-        // SH60 --taskv4-seed frame: force every drain dispatch type-4
-        // vector. The idle path's heartbeat sentinel dispatches (0x2856f24/8,
-        // w4=2/3 telemetry emitters) never reach vector [0x106829ea8]; w4=4
-        // popped-task path (0x2856ffc) hits only in an early-init window.
-        // Deterministic fix: rewrite heartbeat mov w4,#2/#3 -> mov w4,#4, so
-        // every idle dispatch calls the real dispatcher (0x10285371c) -> br to
-        // the seeded type4_frame_thunk -> a real task-driven frame per drain.
+        // SH60 --taskv4-seed frame: force every drain dispatch type-4 vector. The idle
+        // heartbeat sentinels (0x2856f24/8, w4=2/3) never reach [0x106829ea8]; w4=4 popped-task
+        // (0x2856ffc) hits only in an early window. Rx: rewrite heartbeat mov w4,#2/#3 -> #4 so
+        // every idle dispatch -> dispatcher 0x10285371c -> br seeded type4_frame_thunk = a frame.
         if taskv4_frame_seed_active() {
             for (addr, name, word) in [
                 (0x102856f24u64, "heartbeat w4#2", 0x52800084u32), // mov w4,#4
@@ -9084,9 +9068,9 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
             eprintln!("[kernel:NOP re-arm store 0x{rearm:x} (gate-2) under JIT_DRIVE_LIFECYCLE");
         }
     }
-    // --drain-poll <ms>: make the idle-task-deque drain (0x2856e40) wait FINITE not infinite -1
-    // (parked forever on generic-wait 0x284d014, so pop-loop 0x2856f94 never runs; a finite ms
-    // times it out -> pop-loop dispatches a host node in [headcell+0] via [node+112]->[vt+40]).
+    // --drain-poll <ms>: drain (0x2856e40) waits FINITE not -1 (parked forever on generic-wait
+    // 0x284d014, so pop-loop 0x2856f94 never runs; finite ms times out -> dispatches a host node in
+    // [headcell+0] via [node+112]->[vt+40]).
     {
         let args: Vec<String> = std::env::args().collect();
         if let Some(i) = args.iter().position(|a| a == "--drain-poll") {
@@ -9498,10 +9482,9 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                         if emit {
                             // Emitter draws onto live ctx; drive it AFTER this frame's walker so its swap
                             // shows the engine-emitted quad (walker's swap precedes).
-                            // RENDEREMITTER_QUADS=N (SH67d): POPULATED N-quad frame in ONE engine-emitter
-                            // jit_run (pre-uploaded VBO, GL_TRIANGLES) - closes SH67c glBufferData orphan
-                            // blocker, proves populated multi-element engine-emitted frames headlessly.
-                            // Default (unset) = SH67b.
+                            // RENDEREMITTER_QUADS=N (SH67d): POPULATED N-quad frame in ONE engine-emitter jit_run
+                            // (pre-uploaded VBO, GL_TRIANGLES) - closes SH67c glBufferData orphan, proves
+                            // populated multi-element engine-emitted frames headlessly. Default=SH67b.
                             let nq: usize = std::env::var("RENDEREMITTER_QUADS")
                                 .ok().and_then(|v| v.parse().ok()).unwrap_or(0);
                             // RENDEREMITTER_TEX=1 (SH67e): 3rd per-vertex texcoord attrib (aTex loc2)
@@ -9543,11 +9526,10 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
             }
             let _ = &real_ctx;
             // --renderframe (opt-in, +--renderinit): after real render-init, present the engine's
-            // LIVE EGL ctx. Reverse (SH17): init inner 0x105b3a2d8 wrote live handles into
-            // `scratch` ([+32]=display,[+40]=surface,[+48]=context). Swap fn 0x105b3b408 tail
-            // `ldp x8,x1,[x0,#32]; mov x0,x8; b eglSwapBuffers` = eglSwapBuffers([x0+32],[x0+40]);
-            // x0=scratch makes the engine's own swap present headlessly (llvmpipe+Xvfb) without
-            // re-running init (thread keeps ctx current).
+            // LIVE EGL ctx. Reverse (SH17): init inner 0x105b3a2d8 wrote live handles into `scratch`
+            // ([+32]=display,[+40]=surface,[+48]=context). Swap fn 0x105b3b408 tail `ldp x8,x1,[x0,#32];
+            // mov x0,x8; b eglSwapBuffers` = eglSwapBuffers([x0+32],[x0+40]); x0=scratch makes the
+            // engine's own swap present headlessly (llvmpipe+Xvfb) without re-init (thread keeps ctx current).
             if renderframe_args.iter().any(|a| a == "--renderframe") {
                 // --renderbind (opt-in): drive the engine's OWN make-current
                 // method (ctx vtable [vt+16] = 0x105b3b358) before presenting, the exact
@@ -15658,6 +15640,28 @@ mod sh115_tests {
             eprintln!("sh350 LSM name-pack single-caller inert-target pinned (SH349+1 terminal 0x101d9a708; one caller -> benign index-0 continuation).");
         } else {
             eprintln!("sh350 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
+    fn sh352_flags_loaded_latch_addr_corrected() {
+        // SH352 R1-gate fix: arm flags-loaded at 0x1072739d4 (file 0x72739d4), not 0x10672739d4.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            assert_eq!(word(0x102_24fa18), 0x90028128, "sh352 adrp 7273000");
+            assert_eq!(word(0x102_24fa20), 0x39675108, "sh352 ldrb [x8,#2516]=[0x72739d4]");
+            let latch = el.host_addr_of(0x1072739d4).unwrap_or(0);
+            let stale = el.host_addr_of(0x10672739d4).unwrap_or(0);
+            assert_ne!(latch & !0xfff, stale & !0xfff, "sh352 gates differ in page");
+            assert_ne!(latch, 0, "sh352 latch resolves in-image");
+            eprintln!("sh352 flags-loaded latch corrected -> 0x1072739d4 (file 0x72739d4).");
+        } else {
+            eprintln!("sh352 real-image guard: no real libroblox.so, skipping anchors");
         }
     }
 

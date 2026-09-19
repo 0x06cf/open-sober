@@ -1,5 +1,36 @@
 # Open Sober — Agent Handoff
 
+## SH352 (Sep 19, 2026, hermes-worker): fix the R1 content-path flags-loaded gate address (0x1072739d4, was the read-only 0x10672739d4 -> primary gate silently never armed) + measure the completing skip-appstart ladder end-to-end (app-events return, R1 stages, once-slot "Execute" handle)
+Single-agent (cone suppressed). Production fix: `stage_r1_core_scripts` (jit.rs) arming the loader
+gates wrote the flags-loaded latch to 0x10672739d4 (=file 0x672739d4, read-only), so `page_writable_rw`
+refused it and that PRIMARY gate never armed — the other 4 armed, R1 content staged but the
+flags-loaded gate stayed 0. Corrected to 0x1072739d4 (=file 0x72739d4, the latch every other reader
+uses; gate read @0x224fa18/20 adrp 7273000 + ldrb [x8,#2516]). +`sh352_flags_loaded_latch_addr_corrected`
+real-image hermetic (pins gate-read words + asserts the two candidate addrs resolve to different
+image pages). elfjit.rs held under the 1MB hook after condensing SH-prose comments (facts/addresses
+preserved). Workspace green (elfjit examples 159/0; arm64jit lib 418/0; cargo test --workspace exit 0).
+
+### The forward this cycle
+MEASURED (real libroblox.so, completing `--v2boot-skip-appstart` ladder + SH269 GOVFLAG + SH307
+preload-valuecell, 3/3 deterministic EXIT 124):
+- SendAppEventOnAppReady + SendAppEventOnGameLoaded both RETURN Ok cleanly (previously died at the
+  governor NULL-DM wall 0x102ea0b9c then the SH270 preload wall 0x102bb803c).
+- R1 content stages on the completing ladder (AppShell.lua + CoreScripts.lua @ fsmap mirror); the
+  corrected flags-loaded gate now ARMS (`0x1072739d4 0x0->0x1`, 5/5 gates, none dropped — previously
+  `0x10672739d4:unmapped`).
+- SH155/SH315 probes read real state: once-slot[0x106a68408]=0x400000b (the "Execute" service handle,
+  SH316), service-registry-count=12, app-data-model-count=0x1. DM-root 0, MH_* false.
+
+### Honest
+Correctness fix + strongest-yet session drive. Does NOT manufacture a live DataModel; once-slot
+0x400000b is the matched "Execute" handle, not a DM. Route-B live-DM structural gate UNCHANGED,
+SH174 capture-latch stays the single forward hook.
+
+### Next (unchanged, authoritative)
+Route-B live-DM structural gate stands (SESSION-CTOR / do-init, SH184/185 four-stacked closure).
+R1 content half is now BOTH staged (SH351) AND gate-armed-verified (SH352); the SESSION half
+(do-init owning a live DM) remains the wall. SH174 capture-latch stays the single forward hook.
+
 ## SH351 (Sep 19, 2026, hermes-worker): stage the R1 synthetic CoreScript content path (Route-B marker half) — hand-authored Luau ScreenGui module + real loader gates, latent-but-correct
 Single-agent (cone suppressed). Additions: `stage_r1_core_scripts` (jit.rs) + `fsmap::staging_root`
 + `page_writable_rw` guard + 2 hermetic tests (sh351_*) + elffjit opt-in rung `--v2boot-r1-stage`.
