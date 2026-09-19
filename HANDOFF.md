@@ -1,5 +1,41 @@
 # Open Sober — Agent Handoff
 
+## SH373 (Sep 20, 2026, hermes-worker): MEASURED — SH285 CROSSOVER from the SH371 reaching-env (the standing SH285 persistence leaf is deterministically crossed 5/5, terminal advances to 0x101d9a708 in the SAME measured-closed LSM unconstructed family); recon-v3 + sh372 green
+Single-agent (cone suppressed). One new probe runs/capture_sh373_cont_appendskip.sh + live
+captures (gitignored) + docs/frontier-sh373-sh285-crossover-continuation.md. No production
+path edited (append/pack skips are SH349/SH350's existing default-inert opt-ins; SH373
+combines SH349's append-skip with the SH371 reaching env and measures). Workspace green
+(cargo test --workspace EXIT 0, 615 passed/0 failed incl sh372).
+
+### The forward this cycle (a reproducible cross, then an honest verdict)
+For the first time the standing SH285 persistence-wall (guestpc=0x101db1b08) is
+deterministically CROSSED (5/5 runs, sh285=0). SH371 added the DM_CONT_M48_SEED +
+CONT_APPNAME_SEED that make the DM-creator continuation continueAfterFlagsLoaded_
+(0x102bd1d68) run DEEP headlessly. SH373 adds SH349's append sub-call skip on top:
+- continuation fires; **SH285 leaf 0x101db1b08 = 0 hits** (was the terminal of every
+  SH260/284/285/3444/348/371/372 run) — the append byte-copy 0x101d9a15c IS the wall again;
+- run advances to **0x101d9a708** (SH349's pack/name-string helper), faulting on source
+  pointer x19=0xff..ff = the SAME unconstructed-live-object family SH349/350/358 closed.
+- SH358's earlier "0 continuation hits for DMCONT+skips" is explained: that run LACKED the
+  M+0x48/appname seeds, so the continuation was never reached.
+- The append+pack combo (SH373b) instead parks at pool-pop write-site 0x101d9a528
+  (write-to-0x1 divergence), a different arm that doesn't reach the continuation.
+
+### Interpretation
+SH285 is NOT a fundamental invariant — it is the append byte-copy leaf, crossable with the
+known single-caller skip once the continuation is reached. But the cross lands one fencepost
+later in the SAME family (0x101d9a708), which SH349 reached + SH350 crossed into the
+unbounded pool-pop family. This RE-STRENGTHENS the standing verdict: the persistence lane is
+measured-returned (whack-a-mole UNBOUNDED); only a REAL LocalStorageManager/session ctor
+gets past, and no seed manufactures it (SH248h/SH256). SH373 closes the last "is SH285 itself
+the invariant?" loophole by crossing it and showing the next fencepost is already-known.
+
+### Honest
+No DataModel (DM-root [0x106a68818]=0, MH_* false). Route-B live-DM structural gate
+UNCHANGED. SH174 capture-latch stays the single forward hook. Do NOT extend to
+pack-skip+LSM whack-a-mole (SH350 unbounded); do NOT re-drive further sub-call skips into
+the family (SH349/350/358 closure stands).
+
 ## SH372 (Sep 20, 2026, hermes-worker): MEASURED — the DM-creator continuation and the settings-state init path CONVERGE on the identical SH285 persistence-object leaf (answers SH371's explicit "same object or different?" gap with a fresh register dump); recon-v3 deliverables re-verified green
 Single-agent (cone suppressed). One new probe runs/capture_sh372_continuation_terminal.sh
 (JIT_DUMP_PC + JIT_GUEST_STACK_DUMP + JIT_REGION_WATCH on the continuation body) + one new
