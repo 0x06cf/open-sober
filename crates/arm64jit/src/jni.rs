@@ -2252,6 +2252,18 @@ mod tests {
             fst.x[2] = field_id(b"density");
             let bits = unsafe { super::jni_get_float_field(&mut fst as *mut CpuState) };
             assert_eq!(bits as u64 & 0xffff_ffff, 1.0f32.to_bits() as u64, "density float = 1.0f32");
+            // The remaining DisplayMetrics float fields (recon v2 shape) through
+            // the SAME GetFloatField slot — scaledDensity=1.0, xdpi/ydpi=96 —
+            // were production arms with no field pin (only density was asserted).
+            for (name, expect) in [
+                ("scaledDensity", 1.0f32),
+                ("xdpi", 96.0f32),
+                ("ydpi", 96.0f32),
+            ] {
+                fst.x[2] = field_id(name.as_bytes());
+                let b = unsafe { super::jni_get_float_field(&mut fst as *mut CpuState) };
+                assert_eq!(b as u64 & 0xffff_ffff, expect.to_bits() as u64, "{name} float = {expect}");
+            }
 
             // GetLongField -> honest 0 (no known long display fields).
             assert_eq!(super::jni_get_long_field(env, 0x999, field_id(b"anyField"), 0, 0, 0, 0, 0), 0);
