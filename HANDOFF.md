@@ -1,6 +1,27 @@
 # Open Sober — Agent Handoff
 
-## SH405 (Sep 21, 2026, hermes-worker): arming the SH320 main-id seed (JIT_ROUTEB_DONEPATH_MAIN) flips the do-init onto its MAIN dispatch — the never-executed 0x10258b5d8 app-start body finally RUNS deep headlessly (crosses SH322 lifecycle + SH323 SSO), then drains into the standing SH285/LSM persistence lane from a SECOND (MAIN-arm) entry point; the persistence lane is now measured ARM-RELATIVE (fall-through SH404 + MAIN SH405)
+## SH406 (Sep 21, 2026, hermes-worker): extended the SH269 GOVFLAG fixed-.bss flag seed to the SH405 MAIN-arm app-start continuation — the 0x10258b5d8 app-start body's continuation now PASSES the NULL-controller deref it faulted at (guestpc 0x1025f501c) and drains into the standing SH285/SH341 persistence lane; DMCONT 0x102bd1d68 still 0 hits
+Single-agent (cone suppressed). No production behavior change (default-inert opt-in
+JIT_ROUTEB_APPSART_GOVFLAG; widening the guard's pc-window does nothing when unselected).
+SH405 measured the MAIN arm faults SIGSEGV (fault=0x0) at guestpc 0x1025f501c right after
+`bl 0x25f52b4` returns x0=0, and left two "Next" questions. SH406 answers them:
+- ROOT CAUSE: the app-start continuation reads the SAME fixed-.bss flag byte [0x106a64da0]
+  SH269 seeds (`ldrb w8,[x9,#3488]` @0x25f502c; cbz @0x25f503c). flag==0 -> `ldr x0,[x19,#1032]`
+  (NULL app-DM controller) -> `ldr x8,[x0]` fault=0x0. flag!=0 -> `mov x0,x19; bl 0x2ea3a84`
+  (preload-overrides with real x19) + branches over the deref. SH269's seed only windowed the
+  governor pcs (0x102ea0b60..0x2ea0bd0) which the MAIN arm bypasses -> flag stayed 0.
+- FIX: widened `routeb_govflag_seed_guard`'s pc-window to the StartAppWithParams continuation
+  (0x1025f5008..0x1025f5060) so the same idempotent [0x106a64da0].bit0=1 seed fires on the MAIN
+  arm. MEASURED (real libroblox.so, SH405 env, EXIT 139): seed fires at pc=0x1025f5008, the
+  app-start body passes 0x1025f501c (no fault there), and the continuation executes deep into the
+  SH341 pool-pop persistence lane (188 events, caller LR=0x10626b6dc) — NOT toward DMCONT.
+- **DMCONT 0x102bd1d68 = 0 region hits** — the MAIN-arm continuation lands in the SAME
+  measured-closed SH285/LSM persistence family (answers SH405's (1): same lane, not do-init
+  completion; (2) DMCONT stays 0). New real-image hermetic sh406 (arm64jit lib 454->455)
+  byte-pins the flag read 0x39768128 / cbz 0x34000088 / NULL-controller deref 0xf9420660+f9400008
+  / helper branch 0xaa1303e0. +frontier-sh406-govflag-appstart-main-arm doc. Honest: no DM
+  (DM-root 0, MH_* false, AppBridgeV2 genuine vt unchanged). Workspace green (cargo test
+  --workspace EXIT 0, 455/0); jit.rs under 1MiB hook, elfjit.rs untouched.
 Single-agent (cone suppressed). New probe runs/capture_sh405_donepath_main.sh (SH404 env +
 JIT_ROUTEB_DONEPATH_MAIN + LIFECYCLE_EARLYRET + SETTINGS_SSO_SEED) + new real-image hermetic
 `sh405_donepath_main_flips_doinit_to_main_dispatch_into_appstart` (arm64jit lib 453->454),

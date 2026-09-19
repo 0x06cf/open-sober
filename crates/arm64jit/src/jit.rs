@@ -828,21 +828,18 @@ pub fn drive_messagebus_publish_receive_payload(
     }
 }
 
-/// SH366 (--v2boot-glue-cmd): drive the guest app-command DISPATCHER `process_cmd` (0x102bcd6e4)
-/// to deliver INIT_WINDOW through the engine's real window/GL-surface chain — the SESSION-CTOR
-/// precondition named since SH39b (glue LOOP 0 hits), dead-drain SH365. Never ENTERED (ALooper
-/// can't jit_run; this bounded dispatcher CAN). ABI process_cmd(app=x0,cmd=x1):
-///   entry sub w8,w1,#1; cmp #0x13; b.hi default; `ldr x20,[x0]` then ::tbl; INIT_WINDOW(11)->0x2bcd78c
-///   case: `ldr x0,[x20,#64]; strb w8,#1,[x20,#9]; bl 0x2bd29a0` (window-attach); gate [0x10683d8b0]:0.
-///   Window-attach 0x2bd29a0 reads [this+0x268] once-guard; a zeroed obj skips the once-body + rets.
-///   Fabricated app ([app]=inner, inner[+64]=zeroed win) makes the dispatcher set [inner+9]=1 + call
-///   real window-attach headlessly. Returns Ok(0); [inner+9]==1 proves INIT_WINDOW EXECUTED; single jit_run.
-/// SH367 (--v2boot-glue-cmd, MEASURED NEGATIVE): once-guard-ARMED real attach faults — with
-/// [win+0x268].bit0 ARMED, 0x2bd29a0 enters real GL post-init bl 0x2291c24 (( [?win+0x278]!=0)) then
-/// bl 0x22985c0, whose DEEP body needs a REAL EGL surface/context (fabricated NULL obj can't) ->
-/// SIGSEGV in host GL dispatch (guestpc 0x7f0000001f50, EXIT 134) before INIT_WINDOW completes.
-/// Pins real window-attach COMPLETION as the standing Session-Ctor wall, one level deeper than SH366.
-/// Keep the once-guard OFF (SH366 clean entry).
+/// SH366 (--v2boot-glue-cmd): drive guest app-command DISPATCHER `process_cmd` (0x102bcd6e4) to
+/// deliver INIT_WINDOW through the engine's real window/GL-surface chain (SESSION-CTOR condition
+/// since SH39b; dead-drain SH365). Never ENTERED (ALooper can't jit_run; this bounded dispatcher CAN).
+/// ABI process_cmd(app=x0,cmd=x1): entry sub w8,w1,#1; cmp #0x13; b.hi default; ldr x20,[x0]; tbl;
+/// INIT_WINDOW(11)->0x2bcd78c: ldr x0,[x20,#64]; strb w8,#1,[x20,#9]; bl 0x2bd29a0 (window-attach);
+/// gate [0x10683d8b0]:0. Window-attach 0x2bd29a0 reads [this+0x268] once-guard; zeroed obj skips the
+/// once-body+rets. Fabricated app ([app]=inner, inner[+64]=zeroed win) makes it set [inner+9]=1 + call
+/// real window-attach headlessly; [inner+9]==1 proves INIT_WINDOW EXECUTED; single jit_run.
+/// SH367 (MEASURED NEGATIVE): once-guard-ARMED real attach faults — with [win+0x268].bit0 ARMED,
+/// 0x2bd29a0 enters real GL post-init bl 0x2291c24 ((?[win+0x278]!=0)) then bl 0x22985c0, whose DEEP
+/// body needs a REAL EGL surface/context (fabricated NULL obj can't) -> SIGSEGV in host GL dispatch
+/// (guestpc 0x7f0000001f50, EXIT 134) before INIT_WINDOW completes. Keep the once-guard OFF.
 pub fn drive_glue_process_cmd(iimg: &[u8], ib: u64, tpidr: u64, boot_sp: u64) -> u64 {
     // Version gate word [0x10683d8b0]: keep 0 so `b.cc`/`cbz` route straight to the body.
     const VERSION_GATE: u64 = 0x10683d8b0;
@@ -1801,27 +1798,22 @@ fn routeb_appstart_settings_once_seed_guard(_state: *mut CpuState, pc: u64) {
     }
 }
 
-/// SH269 (opt-in JIT_ROUTEB_APPSART_GOVFLAG): the post-ladder SESSION-CTOR rungs — SendAppEvent
-/// OnAppReady (0x102bb463c), OnGameLoaded (0x102bb429c), MessageBus.subscribe (0x102ba5bb8) — were
-/// wired in SH264-267 but NEVER executed headlessly because --v2boot's StartLuaAppDM/V2StartApp rungs
-/// self-drove deep and killed the process before the loop reached them. --v2boot-skip-appstart skips
-/// those two so the loop completes; this guard then drives the governor predicate SendAppEvent reaches.
-/// MEASURED (real libroblox.so, SH267 seed set + skip-appstart): SendAppEventOnAppReady reached the
-/// governor
-/// predicate 0x2ea0b9c (FIRST time) and faulted `[SIGSEGV] fault=0x0 guestpc=0x102ea0b9c x0=0
-/// x21=host-app-governor` — disasm of 0x2ea0b9c..0x2ea0be0:
-///   ldrb w8,[6a64000+#3488] (=0x106a64da0)  ; cbz w8 -> 0x2ea0bd0 (flag CLEAR)
-///   [flag clear] ldr x0,[x21,#1032]; ldr x8,[x0]  <- x0 = app-DM controller = 0 -> NULL deref
-///   [flag set]   mov x0,x21; bl 0x2ea3a84  (passes the REAL governor to preload-overrides, not NULL)
-/// [0x106a64da0] is a seeded fixed-.bss flag byte (same region as SH239 ctor-guard 0x106a64d70), NOT
-/// live-object. Seeding bit0=1 routes the governor to the helper branch so the session drive advances
-/// PAST the NULL-controller deref — SH248e/SH259 once-flag pattern at a NEW cell. Default-inert:
-/// fires only under the env; idempotent (ORs bit0 only).
+/// SH269+SH406 (opt-in JIT_ROUTEB_APPSART_GOVFLAG): seed fixed-.bss flag [0x106a64da0] bit0=1
+/// (6a64000+#3488, same region as SH239 0x106a64d70) at either reach that reads it, routing the
+/// caller's cbz to the preload-overrides helper instead of a NULL app-DM controller deref.
+/// SH269: governor SendAppEvent reach 0x2ea0b9c (fault=0x0, x21=governor; flag clear -> ldr
+/// x0,[x21,#1032]; ldr x8,[x0]; flag set -> mov x0,x21; bl 0x2ea3a84). SH406 (MAIN arm, SH405):
+/// the StartAppWithParams continuation 0x1025f501c reads the SAME flag (ldrb w8,[x9,#3488]
+/// @0x25f502c; cbz @0x25f503c); flag clear -> ldr x0,[x19,#1032] (NULL app-DM controller) ->
+/// ldr x8,[x0] fault=0x0 (measured); flag set -> mov x0,x19; bl 0x2ea3a84. Idempotent (ORs bit0),
+/// default-inert (fires only under the env).
 fn routeb_govflag_seed_guard(_state: *mut CpuState, pc: u64) {
     if std::env::var_os("JIT_ROUTEB_APPSART_GOVFLAG").is_none() {
         return;
     }
-    if !(0x102ea0b60..0x102ea0bd0).contains(&pc) {
+    let in_gov = (0x102ea0b60..0x102ea0bd0).contains(&pc);
+    let in_appstart_cont = (0x1025f5008..0x1025f5060).contains(&pc);
+    if !(in_gov || in_appstart_cont) {
         return;
     }
     const FLAG: u64 = 0x106a64da0; // governor predicate byte (6a64000+#3488)
@@ -2086,20 +2078,15 @@ fn routeb_doinit_dyn_trace_guard(state: *mut CpuState, pc: u64) {
     }
 }
 
-/// SH388 (opt-in JIT_ROUTEB_DMSVC_GETTER=1): READ-ONLY reachability probe of the SEP-15
-/// re-attack cone door that SH387 byte-anchored — DataModelServices current-DM accessor
-/// 0x2dbcc10 (the GETTER leaf `adrp x0,6391000; add #0x908; ret` -> returns &current-DM
-/// holder 0x106391908) and its real BODY 0x2dbcc1c (`sub sp,#0x40`, canary got 0x67d16f0,
-/// dispatches bl 0x24e3e98 / 0x2417d58 = persistence-family). SH387 pinned the BYTES but
-/// never MEASURED whether the engine ever EXECUTES these on a headless run — the exact
-/// "is the cone door live or dead" gap the operator's SEP-15 directive ("re-examine whether
-/// the declared 'not seedable' wall can be crossed ... rather than a static seed") names.
-/// This probe fires at block ENTRY of BOTH the getter (0x102dbcc10) and the body
-/// (0x102dbcc1c) on the live ladder, and reads back the current-DM holder [0x106391908]
-/// (does a planted SH180/181 manufactured DM survive to be consumed?) + the app-data-model
-/// counter [0x106dca0e88] (the EXECUTE-DO-INIT-GATES "app-data-model counter advanced"
-/// marker). ZERO guest mutation — pure observability, one readout per pc per run. If the
-/// getter/body fire 0x on the full env, the cone door is measured DEAD headlessly (clean
+/// SH388 (opt-in JIT_ROUTEB_DMSVC_GETTER=1): READ-ONLY reachability probe of the SEP-15 re-attack
+/// cone door that SH387 byte-anchored — DataModelServices current-DM accessor 0x2dbcc10 (GETTER
+/// leaf returns &holder 0x106391908) and real BODY 0x2dbcc1c (sub sp,#0x40, canary 0x67d16f0,
+/// dispatch bl 0x24e3e98/0x2417d58 = persistence-family). SH387 pinned the BYTES but never MEASURED
+/// whether the engine EXECUTES them headlessly — the "cone door live or dead" gap the SEP-15
+/// directive names. Fires at block ENTRY of both pcs on the live ladder + reads current-DM holder
+/// [0x106391908] (does a planted SH180/181 DM survive?) + app-data-model counter [0x106dca0e88].
+/// ZERO guest mutation; one readout per pc per run. If they fire 0x, the cone door is measured
+/// DEAD headlessly (clean
 /// closure); if they fire, the planted-DM-in-holder premise gets direct runtime evidence.
 fn routeb_dmsvc_getter_probe(state: *mut CpuState, pc: u64) {
     if std::env::var_os("JIT_ROUTEB_DMSVC_GETTER").is_none() {
@@ -2146,23 +2133,15 @@ fn routeb_dmsvc_getter_probe(state: *mut CpuState, pc: u64) {
     );
 }
 
-/// SH381 (opt-in JIT_ROUTEB_DOINIT_ONCELAMBDA=1): READ-ONLY probe of the do-init
-/// once-lambda's DM-constructor RETURN at the exact store — closes the address
-/// reconciliation gap that SH361/311 left open. do-init 0x2206c40 (once-path,
-/// file 0x2206d10): `adrp x23,6a68000; add x0,#0x410` read once-guard; then
-/// `bl 0x284ce54`(acquire-once) -> `bl 0x2173b3c`(construct) @0x2206d6c ->
-/// `str x0,[x23,#1032]` @0x2206d74 stores the ctor return into the once-SLOT
-/// [0x106a68408] (0x6a68000 + 1032 == 0x408). ALL harness probes read a
-/// DIFFERENT cell — DM-root [0x106a68818] (=+0x818) — so whether the once-lambda
-/// actually produces a real host-heap/guest object (DM forward) or only the
-/// 0x400000b sentinel (service-handle) was never directly measured at the store
-/// on the FULL ladder (SH311 logged 0x400000b only on the skip-appstart env and
-/// only after the run, never the live ctor return). This guard fires at the
-/// block-entry pc 0x102206d70 (the `adrp x23` just AFTER the ctor bl, x0 =
-/// ctor return still live) and logs x0 + the current contents of BOTH cells
-/// [0x106a68408] and [0x106a68818], WITHOUT mutating guest state. Classifies:
-/// x0 in guest/heap space (>=0x100000000, top-16-bits 0) = real constructed obj;
-/// x0 small/0x400000b = sentinel/handle (once-path builds no live DM). Fires
+/// SH381 (opt-in JIT_ROUTEB_DOINIT_ONCELAMBDA=1): READ-ONLY probe of the do-init once-lambda's
+/// DM-constructor RETURN at the exact store. do-init 0x2206c40 (once-path, file 0x2206d10):
+/// adrp x23,6a68000; add #0x410 read once-guard; bl 0x284ce54(acquire-once) -> bl 0x2173b3c
+/// (construct) @0x2206d6c -> str x0,[x23,#1032] @0x2206d74 stores ctor return into once-SLOT
+/// [0x106a68408]. Harness probes read a DIFFERENT cell (DM-root [0x106a68818]=+0x818), so whether
+/// the once-lambda builds a real object or only the 0x400000b sentinel was never measured live.
+/// Guard fires at block-entry pc 0x102206d70 (after the ctor bl, x0 live) + logs x0 + BOTH cells
+/// [0x106a68408]/[0x106a68818], no guest mutation. Classifies: x0>=0x100000000 real obj; small/
+/// 0x400000b = sentinel (once-path builds no live DM). Fires
 /// once, deduped, default-inert.
 fn routeb_doinit_oncelambda_probe(state: *mut CpuState, pc: u64) {
     if std::env::var_os("JIT_ROUTEB_DOINIT_ONCELAMBDA").is_none() {
@@ -2194,21 +2173,17 @@ fn routeb_doinit_oncelambda_probe(state: *mut CpuState, pc: u64) {
     );
 }
 
-/// SH362 (opt-in JIT_ROUTEB_DISPATCH_BODY_TRACE=1): READ-ONLY body trace of the do-init
-/// MAIN-branch DM/app-shell dispatch target itself — the function at 0x258b5d8 (guest
-/// 0x10258b5d8 = nativeAppBridgeV2StartAppWithParams+0x494) that SH361's dynamic trace PROVED
-/// the `br x1` @0x2206e24 lands on. SH361 measured the dispatch LANDS here; nobody measured
-/// whether this landed body actually EXECUTES headlessly or WHICH of its two divergent init
-/// paths it takes. The body: `sub sp,#0x170` prologue @0x258b5d8, `adrp x20,67d1000 -> ldr
-/// canary`, `mov x19,x0` (obj) — then `adrp x8,6a64000; ldrb w8,[x8,#3488]` @0x258b604 reads
-/// flag byte [0x106a64da0], `cbz w8,0x258b640` @0x258b608: nonzero -> path A @0x258b60c (bl
-/// nativePreloadFlagOverrides 0x2dae640 -> blr vt[+144] -> bl 0x2366694 -> bl
-/// nativePreloadFlagOverrides -> blr vt[+296]); zero -> path B @0x258b640 (bl 0x2367270 ->
-/// blr vt[+144] -> bl 0x2366694 -> bl 0x2367270 -> blr vt[+296]). Both converge @0x258b670 ->
-/// bl 0x23c19e0 then stack-canary check -> `ret`. The guard OBSERVES the inbound args x0/x1/x2,
-/// the flag byte [0x106a64da0] (the cbz @0x258b608 decision) + the obj vt + vt[+144]/vt[+296]
-/// (the two blr dispatch slots) and reports which path the ladder actually takes, WITHOUT
-/// mutating guest state. Fires once per run at the true block entry pc 0x10258b5d8.
+/// SH362 (opt-in JIT_ROUTEB_DISPATCH_BODY_TRACE=1): READ-ONLY body trace of the do-init MAIN-branch
+/// DM/app-shell dispatch target — fn 0x258b5d8 (guest 0x10258b5d8 = StartAppWithParams+0x494) that
+/// SH361 proved `br x1` @0x2206e24 lands on; nobody measured whether this landed body EXECUTES or
+/// WHICH of its two divergent paths it takes. Body: `sub sp,#0x170` @0x258b5d8, adrp 67d1000 canary,
+/// mov x19,x0 (obj); adrp 6a64000; ldrb w8,[x8,#3488] @0x258b604 reads flag [0x106a64da0],
+/// cbz w8,0x258b640 @0x258b608: nonzero->path A @0x258b60c (bl nativePreloadFlagOverrides 0x2dae640
+/// -> blr vt[+144] -> bl 0x2366694 -> nativePreloadFlagOverrides -> blr vt[+296]); zero->path B
+/// @0x258b640 (bl 0x2367270 -> blr vt[+144] -> bl 0x2366694 -> bl 0x2367270 -> blr vt[+296]).
+/// Both converge @0x258b670 -> bl 0x23c19e0 + canary check -> ret. Guard OBSERVES x0/x1/x2 + the flag
+/// byte + obj vt + vt[+144]/vt[+296] and reports which path, WITHOUT mutating guest. Fires once at
+/// block-entry pc 0x10258b5d8.
 fn routeb_startapp_dispatch_body_guard(state: *mut CpuState, pc: u64) {
     if std::env::var_os("JIT_ROUTEB_DISPATCH_BODY_TRACE").is_none() {
         return;
@@ -3793,21 +3768,17 @@ fn routeb_dm_instance_guard(_state: *mut CpuState, pc: u64) {
     });
 }
 
-/// SH191 (Route-B service-node attach): after SH190e self-constructs a real RBX::PlayerGui
-/// INSTANCE (engine-authored, [obj+0]=0x106648950), make it a real PlayerGui SERVICE NODE on the
-/// genuine DM's [dm+0x68] list ([node+0x18]==0x87e), then drive the engine's OWN getService walker
-/// 0x105e09bc8 to RESOLVE "PlayerGui" -> classid and MATERIALIZE it into its out-pair. Closes the
-/// SH190e gap ("PlayerGui not a service NODE on [dm+0x68]") USING the engine-authored instance (not
-/// a fabricated one): [node+8]= the captured PlayerGui obj, so materializer 0x2377600 reads
-/// {instance,refcount} at [node+8]/[node+16] and returns the SELF-constructed instance. Host work =
-/// link the thin node only; instance+resolution are engine.
-/// WALKER ABI (0x5e09bc8): x0=dm, x1=&name (libc++ std::string), x8=&out (16-byte {item,refcount}).
-/// Resolves name->classid via registry 0x106dca0e70 (resolver 0x2373cec), walks [dm+0x68] (node[+0x18]
-/// ==classid, [node+0x68]=next), on match materializer 0x2377600 copies [node+8]/[node+16].
-/// NAME decode (0x5e09bfc): `ldrb w8,[x1]; lsr w8,#1` — byte0=(cap|bit0=long); long => [x1+16].
-/// Fabricate long-form name {__cap_=0x13 (long), __size_=9, __data_=&"PlayerGui"} -> key ptr+len=9 ->
-/// resolver matches engine's own 9-char "PlayerGui" key. default-inert (JIT_ROUTEB_DM_SERVICE_NODE=1);
-/// node thin+host-leaked; gated on genuinely constructed instance (vptr 0x106648950).
+/// SH191 (Route-B service-node attach): after SH190e self-constructs a real RBX::PlayerGui INSTANCE
+/// (engine-authored, [obj+0]=0x106648950), make it a real PlayerGui SERVICE NODE on the genuine DM's
+/// [dm+0x68] list ([node+0x18]==0x87e), then drive engine getService walker 0x105e09bc8 to RESOLVE
+/// "PlayerGui"->classid + MATERIALIZE into out-pair. Closes SH190e gap USING the engine-authored
+/// instance (not fabricated): [node+8]=the PlayerGui obj, so materializer 0x2377600 reads
+/// {instance,refcount} at [node+8]/[node+16]. Host work = link the thin node only.
+/// WALKER ABI (0x5e09bc8): x0=dm, x1=&name(std::string), x8=&out; resolve via registry 0x106dca0e70
+/// (0x2373cec), walk [dm+0x68] (node[+0x18]==classid, [node+0x68]=next), materialize [node+8]/[16].
+/// NAME (0x5e09bfc): byte0=(cap|bit0=long); long => [x1+16]. Fabricate long-form
+/// {__cap_=0x13,__size_=9,__data_=&"PlayerGui"} -> resolver matches engine's 9-char key.
+/// default-inert (JIT_ROUTEB_DM_SERVICE_NODE=1); node thin+host-leaked; gated on genuine instance.
 fn routeb_dm_service_resolve_guard(_state: *mut CpuState, pc: u64) {
     if std::env::var_os("JIT_ROUTEB_DM_SERVICE_NODE").is_none() {
         return;
@@ -17775,6 +17746,36 @@ mod fp16_and_fabd_fccmp_exec {
             eprintln!("[abi] sh405 MAIN-arm app-start call chain beyond the do-init dispatch pinned (persistence-lane is arm-relative: fall-through SH404 + MAIN SH405)");
         } else {
             eprintln!("sh405 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
+    fn sh406_govflag_seed_covers_appstart_main_arm_continuation() {
+        // SH406: SH269's GOVFLAG guard only windowed the governor pcs
+        // (0x102ea0b60..0x102ea0bd0), but the SH405 MAIN arm bypasses the governor and the
+        // StartAppWithParams continuation at 0x1025f501c reads the SAME flag byte
+        // `ldrb w8,[x9,#3488]` @0x25f502c. When the flag was never seeded (0) the cbz @0x25f503c
+        // falls to `ldr x0,[x19,#1032]` (NULL app-DM controller) -> `ldr x8,[x0]` SIGSEGV
+        // fault=0x0 (measured guestpc 0x1025f501c on the SH405 MAIN arm). Byte-pin the flag-read
+        // + cbz + both branches (helper 0x2ea3a84 routing real x19 vs the NULL-controller deref).
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let word_at = |vaddr: u64| -> u32 {
+                let off = (vaddr & 0xffff_ffff) as usize;
+                u32::from_le_bytes([img[off], img[off + 1], img[off + 2], img[off + 3]])
+            };
+            // app-start continuation: ldrb w8,[x9,#3488] @0x25f502c (adrp 6a64000 = 0x106a64da0),
+            // cbz w8,0x25f504c @0x25f503c; helper branch mov x0,x19; bl 0x2ea3a84 @0x25f5040;
+            // NULL-controller deref ldr x0,[x19,#1032] @0x25f504c + ldr x8,[x0] @0x25f5050.
+            assert_eq!(word_at(0x1025f502c), 0x3976_8128, "sh406 app-start flag read ldrb w8,[x9,#3488] (=0x106a64da0)");
+            assert_eq!(word_at(0x1025f503c), 0x3400_0088, "sh406 cbz w8,0x25f504c (imm19=4 words=+0x10, Rt=w8) -> NULL-controller path");
+            assert_eq!(word_at(0x1025f504c), 0xf942_0660, "sh406 ldr x0,[x19,#1032] (NULL app-DM controller)");
+            assert_eq!(word_at(0x1025f5050), 0xf940_0008, "sh406 ldr x8,[x0] (the fault=0x0 deref)");
+            assert_eq!(word_at(0x1025f5040), 0xaa13_03e0, "sh406 helper branch mov x0,x19 (real app obj)");
+            eprintln!("[abi] sh406 app-start MAIN-arm flag read + NULL-controller deref pinned (flag 0x106a64da0 gates a NEW reach the governor-window GOVFLAG seed missed)");
+        } else {
+            eprintln!("sh406 real-image guard: no real libroblox.so, skipping anchors");
         }
     }
 
