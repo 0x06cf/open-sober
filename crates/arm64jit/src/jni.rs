@@ -646,6 +646,10 @@ fn auto_value_string_getter(name: &[u8]) -> Option<&'static [u8]> {
         // text/layout. Returning "en" gives the UI a real (non-empty) default.
         b"getLanguage" => Some(b"en"),
         b"getNetworkType" => Some(b"WIFI"),
+        // DeviceParams.displayResolution (recon v2 shape) — "1280x720" so any
+        // UI that derives a scale from the resolution string sees a real one,
+        // not empty. Symmetric with getNetworkType/getCountry above.
+        b"getDisplayResolution" => Some(b"1280x720"),
         b"getAppVersion" => Some(b""),
         // PlatformParams.assetFolderPath → the host assets root (SH57 assets
         // extraction). A real path here lets the engine's content loader find
@@ -956,6 +960,11 @@ extern "C" fn jni_get_int_field(
         Some(b"screenWidthDp") => 1280,
         Some(b"screenHeightDp") => 720,
         Some(b"orientation") => 2, // LANDSCAPE
+        // DeviceParams.displayPhysical{Width,Height}Pixels (recon v2 shape) — the
+        // real physical pixel size, matching getDisplayResolution. Some DeviceParams
+        // surfaces expose physical pixels as int fields rather than the string.
+        Some(b"displayPhysicalWidthPixels") => 1280,
+        Some(b"displayPhysicalHeightPixels") => 720,
         _ => 0,
     }
 }
@@ -1851,6 +1860,7 @@ mod tests {
                     b"getCountry" => assert_eq!(len, 2, "getCountry \"US\""),
                     b"getLanguage" => assert_eq!(len, 2, "getLanguage \"en\""),
                     b"getNetworkType" => assert_eq!(len, 4, "getNetworkType \"WIFI\""),
+                    b"getDisplayResolution" => assert_eq!(len, 7, "getDisplayResolution \"1280x720\""),
                     _ => assert_eq!(len, 0, "{} defaults to empty", String::from_utf8_lossy(name)),
                 }
             }
@@ -2213,6 +2223,8 @@ mod tests {
             assert_eq!(gif(env, 0x999, field_id(b"screenWidthDp"), 0, 0, 0, 0, 0), 1280);
             assert_eq!(gif(env, 0x999, field_id(b"screenHeightDp"), 0, 0, 0, 0, 0), 720);
             assert_eq!(gif(env, 0x999, field_id(b"orientation"), 0, 0, 0, 0, 0), 2);
+            assert_eq!(gif(env, 0x999, field_id(b"displayPhysicalWidthPixels"), 0, 0, 0, 0, 0), 1280);
+            assert_eq!(gif(env, 0x999, field_id(b"displayPhysicalHeightPixels"), 0, 0, 0, 0, 0), 720);
             // Unknown field -> honest 0.
             assert_eq!(gif(env, 0x999, field_id(b"someField"), 0, 0, 0, 0, 0), 0);
 
