@@ -56,6 +56,20 @@ site (nativeGameGlobalInit body, canary slot zeroed in do-init once-path) and
 provides the instrument to correlate its writer next. Route-B live-DM structural
 gate UNCHANGED. recon-v3 deliverables unchanged-green.
 
+## Writer-hunt is a re-tread of the Route-B do-init wall (measured)
+The naive NEXT ("arm a narrow store-watch to name the zeroing writer") is a
+RE-TREAD: disassembling the four callees between the canary store (0x2206c70) and
+compare (0x2206cf4) — 0x6201bd4 (FMOD), 0x220671c (once-lambda gate), 0x2206db8
+(once-lambda do-init dispatch), 0x221942c (16-byte struct touch) — shows ALL have
+small (<0xc0) frames and write only to their own locals; none directly writes the
+caller's canary. The zeroing lands during the once-lambda do-init dispatch chain
+(deeper callees), which SH404/405/407 already measured running deep into the
+app-shell ctor band and draining into the standing SH285/LSM persistence lane.
+So the canary-zero is a SYMPTOM of the do-init once-path construction (the Route-B
+wall), not a distinct seedable store; fix the once-path / persistence lane and the
+canary-zero resolves with it. Do NOT spend a cycle on a narrow store-watch for it
+(that is re-driving the measured do-init wall from one more angle).
+
 ## Files
 - docs/frontier-sh420-stackchk-fail-shim-names-wall.md
 - runs/capture_sh420_stackchk_fail.sh
