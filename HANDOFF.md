@@ -1,5 +1,16 @@
 # Open Sober — Agent Handoff
 
+## SH410 (Sep 19, 2026, hermes-worker): COMPLETE the fuller NativeHelper lifecycle surface — drive the login-vs-home gate `onDidLogInReceived` (VOID-with-String, 0x50a545) with a real login payload, steering a fresh headless session to its OWN login screen; the FULL 5-milestone lifecycle now fires through the engine's own registered slot-61 shim
+Single-agent (cone suppressed). Workspace green (cargo test --workspace EXIT 0;
+arm64jit lib 457/0). Production code only in jni.rs + session.rs (both far under
+the 1MiB hooks); jit.rs/elfjit.rs untouched. Real-binary MEASURED on libroblox.so
+(SH400 capture env, EXIT 124, 0 crash). Commit 5738301.
+- jni.rs: +`MH_LOGIN_RECEIVED`/`MH_LOGGED_IN` observables + getters; `jni_call_void_method` now reads the a3 login-payload jstring on onDidLogInReceived and sets both (empty payload -> NOT logged in -> LOGIN; non-empty -> remembered sign-in -> HOME); +`fire_nativehelper_login_payload(payload)`.
+- session.rs: `drive_nativehelper_lifecycle()` (wired after the surface atom, recon-routeB step-2 position) fires onDidLogInReceived with an EMPTY payload; hermetic asserts login_received AND not logged_in.
+- MEASURED: `onDidLogInReceived (0B payload) -> logged_in=false; login screen`; MH_LOGIN_RECEIVED=true; substrate 11/16 Ok; AppBridgeV2 genuine vt 0x1063a3410; EXIT 124, 0 crash. The FULL five `gameActivity_*` milestones now fire in order: onFlagsLoaded -> onEngineInitialized -> onAppReady -> onDidLogInReceived -> (onGameLoaded stays false, honest).
+- Honest: NOT a DM (DM-root [0x106a68818]=0, no make_shared); does not boot Lua by itself (a completed do-init still owns the live DM, SH405). This is the SEP-18 BUILD-THE-RUNTIME host-side LOGIN-STATE surface — it makes the login-vs-home discriminator read a real host signal (the payload) steering to the operator's FIRST screen ("login renders"). Route-B live-DM structural gate UNCHANGED. No re-treads.
+- Files: docs/frontier-sh410-loginstate-gate.md; log /home/hermes-worker/runs/sh410-baseline-login.txt (outside repo).
+
 ## SH409 (Sep 21, 2026, hermes-worker): the SH400 substrate's missing onAppReady host surface — drive the NativeHelper lifecycle milestones (onFlagsLoaded -> onEngineInitialized -> onAppReady) through the engine's own registered JNI CallVoidMethod shim, in the recon-routeB step-2 position (after surface, before SendAppEventOnAppReady); MEASURED on real libroblox.so MH_APP_READY now latches (was always 0)
 Single-agent (cone suppressed). The SH407/408 frontier "Next" named the one
 genuinely-open surface: "REAL session-compat runtime (SH400 substrate + a real
