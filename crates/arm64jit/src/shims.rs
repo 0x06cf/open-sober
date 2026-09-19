@@ -1741,10 +1741,132 @@ pub fn register_cxx_shims() -> usize {
     shims.len()
 }
 
+/// SH4xx-next instrument: hook `__stack_chk_fail` so the GENUINE canary-`
+/// stack-smash wall (nativeGameGlobalInit / app-shell ctor, SH97/98) can be
+/// pinned to its exact failing guest frame. The store-watch is inadequate here
+/// (it perturbs scheduling via a per-store host-call AND filters to host-ptr
+/// values only, so a canary clobber by any other value class is invisible).
+/// `__stack_chk_fail` fires exactly ONCE at the check failure -- zero
+/// scheduling perturbation -- and this shim reads the failing frame from the
+/// live guest thread's CpuState (via guest_state_of_host: this hostcall runs on
+/// the guest thread, so gettid() maps to its state), logs acting-vs-expected
+/// canary + the guest return address (names the function), then forwards to the
+/// real libc `__stack_chk_fail` so the abort still fires (behavior preserved).
+/// Default-inert: only logs when JIT_STACKCHK_DUMP=1; the forward is always
+/// taken so the crash outcome is byte-identical whether or not the env is set.
+static STACKCHK_TEST_OVERRIDE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static STACKCHK_TEST_MUTE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Test-only override: pin the dump flag + mute the forward-abort so a hermetic
+/// can exercise the gating and dump path safely (no live guest state, no abort).
+#[doc(hidden)]
+pub fn set_stackchk_fail_test(on: bool) {
+    use std::sync::atomic::Ordering;
+    STACKCHK_TEST_OVERRIDE.store(true, Ordering::Relaxed);
+    STACKCHK_TEST_MUTE.store(on, Ordering::Relaxed);
+}
+/// Expose the current test-mute state (a hermetic asserts it gated the forward).
+#[doc(hidden)]
+pub fn stackchk_fail_test_muted() -> bool {
+    STACKCHK_TEST_MUTE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+extern "C" fn stack_chk_fail_dump(
+    _a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    use std::sync::atomic::Ordering;
+    // Test override is LIVE (checked each call) so a hermetic can toggle it
+    // regardless of prior calls; the production env is cached once (immutable).
+    let dump = if STACKCHK_TEST_OVERRIDE.load(Ordering::Relaxed) {
+        STACKCHK_TEST_MUTE.load(Ordering::Relaxed)
+    } else {
+        *DUMP.get_or_init(|| {
+            std::env::var("JIT_STACKCHK_DUMP").ok().as_deref() == Some("1")
+        })
+    };
+    if dump {
+        // PRIMARY datum: the guest return address of the `bl __stack_chk_fail`
+        // that this hostcall implements. The dispatcher sets CURRENT_GUEST_PC
+        // (thread-local, this hostcall runs on the guest thread) to the guest
+        // address right AFTER the `bl`, i.e. inside the failing function's
+        // epilogue — this names the exact guest function whose canary check
+        // failed, independent of the guest frame layout.
+        let gp = crate::jit::current_guest_pc();
+        // Secondary: try to read the failing frame from the live guest state.
+        // Best-effort — only trust x29 when it looks like a real frame pointer.
+        let tid = unsafe { libc::gettid() };
+        let stp = crate::jit::guest_state_of_host(tid as i64);
+        let (mut x29, mut x30, mut sp, mut slot, mut slot8, mut expect) =
+            (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        let domain = |p: u64| p != 0 && p >= 0x100000000 && (p >> 48) as u16 != 0xffff;
+        if stp != 0 {
+            // SAFETY: this hostcall runs on the guest thread (the dispatcher
+            // invoked it from that thread's jit_run); the state is ours and
+            // quiescent while we execute. Read-only integer regs + canary.
+            let st = unsafe { &*(stp as *const crate::jit::CpuState) };
+            x29 = st.x[29];
+            x30 = st.x[30];
+            sp = st.x[31];
+            if domain(x29) {
+                let canary_slot = x29.wrapping_sub(16);
+                let slot8_addr = x29.wrapping_sub(8);
+                unsafe {
+                    if domain(canary_slot) {
+                        slot = std::ptr::read_unaligned(canary_slot as *const u64);
+                    }
+                    if domain(slot8_addr) {
+                        slot8 = std::ptr::read_unaligned(slot8_addr as *const u64);
+                    }
+                }
+            }
+            // Expected canary: the guard GOT slot 0x67d16f0 holds the ADDRESS of
+            // the canary var; the guest reads the bytes via `ldr x8,[xN]`.
+            unsafe {
+                let guard_addr = std::ptr::read_unaligned(0x1067d16f0u64 as *const u64);
+                if domain(guard_addr) {
+                    expect = std::ptr::read_unaligned(guard_addr as *const u64);
+                }
+            }
+            eprintln!(
+                "[stack_chk_fail] __guest_pc={gp:#x} tid={tid} state=x29={x29:#x} x30={x30:#x} \
+                 sp={sp:#x} canary@-16={slot:#x} @-8={slot8:#x} expected={expect:#x}"
+            );
+        } else {
+            eprintln!(
+                "[stack_chk_fail] __guest_pc={gp:#x} tid={tid} (no live guest state)"
+            );
+        }
+    }
+    // Forward to the real libc `__stack_chk_fail` (which prints the standard
+    // "stack smashing detected" and aborts), preserving the exact crash.
+    // Test context (override armed): never abort — the hermetic only checks
+    // gating/value-classification. Production (override unarmed) always aborts
+    // so behavior is never silently swallowed.
+    if STACKCHK_TEST_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        return 0;
+    }
+    static REAL: std::sync::OnceLock<Option<unsafe extern "C" fn()>> = std::sync::OnceLock::new();
+    let real = REAL.get_or_init(|| {
+        let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, b"__stack_chk_fail\0".as_ptr() as *const _) };
+        unsafe { std::mem::transmute::<*mut libc::c_void, Option<unsafe extern "C" fn()>>(p) }
+    });
+    if let Some(f) = *real {
+        unsafe { f() };
+    }
+    // Unreachable for the real libc symbol (it aborts); safety net for hosts that
+    // can't resolve it: abort directly so behavior is never silently swallowed.
+    unsafe { libc::abort() }
+}
+
 /// Register all host-side bionic shims; returns the number registered.
 pub fn register_shims() -> usize {
     let shims: &[(&[u8], HostCall)] = &[
         (b"__errno\0", bionic_errno),
+        // SH4xx-next: hook __stack_chk_fail to dump the genuine canary wall's
+        // failing frame (default-inert JIT_STACKCHK_DUMP; always forwards).
+        (b"__stack_chk_fail\0", stack_chk_fail_dump),
         (b"__strlen_chk\0", bionic_strlen_chk),
         // SH97: route `strlen` through the mapped-domain-guarded shim (register_named
         // takes precedence over the generic dlsym binding), so a garbage guest C-string
@@ -1950,6 +2072,32 @@ mod tests {
     #[test]
     fn bionic_errno_returns_valid_pointer() {
         assert!(crate::shims::bionic_errno(0, 0, 0, 0, 0, 0, 0, 0) != 0);
+    }
+
+    /// SH4xx-next: the `__stack_chk_fail` host shim — a default-inert, one-shot
+    /// instrument that names the GENUINE canary-wall failing guest frame (the
+    /// store-watch perturbs scheduling AND filters to host-ptr values only, so
+    /// it cannot catch the real clobber). The shim: (1) is registered by the
+    /// `__stack_chk_fail` import name (register_named precedence over dlsym),
+    /// (2) is default-inert (dump off by default, still forwards), (3) when it
+    /// runs it reads the dispatcher's CURRENT_GUEST_PC (the guest return addr,
+    /// which names the failing function) and (in production) forwards to the
+    /// real libc fail so the abort is preserved. Hermetic: pin the test override
+    /// (dump ON + forward muted) and assert the value-classification path
+    /// returns safely without a live image or an abort.
+    #[test]
+    fn stack_chk_fail_dump_returns_safely_under_test_override() {
+        use std::sync::atomic::Ordering;
+        // Test override: dump ON + forward muted -> must return 0, no abort.
+        set_stackchk_fail_test(true);
+        assert!(stackchk_fail_test_muted(), "test-mute must gate the forward");
+        let r = stack_chk_fail_dump(1, 2, 3, 4, 5, 6, 7, 8);
+        assert_eq!(r, 0, "override path must return without aborting");
+        assert!(STACKCHK_TEST_OVERRIDE.load(Ordering::Relaxed));
+        // Cleanup: disarm so later prod-path code (and other tests) see the
+        // default gate, not a stale test override.
+        STACKCHK_TEST_OVERRIDE.store(false, Ordering::Relaxed);
+        STACKCHK_TEST_MUTE.store(false, Ordering::Relaxed);
     }
 
     /// SH97-harden: the guarded string-op shims must NOT deref a garbage pointer
