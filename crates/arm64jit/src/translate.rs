@@ -9652,4 +9652,77 @@ mod tests {
         assert_eq!(abs.windows(3).filter(|w| *w == [0x48, 0x63, 0xc0]).count(), 4, "4-lane abs has 4 movsxd");
         assert_eq!(abs.windows(3).filter(|w| *w == [0x48, 0xf7, 0xd8]).count(), 0, "abs never neg rax");
     }
+
+    #[test]
+    fn sh449_cmpzero_eq_2s_sete_no_signextend_allones_store32() {
+        // cmeq V1.2s V2.2s,#0 (rd=1 rn=2 esize=4 q=false cond=0): per-lane a
+        // 32-bit zero-extending load (8b 83), test rax (48 85 c0), sete al
+        // (0f 94 c0), movzx (0f b6 c0), neg rax (48 f7 d8) -> 0 or all-ones,
+        // 32-bit store (89 83). eq (cond 0) is UNSIGNED — no movsxd. Full-buffer.
+        let b = tr_bytes(Inst::SimdCmpZero { rd: 1, rn: 2, esize: 4, q: false, cond: 0 });
+        assert_eq!(b, vec![
+            0x8b, 0x83, 0x30, 0x01, 0x00, 0x00, // mov eax,[0x130] lane0
+            0x48, 0x85, 0xc0,                   // test rax,rax
+            0x0f, 0x94, 0xc0,                   // sete al
+            0x0f, 0xb6, 0xc0,                   // movzx eax,al
+            0x48, 0xf7, 0xd8,                   // neg rax (0 or all-ones)
+            0x89, 0x83, 0x20, 0x01, 0x00, 0x00, // mov [0x120],eax
+            0x8b, 0x83, 0x34, 0x01, 0x00, 0x00,
+            0x48, 0x85, 0xc0,
+            0x0f, 0x94, 0xc0,
+            0x0f, 0xb6, 0xc0,
+            0x48, 0xf7, 0xd8,
+            0x89, 0x83, 0x24, 0x01, 0x00, 0x00,
+        ]);
+        assert!(!b.windows(3).any(|w| w == [0x48, 0x63, 0xc0]), "cmeq (cond 0) is unsigned — must not movsxd");
+    }
+
+    #[test]
+    fn sh449_cmpzero_cond_cc_byte_is_the_semantic() {
+        // The setcc opcode byte IS the semantic: cond 0=eq 0f 94, 1=gt 0f 9f,
+        // 2=ge 0f 9d, 3=lt 0f 9c, 4=le 0f 9e. A wrong cond picks the wrong
+        // comparison, silently (a >= 0 becomes a > 0). Signed conds (1-4)
+        // MUST movsxd (48 63 c0) the lane; eq does not.
+        let cc_for = |cond| {
+            let b = tr_bytes(Inst::SimdCmpZero { rd: 1, rn: 2, esize: 4, q: false, cond });
+            let i = b.windows(2).position(|w| w == [0x0f, 0x94]).or_else(|| b.windows(2).position(|w| w == [0x0f, 0x9f]))
+                .or_else(|| b.windows(2).position(|w| w == [0x0f, 0x9d])).or_else(|| b.windows(2).position(|w| w == [0x0f, 0x9c]))
+                .or_else(|| b.windows(2).position(|w| w == [0x0f, 0x9e])).unwrap();
+            (b[i], b[i + 1])
+        };
+        assert_eq!(cc_for(0), (0x0f, 0x94), "eq=sete");
+        assert_eq!(cc_for(1), (0x0f, 0x9f), "gt=setg");
+        assert_eq!(cc_for(2), (0x0f, 0x9d), "ge=setge");
+        assert_eq!(cc_for(3), (0x0f, 0x9c), "lt=setl");
+        assert_eq!(cc_for(4), (0x0f, 0x9e), "le=setle");
+        // signed conds sign-extend the 32-bit lane.
+        assert!(tr_bytes(Inst::SimdCmpZero { rd: 1, rn: 2, esize: 4, q: false, cond: 4 })
+            .windows(3).any(|w| w == [0x48, 0x63, 0xc0]), "le (signed) must movsxd");
+    }
+
+    #[test]
+    fn sh449_cmpzero_lt_1b_8_lanes_signextend_byte_store() {
+        // cmlt V1.8b V2.8b,#0 (esize=1 q=false cond=3): 8 lanes; each loads via
+        // movsx_byte_mem (48 0f be — signed), test, setl (0f 9c), movzx, neg,
+        // byte store (88 83), lanes advance +1 (0x130..0x137, 0x120..0x127).
+        let b = tr_bytes(Inst::SimdCmpZero { rd: 1, rn: 2, esize: 1, q: false, cond: 3 });
+        assert!(b.windows(7).any(|w| w == [0x48, 0x0f, 0xbe, 0x83, 0x30, 0x01, 0x00]), "lane0 signed byte load (48 0f be)");
+        assert!(b.windows(7).any(|w| w == [0x48, 0x0f, 0xbe, 0x83, 0x37, 0x01, 0x00]), "lane7 signed byte load at +7");
+        assert!(b.windows(6).any(|w| w == [0x88, 0x83, 0x27, 0x01, 0x00, 0x00]), "lane7 byte store at 0x127");
+        assert_eq!(b.windows(3).filter(|w| *w == [0x0f, 0x9c, 0xc0]).count(), 8, "8 lanes, 8 setl");
+    }
+
+    #[test]
+    fn sh449_cmpzero_eq_2d_q_64bit_load_store_and_unsigned() {
+        // cmeq V1.2d V2.2d,#0 (esize=8 q=true cond=0): full 64-bit load
+        // (48 8b 83) + test + sete + neg + 64-bit store (48 89 83), 2 lanes at
+        // +8. eq never sign-extends (64-bit load is already the full value).
+        let b = tr_bytes(Inst::SimdCmpZero { rd: 1, rn: 2, esize: 8, q: true, cond: 0 });
+        assert!(b.windows(7).any(|w| w == [0x48, 0x8b, 0x83, 0x30, 0x01, 0x00, 0x00]), "2d 64-bit load (48 8b 83)");
+        assert!(b.windows(7).any(|w| w == [0x48, 0x89, 0x83, 0x28, 0x01, 0x00, 0x00]), "2d 64-bit store lane1 at +8 0x128");
+        assert_eq!(b.windows(3).filter(|w| *w == [0x0f, 0x94, 0xc0]).count(), 2, "2 lanes, 2 sete");
+        // the all-ones mask construction appears once/lane: test + sete + neg =
+        // every lane's result is 0 or 0xffffffffffffffff (64-bit neg of 0/1).
+        assert_eq!(b.windows(3).filter(|w| *w == [0x48, 0xf7, 0xd8]).count(), 2, "2 neg rax (0-or-allones)");
+    }
 }
