@@ -1,5 +1,44 @@
 # Open Sober — Agent Handoff
 
+## SH361 (Sep 20, 2026, hermes-worker): implement + MEASURE the operator's "dynamic DM-ctor trace rather than a static seed" — a read-only observation guard at the do-init worker entry 0x2206db8 that measures whether the MAIN branch's DM-holder field [container+32] is NULL (cbz @0x2206df8 -> MessageBus_getLastRaw bail 0x2206ea4) or non-NULL (-> `br x1` @0x2206e24 DM/app-shell dispatch). MEASURED (full app-start ladder): the container field IS non-NULL ([obj]vt=0x10635dde8) and the dispatch fires, landing at **0x10258b5d8 = nativeAppBridgeV2StartAppWithParams+0x494** (app-bridge StartApp body, not a DataModel ctor) — refining SH320's assumed "DM-ctor entry": the MAIN dispatch converges on StartAppWithParams, then runs dies at the SH285 persistence wall 0x101db1b08, DM-root 0
+Single-agent (cone suppressed). One new READ-ONLY observation guard
+`routeb_doinit_dyn_trace_guard` (jit.rs, opt-in JIT_ROUTEB_DOINIT_DYN_TRACE=1,
+default-inert, once-per-run, ZERO guest mutation) + one hermetic sh361 +
+probe runs/capture_sh361_doinit_dyn_trace.sh. elfjit.rs product path unchanged.
+Workspace green (arm64jit lib 423->424; cargo test --workspace EXIT 0, 0 failures)
+as this HEAD. recon-v3 self-driven frame + JSON fixes re-verified green this cycle
+(24 real task frames, dispatch #2698000, present #23 swap Ok(0x1), 0 json abort,
+0 crash).
+- The operator's EXECUTE-DO-INIT-GATES asks for a "dynamic DM-ctor trace (SH164's
+  harness-trace artifact) rather than a static seed"; SH320 had described the do-init
+  MAIN-branch binder-dispatch as a "DM-ctor entry" WITHOUT ever reading [container+32].
+  SH361 closes that measured-vs-assumed gap at the exact decision point.
+- Disasm (real libroblox.so): do-init worker 0x2206db8, `mov x19,x1` @0x2206dd0 ->
+  `ldr x0,[x19,#32]` @0x2206df4 -> `cbz x0,0x2206ea4` @0x2206df8 (NULL -> MessageBus
+  bail) -> else `ldr x8,[x0]; ldr x1,[x8,#48]` @0x2206e00 -> `br x1` @0x2206e24.
+- MEASURED: `[routeb-doinit-dyn] SH361 ... container=0x5632067bfb70
+  [container+32]=0x563206dab800 (non-NULL) -> reach DM-ctor dispatch: [obj]vt=0x10635dde8
+  vt[+48]=0x10258b5d8 (br x1 @0x2206e24). once-guard=0x101 once-slot=0x400000b DM-root=0x0`
+  -> the MAIN dispatch fires (does NOT bail to MessageBus) and lands at
+  0x10258b5d8 = nativeAppBridgeV2StartAppWithParams+0x494 (disasm sub sp,#0x170 prologue,
+  `ldrb [x8,#3488]` then bl nativePreloadFlagOverrides) -> StartAppWithParams app-bridge
+  body, NOT a DM ctor.
+- Run then ABRTs (EXIT 134) at the standing SH285 persistence-lane live-object wall
+  guestpc=0x101db1b08; DM-root [0x106a68818]=0; MH_* false. Route-B live-DM structural
+  gate UNCHANGED (no DM manufactured).
+
+### Forward this cycle
+The operator's "dynamic DM-ctor trace" is implemented + measured: the do-init MAIN
+branch reaches its br dispatch (container field non-NULL) and lands in StartAppWithParams,
+then dies at the SH285 live-object wall — the standing route-B block, now pinned one level
+deeper (exact dispatch target, not just region).
+
+### Honest
+Does NOT manufacture a DataModel. Route-B live-DM structural gate UNCHANGED
+(DM-root [0x106a68818]=0, MH_* false). SH174 capture-latch stays the single
+forward hook. Files: docs/frontier-sh361-doinit-dyn-trace.md,
+runs/capture_sh361_doinit_dyn_trace.sh, sh361 hermetic (arm64jit lib 424).
+
 ## SH360 (Sep 20, 2026, hermes-worker): implement + MEASURE the operator's EXECUTE-DO-INIT-GATES empty-vector gate seed — the do-init app-shell band's 0x20-stride vector walker at [0x106dcb160] collapses its constructed-empty begin==end host-heap pointer pair to NULL (behavior-preserving), default-inert JIT_ROUTEB_DOINIT_EMPTYVEC, fires at the two real block-entry pcs on the full ladder
 Single-agent (cone suppressed). One new guard `routeb_doinit_emptyvec_gate`
 (jit.rs) + one hermetic sh360 (arm64jit lib 422->423) + probe script; elfjit.rs

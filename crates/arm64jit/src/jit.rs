@@ -1714,6 +1714,60 @@ fn routeb_donepath_main_branch_guard(_state: *mut CpuState, pc: u64) {
     eprintln!("[routeb-sh320] seeded do-init done-path main-id [0x106863a68]=0x{me:x} (this jit thread) at dispatcher 0x2206db8 pc={pc:#x} (was 0x{cur:x}) -> b.eq NOT taken -> MAIN binder-dispatch 0x206df4 (DM-ctor entry)");
 }
 
+/// SH361 (opt-in JIT_ROUTEB_DOINIT_DYN_TRACE=1): READ-ONLY "dynamic DM-ctor trace" at the
+/// do-init worker entry 0x2206db8 (a true block entry, SH320's dispatcher pc). The worker's
+/// MAIN branch reads `ldr x0,[x19,#32]` @0x2206df4 (x19 = the container arg, saved from x1
+/// @0x2206dd0) then `cbz x0, 0x2206ea4` @0x2206df8: NULL -> bails to MessageBus_getLastRaw
+/// (DM-ctor dispatch 0x2206e24 `br x1` NOT attempted); non-NULL -> falls through to
+/// `ldr x8,[x0]; ldr x1,[x8,#48]` @0x2206e00 and `br x1` @0x2206e24 = the DM/app-shell ctor
+/// dispatch. This is the exact decision point the operator's "dynamic DM-ctor trace rather
+/// than a static seed" (EXECUTE-DO-INIT-GATES) names. The guard OBSERVES [container+32] +
+/// the once/DM-root cells and logs which way the MAIN branch actually goes on the live ladder,
+/// WITHOUT mutating guest state. It does NOT force anything (distinct from SH320 which seeds
+/// main-id); it answers "does the ladder's do-init reach the DM-ctor dispatch or not" — the
+/// measured-versus-assumed gap SH320's docs flagged ('MAIN branch binder-dispatch 0x206df4 ->
+/// vt+0x30 -> br x1' was described as a DM-ctor entry without ever reading [container+32]).
+/// Default-inert, read-only, fires once per run (deduped by pc). Fire at block entry 0x2206db8
+/// so x1 (the container) is already set by the caller (the worker saves it to x19 mid-block).
+fn routeb_doinit_dyn_trace_guard(state: *mut CpuState, pc: u64) {
+    if std::env::var_os("JIT_ROUTEB_DOINIT_DYN_TRACE").is_none() {
+        return;
+    }
+    if pc != 0x102206db8 {
+        return;
+    }
+    static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if FIRED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return; // once per run — keep the trace to a single decisive readout
+    }
+    let s = unsafe { &*state };
+    let container = s.x[1]; // worker arg: becomes x19 mid-block, [x19,#32] is the DM-holder field
+    // Safe guest reads: page-guard first (the DM field may live on an unmapped page headlessly).
+    let rd = |a: u64| -> u64 {
+        if a != 0 && a >= 0x100000000 && a >> 56 == 0 && a & 7 == 0 && any_page_mapped(a) {
+            unsafe { std::ptr::read_unaligned(a as *const u64) }
+        } else {
+            0
+        }
+    };
+    let dm_field = rd(container.wrapping_add(32));
+    let once_guard = rd(0x106a68410);
+    let dm_root = rd(0x106a68818);
+    let once_slot = rd(0x106a68408);
+    // Which way does the MAIN branch go? NULL dm_field -> MessageBus bail; non-NULL -> br x1 DM dispatch.
+    if dm_field == 0 {
+        eprintln!(
+            "[routeb-doinit-dyn] SH361 DM-ctor trace @0x2206db8: container={container:#x} [container+32]={dm_field:#x} (NULL) -> cbz @0x2206df8 TAKEN -> bails to MessageBus_getLastRaw 0x2206ea4; DM-ctor dispatch 0x2206e24 `br x1` NOT reached. once-guard={once_guard:#x} once-slot={once_slot:#x} DM-root={dm_root:#x}"
+        );
+    } else {
+        let vt = rd(dm_field);
+        let vt48 = rd(vt.wrapping_add(48));
+        eprintln!(
+            "[routeb-doinit-dyn] SH361 DM-ctor trace @0x2206db8: container={container:#x} [container+32]={dm_field:#x} (non-NULL) -> reach DM-ctor dispatch: [obj]vt={vt:#x} vt[+48]={vt48:#x} (br x1 @0x2206e24). once-guard={once_guard:#x} once-slot={once_slot:#x} DM-root={dm_root:#x}"
+        );
+    }
+}
+
 /// SH334 (opt-in JIT_ROUTEB_REG_LIVE=1): LIVE dump of the service-registry + DM-root +
 /// tier-2 controller-name cell at the exact moment the DM-controller ctor's name->service
 /// lookup (fn 0x2168798, block entry 0x102168798) runs on the MAIN path. The SH332/333
@@ -6811,6 +6865,12 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // thread-match b.eq is taken -> MAIN binder-dispatch 0x206df4 (DM-ctor entry), not the
         // non-main box-build. Works whether the done-path runs on the ladder or a spawned worker.
         routeb_donepath_main_branch_guard(state, pc);
+        // SH361 (opt-in JIT_ROUTEB_DOINIT_DYN_TRACE=1): READ-ONLY dynamic DM-ctor trace at the
+        // do-init worker entry 0x2206db8 — observes [container+32] (the cbz @0x2206df8 decision:
+        // NULL -> MessageBus_getLastRaw bail 0x2206ea4, non-NULL -> DM-ctor `br x1` @0x2206e24)
+        // and logs which way the MAIN branch actually goes on the live ladder. No guest mutation
+        // (distinct from SH320's main-id seed). Default-inert, once-per-run.
+        routeb_doinit_dyn_trace_guard(state, pc);
         // SH322 (opt-in JIT_ROUTEB_LIFECYCLE_EARLYRET): cross the SH273 lifecycle-notifier
         // live-object wall the SH320/321 MAIN-path reaches (fn 0x21f3748 faults 0x50 on
         // [x1]==0). Seed the caller pair [x1] = obj with byte[+80].bit1=1 so the tbnz @0x21f3774
@@ -8727,6 +8787,57 @@ mod tests {
                 "mismatched cell rewritten to executing thread (b.eq now taken)");
             env_test_remove("JIT_ROUTEB_DONEPATH_MAIN");
             std::ptr::write_unaligned(cell as *mut u64, 0);
+        }
+    }
+
+    #[test]
+    fn sh361_doinit_dyn_trace_is_read_only_env_pc_gated() {
+        // SH361 (JIT_ROUTEB_DOINIT_DYN_TRACE): READ-ONLY dynamic DM-ctor trace at the do-init
+        // worker entry 0x2206db8. Must (a) be inert without env, (b) fire only at pc 0x102206db8,
+        // (c) READ the container arg x1's [x1+32] (the cbz @0x2206df8 DM-holder field) WITHOUT
+        // writing any guest state (pure observation — a NULL field must NEVER be seeded by this
+        // guard, unlike SH320 which writes main-id). Env is read fresh each entry (not OnceLock),
+        // so the test toggles it across phases like the other routeb guards.
+        // Use a scratch guest cell for the container so [container+32] is a real readable field.
+        let cell: u64 = 0x1063_1128;
+        unsafe {
+            assert!(routeb_ensure_writable(cell), "scratch .bss page must be writable");
+            // (a) inert without env: guard must not print (only observable via no guest write).
+            env_test_remove("JIT_ROUTEB_DOINIT_DYN_TRACE");
+            std::ptr::write_unaligned(cell as *mut u64, 0xdead); // container+0 = sentinel
+            std::ptr::write_unaligned((cell + 32) as *mut u64, 0xbad); // [container+32] field
+            let mut st: CpuState = unsafe { std::mem::zeroed() };
+            st.x[1] = cell;
+            routeb_doinit_dyn_trace_guard(&mut st, 0x102206db8);
+            // (a/read-only) [container+32] must be UNTOUCHED — the trace never writes guest state.
+            assert_eq!(
+                std::ptr::read_unaligned((cell + 32) as *const u64),
+                0xbad,
+                "SH361 read-only: [container+32] left untouched (trace never seeds/mutates)"
+            );
+            // (b) env set, wrong pc -> inert (no write, no effect).
+            env_test_set("JIT_ROUTEB_DOINIT_DYN_TRACE", "1");
+            std::ptr::write_unaligned((cell + 32) as *mut u64, 0xbad);
+            routeb_doinit_dyn_trace_guard(&mut st, 0x102206d90);
+            assert_eq!(
+                std::ptr::read_unaligned((cell + 32) as *const u64),
+                0xbad,
+                "SH361 pc-gated: fires only at worker entry 0x2206db8"
+            );
+            // (c) env set + worker entry pc + container with NULL field -> still read-only, and
+            // survive a NULL field on a page-guarded unmapped cell (rd() returns 0, no fault).
+            st.x[1] = cell;
+            routeb_doinit_dyn_trace_guard(&mut st, 0x102206db8);
+            assert_eq!(
+                std::ptr::read_unaligned((cell + 32) as *const u64),
+                0xbad,
+                "SH361 read-only even when it fires: field left untouched"
+            );
+            // (d) x1=0 (no container): must not fault (rd(container+32) guarded).
+            let mut st0: CpuState = unsafe { std::mem::zeroed() };
+            st0.x[1] = 0;
+            routeb_doinit_dyn_trace_guard(&mut st0, 0x102206db8);
+            env_test_remove("JIT_ROUTEB_DOINIT_DYN_TRACE");
         }
     }
 
