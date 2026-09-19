@@ -1,6 +1,30 @@
 # Open Sober — Agent Handoff
 
-## SH392 (Sep 21, 2026, hermes-worker): arm the SH391 render-determinism guard on the canonical HARD-GATE artifact runbook — the ship-all-cycles recon-v3 deliverable (capture_taskv4_frame.sh) ran WITHOUT the deterministic fix engaged, so the 24-frame "0 crash" artifact was still subject to the ~1/25 SH345 wire-into-.text flake, with SH391's fix available but inert by default
+## SH393 (Sep 21, 2026, hermes-worker): drive the FULL app-command dispatcher table on the confirmed-green SH366 entry — a complete per-command safety map (15/20 safe, cmd 1/13/15/17/18 measured-unsafe) of the engine's own process_cmd, the SESSION-CTOR command-queue lever advanced from SH368's 3-command subset
+Single-agent (cone suppressed). Recon-v3 immediate-priority deliverables re-verified green at this
+exact HEAD first: capture_taskv4_frame.sh (SH391 guard armed) attempt 1 = 24 real task-driven frames
+`present swap Ok(0x1)`, 196 node pops, 0 json abort, 0 crash, EXIT 124; capture_sh304 session-gated
+producer correctly INERT (0 GATED); JIT_JSON_ZERO_FIX present at 0x102355d40. New default-inert opt-in
+rung `--v2boot-glue-cmd-full` (jit.rs `drive_glue_process_cmd_full`) + real-image hermetic
+`sh393_glue_cmd_full_table_bound_pinned` (arm64jit lib 445->446) + capture runs/capture_sh393_glue_full.sh
++ frontier doc. MEASURED + disasm-classified the full 20-entry process_cmd (0x102bcd6e4) jump table:
+the case is chosen by a 16-bit rel offset (table 0x69408a -> case 0x2bcd730+rel*4); every case reads
+the version gate [0x683d8d0] then `cmp byte0,#6; b.cc <target>`; the b.cc TARGET decides safety at gate 0.
+**15 SAFE** (b.cc->epilogue 0x2bcdbf0 / glue/telemetry-only body, incl INIT_WINDOW cmd 11) drive
+cleanly — MEASURED 15/15 `process_cmd returned Ok`, cmd-11 marker [inner+9]=1, EXIT 124, 0 crash.
+**5 UNSAFE** (measured the runtime refuses headlessly): cmd 1 = PRE-GATE live-object deref
+0x2bcd9fc `[x20+24]->[+56]` (fault 0x38); cmd 13 = gate-checked-but-body derefs [x20+24] @0x2bcdc74
+(fault 0x20); cmd 15/17/18 = same live-object-deref class. This PROVES gate-check alone != safety
+(the b.cc target does). Session observables re-confirm SH366/368 with the full table: the engine's
+own command dispatcher does NOT self-transition AppBridgeV2 ([0x106a705e8] 0x0->0) or the surface
+XID (0x200000) — those still move only when a live session/do-init builds the DM world. Workspace
+green (cargo test --workspace EXIT 0; arm64jit lib 446/0; jit.rs 1,046,770 B <1MiB hook; elfjit.rs
+1,048,492 B <1MiB hook, pulled under by condensing two SH-prose comments — 4 bytes over the hook
+mid-cycle). Route-B live-DM structural gate UNCHANGED (DM-root [0x106a68818]=0, MH_* false,
+AppBridgeV2 0); SH174 capture-latch stays the single forward observer. Do-not-re-tread +:
+do NOT drive cmd 1/13/15/17/18 expecting a headless return (measured live-object deref; SH366/367 class).
+
+## SH392 (Sep 21, 2026, hermes-worker): arm the SH391 render-determinism guard on the canonical HARD-GATE artifact runbook — the recon-v3 deliverable (capture_taskv4_frame.sh) ran WITHOUT the deterministic fix engaged, so the "24 frames 0 crash" artifact was still subject to the ~1/25 SH345 wire-into-.text flake
 Single-agent (cone suppressed). The recon-v3 self-driven-frame capture
 (capture_taskv4_frame.sh) was re-verified green at this exact HEAD on skill
 handover — attempt 1: 24 real task-driven frames `present swap Ok(0x1)`, 197

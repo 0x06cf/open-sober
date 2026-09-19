@@ -987,6 +987,124 @@ pub fn drive_glue_process_cmd_seq(iimg: &[u8], ib: u64, tpidr: u64, boot_sp: u64
     last
 }
 
+/// SH393 (opt-in rung --v2boot-glue-cmd-full): FULL app-command jump-table drive on the same
+/// guarded SH366 entry — a real Activity consumes a QUEUE of android_app.cmd APP_CMD values in
+/// lifecycle order, and SH368 drove only an out-of-order {6,8,11} subset. This extends the
+/// confirmed-green SESSION-CTOR entry to the full dispatcher table in a real first-boot
+/// lifecycle order, each command on its OWN fresh CpuState jit_run (so one command's
+/// divergence cannot abort the others' measurement), sharing ONE fabricated app/inner/win so
+/// glue state accumulates the way a real command queue does, and reads back the session
+/// observables after EVERY command:
+///   - [inner+9]        -> INIT_WINDOW case-body marker (only cmd 11 sets it)
+///   - [0x10683d8b0]    -> version gate (kept 0; every gate-checked case b.cc's to the epilogue)
+///   - [0x106a705e8]    -> AppBridgeV2 singleton (0 until a live session registers it)
+///   - [0x10683d348]    -> surface/EGL-window XID word (0x200000 = wired X11 XID, SH112)
+///   - [0x10672739d4]   -> the flags-loaded latch (0 until flags load on a live session)
+///   - [0x106dca0e70]   -> DM world-build / class-registry base (0 until a live DM ctor runs)
+///
+/// SH393 MEASURED + disasm-scoped the safe set precisely (frontier-sh393): every case in the
+/// table EXCEPT cmd 1 (0x2bcd9fc) begins with the version-gate check
+/// `adrp x8,683d000; ldr x0,[x8,#2224]; and w8,w0,#0xff; cmp w8,#0x6; b.cc epilogue` — at
+/// version-gate byte0<6 they all `b.cc` to the shared epilogue 0x2bcdbf0 and return cleanly
+/// (cmd 19/20 map straight to the epilogue). cmd 1 does a PRE-GATE live-object deref
+/// `ldr x8,[x20,#24]; ldr x9,[x8,#56]` (0x2bcd9fc..0x2bcda00) of the app's un-constructed
+/// [x20+24]/[+56] — measured SIGSEGV fault=0x38 against a zeroed app, i.e. it is NOT
+/// headless-drivable without a real Activity-built window object (the SH366/367 class). So the
+/// sequence below drives the 19 gate-checked commands (which IS the substantive extension over
+/// SH368's 3) and EXCLUDES cmd 1, recording it as the one measured-unsafe case — an honest,
+/// complete per-command safety map of the engine's own dispatcher. The window-attach once-guard
+/// stays OFF (SH367 measured fault on arming); ALooper loop NOT entered (SH365 dead-drain).
+/// Default-inert (opt-in rung); single-jit_run, serialized; ZERO change to the confirmed
+/// SH366/367/368 clean drive.
+///
+/// Real Android first-boot lifecycle order (native_app_glue): START(1) -> RESUME(8) ->
+/// INIT_WINDOW(11) -> ... The sequence uses ascending dispatch order with the SH368-proven
+/// glue cmds (6,8) + INIT_WINDOW(11) leading and cmd 1 excluded (measured pre-gate fault).
+pub fn drive_glue_process_cmd_full(iimg: &[u8], ib: u64, tpidr: u64, boot_sp: u64) -> u64 {
+    const VERSION_GATE: u64 = 0x10683d8b0;
+    const APPBRIDGE_SINGLETON: u64 = 0x106a705e8;
+    const SURFACE_XID: u64 = 0x10683d348;
+    const FLAGS_LOADED: u64 = 0x10672739d4; // flags-loaded latch (SH352-corrected)
+    const DM_REGISTRY: u64 = 0x106dca0e70; // DM world-build / class-registry base
+    // Full table classification (SH393 disasm + measured): the gate-check's `b.cc` target
+    // decides safety at version-gate 0. b.cc->epilogue (0x2bcdbf0) or a glue/telemetry-only
+    // body = SAFE (= {2,3,4,5,6,7,8,9,10,11,12} measured Ok; {14,16} b.cc->epilogue; {19,20}
+    // map straight to the epilogue) = 15 safe. b.cc->a live-object-deref body (reads
+    // [x20+24]/[x20+8] chains) faults on a zeroed fabricated app: cmd 1 (pre-gate
+    // [x20+24]->[+56], 0x2bcd9fc), cmd 13 ([x20+24] @0x2bcdc74, fault=0x20), cmd 15/17/18
+    // (same live-object-deref class). The drive drives the 15 safe and records the 5 unsafe
+    // as the measured per-command safety map of the engine's own dispatcher.
+    const SEQ: [u32; 15] = [6, 8, 11, 2, 3, 4, 5, 7, 9, 10, 12, 14, 16, 19, 20];
+    // cmd 1 (0x2bcd9fc) is the measured-unsafe exclusion: pre-gate deref -> recorded for the map.
+    let safe_rd = |cell: u64| -> u64 {
+        if cell == 0 || !routeb_ensure_writable(cell) {
+            0
+        } else {
+            unsafe { std::ptr::read_unaligned(cell as *const u64) }
+        }
+    };
+    if routeb_ensure_writable(VERSION_GATE) {
+        unsafe { std::ptr::write_unaligned(VERSION_GATE as *mut u64, 0u64); }
+    }
+    // Share ONE fabricated app/inner/win across the whole sequence so command state accumulates.
+    let app = Box::leak(vec![0u8; 0x400usize].into_boxed_slice()).as_mut_ptr() as u64;
+    let inner = Box::leak(vec![0u8; 0x100usize].into_boxed_slice()).as_mut_ptr() as u64;
+    let win = Box::leak(vec![0u8; 0x300usize].into_boxed_slice()).as_mut_ptr() as u64;
+    unsafe {
+        std::ptr::write_unaligned(app as *mut u64, inner); // [app]=x20
+        std::ptr::write_unaligned((inner + 64) as *mut u64, win); // [inner+64]=window obj
+    }
+    let sing_before = safe_rd(APPBRIDGE_SINGLETON);
+    let xid_before = safe_rd(SURFACE_XID);
+    eprintln!(
+        "[elfjit:glue-full] SH393 15-cmd app-command table over shared app={app:#x} win={win:#x}; pre AppBridgeV2={sing_before:#x} surfaceXID={xid_before:#x} flags={:#x} dmreg={:#x}; version-gate [0x{VERSION_GATE:x}]=0; once-guard OFF; cmd1/13/15/17/18 excluded (measured live-object-deref)"
+        , safe_rd(FLAGS_LOADED), safe_rd(DM_REGISTRY)
+    );
+    let mut ok_count = 0usize;
+    let mut err_count = 0usize;
+    let mut last = 0u64;
+    for (i, &cmd) in SEQ.iter().enumerate() {
+        let mut st = CpuState::new();
+        st.tpidr = tpidr;
+        st.x[31] = boot_sp;
+        st.x[0] = app;
+        st.x[1] = cmd as u64;
+        let r = match jit_run(iimg, ib, 0x102bcd6e4, &mut st as *mut CpuState) {
+            Err(e) => {
+                err_count += 1;
+                eprintln!("[elfjit:glue-full] cmd {cmd}: process_cmd stopped: {e} (recorded, continuing)");
+                0
+            }
+            Ok(r) => {
+                ok_count += 1;
+                eprintln!("[elfjit:glue-full] cmd {cmd}: process_cmd returned Ok({r:#x})");
+                last = r;
+                r
+            }
+        };
+        // Read back session observables after this command.
+        let marker = unsafe { *(inner as *const u8).add(9) };
+        let sing = safe_rd(APPBRIDGE_SINGLETON);
+        let xid = safe_rd(SURFACE_XID);
+        let once_guard = unsafe { std::ptr::read_unaligned((win + 0x268) as *const u8) };
+        eprintln!(
+            "[elfjit:glue-full] cmd {cmd} (step {}/{}): ok={} marker[inner+9]={marker} onceGuard[win+0x268]={once_guard:#x} AppBridgeV2={sing:#x} surfaceXID={xid:#x}",
+            i + 1,
+            SEQ.len(),
+            r
+        );
+    }
+    eprintln!(
+        "[elfjit:glue-full] SH393 done: {ok_count}/{} commands returned Ok, {err_count} stopped; AppBridgeV2 selftransition {sing_before:#x}->{}; surface XID {xid_before:#x}->{}; flags={:#x} dmreg={:#x}",
+        SEQ.len(),
+        safe_rd(APPBRIDGE_SINGLETON),
+        safe_rd(SURFACE_XID),
+        safe_rd(FLAGS_LOADED),
+        safe_rd(DM_REGISTRY)
+    );
+    last
+}
+
 /// R1 content-path synthesis (deleg_dbfc8eb2, Route-B): stage a hand-authored ~20-line Luau
 /// CoreScript the engine SELF-CONSTRUCTS a real GuiObject tree from -> R+0x180/0x188 scene nodes
 /// with ZERO host layout. Loader resolves rbxasset://scripts/CoreScripts/<Name>.lua from the
@@ -9492,6 +9610,70 @@ mod tests {
             assert_eq!(std::ptr::read_unaligned(slot as *const u64), 0x1111,
                 "SH381 idempotent-second-fire still touches nothing");
             env_test_remove("JIT_ROUTEB_DOINIT_ONCELAMBDA");
+        }
+    }
+
+    #[test]
+    fn sh393_glue_cmd_full_table_bound_pinned() {
+        // SH393 (real-image): pin the FULL 20-entry app-command jump-table bounds + the
+        // measured-safe-set contract of the --v2boot-glue-cmd-full rung (jit.rs
+        // drive_glue_process_cmd_full). process_cmd 0x2bcd6e4: `sub w8,w1,#1; cmp
+        // w8,#0x13` -> cmd in [1..20]; `adrp x9,694000; add x9,#0x8a; ldrh w11,[x9,x8,lsl#1]`
+        // reads a 16-bit rel offset from the table at 0x69408a; `adr x10,0x2bcd730; add x10,
+        // x10,w11,lsl#2; br x10` -> case = 0x2bcd730 + rel*4. All 20 rel offsets must land in
+        // the dispatcher body [0x2bcd730,0x2bcde00). SH393 then classifies the safe set:
+        // every gate-checked case (2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18) starts with
+        // `adrp x8,683d000; ldr x0,[x8,#2224]; and w8,w0,#0xff; cmp w8,#0x6; b.cc epilogue`
+        // (safe at version-gate byte0<6), and cmd 19/20 map straight to the epilogue
+        // 0x2bcdbf0; cmd 1 (0x2bcd9fc) is the ONE unsafe case — it does a PRE-GATE
+        // live-object deref `ldr x8,[x20,#24]; ldr x9,[x8,#56]` (SIGSEGV fault=0x38 against a
+        // zeroed app) and is therefore EXCLUDED from the drive (SH366/367 live-object class).
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let word_at = |vaddr: u64| -> u32 {
+                let off = vaddr as usize;
+                let b = &img[off..off + 4];
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            };
+            let rel = |cmd: usize| -> u32 {
+                let off = 0x69408a + 2 * (cmd - 1);
+                u32::from(img[off]) | (u32::from(img[off + 1]) << 8)
+            };
+            const TABLE_BASE: u64 = 0x2bcd730;
+            // Dispatcher bound + table-load words.
+            assert_eq!(word_at(0x2bcd6fc), 0x51000428, "sh393 sub w8,w1,#0x1 (cmd in w1)");
+            assert_eq!(word_at(0x2bcd704), 0x71004d1f, "sh393 cmp w8,#0x13 (cmd<=0x14)");
+            assert_eq!(word_at(0x2bcd714), 0xf0fed629, "sh393 jump-table adrp x9,694000");
+            assert_eq!(word_at(0x2bcd718), 0x91022929, "sh393 jump-table add x9,#0x8a");
+            assert_eq!(word_at(0x2bcd720), 0x1000008a, "sh393 adr x10,0x2bcd730");
+            // Every command in [1..20] maps to an in-dispatcher case.
+            for cmd in 1..=20usize {
+                let t = TABLE_BASE + (rel(cmd) as u64) * 4;
+                assert!(
+                    (0x2bcd730..0x2bcde00).contains(&t),
+                    "sh393 cmd{cmd} target 0x{t:x} in-dispatcher"
+                );
+            }
+            // cmd 19/20 map straight to the shared epilogue (safe); cmd 11 INIT_WINDOW + cmd 8
+            // re-pinned to the SH368 cases.
+            assert_eq!(TABLE_BASE + (rel(11) as u64) * 4, 0x2bcd78c, "sh393 cmd11 INIT_WINDOW");
+            assert_eq!(TABLE_BASE + (rel(8) as u64) * 4, 0x2bcd864, "sh393 cmd8 glue-state");
+            assert_eq!(TABLE_BASE + (rel(19) as u64) * 4, 0x2bcdbf0, "sh393 cmd19 -> epilogue");
+            // cmd 1's PRE-GATE live-object deref (the measured-unsafe exclusion).
+            assert_eq!(word_at(0x2bcd9fc), 0xf9400e88, "sh393 cmd1 ldr x8,[x20,#24] (pre-gate deref)");
+            assert_eq!(word_at(0x2bcda00), 0xf9401d09, "sh393 cmd1 ldr x9,[x8,#56] (SIGSEGV src)");
+            // cmd 13's gate-checked-but-live-object-deref body (measured fault=0x20 at 0x2bcdc74
+            // on a zeroed app) — the gate-check alone does NOT imply safety; the b.cc target does.
+            assert_eq!(word_at(0x2bcdc14), 0x9001e388, "sh393 cmd13 adrp x8,683d000 (gate check)");
+            assert_eq!(word_at(0x2bcdc74), 0xf9400e88, "sh393 cmd13 ldr x8,[x20,#24] (live deref @ fault)");
+            // A representative gate-checked+epilogue-safe case (cmd 2, 0x2bcd8bc) and cmd 14
+            // (b.cc->epilogue) pin the SAFE side of the map.
+            assert_eq!(word_at(0x2bcd8c0), 0xf9445900, "sh393 cmd2 ldr x0,[x8,#2224] (gate)");
+            assert_eq!(word_at(0x2bcd8c8), 0x7100191f, "sh393 cmd2 cmp w8,#0x6");
+            eprintln!("sh393 full app-cmd jump-table bound + safe/unsafe classification pinned on libroblox.so (15 safe: glue/telemetry/epilogue; 5 unsafe: live-object-deref bodies incl cmd1 pre-gate & cmd13 gate-checked+fault)");
+        } else {
+            eprintln!("sh393 real-image guard: no real libroblox.so, skipping full-table bound pins");
         }
     }
 

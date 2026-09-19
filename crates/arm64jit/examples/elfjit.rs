@@ -6661,6 +6661,11 @@ fn main() {
                     arm64jit::jit::drive_glue_process_cmd_seq(iimg, ib, tpidr, boot_sp);
                     dump("glue-seq cmd sequence");
                 }
+                // SH393 (--v2boot-glue-cmd-full): FULL app-dispatcher safe-table drive on the SH366 entry.
+                if std::env::args().any(|a| a == "--v2boot-glue-cmd-full") {
+                    arm64jit::jit::drive_glue_process_cmd_full(iimg, ib, tpidr, boot_sp);
+                    dump("glue-full cmd table");
+                }
                 // Route-B latch (recon-routeB-globaltinit-unblock.md): gameGlobalInit only leaves its
             // nanosleep park once [0x72739d4].bit0==1 (flags loaded). Drive nativeInitializeNativeFlags
             // (0x10232048c) FIRST as rung 0 - the engine's OWN flags-loaded write chain. SH82: GlobalInit
@@ -7240,12 +7245,8 @@ fn main() {
                     }
                     dump("EngSettingsReceived");
                 }
-                // SH278: cross the SH277 state gate via the engine's own receive. SH277 proved a
-                // fabricated manager mono-tails (state [this+16]=0 -> benign tail). The
-                // engine-settings receive (0x2bd1c38) sets state->3 ITSELF when [this+649]!=0,
-                // so seeding that ONE byte lets the ENGINE set state=3; then driving initEngine_
-                // dispatch 0x2bd1cf0 takes its ==3 branch settings-serializer. Opt-in
-                // --v2boot-session-engine3 (session-state transition, NOT a DM ctor).
+                // SH278: cross the SH277 state gate via engine receive — the settings receive (0x2bd1c38) sets
+                // state->3 itself when [this+649]!=0 (seed that byte), then initEngine_ dispatch 0x2bd1cf0 takes ==3. Opt-in --v2boot-session-engine3.
                 if std::env::args().any(|a| a == "--v2boot-session-engine3") {
                     unsafe { *(0x10683d8f8u64 as *mut u64) = 6u64; }
                     let mgr3 = Box::leak(vec![0x0u8; 0x800usize].into_boxed_slice()).as_mut_ptr() as u64;
@@ -10219,8 +10220,7 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                                                                 stex.x[7] = GL_UNSIGNED_BYTE; // type
                                                                                 let _ = arm64jit::jit::jit_run(iimg, ibase, plt_tex_image_2d, &mut stex as *mut CpuState);
                                                                             } else {
-                                                                                 // ETC1/ETC2-RGB live-path: upload a REAL 8x8 ETC1 (4 solid 4x4 blocks=32B) via
-                                                                                 // glCompressedTexImage2D; bridge decodes ETC1->RGBA + re-uploads glTexImage2D.
+                                                                                 // ETC1/ETC2-RGB live-path: 8x8 ETC1 (4 solid 4x4 blocks=32B) via glCompressedTexImage2D; bridge decodes ETC1->RGBA
                                                                                  // Indiv mode cw0 sel0 -> color=(c*0x11)+2; ETC2 mode1/2==ETC1; relabel internalformat
                                                                                  // to prove decode_etc2_rgb handles the real path.
                                                                                 const GL_ETC1_RGB8_OES: u64 = 0x8d64;
