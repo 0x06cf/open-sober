@@ -1,5 +1,18 @@
 # Open Sober — Agent Handoff
 
+## SH370 (Sep 20, 2026, hermes-worker): SH357-consolidation completion — lock the sh323 cookie-jar/settings guard test under the shared ROUTEB_PROC_TEST_LOCK (determinism hardening); recon-v3 deliverables re-verified green at HEAD
+Single-agent (cone suppressed). One-line test-harness fix (arm64jit/src/jit.rs): `sh323_settings_sso_seed_guard`
+was the one routeb-family cookie-jar test that did NOT hold the consolidated ROUTEB_PROC_TEST_LOCK all its
+siblings (sh248d/sh248e/sh273/sh175) hold, so under parallel `--test-threads=16` it raced the locked siblings'
+mid-assert on the shared fixed cookie-jar page (CELL_B=0x106ed7a28 == sh248d's B), giving intermittent
+"cookie-jar slot A/B must be seeded" failures (left:0). Added the lock (behavior-neutral, no assertion
+weakened). MEASURED: sh323 passes; sh323/248d/248e pass 50/50 under 16-thread isolation; `cargo test
+--workspace` deterministic-green EXIT 0 (612/0; 6/6 canonical runs + earlier 10/10/8/8). The residual futex/
+sharded-page flake only appears under artificial `--test-threads=16` and is the documented SH345/346/357
+accepted load-sensitive class — the canonical gate is reproductibly green. Route-B live-DM structural gate
+UNCHANGED (DM-root 0, MH_* false); recon-v3 frame plane re-verified green (24 frames swap Ok(0x1), 0 json,
+0 crash).
+
 ## SH369 (Sep 20, 2026, hermes-worker): MEASURED structural pin — window-attach COMPLETION funnels into the CLOSED persistence lane (flags-latch 0x72739d4 -> initStorageManagerNative 0x1db1050), NOT to a live DM; refines SH367's "needs a real surface" reading
 Single-agent (cone suppressed). One new real-image hermetic
 `sh369_window_attach_completion_converges_to_persistence_lane` (arm64jit lib 432; 11 word-pins
