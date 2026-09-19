@@ -1,6 +1,33 @@
 # Open Sober — Agent Handoff
 
+## SH417c (Sep 19, 2026, hermes-worker): extend the SH417b crossing-env audit to the canonical stable `--v2boot` FULL-BOOT runbooks — capture_v2boot.sh (SH54) + capture_v2boot_gate.sh (SH81) both omitted the crossing env and silently inherited the SH83/SH91 hashfix-lane SIGSEGV that SH417b cleaned from the input loop; env added + MEASURED
+Single-agent (cone suppressed). recon-v3 deliverables re-verified green at HEAD first
+(capture_taskv4_frame.sh attempt 1: 24 real task frames `present swap Ok(0x1)`, 197 node
+pops, 0 json abort, 0 crash). Workspace green (cargo test --workspace EXIT 0; arm64jit lib
+472/0, full suite ok). Production code in jit.rs/elfjit.rs/session.rs UNCHANGED (byte-identical
+at HEAD) — this is a runbook-only + doc + attribution correction, the SH417b next-forward #1
+(missing-env audit on every boot-path runbook).
+- The audit found two canonical stable-baseline FULL-BOOT runbooks that drive a real `--v2boot`
+  ladder WITHOUT the crossing env (`JIT_ROUTEB_HASHFIX JIT_JSON_ZERO_FIX JIT_ROUTEB_SETFIX`):
+  runs/capture_v2boot.sh + runs/capture_v2boot_gate.sh. Both silently crash the way SH417b
+  proved was a MISSING-ENV artifact, not "Route-B".
+- MEASURED on real libroblox.so: capture_v2boot.sh WITHOUT the env → SIGSEGV guestpc=0x1029f3f7c
+  (fault=0x0, the hashfix string-hash-map `blr x8` lane), EXIT 134, crash-count 2. WITH the env →
+  routeb-hashfix fires hundreds of times, 0x1029f3f7c GONE, run ADVANCES into nativeGameGlobalInit's
+  real body, then aborts at `*** stack smashing detected ***` — the documented SH97/98 canary wall
+  deeper in the ladder, a SEPARATE pre-existing wall correctly NOT claimed clean (crash-count 1).
+- capture_v2boot_gate.sh (SH81 header claimed "CRASH-FREE now") carried NO crossing env — same latent
+  misattribution; env added to match. Out of scope correctly: capture_v2boot_sh82.sh is a DIAGNOSTIC
+  runbook whose whole purpose is the hashfix-lane progression; render-plane + sustain + session-producer
+  runbooks never reach the lane (no full --v2boot boot).
+- Honest: NOT a Route-B step, no DM (DM-root 0, MH_* false unchanged). Artifact-quality/attribution
+  correction — removes a genuine crash from the canonical stable-boot runbook and fixes two headers'
+  latent misattribution. Route-B live-DM structural gate UNCHANGED.
+- Files: runs/capture_v2boot.sh + runs/capture_v2boot_gate.sh (+ crossing env) +
+  docs/frontier-sh417-host-input-loop.md (SH417c section).
+
 ## SH417b (Sep 26, 2026, hermes-worker): the boot/input-loop runbook's "known pre-existing nativeInit Route-B lane SIGSEGV" at guestpc=0x1029f3f7c was a MISSING-ENV artifact, not a distinct crash — the promoted host-input LOOP (SH417/418, --v2boot-input-loop) is now a deterministic-clean boot on the real binary (EXIT 124 stable idle, 0 SIGSEGV/SIGABRT)
+
 Single-agent (cone suppressed). recon-v3 deliverables re-verified green at this exact HEAD first
 (capture_taskv4_frame.sh attempt 1: 24 real task frames `present swap Ok(0x1)`, 194 node pops, 0
 json abort, 0 crash, EXIT 124). Workspace green (arm64jit lib 568/0 incl. sh417/sh418; cargo test

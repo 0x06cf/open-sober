@@ -84,6 +84,41 @@ this env; capture_sh416_input_poll.sh was reverted unchanged.)
 - runs/capture_sh417_host_input_loop.sh (SH417b: + crossing env -> deterministic-clean)
 - docs/frontier-sh417-host-input-loop.md
 
+## SH417c audit (this cycle): extend the SH417b missing-env audit to the FULL-BOOT
+## --v2boot runbooks — capture_v2boot.sh (SH54) + capture_v2boot_gate.sh (SH81)
+
+SH417b noted the crossing-env audit should run on every boot-path runbook. The
+audit found two canonical stable-baseline `--v2boot` full-boot runbooks
+(runs/capture_v2boot.sh, runs/capture_v2boot_gate.sh) that omitted the crossing
+env and silently inherited the exact SH83/SH91 hashfix-lane crash SH417b
+cleaned from the input loop. MEASURED on real libroblox.so:
+
+- capture_v2boot.sh WITHOUT the env: SIGSEGV guestpc=0x1029f3f7c (fault=0x0,
+  the string-hash-map `blr x8` into garbage hash-fn-2 — precisely the hashfix
+  lane), EXIT 134, crash-count 2.
+- Same runbook WITH `JIT_ROUTEB_HASHFIX=1 JIT_JSON_ZERO_FIX=1 JIT_ROUTEB_SETFIX=1`:
+  routeb-hashfix fires (hundreds of lines incl. SH83/SH84/SH88/SH92 inserts),
+  guestpc=0x1029f3f7c GONE, run ADVANCES into nativeGameGlobalInit's real body,
+  then aborts at `*** stack smashing detected ***` — the documented SH97/98
+  canary wall deeper in the ladder, a SEPARATE pre-existing wall (NOT claimed
+  clean). crash-count 1.
+- capture_v2boot_gate.sh (SH81, header claims "CRASH-FREE now") carried NO
+  crossing env — same latent misattribution; env added to match.
+- Out of scope (correctly untouched): capture_v2boot_sh82.sh is a DIAGNOSTIC
+  runbook whose purpose is demonstrating exactly the hashfix lane progression;
+  capture_sustain_loop.sh + capture_sh304_session_producer.sh + all render-plane
+  runbooks (triangle/quad/mesh/tex/emitter) drive the harness-frame/startapp path
+  that never reaches the hashfix insert lane (no full --v2boot ladder).
+
+Honest: NOT a Route-B step, no DM (DM-root 0, MH_* false unchanged). This is an
+artifact-quality/attribution correction in the same class as SH417b: it removes a
+genuine crash from the canonical stable boot runbook (the "0 crash" guarantee a
+usable headless session needs) and fixes the two SH54/SH81 headers' latent
+misattribution of a hashfix-lane SIGSEGV as a Route-B/pre-existing lane. Route-B
+live-DM structural gate UNCHANGED. recon-v3 deliverables re-verified green at
+HEAD this cycle (capture_taskv4_frame.sh attempt 1: 24 real task frames `present
+swap Ok(0x1)`, 197 node pops, 0 json abort, 0 crash).
+
 ## Next (standing)
 
 Route B / do-init completeness stays top (STATUS #1): the substrate now REPORTS

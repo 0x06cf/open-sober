@@ -8,6 +8,7 @@ cd "$(dirname "$0")/.."
 LOG=/home/hermes-worker/runs/open-sober/runs/sh81-v2boot-gate.txt
 rm -f "$LOG"
 timeout 55 env JIT_DRIVE_LIFECYCLE=1 RENDERINIT_WARMUP_MS=5000 V2BOOT_WARMUP_MS=4500 \
+  JIT_ROUTEB_HASHFIX=1 JIT_JSON_ZERO_FIX=1 JIT_ROUTEB_SETFIX=1 \
   ./target/debug/examples/elfjit ~/.cache/open-sober/robbox/libroblox.so 0x2173ff4 \
   --jni --startapp 0x258b144 --v2boot \
   --renderinit 0x105b3a280 --renderthunk --renderframe \
