@@ -1,5 +1,24 @@
 # Open Sober — Agent Handoff
 
+## SH402 (Sep 20, 2026, hermes-worker): CORRECTED SH401's StartAppWithParams attribution + MEASURED the REAL StartApp boot body + app-shell band reach through the ordered substrate; DMCONT 0x102bd1d68 remains the standing next gate (0 hits)
+Single-agent (cone suppressed). SH401 measured the governor reach but mis-attributed the
+governor's `bl 0x258c6e4` as a "StartAppWithParams entry" — RECON-V3's prose already flagged
+0x258c6e4 is NOT a boot body. SH402 byte-confirms it is the AppBridgeV2 app-registry HASH-INSERT
+helper (clean `stp x29,x30,[sp,#-64]!` a9bc7bfd prologue, ~0x1d0-byte leaf, returns) whose
+SH159e empty-param patch makes it INSERT-then-`ret` (benign no-op), and MEASURES that the REAL
+boot body nativeAppBridgeV2StartAppWithParams at 0x258b144 (`sub sp,#0xf0` = d103c3ff) runs DEEP
+headlessly through the SH400 ordered substrate drive — region-watch recorded 7 block-entry pcs
+0x258b144..0x258b268 — with the do-init/app-shell ctor band [0x102207b50,0x102209000) ENTERED
+(~10 distinct pcs, incl the SH360 emptyvec walker 0x102208e4c/e88). DMCONT 0x102bd1d68 still
+0 hits (2/2, EXIT 124, 0 crash). Also MEASURED two never/now-run compositions: the genuine-single
+drive + the OLD SH371 DMCONT-firing rungs, and a plain re-run of the SH371 env, both abort at the
+run-variable live-object arm guestpc 0x10284cfa0 (EXIT 134) before any StartApp body / DMCONT
+(not a fresh seedable gate). New real-image hermetic sh402 (arm64jit lib 450->451) byte-pins boot
+body / hash-insert helper / app-shell band entry / emptyvec walker pc; +3 capture scripts + frontier
+doc. Honest: no DM (DM-root 0, MH_* false, AppBridgeV2 vt 0x1063a3410 unchanged). The STEP forward
+is that the StartApp boot body (not just the hash helper) is now reachable through the substrate;
+DMCONT stays the next gate. Workspace green (631/0; jit.rs condensed under 1MiB hook to 1,048,690 B).
+
 ## SH401 (Sep 19, 2026, hermes-worker): MEASURED the do-init → governor reach through the GENUINE AppBridgeV2 singleton — the frontier's named next gate after SH400, now crossed headlessly: the ordered session drive executes the real governor 0x102e9fa84 and its make-call into StartAppWithParams
 Single-agent (cone suppressed). SH400 measured that StartLuaAppDM driven in the ordered
 `ROUTEB_SESSION_SUBSTRATE` self-constructs the AppBridgeV2 singleton [0x106a705e8] to its genuine

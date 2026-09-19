@@ -832,29 +832,22 @@ pub fn drive_messagebus_publish_receive_payload(
     }
 }
 
-/// SH366 (--v2boot-glue-cmd): drive the guest app-command DISPATCHER `process_cmd`
-/// (guest 0x102bcd6e4) to deliver APP_CMD_INIT_WINDOW through the engine's real window/GL-
-/// surface chain — the SESSION-CTOR precondition named since SH39b (which only watched the glue
-/// LOOP at 0 hits), confirmed dead-drain by SH365. Never before ENTERED (the infinite ALooper
-/// loop can't be jit_run; this bounded dispatcher CAN). ABI: process_cmd(app=x0, cmd=x1):
-///   entry sub w8,w1,#1; cmp w8,#0x13; b.hi default -> w1 is the APP_CMD value
-///   `ldr x20,[x0]` then ::tbl; INIT_WINDOW(11)->x8=10->offset 0x17->case 0x2bcd78c
-///   case body: `ldr x0,[x20,#64]; strb w8,#1,[x20,#9]; bl 0x2bd29a0` (window-attach)
-///   version gate [0x10683d8b0]: byte0==6 && 0xfc00 -> else skip to body (keep 0 = body)
-/// Window-attach 0x2bd29a0 reads [this+0x268] once-guard; a zeroed obj skips the once-body and
-/// rets clean. So a fabricated app ([app]=inner, inner[+64]=zeroed-window-obj) makes the
-/// dispatcher take the INIT_WINDOW body, set [inner+9]=1, and call the real window-attach path
-/// headlessly for the first time. Returns Ok(0); [inner+9]==1 proves the engine's INIT_WINDOW
-/// case EXECUTED. Single serialized jit_run.
-/// SH367 (--v2boot-glue-cmd, MEASURED NEGATIVE): once-guard-ARMED real window-attach faults.
-/// With [win+0x268].bit0 ARMED, 0x2bd29a0 falls into the real GL post-init chain bl 0x2291c24
-/// (returns ([?win+0x278]!=0)) then bl 0x22985c0, whose DEEP body (cbz @0x22985c4 NOT fast-
-/// returned, the crafted non-null obj makes 0x2291c24 return 1) needs a REAL EGL surface/context
-/// — a fabricated NULL-first-word obj can't satisfy it; SIGSEGV inside host GL dispatch
-/// (guestpc=0x7f0000001f50 fault=0x7f818c0097, EXIT 134) before the INIT_WINDOW body completes.
-/// Pins real window-attach COMPLETION (and the do-init chain) as the standing Session-Ctor wall,
-/// one level deeper than SH366. Keep the once-guard OFF (SH366 clean entry) so the drive stays
-/// confirmed-green.
+/// SH366 (--v2boot-glue-cmd): drive the guest app-command DISPATCHER `process_cmd` (0x102bcd6e4)
+/// to deliver INIT_WINDOW through the engine's real window/GL-surface chain — the SESSION-CTOR
+/// precondition named since SH39b (glue LOOP 0 hits), dead-drain SH365. Never ENTERED (ALooper loop
+/// can't jit_run; this bounded dispatcher CAN). ABI process_cmd(app=x0,cmd=x1):
+///   entry sub w8,w1,#1; cmp #0x13; b.hi default; `ldr x20,[x0]` then ::tbl; INIT_WINDOW(11)->0x2bcd78c
+///   case: `ldr x0,[x20,#64]; strb w8,#1,[x20,#9]; bl 0x2bd29a0` (window-attach); version gate
+///   [0x10683d8b0]: keep 0 (skip BODY check). Window-attach 0x2bd29a0 reads [this+0x268] once-guard;
+///   a zeroed obj skips the once-body + rets clean. Fabricated app ([app]=inner, inner[+64]=zeroed win)
+///   makes the dispatcher run INIT_WINDOW, set [inner+9]=1 + call real window-attach headlessly.
+///   Returns Ok(0); [inner+9]==1 proves INIT_WINDOW EXECUTED. Single serialized jit_run.
+/// SH367 (--v2boot-glue-cmd, MEASURED NEGATIVE): once-guard-ARMED real attach faults — with
+/// [win+0x268].bit0 ARMED, 0x2bd29a0 enters real GL post-init bl 0x2291c24 (( [?win+0x278]!=0)) then
+/// bl 0x22985c0, whose DEEP body needs a REAL EGL surface/context (fabricated NULL obj can't) ->
+/// SIGSEGV in host GL dispatch (guestpc 0x7f0000001f50, EXIT 134) before INIT_WINDOW completes.
+/// Pins real window-attach COMPLETION as the standing Session-Ctor wall, one level deeper than SH366.
+/// Keep the once-guard OFF (SH366 clean entry).
 pub fn drive_glue_process_cmd(iimg: &[u8], ib: u64, tpidr: u64, boot_sp: u64) -> u64 {
     // Version gate word [0x10683d8b0]: keep 0 so `b.cc`/`cbz` route straight to the body.
     const VERSION_GATE: u64 = 0x10683d8b0;
@@ -1826,23 +1819,21 @@ fn routeb_appstart_settings_once_seed_guard(_state: *mut CpuState, pc: u64) {
 }
 
 /// SH269 (opt-in JIT_ROUTEB_APPSART_GOVFLAG): the post-ladder SESSION-CTOR rungs — SendAppEvent
-/// OnAppReady (0x102bb463c), SendAppEventOnGameLoaded (0x102bb429c), MessageBus.subscribe
-/// (0x102ba5bb8) — were wired in SH264-267 but NEVER executed headlessly because --v2boot's
-/// StartLuaAppDM / V2StartApp rungs self-drove deep into app-start and killed the process before
-/// the loop reached them. --v2boot-skip-appstart skips those two rungs so the loop completes; this
-/// guard then drives the governor predicate SendAppEventOnAppReady reaches. MEASURED (real
-/// libroblox.so, full SH267 seed set + skip-appstart): SendAppEventOnAppReady REACHED the governor
+/// OnAppReady (0x102bb463c), OnGameLoaded (0x102bb429c), MessageBus.subscribe (0x102ba5bb8) — were
+/// wired in SH264-267 but NEVER executed headlessly because --v2boot's StartLuaAppDM/V2StartApp rungs
+/// self-drove deep and killed the process before the loop reached them. --v2boot-skip-appstart skips
+/// those two so the loop completes; this guard then drives the governor predicate SendAppEvent reaches.
+/// MEASURED (real libroblox.so, SH267 seed set + skip-appstart): SendAppEventOnAppReady reached the
+/// governor
 /// predicate 0x2ea0b9c (FIRST time) and faulted `[SIGSEGV] fault=0x0 guestpc=0x102ea0b9c x0=0
 /// x21=host-app-governor` — disasm of 0x2ea0b9c..0x2ea0be0:
 ///   ldrb w8,[6a64000+#3488] (=0x106a64da0)  ; cbz w8 -> 0x2ea0bd0 (flag CLEAR)
 ///   [flag clear] ldr x0,[x21,#1032]; ldr x8,[x0]  <- x0 = app-DM controller = 0 -> NULL deref
-///   [flag set]   mov x0,x21; bl 0x2ea3a84  (passes the REAL live governor object to the
-///                preload-overrides helper instead of the NULL controller)
-/// [0x106a64da0] is a seeded fixed-.bss flag byte (same region as the SH239 ctor-guard
-/// 0x106a64d70), NOT a live-object. Seeding bit0=1 routes the governor to its
-/// (helper-driven) branch so the session drive advances PAST the NULL-controller deref —
-/// the SH248e/SH259 once-flag pattern at a NEW cell, reached from the REAL session path.
-/// Default-inert: fires only under the env; idempotent (ORs bit0 only).
+///   [flag set]   mov x0,x21; bl 0x2ea3a84  (passes the REAL governor to preload-overrides, not NULL)
+/// [0x106a64da0] is a seeded fixed-.bss flag byte (same region as SH239 ctor-guard 0x106a64d70), NOT
+/// live-object. Seeding bit0=1 routes the governor to the helper branch so the session drive advances
+/// PAST the NULL-controller deref — SH248e/SH259 once-flag pattern at a NEW cell. Default-inert:
+/// fires only under the env; idempotent (ORs bit0 only).
 fn routeb_govflag_seed_guard(_state: *mut CpuState, pc: u64) {
     if std::env::var_os("JIT_ROUTEB_APPSART_GOVFLAG").is_none() {
         return;
@@ -2815,23 +2806,15 @@ pub fn routeb_dm_force_shell() -> u64 {
     })
 }
 
-/// SH165-fwd (recon deleg_62a86bcd task-0, authoritative): fnB (0x102bd1b98 engine-init)
-/// bl 0x102bd8ce8, which reads its arg's +0x18 C-string and forwards it to a
-/// NativeDataModelManager manager via vtable slots +0xf8/+0x108/+0x1f0
-/// (continueAfterFlagsLoaded_). The manager singleton comes from the getter 0x102174c04,
-/// which returns the holder global at GUEST 0x102727550 — but JNI_OnLoad (boot entry
-/// 0x102173ff4) already stlr'd a host JavaVM* into that global, so under the DMFORCE
-/// ladder the getter would return a host JNINativeInterface* and the engine-init's
-/// vt[+0xf8] blr would dispatch into RAW HOST JNI. THIS guard re-seeds 0x102727550 with
-/// a fabricated all-leaf-vtable manager M so the getter returns M and the subsequent
-/// vt dispatches (+0xf8/+0x108/+0x1f0) resolve to benign leaves; with all other vt slots
-/// 0 (=> vt[+0x720]==0) the post-FFI continuation 0x2bd9058 soft-returns cleanly. SCOPED:
-/// fires ONLY on entry to the fnB engine-init region (0x102bd1b98), gated on the same
-/// JIT_ROUTEB_DMFORCE flag that forces fnB — it never blanket-clobbers the JNI-critical
-/// global on the normal boot path. Idempotent. Layout: vt[+0x30]=write-leaf
-/// (str x0,[x1]; mov w0,#0; ret — getter fills its out-field [x1] with `this`), vt[+0xf8]/
-/// [+0x108]/[+0x1f0]=leaf, all other slots 0; M[+0]=vt, M[+8]=0 (getter tail-helper
-/// 0x624e6c0 cbz-cleans on M[+8]==0).
+/// SH165-fwd (deleg_62a86bcd): fnB (0x102bd1b98) bl 0x102bd8ce8 reads arg+0x18 C-string, forwards
+/// to NativeDataModelManager via vt +0xf8/+0x108/+0x1f0 (continueAfterFlagsLoaded_). Manager singleton
+/// from getter 0x102174c04 -> holder GUEST 0x102727550, but JNI_OnLoad (0x102173ff4) already stlr'd a
+/// host JavaVM* there -> vt[+0xf8] would dispatch into RAW HOST JNI. Guard re-seeds 0x102727550 with a
+/// fabricated all-leaf-vtable manager M so the getter returns M and vt dispatches (+0xf8/+0x108/+0x1f0)
+/// resolve to benign leaves; all other slots 0 (=>vt[+0x720]==0) -> post-FFI 0x2bd9058 soft-returns clean.
+/// SCOPED: fires ONLY on entry to fnB region (0x102bd1b98), gated on JIT_ROUTEB_DMFORCE (blanket-clobber
+/// avoided on normal boot). Idempotent. Layout: vt[+0x30]=write-leaf (str x0,[x1]; mov w0,#0; ret),
+/// vt[+0xf8]/[+0x108]/[+0x1f0]=leaf, rest 0; M[+0]=vt, M[+8]=0 (getter tail 0x624e6c0 cbz-cleans on 0).
 /// SH243: /proc/self/maps probe — does `guest_addr`'s 0x1000-byte page appear mapped?
 /// (guest==host identity, so the guest address is a real host address). Non-mutating;
 /// used only to avoid faulting on a genuinely-unmapped debug-read cell.
@@ -3873,18 +3856,13 @@ fn routeb_dm_instance_guard(_state: *mut CpuState, pc: u64) {
 ///
 /// WALKER ABI (disasm 0x5e09bc8): x0=dm, x1=&name (libc++ std::string), x8=&out
 /// (16-byte {item,refcount}). It resolves name->classid via the class-name registry
-/// 0x106dca0e70 (resolver 0x2373cec), then walks [dm+0x68] singly-linked (node[+0x18]
-/// == classid, node[+0x68]=next) and on match calls materializer 0x2377600(node,&out)
-/// which copies [node+8]/[node+16] into out.
-///
-/// NAME STRING decode in the walker (0x5e09bfc): `ldrb w8,[x1]; lsr x8,w8,#1` treats
-/// byte0 of x1 as (cap|bit0=long); long-str => w8.bit0=1, len = byte0_cap>>1, data at
-/// [x1+16]. We fabricate a long-form name {__cap_=0x13 (bit0=1 long, cap 9<<1=0x12),
-/// __size_=9, __data_=&"PlayerGui"} so the walker passes key-ptr=x1+16 ptr, len=9 to
-/// the resolver — matching the engine's own registry "PlayerGui" key (9 chars).
-///
-/// default-inert (env JIT_ROUTEB_DM_SERVICE_NODE=1). Node is thin + host-leaked;
-/// gated on a genuinely constructed instance (vptr 0x106648950).
+/// 0x106dca0e70 (resolver 0x2373cec), then walks [dm+0x68] singly-linked (node[+0x18]==classid,
+/// node[+0x68]=next) and on match calls materializer 0x2377600(node,&out) copying [node+8]/[node+16].
+/// NAME decode (0x5e09bfc): `ldrb w8,[x1]; lsr w8,#1` — byte0=(cap|bit0=long); long => data at [x1+16].
+/// Fabricate long-form name {__cap_=0x13 (long), __size_=9, __data_=&"PlayerGui"} -> walker passes key
+/// ptr+len=9 -> resolver matches the engine's own "PlayerGui" key (9 chars).
+/// default-inert (env JIT_ROUTEB_DM_SERVICE_NODE=1). Node thin+host-leaked; gated on genuinely
+/// constructed instance (vptr 0x106648950).
 fn routeb_dm_service_resolve_guard(_state: *mut CpuState, pc: u64) {
     if std::env::var_os("JIT_ROUTEB_DM_SERVICE_NODE").is_none() {
         return;
@@ -6393,25 +6371,16 @@ fn cached_block(
 /// dispatcher compiles & re-enters there. Halts when `pc == 0`.
 // ---------------------------------------------------------------------------
 // SH202: on-demand single-site V2 singleton-dispatch family patcher.
-//
-// SH200 patched 4 located objB-vtable dispatch sites deterministically, but the
-// ~365-site family (sh201_v2_family_scan) stops V2Init/V2Start run-variably at
-// the OTHER sites (blr at 0x1062514e0 / 0x106259a50 / 0x106265f40 measured),
-// so the SH199 world-build gate fn 0x102ea3b14 is never reliably reached. The
-// family-wide RUNTIME patch crash-loops the run (SH201 over-patch: it touches
-// genuine in-band calls N<0xf0 -> SIGABRT), so it can't be pre-scribed.
-//
-// SH202's lever (SH201 §6 "next genuine lever"): patch ONLY the exact site the
-// run ACTUALLY dispatches through, ON DEMAND, at the outside-image stop. At
-// that stop the guest `blr x8` that jumped into host box-alloc bytes has set
-// x30 = blr+4, so `blr_site = x30-4`. The dispatcher has not yet executed any
-// code at the bad pc, so it is safe to: verify the site is a genuine family
-// member, patch its dispatch window (materialize the stable singleton object
-// into x0 + nop the blr), drop the block cache for the window, rewind pc to the
-// window start, and `continue` the run_loop — the patched site re-executes and
-// the run progresses past it instead of dying. Blinded family clearing, one
-// site at a time, never touching untouched in-band sites.
-//
+// SH200 patched 4 located objB-vtable sites deterministically, but the ~365-site
+// family (sh201_v2_family_scan) stops V2Init/V2Start run-variably at OTHER sites
+// (blr 0x1062514e0/0x106259a50/0x106265f40 measured), so SH199 world-build gate
+// 0x102ea3b14 is never reliably reached. Family-wide patch crash-loops (SH201
+// over-patch: touches genuine in-band N<0xf0 -> SIGABRT), so not pre-scribable.
+// SH202's lever: patch ONLY the exact site the run ACTUALLY dispatches through,
+// ON DEMAND, at the outside-image stop (guest `blr x8` into host box-alloc set
+// x30=blr+4 -> `blr_site=x30-4`). Safe to: verify family member, patch dispatch
+// window (materialize stable singleton into x0 + nop blr), drop block cache,
+// rewind pc, `continue` run_loop. Blinded clearing one site at a time.
 // Default-INERT: only fires when JIT_ROUTEB_V2_ONDEMAND=1.
 // ---------------------------------------------------------------------------
 /// SH202 pure classifier: given the guest address of a candidate `blr x8`,
@@ -7123,15 +7092,14 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
                         }
                     }
                 }
-                // SH92: at the INSERT entry (0x1029f3e70), a NON-FAMILY map/this must also be
-                // substituted. The OTel registrar loop (file 0x29b3814) reads its INSERT map from
-                // [0x106838380]; that slot can end up holding the `.data` descriptor-table base
-                // 0x1067da308 (in-image, so SH88's `v<0x100000000` predicate passes it through) —
-                // a NON-coherent object, not the seeded empty map. Its +0x10 (=[0x67da318]=
-                // 0x00a80000003f0060) is not an in-image family hash, so the +0x18 repair also
-                // `continue`s, and INSERT runs with garbage -> its +0x30 stack-spill slot is
-                // executed as code (fault==rip==stack, observed 0x1029b3828). Overwrite the
-                // candidate with the seeded substitute map iff it is NOT a real family map:
+                // SH92: at INSERT entry (0x1029f3e70), a NON-FAMILY map/this must also substitute.
+                // The OTel registrar loop (file 0x29b3814) reads its INSERT map from [0x106838380];
+                // that slot can hold the `.data` descriptor-table base 0x1067da308 (in-image, so
+                // SH88's v<0x100000000 predicate passes it) — a NON-coherent object, not the seeded
+                // empty map. Its +0x10 (=[0x67da318]=0x00a80000003f0060) is not a family hash, so
+                // the +0x18 repair `continue`s and INSERT runs with garbage -> its +0x30 stack-spill
+                // slot executes as code (fault==rip==stack, observed 0x1029b3828). Overwrite the
+                // candidate with the seeded substitute iff NOT a real family map:
                 //   m==0 or m<0x100000000  -> invalid/sub-image -> substitute
                 //   else [m+0x10] not in {SPAN_HASH,STRING_HASH} -> non-family object -> substitute
                 // (A real family map's +0x10 IS one of those hashes and is never overwritten;
@@ -8405,16 +8373,13 @@ pub fn compile_image_bounded(
 }
 
 #[cfg(test)]
-/// SH357: `std::env::set_var`/`remove_var` are NOT thread-safe (unsafe in edition 2024;
-/// libc setenv/putenv mutate the process-global environ concurrently => UB, intermittent
-/// SIGSEGV and PoisonError under the 8-core parallel test harness). Every routeb/functional
-/// guard test toggles process env, so ALL test env mutations must serialize on ONE shared
-/// lock (this is exactly the FS_ROOT_LOCK precedent for shared test-root state). Process-env
-/// reads (std::env::var in the guards) are safe as long as no writer is mid-mutation; with
-/// set/remove serialized, each test's set-then-guard relies on its own linear ordering.
-/// Defined at `jit` module scope (not inside `mod tests`) so every nested/sibling test module
-/// (`mod tests`, routeb_lsm_keyfix_guard_tests, isa_regress_tests, ...) sees them via
-/// `use super::*`. Production code never calls these (single jit_run thread).
+/// SH357: `std::env::set_var`/`remove_var` are NOT thread-safe (unsafe in edition 2024; libc
+/// setenv/putenv mutate process-global environ concurrently => UB, intermittent SIGSEGV and
+/// PoisonError under the 8-core parallel harness). Every routeb/functional guard test toggles
+/// process env, so ALL test env mutations serialize on ONE shared lock (the FS_ROOT_LOCK
+/// precedent). Env reads are safe as long as no writer is mid-mutation. Defined at `jit` module
+/// scope (not `mod tests`) so nested/sibling test modules see them via `use super::*`.
+/// Production never calls these (single jit_run thread).
 pub(crate) fn env_test_set(key: &str, val: &str) {
     static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
     let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -17779,6 +17744,40 @@ mod fp16_and_fabd_fccmp_exec {
             );
         } else {
             eprintln!("sh401 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
+    fn sh402_startapp_boot_body_and_appshell_band_reach_pinned() {
+        // SH402: replaying the SH401 measured reach (ordered substrate -> genuine AppBridgeV2
+        // single vt -> governor 0x102e9fa84) at this HEAD with region-watch on the REAL StartApp
+        // path shows the governor's `bl 0x258c6e4` (SH401's "StartAppWithParams" hit) is actually
+        // the AppBridgeV2 app-registry HASH-INSERT helper (RECON-V3 "0x258c6e4 is NOT a boot body"),
+        // while the REAL boot body nativeAppBridgeV2StartAppWithParams at 0x258b144 (`sub sp,#0xf0`
+        // = d103c3ff) runs DEEP headlessly (7 block-entry pcs 0x258b144..0x258b268) and the
+        // do-init/app-shell ctor band [0x102207b50,0x102209000) is ENTERED (~10 pcs, mostly SH360
+        // emptyvec walker 0x102208e88). DMCONT 0x102bd1d68 still 0. Corrects SH401's attribution.
+        // Byte-pin:
+        //   boot body 0x10258b144 = sub sp,#0xf0 (d103c3ff) -- the REAL StartAppWithParams
+        //   hash-insert helper 0x10258c6e4 = stp x29,x30 (a9bc7bfd) -- NOT the boot body
+        //   do-init/app-shell band 0x102207b50 entered (unconditional b 14000001)
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let word_at = |vaddr: u64| -> u32 {
+                let off = (vaddr & 0xffff_ffff) as usize;
+                let b = &img[off..off + 4];
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            };
+            assert_eq!(word_at(0x10258b144), 0xd103_c3ff, "sh402 StartAppWithParams BOOT body prologue (sub sp,#0xf0)");
+            assert_eq!(word_at(0x10258c6e4), 0xa9bc_7bfd, "sh402 hash-insert helper frame (NOT boot body)");
+            assert_eq!(word_at(0x102207b50), 0x1400_0001, "sh402 app-shell/do-init band entry (unconditional b)");
+            assert_eq!(word_at(0x102208e88), 0xa940_5275, "sh402 SH360 emptyvec walker block-entry pc");
+            eprintln!(
+                "[abi] sh402 StartApp boot body 0x258b144 (sub sp,#0xf0) + app-shell band [0x102207b50..0x102209000) entered"
+            );
+        } else {
+            eprintln!("sh402 real-image guard: no real libroblox.so, skipping anchors");
         }
     }
 
