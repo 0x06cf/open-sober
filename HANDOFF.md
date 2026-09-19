@@ -1,5 +1,42 @@
 # Open Sober — Agent Handoff
 
+## SH462 (Sep 20, 2026, hermes-worker): DM-root STORE-watch — dynamic write-site trace of the Route-B DM-holder window (first store-level, not read-level, measurement)
+Single-agent (cone suppressed). The recon-v3 immediate-priority deliverables
+remain green at this HEAD (type4_frame_thunk 24 real task-driven frames + 0 json
+abort, SH461-VERIFY). Workspace green (cargo test --workspace EXIT 0; arm64jit
+lib 668->669 incl. 1 new sh462 hermetic; cargo build --workspace + --example
+elfjit OK). Production code ONLY in translate.rs (default-inert observer on the
+existing emitted post-store hook; jit.rs 1,048,390 B < 1MiB hook untouched;
+elfjit.rs/session.rs unchanged — runtime byte-identical when the env is unset).
+- **The operator-asked dynamic trace, one level deeper.** Route B has been
+  measured only by READING the DM-holder cells (SH361/381/334/388 all report
+  DM-root [0x106a68818]=0). NO instrument ever named the guest STORE that would
+  populate them. SH462 adds `JIT_DMROOT_STORE_WATCH=1` (default-inert): any
+  64-bit guest store landing in [0x106a683f0..0x106a68828] (spans once-guard
+  [0x106a68410], once-slot [0x106a68408], DM-root [0x106a68818]) logs pc+value.
+- **MEASURED on the real libroblox.so** (SH415 env + the store-watch flag; EXIT
+  124 stable, substrate 11/16, probe LIVE DM=false): **11 distinct fires, ALL in
+  the once-slot/guard region [0x106a68408..0x106a684d0]** — the do-init
+  once-lambda world-build [0x22065xx..0x2206axx] DOES run headlessly and
+  populates real structure there. The once-lambda's ctor store at
+  pc=0x102206d74 (SH381's `str x0,[x23,#1032]` after `bl 0x2173b3c`) writes the
+  once-state SENTINEL **0x400000b** into once-slot [0x106a68408] — NOT a
+  DataModel pointer.
+- **Crucial negative: NO guest store ever targets DM-root [0x106a68818]
+  itself.** All fires are in the 0x108-byte region below it. This is the dynamic
+  confirmation the wall is STRUCTURAL at the DM-root WRITE site: the real DM is
+  built by an upstream session path the JIT cannot drive, and the harness's
+  earlier SH155-ladder nonzero 'DM-root' values were host SEED writes, not guest
+  stores (which is why the guest store-watch doesn't list them).
+- Honest: NOT a DM — this is an observer, not a seed; Route-B live-DM gate
+  UNCHANGED. It closes the "is the wall seedable-by-writer" sub-question (a
+  reached writer exists but writes sentinel/state, never a DM into the holder)
+  and sharpens the operator-aligned lever (session-ctor / runtime-surface drive)
+  as the only path to a live DM. No re-treads.
+- Files: docs/frontier-sh462-dmroot-store-watch.md (evidence incl. the measured
+  11-fire trace) + runs/capture_sh462_dmroot_storewatch.sh + crates/arm64jit/
+  src/translate.rs (`#[cfg]`-free observer + test). Commit afaf030.
+
 ## SH461-VERIFY (Sep 19, 2026, hermes-worker): recon-v3 §A type4_frame_thunk SELF-DRIVEN-FRAME deliverable VERIFIED GREEN ON THE REAL BINARY — 24 real task-driven frames (real capture artifact)
 Single-agent (cone suppressed). Ran `runs/capture_taskv4_frame.sh` against the
 real 104MB `libroblox.so` after the SH455-461 test-only codegen-pin lineage kept
