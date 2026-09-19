@@ -9676,6 +9676,42 @@ mod tests {
     }
 
     #[test]
+    fn sh385_lsm_reader_value_slot_and_poolmove_base_pinned() {
+        // SH385 (real-image): byte-anchor the FULL SH285 reader/pool-move mechanism that the
+        // persistence-lane terminal (guestpc=0x101db1b08) faults on, refining SH285's "reader/pop
+        // live-object, [obj+0x50]=0xff..ff" classification one level deeper. The reader 0x1d99e30
+        // (bl'd at 0x1db1ae8 -> x20) does `ldr x8,[0x726f8c0]` (lsm_map_global bucket base) ->
+        // `ldar x8,[bucket]` -> `ldr x0,[x8, idx<<3]` (node) -> `ldr x0,[x0,#40]` = the pool-move
+        // x1. The append 0x1d9a15c then does `add x10, x0, x1` @0x1d9a168 (base = manager + value),
+        // and the backward-copy `strb w11,[x10],#-1` @0x1d9a180 writes there. With x20 uninitialized
+        // (0xff..ff) the base overflows to a high faulting address. SH267's zeroed per-node cells
+        // give a nominal [+40]=0 but the SH285 live dump showed x20=0xffff80... on the
+        // settings-state path, i.e. the reached node is NOT the seeded zeroed cell — path-dependent.
+        // Pins make the classification reproducible. Index by FILE OFFSET (guest-0x100000000).
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let word_at = |vaddr: u64| -> u32 {
+                let off = vaddr as usize;
+                let b = &img[off..off + 4];
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            };
+            // reader 0x1d99e30: map-global base load + node deref + value slot.
+            assert_eq!(word_at(0x1d99e34), 0xd002a6a8, "sh385 reader adrp x8,726f000 (map global)");
+            assert_eq!(word_at(0x1d99e40), 0xf9446108, "sh385 reader ldr x8,[x8,#2240] (lsm_map_global)");
+            assert_eq!(word_at(0x1d99e50), 0xf8697900, "sh385 reader ldr x0,[x8,x9,lsl#3] (node)");
+            assert_eq!(word_at(0x1d99e60), 0xf9401400, "sh385 reader ldr x0,[x0,#40] (value slot x20)");
+            // pool-move append 0x1d9a15c: base sum + backward store.
+            assert_eq!(word_at(0x1d9a15c), 0xb9400048, "sh385 append ldr w8,[x2] (len)");
+            assert_eq!(word_at(0x1d9a168), 0x8b01000a, "sh385 append add x10,x0,x1 (base=manager+value)");
+            assert_eq!(word_at(0x1d9a180), 0x381ff54b, "sh385 append strb w11,[x10],#-1 (the SH285 fault store)");
+            eprintln!("sh385 SH285 reader mechanism pinned (x20=[mapnode+40] via lsm_map_global; pool-move base add x10,x0,x1 @0x1d9a168; fault store strb,[x10],#-1 @0x1d9a180)");
+        } else {
+            eprintln!("sh385 real-image guard: no real libroblox.so, skipping reader/pool-move pins");
+        }
+    }
+
+    #[test]
     fn sh375_setinitparams_is_genuine_3f0_frame_lsm_consumer() {
         // SH375 (real-image): with the SH373 reaching-env (LSM_APPEND_SKIP + DM_CONT_M48_SEED
         // + CONT_APPNAME_SEED) the SH285 persistence wall is deterministically CROSSED and the

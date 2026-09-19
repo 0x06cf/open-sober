@@ -1,5 +1,25 @@
 # Open Sober — Agent Handoff
 
+## SH385 (Sep 20, 2026, hermes-worker): MEASURED NEGATIVE (fully-composed LSM-crossing) + byte-anchored SH285 reader/pool-move mechanism — the LAST never-run composition loophole closed, refining the persistence-lane verdict to the exact fault mechanism
+Single-agent (cone suppressed). Before implementing the SH383/384 "wire the manufactured LSM
+manager into the lane" step, run the never-composed full-crossing intersection: the LSM crossings
+(KEYFIX + APPEND_SKIP + PACK_SKIP) + full reaching env, watching for the do-init MAIN dispatch body
+(0x10258b5d8, SH362's measured-never-executing gate). MEASURED (real libroblox.so, EXIT 134): even
+with all three crossings armed the ladder STILL drains to the LSM pool-pop family (guestpc=0x101d9a528,
+non-poisoned-key fault) and 0x258b5d8 gets ZERO region hits — the composed crossings do NOT exit the
+persistence family nor reach the do-init body (consistent with SH379; keyfix was its missing leg).
+Disasm-refined the SH285 letter one level deeper: reader 0x1d99e30 returns x20=[mapnode+40] via
+lsm_map_global; append 0x1d9a15c computes write base `add x10,x0,x1` (manager+value) and the
+backward-store `strb [x10],#-1` @0x1d9a180 is the fault site; SH267's zeroed node cells give a
+nominal [+40]=0 BUT the SH285 live dump showed x20=0xffff80... on the settings-state path (the
+reached node is NOT the SH267 cell) — the exact node/value is path-dependent, set only by a real LSM
+session ctor. New hermetic `sh385_lsm_reader_value_slot_and_poolmove_base_pinned` (arm64jit lib
+439->440) + probe runs/capture_sh385_composed_lsm.sh + frontier doc. Workspace green (cargo test
+--workspace EXIT 0; jit.rs 1,014,534 B <1MiB). Route-B live-DM structural gate UNCHANGED (DM-root 0,
+MH_* false, AppBridgeV2 0). SH174 capture-latch stays the single forward observer. The LSM lane is
+now closed as a Route-B avenue with the strongest (fully-composed + byte-anchored) evidence on
+record; do NOT re-compose its crossings expecting the do-init body.
+
 ## SH384 (Sep 20, 2026, hermes-worker): implemented + MEASURED the DRIVE of the GENUINE
 LocalStorageManager ctor (guest 0x101db0dfc, file 0x1db0dfc, r-x text seg [0x100000000,0x1062d8190),
 ELF file-offset==vaddr) through real relocated engine code with a coherent zeroed container —
