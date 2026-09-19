@@ -8128,4 +8128,107 @@ mod tests {
             0x89, 0x83, 0x10, 0x01, 0x00, 0x00, // mov [rbx+0x110], eax  (d0 low 4)
         ]);
     }
+
+    // SH432: hermetic coverage of the SIMD/vector ALU codegen families
+    // (translate.rs SimdVLog, SminMax, SimdSatAdd) — the byte emission that
+    // carries real rendered geometry/color lane math. decode.rs + jit.rs pin
+    // decode + runtime, but the EMISSION between them was unpinned for these
+    // three families. SH432 pins the semantically-critical discriminators a
+    // byte error silently corrupts: the pand/por/pxor/pandn opcode choice in
+    // SimdVLog (a /r field flub maps Vd&Vm to Vd^Vm or worse), the cmov
+    // condition byte that selects max-vs-min AND signed-vs-unsigned in
+    // SminMax (cmovg 0x4F / cmovl 0x4C / cmova 0x47 / cmovb 0x42 — a flub
+    // returns the wrong lane or clamps the wrong direction), the movsxd
+    // sign-extension presence that flips sub-byte saturating results, and the
+    // smax-vs-smin constant + cmov pairing in SimdSatAdd that decides which
+    // bound a signed overflow clamps to (a sign-extended 0x80 lane vs a
+    // zero-extended +128 changes the clamp entirely). Exact-byte, synthetic
+    // Inst -> translate() (see tr_bytes), deterministic, no image/env.
+    // [RBX]=CpuState; vector slot v[t] = VECTOR_BASE(0x110) + t*16.
+
+    // SimdVLog AND: load Vn@0x120 + Vm@0x130 into xmm0/xmm1, `pand xmm0,xmm1`
+    // (66 0F DB C1), store Vd@0x110. Whole-buffer pin.
+    #[test]
+    fn sh432_simdvlog_and_emits_pand_and_stores_vd() {
+        let b = tr_bytes(Inst::SimdVLog { rd: 0, rn: 1, rm: 2, op: 0 });
+        assert_eq!(b, vec![
+            0xf3, 0x0f, 0x6f, 0x83, 0x20, 0x01, 0x00, 0x00, // movdqu xmm0,[rbx+0x120]  Vn
+            0xf3, 0x0f, 0x6f, 0x8b, 0x30, 0x01, 0x00, 0x00, // movdqu xmm1,[rbx+0x130]  Vm
+            0x66, 0x0f, 0xdb, 0xc1,                         // pand xmm0,xmm1  (AND)
+            0xf3, 0x0f, 0x7f, 0x83, 0x10, 0x01, 0x00, 0x00, // movdqu [rbx+0x110],xmm0  Vd
+        ]);
+    }
+
+    // SimdVLog opcode discriminator: after the two identical movdqu loads
+    // (16 bytes), the /r-based opcode byte distinguishes AND/ORR/EOR/BIC
+    // (DB/EB/EF/DF). A /r-flub would emit one op in another's slot.
+    #[test]
+    fn sh432_simdvlog_op_discriminates_pand_por_pxor_pandn() {
+        let cases = [
+            (0u8, &[0x66, 0x0f, 0xdb, 0xc1][..]), // AND  pand  xmm0,xmm1
+            (2u8, &[0x66, 0x0f, 0xeb, 0xc1][..]), // ORR  por   xmm0,xmm1
+            (1u8, &[0x66, 0x0f, 0xef, 0xc1][..]), // EOR  pxor  xmm0,xmm1
+            (9u8, &[0x66, 0x0f, 0xdf, 0xc8][..]), // BIC  pandn xmm1,xmm0
+        ];
+        for (op, want) in cases {
+            let b = tr_bytes(Inst::SimdVLog { rd: 0, rn: 1, rm: 2, op });
+            assert_eq!(&b[0..16], &b[16..].get(0..0).map(|_| b[0..16].as_ref()).map(|_| {
+                // both loads identical regardless of op
+                &[0xf3, 0x0f, 0x6f, 0x83, 0x20, 0x01, 0x00, 0x00,
+                  0xf3, 0x0f, 0x6f, 0x8b, 0x30, 0x01, 0x00, 0x00][..]
+            }).unwrap()[..]);
+            assert_eq!(&b[16..20], want);
+        }
+    }
+
+    // SminMax signed .2s max (esize=4,q=false): each lane loads A,B with the
+    // movsxd SIGN-extend (48 63) so negative lanes compare correctly, then
+    // `cmp rcx,rax; cmovg rax,rcx` (48 39 C1 / 48 0F 4F C1) keeps the larger.
+    // The 48 63 movsxd and the 4F (cmovg not cmovl) are the discriminators.
+    #[test]
+    fn sh432_sminmax_signed_max_signextends_and_cmovg() {
+        let b = tr_bytes(Inst::SminMax { rd: 0, rn: 1, rm: 2, max: true, unsigned: false, esize: 4, q: false });
+        // per-lane: mov eax,[rbx+0x120]; movsxd rax,eax; mov ecx,[rbx+0x130];
+        // movsxd rcx,ecx; cmp rcx,rax; cmovg rax,rcx
+        assert!(b.windows(3).any(|w| w == [0x48, 0x63, 0xc0]), "signed A lane must movsxd");
+        assert!(b.windows(3).any(|w| w == [0x48, 0x63, 0xc9]), "signed B lane must movsxd");
+        assert!(b.windows(2).any(|w| w == [0x48, 0x39]), "cmp rcx,rax present");
+        assert!(b.windows(4).any(|w| w == [0x48, 0x0f, 0x4f, 0xc1]),
+            "signed max must cmovg (0x4F), not cmovl/others");
+        assert!(!b.windows(4).any(|w| w == [0x48, 0x0f, 0x4c, 0xc1]), "no cmovl in a max lane");
+    }
+
+    #[test]
+    fn sh432_sminmax_unsigned_min_zeroextends_and_cmovb() {
+        let b = tr_bytes(Inst::SminMax { rd: 0, rn: 1, rm: 2, max: false, unsigned: true, esize: 1, q: false });
+        assert!(b.windows(2).any(|w| w == [0x0f, 0xb6]), "movzx byte lane present");
+        assert!(!b.windows(2).any(|w| w == [0x48, 0x63]), "unsigned lanes must NOT sign-extend");
+        assert!(b.windows(4).any(|w| w == [0x48, 0x0f, 0x42, 0xc1]),
+            "unsigned min must cmovb (0x42), not cmovl (signed)");
+        assert!(!b.windows(4).any(|w| w == [0x48, 0x0f, 0x4c, 0xc1]), "no signed cmovl in unsigned lane");
+    }
+
+    #[test]
+    fn sh432_simdsatadd_signed_clamps_smax_and_smin() {
+        let b = tr_bytes(Inst::SimdSatAdd { rd: 0, rn: 1, rm: 2, esize: 4, sub: false, unsigned: false, q: true });
+        assert!(b.windows(3).any(|w| w == [0x48, 0x63, 0xc0]), "sqadd sign-extends the A lane");
+        assert!(b.windows(10).any(|w| w == [0x49, 0xba, 0xff, 0xff, 0xff, 0x7f, 0, 0, 0, 0]),
+            "smax bound must be 0x7FFFFFFF loaded into r10");
+        assert!(b.windows(4).any(|w| w == [0x49, 0x0f, 0x4f, 0xc2]), "signed overflow cmovg -> r10 (smax)");
+        assert!(b.windows(10).any(|w| w == [0x49, 0xba, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0xff, 0xff]),
+            "smin bound must be 0x80000000 as a SIGNED negative in r10");
+        assert!(b.windows(4).any(|w| w == [0x49, 0x0f, 0x4c, 0xc2]), "signed underflow cmovl -> r10 (smin)");
+    }
+
+    #[test]
+    fn sh432_simdsatadd_unsigned_clamps_zero_no_signextend() {
+        let b = tr_bytes(Inst::SimdSatAdd { rd: 0, rn: 1, rm: 2, esize: 2, sub: true, unsigned: true, q: false });
+        assert!(b.windows(2).any(|w| w == [0x0f, 0xb7]), "uqsub zero-extends word lanes (movzx)");
+        assert!(!b.windows(2).any(|w| w == [0x48, 0x63]), "unsigned lanes must NOT sign-extend");
+        assert!(b.windows(10).any(|w| w == [0x49, 0xba, 0, 0, 0, 0, 0, 0, 0, 0]),
+            "uqsub clamp floor must be literal 0 in r10, not smax/smin");
+        assert!(b.windows(2).any(|w| w == [0x48, 0x29]), "sub rax,rcx after the borrow check");
+        assert!(b.windows(4).any(|w| w == [0x49, 0x0f, 0x42, 0xc2]), "unsigned underflow cmovb -> r10 (0)");
+        assert!(!b.windows(4).any(|w| w == [0x49, 0x0f, 0x4f, 0xc2]), "no signed smax clamp in unsigned lane");
+    }
 }

@@ -1,5 +1,42 @@
 # Open Sober — Agent Handoff
 
+## SH432 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD/vector-ALU codegen families (translate.rs SimdVLog, SminMax, SimdSatAdd) — 6 exact-byte pins of the emission that carries real rendered geometry/color lane math: the pand/por/pxor/pandn opcode discriminator (66 0F DB/EB/EF/DF; a /r-flub maps Vd&Vm to Vd^Vm), the SminMax cmov condition byte selecting max-vs-min AND signed-vs-unsigned (cmovg 0x4F / cmovb 0x42 vs cmovl 0x4C — a flub returns the wrong lane or clamps the wrong direction), the movsxd presence flips sub-byte saturating lanes, and the smax-vs-smin CONSTANT+cmov pairing in SimdSatAdd that decides which bound signed overflow clamps to
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+re-verified green at this exact HEAD first (capture_taskv4_frame.sh attempt 1:
+24 real task-driven frames `present swap Ok(0x1)`, 194 node pops, 0 json abort,
+0 crash, EXIT 124). Workspace green (cargo test --workspace EXIT 0; arm64jit lib
+556/0 incl. 6 new sh432 pins, was 550; cargo build --example elfjit OK).
+Production code ONLY in translate.rs `#[cfg(test)]` addition (translator core
+body byte-untouched; jit.rs/elfjit.rs/session.rs unchanged).
+- The SIMD/vector-ALU families had no direct byte tests (decode pins decode,
+  jit pins runtime, but the byte EMISSION between them was unpinned for
+  SimdVLog/SminMax/SimdSatAdd — STATUS next-forward #5). SH432 pins the
+  semantically-critical discriminators a byte error silently corrupts:
+  (1) SimdVLog AND whole-buffer (`movdqu xmm0,[rbx+0x120]; movdqu xmm1,[rbx+0x130];
+  pand xmm0,xmm1 = 66 0F DB C1; movdqu [rbx+0x110],xmm0` — Vd slot @ VECTOR_BASE
+  0x110 + vt*16) + the op discriminator across AND/ORR/EOR/BIC (DB/EB/EF/DF,
+  with BIC's `pandn xmm1,xmm0` storing via RCX — a /r-flub maps `Vd&Vm` to
+  `Vd^Vm`); (2) SminMax signed .2s max sign-extends lanes (movsxd 48 63) then
+  `cmp rcx,rax; cmovg rax,rcx` (48 39 C1 / 48 0F 4F C1), vs unsigned .8b min
+  (movzx 0F B6, NO 48 63, cmovb 48 0F 42 C1) — the cmov condition byte is the
+  max-vs-min AND signed-vs-unsigned discriminator; (3) SimdSatAdd signed sqadd
+  .4s clamps to smax (mov r10,0x7FFFFFFF; cmp r10,rax; cmovg rax,r10 = 49 0F 4F
+  C2) and smin (mov r10,0x80000000-as-negative; cmovl = 49 0F 4C C2), vs unsigned
+  uqsub .2h clamps to literal 0 (mov r10,0; cmp; sub; cmovb = 49 0F 42 C2, no
+  movsxd) — the CONSTANT+cmov pairing decides which bound signed overflow
+  clamps to.
+- 6 exact-byte pins via synthetic `Inst` -> translate() -> CodeBuf.as_slice()
+  (zero-pc 0x1000 = deterministic); subsequence-window asserts for the multi-lane
+  discriminators. [RBX]=CpuState; vector slot v[t]=VECTOR_BASE(0x110)+t*16.
+  Deterministic, no image, no env, parallel-safe.
+- Honest: NOT a DM (SH415 probe re-confirms DM-root [0x106a68818]=0x0 under the
+  complete substrate; Route-B live-DM gate UNCHANGED). BUILD-THE-RUNTIME
+  codegen-surface coverage completion on the SIMD/vector-ALU geometry/color-math
+  families, continuing the SH427/428/429/430/431 translator-core lineage. No
+  re-treads (distinct families).
+- Files: docs/frontier-sh432-translator-simd-vector-alu.md +
+  crates/arm64jit/src/translate.rs (`#[cfg(test)]` only). Commit (pending).
+
 ## SH431 (Sep 19, 2026, hermes-worker): hermetic coverage of the bitmask-immediate LOGIC + high-widen MULTIPLY codegen families (translate.rs LogicImm, MulHigh) — 4 exact-byte pins: the `mov xD,#imm` = ORR xzr alias with rn==31 read as XZR-not-SP (mask materialized in RCX + no [rbx+0xf8] access), the flag-setting ANDS w32 form as the ONLY LogicImm op that emits the full store_nzcv pack (C-store 89 93 08 01 00 00 to [rbx+0x108] + caller pop), and the umulh `mul rcx` /4 vs smulh `imul rcx` /5 high-half-in-RDX distinction (mov [rbx],rdx 48 89 13)
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 re-verified green at this exact HEAD first (capture_taskv4_frame.sh attempt 1:
