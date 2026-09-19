@@ -44,14 +44,32 @@ canary pointer. It's the final 8 bytes of `.got` (file .got range 0x67c9a28-0x67
 ## Honest (do-not-over-claim)
 - Does NOT manufacture a DataModel; DM-root [0x106a68818]=0; MH_* stay false; Route-B live-DM
   structural gate UNCHANGED. The DMCONT continuation still has not reached app-start 0x2bd2058.
-- The new terminal 0x101d9a708 is another member of the SH285-class family, but its pin is
-  DIFFERENT and potentially loader-fixable: a `.got` entry (0x67d16f0) whose relocated value is
-  garbage. If [0x1067d16f0] should hold &__stack_chk_guard and the loader/JIT skipped relocating
-  the final GOT slot, that is a relocation/dispatch gap (a candidate for real loader work, the
-  kind of fix the migration-gate conscience demands hunting before declaring a dead end) — OR
-  it's a per-call live-object wall. Both hypotheses are measurable (seed [0x1067d16f0] to a valid
-  host canary and re-run; if the ladder advances, the GOT was the lever; if a new wall appears,
-  it was one node in the live-object family).
+- **The GOT/canary hypothesis below is REFUTED by the register dump (SH349+1, this cycle):** at the
+  new terminal 0x101d9a708, x20 = 0x56543aa2fbf8 = the plt-PATCHED valid canary address (both GOT
+  slots 0x631aa30 AND 0x67d16f0 were patched to 0x56543aa2fc00, log line `[plt] patched
+  __stack_chk_guard GOT 0x67d16f0 (0x0) -> 0x56543aa2fc00`). The fault is a BYTE-LOAD from
+  x19=0xffffffffffffffff (the CALLER's source pointer = garbage 0xff..ff), NOT a canary read
+  failure. So 0x101d9a708 is one more node in the SAME unconstructed-live-object family, not a
+  loader/relocation gap.
+- **The LSM sub-call-whack-a-mole is UNBOUNDED (measured):** `bl 0x1d9d8b0` (initStorageManagerNative)
+  has HUNDREDS of call sites across the whole binary — it is the most-called function in
+  libroblox.so, invoked from every app-start/session path. Ret-ing its internal byte-copy leaves
+  one-by-one reveals the next unconstructed-field deref of hundreds; this specific single-skip
+  lane is a measured dead-end for "skip the next leaf" granularity.
+- **CORRECTION to the escape-latch note below (verified before implementing, this cycle):** the
+  `[0x683d920]` latch at 0x2bd1fe4/0x2bd1fe8 is the **"app-start already ran" re-entry latch**, NOT
+  a bypass to app-start. `tbnz w8,#0, 0x2bd2080` jumps to 0x2bd2080, which is PAST the app-start
+  `bl 2338ef4` (0x2bd2058); and [0x683d920] is set to 1 only at 0x2bd2060, AFTER app-start returns.
+  So on the FIRST DMCONT pass the latch is 0 and the continuation MUST run both `bl 1d9d8b0`
+  calls to populate the app-start name strings before reaching app-start. Seeding the latch to 1
+  would SKIP app-start, not reach it (the existing JIT_ROUTEB_DMCONT seed of [0x683d920]=0 is
+  correct). **Conclusion: the DMCONT→app-start path has NO clean bypass; the LSM live-object family
+  is mandatory and unbounded via sub-call skips. This closes the "single-seed escape" angle.**
+- **NEW DISCOVERY (SH349+1, verified):** the DMCONT continuation (NativeDataModelManager
+  continuation, file 0x2bd1d68..0x2bd2080) calls initStorageManagerNative via TWO `bl 1d9d8b0`
+  sites (0x2bd2008 for the [x19+80] string, 0x2bd2030 for the [x19+128] string) immediately
+  before the app-start `bl 2338ef4` (0x2bd2058). Both are guarded by libc++-style SSO byte checks
+  (0x2bd1fec bit0 -> populate; else empty-string copy), so the first-pass strings come from LSM.
 - Recon-v3 self-driven frame plane unchanged (re-verified green in the run env).
 
 ## Verify

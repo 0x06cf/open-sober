@@ -23,12 +23,16 @@ stubbed regardless of how the caller block is reached.
 
 ### Conclusion + next
 SH349 is a real, measured forward: the SH285 wall family is crossed for the first time. The new
-terminal 0x101d9a708 is another SH285-class live-object wall but its pin is a `.got` canary slot
-(0x67d16f0) with on-disk value 0x1 / undefined `__stack_chk_guard` and NO static reloc — so the
-next measurement is whether seeding [0x1067d16f0] to a valid host canary makes the ladder advance
-(relocation/dispatch gap -> real loader work, the migration-gate conscience requires hunting it)
-or reveals the next live-object wall (one node in the family). Route-B live-DM gate UNCHANGED;
-SH174 capture-latch stays the single forward hook.
+terminal 0x101d9a708 is another SH285-class live-object wall; the register dump REFUTES the
+canary/GOT-gap hypothesis (x20=valid patched canary; the fault is the caller's garbage source
+pointer x0/x19=0xff..ff). `bl 0x1d9d8b0` has HUNDREDS of call sites across the binary (the
+most-called function), so sub-call-whack-a-mole is unbounded, and the DMCONT→app-start path has
+NO bypass (the [0x683d920] latch is the "app-start already ran" re-entry gate, set only after
+app-start; the two `bl 1d9d8b0` string-build calls are mandatory to reach `bl 2338ef4`). So this
+persistence lane is measured-returned; the Session-CTOR live-DM wall stands. Route-B live-DM gate
+UNCHANGED; SH174 capture-latch stays the single forward hook. Next forward (non-persistence
+Route-B): the dataModel-bindings receive side — onAppLuaWillStart (the sole SEP-17
+dataModel-bindings receive never wired; messageBus publish is driveable-clean per SH347).
 
 ## SH348 (Sep 19, 2026, hermes-worker): measured negative — leaf-`ret`ing initStorageManagerNative does NOT clear the SH285 terminal (the byte-copy @0x101db1b08 is reachable past its own entry)
 Single-agent (cone suppressed). Default-inert opt-in `JIT_ROUTEB_LSM_INIT_SKIP=1`
