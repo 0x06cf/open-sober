@@ -8426,4 +8426,126 @@ mod tests {
         let add = b.windows(3).position(|w| w == [0x48, 0x01, 0xc1]).unwrap();
         assert!(shr < add, "shift must happen before the accumulate add");
     }
+
+// SH435: hermetic coverage of the FP conversion codegen families (translate.rs
+    // Fcvt, FcvtTzReg, FcvtHalf) — the widen/narrow/trunc/FP16 conversions
+    // every color-intensity, light, and texture-sample path leans on. These had
+    // no direct byte tests. SH435 pins the discriminators a byte error silently
+    // corrupts: (1) Fcvt widen (S->D) loads movd xmm0,eax (66 0F 6E C0) then
+    // cvtss2sd (F3 0F 5A C0) + movq_store (66 48 0F D6 ...), vs narrow (D->S)
+    // movq_load (F3 48 0F 7E ...) then cvtsd2ss (F2 0F 5A C0) + movd_r32_xmm
+    // (66 0F 7E C0) + mov_store32 — the 32-vs-64-bit src/dst lane width and the
+    // 5A 0F 5A ... 0x58/0x5A opcode are the widen-vs-narrow discriminators;
+    // (2) FcvtTzReg signed fcvtzs uses cvttsd2si (F2 48 0F 2C C0) DIRECTLY
+    // (trunc-to-zero is already what X86 cvttsd/si does), always a 64-bit store
+    // for D or 32-bit for S, and the UNSIGNED fcvtzu appends the clamp
+    // (mov rcx,0 / test / cmovs = 48 0F 48 C1) so negatives become 0 — the
+    // cmovs presence separates fcvtzu (trunc-toward-zero UNSIGNED) from
+    // fcvtzs; (3) FcvtHalf FP16 promotes via vcvtph2ps (c4 e2 79 13 c0) /
+    // demotes via vcvtps2ph imm0 (c4 e3 79 1d c0 00) — the H->D wides through
+    // cvtss2sd after promote, D->H narrows through cvtsd2ss before demote.
+    // Exact-byte full-buffer + window asserts; synthetic Inst -> translate()
+    // (tr_bytes); deterministic, no image/env. [RBX]=CpuState; vector slot
+    // v[t] = VECTOR_BASE(0x110) + t*16.
+
+    // Fcvt to_d=true (S -> D widen): load low-32 of s1 (0x120) into xmm0 via
+    // movd, promote cvtss2sd, store low-64 of d0. Full-buffer (rd=0,rn=1).
+    #[test]
+    fn sh435_fcvt_widen_single_to_double() {
+        let b = tr_bytes(Inst::Fcvt { to_d: true, rd: 0, rn: 1 });
+        assert_eq!(b, vec![
+            0x8b, 0x83, 0x20, 0x01, 0x00, 0x00, // mov eax,[rbx+0x120]  (s1 low 32)
+            0x66, 0x0f, 0x6e, 0xc0,             // movd xmm0,eax
+            0xf3, 0x0f, 0x5a, 0xc0,             // cvtss2sd xmm0,xmm0  (promote)
+            0x66, 0x48, 0x0f, 0xd6, 0x83, 0x10, 0x01, 0x00, 0x00, // movq [rbx+0x110],xmm0 (d0 low 64)
+        ]);
+        assert!(!b.windows(4).any(|w| w == [0xf2, 0x0f, 0x5a, 0xc0]), "widen must be single->double (F3 cvtss2sd), not F2");
+    }
+
+    // Fcvt to_d=false (D -> S narrow): load low-64 of d1 (0x120) into xmm0 via
+    // movq_load, narrow cvtsd2ss, store low-32 of s0 (movd_r32_xmm + store32).
+    #[test]
+    fn sh435_fcvt_narrow_double_to_single() {
+        let b = tr_bytes(Inst::Fcvt { to_d: false, rd: 0, rn: 1 });
+        assert_eq!(b, vec![
+            0xf3, 0x48, 0x0f, 0x7e, 0x83, 0x20, 0x01, 0x00, 0x00, // movq xmm0,[rbx+0x120] (d1 low 64)
+            0xf2, 0x0f, 0x5a, 0xc0,                               // cvtsd2ss xmm0,xmm0 (narrow)
+            0x66, 0x0f, 0x7e, 0xc0,                               // movd eax,xmm0
+            0x89, 0x83, 0x10, 0x01, 0x00, 0x00,                   // mov [rbx+0x110],eax (s0 low 32)
+        ]);
+        assert!(!b.windows(4).any(|w| w == [0xf3, 0x0f, 0x5a, 0xc0]), "narrow must be double->single (F2 cvtsd2ss), not F3");
+    }
+
+    // FcvtTzReg fcvtzs Dd,Dn (dbl, signed): movq_load -> cvttsd2si DIRECTLY
+    // (x86 cvttsd2si already trunc-toward-zero, so no pre-round), 64-bit
+    // store. The F2 48 0F 2C opcode is the trunc-convert discriminator. The
+    // UNSIGNED fcvtzu must then clamp negatives to 0 with cmovs — it must NOT
+    // store the raw signed trunc (a negative would corrupt the unsigned dst).
+    #[test]
+    fn sh435_fcvtzs_signed_trunc_is_truncate_without_round() {
+        let s = tr_bytes(Inst::FcvtTzReg { rd: 0, rn: 1, dbl: true, unsigned: false });
+        assert_eq!(s, vec![
+            0xf3, 0x48, 0x0f, 0x7e, 0x83, 0x20, 0x01, 0x00, 0x00, // movq xmm0,[rbx+0x120]
+            0xf2, 0x48, 0x0f, 0x2c, 0xc0,                         // cvttsd2si rax,xmm0
+            0x48, 0x89, 0x83, 0x10, 0x01, 0x00, 0x00,             // mov [rbx+0x110],rax
+        ]);
+        assert!(!s.windows(4).any(|w| w == [0x66, 0x0f, 0x2f, 0xc0]), "fcvtzs must NOT add a rounding compare");
+    }
+
+    // FcvtTzReg SIGNED vs UNSIGNED (fcvtzs vs fcvtzu): both truncate, but the
+    // UNSIGNED form appends the clamp (mov rcx,0 / test rcx / cmovs -> rcx)
+    // so a negative result becomes 0; the signed form stores the raw signed
+    // trunc. The cmovs (48 0F 48 C1) presence is the fcvtzu discriminator.
+    #[test]
+    fn sh435_fcvtzu_unsigned_clamps_negative_cmovs() {
+        let u = tr_bytes(Inst::FcvtTzReg { rd: 0, rn: 1, dbl: false, unsigned: true });
+        assert!(u.windows(3).any(|w| w == [0x48, 0x0f, 0x2c]), "fcvtzu truncates via cvttsd2si");
+        assert!(u.windows(4).any(|w| w == [0x48, 0x0f, 0x48, 0xc1]), "fcvtzu must clamp negative to 0 (cmovs rax,rcx)");
+        assert!(u.windows(3).any(|w| w == [0x48, 0x85, 0xc0]), "fcvtzu tests the sign before clamping (test rax,rax)");
+        // single (S) source: 32-bit load then promote cvtss2sd BEFORE trunc
+        assert!(u.windows(4).any(|w| w == [0x66, 0x0f, 0x6e, 0xc0]), "S source loads via movd xmm0,eax");
+        let s = tr_bytes(Inst::FcvtTzReg { rd: 0, rn: 1, dbl: true, unsigned: false });
+        assert!(!s.windows(4).any(|w| w == [0x48, 0x0f, 0x48, 0xc1]), "signed fcvtzs must NOT clamp (raw signed trunc stored)");
+    }
+
+    // FcvtHalf op=0 (H -> S, fcvt s,h): load low-32 of h1, promote via F16C
+    // vcvtph2ps (c4 e2 79 13 c0), store low-32 of s0. op=2 (H -> D) then
+    // wides through cvtss2sd to a 64-bit store. The 13 (ph2ps promote) vs 1d
+    // (ps2ph demote) opcode discriminator is the vector FP16 conversion gate.
+    #[test]
+    fn sh435_fcvthalf_half_to_float_uses_f16c_promote() {
+        let b = tr_bytes(Inst::FcvtHalf { rd: 0, rn: 1, op: 0 });
+        assert_eq!(b, vec![
+            0x8b, 0x83, 0x20, 0x01, 0x00, 0x00, // mov eax,[rbx+0x120]  (h1 low16 in low 32)
+            0x66, 0x0f, 0x6e, 0xc0,             // movd xmm0,eax
+            0xc4, 0xe2, 0x79, 0x13, 0xc0,       // vcvtph2ps xmm0,xmm0  (F16C promote)
+            0x66, 0x0f, 0x7e, 0xc0,             // movd eax,xmm0
+            0x89, 0x83, 0x10, 0x01, 0x00, 0x00, // mov [rbx+0x110],eax  (s0 low 32)
+        ]);
+        assert!(!b.windows(6).any(|w| w == [0xc4, 0xe3, 0x79, 0x1d, 0xc0, 0x00]), "H->S must promote (13), not demote (1d)");
+    }
+
+    #[test]
+    fn sh435_fcvthalf_float_to_half_uses_f16c_demote() {
+        let b = tr_bytes(Inst::FcvtHalf { rd: 0, rn: 1, op: 1 });
+        assert!(b.windows(6).any(|w| w == [0xc4, 0xe3, 0x79, 0x1d, 0xc0, 0x00]), "S->H must demote via vcvtps2ph $0 (c4 e3 79 1d c0 00)");
+        assert!(!b.windows(5).any(|w| w == [0xc4, 0xe2, 0x79, 0x13, 0xc0]), "S->H must NOT promote");
+        // narrow stores low 32 (single) only
+        assert!(b.windows(4).any(|w| w == [0x66, 0x0f, 0x7e, 0xc0]), "S->H result moved via movd eax,xmm0");
+    }
+
+    // FcvtHalf op=2 (H -> D): promote to FP32 then widen cvtss2sd to the low
+    // 64 bits. op=3 (D -> H): narrow cvtsd2ss then demote. The extra cvtss2sd
+    // (after promote) vs cvtsd2ss (before demote) distinguishes the .5-width
+    // conversions from the direct S<->H pair.
+    #[test]
+    fn sh435_fcvthalf_half_to_double_wides_after_promote() {
+        let b = tr_bytes(Inst::FcvtHalf { rd: 0, rn: 1, op: 2 });
+        assert!(b.windows(5).any(|w| w == [0xc4, 0xe2, 0x79, 0x13, 0xc0]), "H->D promotes via vcvtph2ps");
+        assert!(b.windows(4).any(|w| w == [0xf3, 0x0f, 0x5a, 0xc0]), "H->D then widens via cvtss2sd");
+        assert!(b.windows(4).any(|w| w == [0x66, 0x48, 0x0f, 0xd6]), "H->D stores 64-bit (movq [mem],xmm0)");
+        let d = tr_bytes(Inst::FcvtHalf { rd: 0, rn: 1, op: 3 });
+        assert!(d.windows(4).any(|w| w == [0xf2, 0x0f, 0x5a, 0xc0]), "D->H narrows via cvtsd2ss");
+        assert!(d.windows(6).any(|w| w == [0xc4, 0xe3, 0x79, 0x1d, 0xc0, 0x00]), "D->H then demotes via vcvtps2ph");
+    }
 }
