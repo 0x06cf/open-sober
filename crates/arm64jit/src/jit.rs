@@ -9950,7 +9950,15 @@ mod tests {
         let parked = Arc::new(AtomicBool::new(false));
         let p2 = parked.clone();
         let handle = std::thread::spawn(move || {
-            let trel = libc::timespec { tv_sec: 5, tv_nsec: 0 };
+            // SH357: match the REQUEUE sibling (SH346) — the waiter timeout must safely
+            // exceed the whole spin window (up to ~1ms*20_000 = 20s) so a descheduled
+            // waiter under heavy parallel `cargo test --workspace` load can NEVER time
+            // out (wall-clock) before the CMP_REQUEUE lands. A short 5s timeout made
+            // the kernel legitimately report moved=0 when the waiter expired first (an
+            // intermittent flake, not a regression); 60s strands the waiter only if the
+            // requeue+WAKE path is genuinely broken. The SH133-semantics asserts below
+            // (CMP_REQUEUE actually moves + WAKE on dst releases) are unchanged.
+            let trel = libc::timespec { tv_sec: 60, tv_nsec: 0 };
             let waiter: [u64; 6] = [src as u64, libc::FUTEX_WAIT as u64, 1, &trel as *const _ as u64, 0, 0];
             p2.store(true, Ordering::SeqCst);
             let _ = handle_futex(&waiter);
