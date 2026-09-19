@@ -6763,6 +6763,13 @@ fn main() {
                         "[elfjit:v2boot-session] post-lifecycle: MH_FLAGS_LOADED={nf} MH_ENGINE_INITIALIZED={ni} MH_APP_READY={ar} AppBridgeV2[0x106a705e8]=0x{abv_slot:x}"
                     );
                 }
+                // SH400 (--v2boot-session-drive): drive the ordered session substrate via session::drive_routeb_session_substrate.
+                // Default-inert; single serialized jit_run (SH55/64).
+                if std::env::args().any(|a| a == "--v2boot-session-drive") {
+                    let ok = arm64jit::session::drive_routeb_session_substrate(iimg, ib, tpidr, boot_sp);
+                    eprintln!("[elfjit:v2boot-session-drive] SH400 substrate drive done: {ok} Ok");
+                    dump("session-substrate-drive");
+                }
                 // SH269 (--v2boot-skip-appstart): the two app-start self-driver rungs
                 // (StartLuaAppDM 0x1023efe2c via DMCONT, V2StartAppWithParams 0x10258b144)
                 // terminate the PROCESS before the POST-LADDER session-ctor rungs run; skipping
@@ -6868,8 +6875,8 @@ fn main() {
                                     // helper 24c3768 with x0=impl[+0x440]==NULL (fault [x0,#320]); return discarded,
                                     // NOP the 3-insn window.
                                     routeb_patch_gov_tail_cont();
-                                    // SH159b (deleg_0eff24ca): governor 0x102e9fa84 reads x19=[x0+0x20] @0x2e9fac0 (x0=wrapper @
-                                    // [0x106a705e8]; x19=impl=[0x106a70608]); host-garbage -> MODERN appendix SIGSEGV.
+                                    // SH159b (deleg_0eff24ca): governor 0x102e9fa84 reads x19=[x0+0x20] @0x2e9fac0 (x0=wrapper@[0x106a705e8]);
+                                    // x19=impl=[0x106a70608]; host-garbage -> MODERN appendix SIGSEGV.
                                     // Seed a real guest impl buffer + +0x408 DISPATCH obj + DISPATCH vt[+0x18]=benign.
                                     let gov_leaf = *ROUTEB_LEAF_ADDR.get_or_init(|| {
                                         let a = arm64jit::jit::register_host_call_auto(routeb_singleton_leaf);
@@ -7245,8 +7252,8 @@ fn main() {
                     }
                     dump("EngSettingsReceived");
                 }
-                // SH278: cross the SH277 state gate via engine receive — the settings receive (0x2bd1c38) sets
-                // state->3 itself when [this+649]!=0 (seed that byte), then initEngine_ dispatch 0x2bd1cf0 takes ==3. Opt-in --v2boot-session-engine3.
+                // SH278: cross the SH277 state gate via engine receive — 0x2bd1c38 sets state->3 itself
+                // when [this+649]!=0 (seed it); initEngine_ dispatch 0x2bd1cf0 then takes ==3. Opt-in --v2boot-session-engine3.
                 if std::env::args().any(|a| a == "--v2boot-session-engine3") {
                     unsafe { *(0x10683d8f8u64 as *mut u64) = 6u64; }
                     let mgr3 = Box::leak(vec![0x0u8; 0x800usize].into_boxed_slice()).as_mut_ptr() as u64;
@@ -7342,11 +7349,9 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                         eprintln!("[elfjit:v2boot] SH288 consumer post: once-guard={wf:#x} once-built={built:#x} MH_FLAGS_LOADED={nf} MH_APP_READY={ar}");
                         dump("SH288-consumer");
                     }
-                // SH290 (--v2boot-session-itemproc): drive item-PROCESSOR 0x102207950 alone.
-                // Zeroed item cbz-skips both indir blr ([item+32]->vt[+48], [item+48]->0x22193a0)
-                // leaving only once path: guard [0x106a63b08] -> __call_once 0x284ce54 ->
-                // once-body (string-map insert 0x2173b3c -> [0x106a63b00]) -> release 0x284cf5c ->
-                // clock 0x221942c -> ret. Isolates the once-build so it completes + reads back.
+                // SH290 (--v2boot-session-itemproc): drive item-PROCESSOR 0x102207950 alone (zeroed item
+                // cbz-skips both indir blrs -> once path: guard 0x106a63b08 -> __call_once 0x284ce54 ->
+                // string-map insert 0x2173b3c -> release 0x284cf5c -> clock 0x221942c -> ret; isolates the once-build).
                 if std::env::args().any(|a| a == "--v2boot-session-itemproc") {
                     let item = Box::leak(vec![0x0u8; 0x120usize].into_boxed_slice()).as_mut_ptr() as u64;
                     unsafe { *(0x106a63b08u64 as *mut u64) = 0; } // force once-guard clear so the once-body runs
@@ -10170,8 +10175,7 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                                                             let _ = gcall(plt_tex_parameteri, GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST, 0, 0, 0);
                                                                             let _ = gcall(plt_tex_parameteri, GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST, 0, 0, 0);
                                                                             if mesh_tex.is_some() {
-                                                                                 // REAL Roblox material map: parse DDS R8, expand to RGBA, 9-arg
-                                                                                 // glTexImage2D (real APK pixels on real mesh geometry), gray ->(v,v,v,255).
+                                                                                 // REAL Roblox material map: parse DDS R8 -> RGBA, 9-arg glTexImage2D (APK pixels, gray->(v,v,v,255)).
                                                                                 let dds_bytes = std::fs::read(mesh_tex.as_ref().unwrap()).expect("read studs.dds");
                                                                                 let (tw, th, r8) = parse_roblox_dds_r8(&dds_bytes).expect("dds R8 parse");
                                                                                 eprintln!(
@@ -10220,9 +10224,8 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                                                                 stex.x[7] = GL_UNSIGNED_BYTE; // type
                                                                                 let _ = arm64jit::jit::jit_run(iimg, ibase, plt_tex_image_2d, &mut stex as *mut CpuState);
                                                                             } else {
-                                                                                 // ETC1/ETC2-RGB live-path: 8x8 ETC1 (4 solid 4x4 blocks=32B) via glCompressedTexImage2D; bridge decodes ETC1->RGBA
-                                                                                 // Indiv mode cw0 sel0 -> color=(c*0x11)+2; ETC2 mode1/2==ETC1; relabel internalformat
-                                                                                 // to prove decode_etc2_rgb handles the real path.
+                                                                                 // ETC1/ETC2-RGB live-path: 8x8 ETC1 via glCompressedTexImage2D; bridge decodes ETC1->RGBA
+                                                                            // (indiv cw0->(c*0x11)+2; ETC2 mode1/2==ETC1; relabel internalformat to prove the real path).
                                                                                 const GL_ETC1_RGB8_OES: u64 = 0x8d64;
                                                                                 const GL_COMPRESSED_RGB8_ETC2: u64 = 0x9274;
                                                                                 let comp_fmt = if etc2_mode { GL_COMPRESSED_RGB8_ETC2 } else { GL_ETC1_RGB8_OES };
@@ -11161,11 +11164,10 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                 let _ = gcall(0x1062d78f0, prog, 1, uv_name, 0,0,0);  // glBindAttribLocation aUV->1
                                 let _ = gcall(0x1062d78e0, prog, 0,0,0,0,0);          // glLinkProgram
                                 let _ = gcall(0x1062d75a0, prog, 0,0,0,0,0);          // glUseProgram
-                                // Texture: default = 2x2 RGBA checkerboard RED/GREEN/BLUE/WHITE;
-                                // --renderframe-etc2a = a REAL 8x8 ETC2-RGBA8/EAC texture (0x9278)
-                                                                                 // via glCompressedTexImage2D (last compressed format with an
-                                // unimplemented live-path prove). The bridge decodes ETC2-RGBA8 and
-                                // re-uploads, EAC alpha + RGB both reach the quad.
+                                // Texture: default 2x2 RGBA checkerboard RED/GREEN/BLUE/WHITE;
+                                // --renderframe-etc2a = real 8x8 ETC2-RGBA8/EAC (0x9278) via
+                                                                                 // glCompressedTexImage2D (last compressed format with an unimplemented live-path prove).
+                                // The bridge decodes ETC2-RGBA8 + EAC alpha/RGB both reach the quad.
                                 let tex_data = base + 0x6000;
                                 let tex_sp = base + 0xf80;
                                 let tex_id_slot = base + 0xfd0;

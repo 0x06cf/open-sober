@@ -12,3 +12,4 @@ pub mod jni;
 pub mod boot;
 pub mod signals;
 pub mod fsmap;
+pub mod session;
