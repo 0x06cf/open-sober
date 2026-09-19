@@ -640,6 +640,11 @@ fn auto_value_string_getter(name: &[u8]) -> Option<&'static [u8]> {
         b"getDeviceSku" => Some(b"cordial"),
         b"getManufacturer" => Some(b"Cordial"),
         b"getCountry" => Some(b"US"),
+        // LocaleList/Locale chain (recon-framework-boot-order): getLocales() ->
+        // LocaleList (size=1, getLanguage="en", getCountry="US"). getCountry is
+        // above; getLanguage is the companion the engine reads for locale-aware
+        // text/layout. Returning "en" gives the UI a real (non-empty) default.
+        b"getLanguage" => Some(b"en"),
         b"getNetworkType" => Some(b"WIFI"),
         b"getAppVersion" => Some(b""),
         // PlatformParams.assetFolderPath → the host assets root (SH57 assets
@@ -1844,6 +1849,7 @@ mod tests {
                     b"getDeviceSku" => assert_eq!(len, 7, "getDeviceSku \"cordial\""),
                     b"getManufacturer" => assert_eq!(len, 7, "getManufacturer \"Cordial\""),
                     b"getCountry" => assert_eq!(len, 2, "getCountry \"US\""),
+                    b"getLanguage" => assert_eq!(len, 2, "getLanguage \"en\""),
                     b"getNetworkType" => assert_eq!(len, 4, "getNetworkType \"WIFI\""),
                     _ => assert_eq!(len, 0, "{} defaults to empty", String::from_utf8_lossy(name)),
                 }
