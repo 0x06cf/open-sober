@@ -1837,6 +1837,8 @@ mod tests {
                 &b"getManufacturer"[..],
                 &b"getCountry"[..],
                 &b"getNetworkType"[..],
+                &b"getLanguage"[..],
+                &b"getDisplayResolution"[..],
                 &b"getAppVersion"[..],
             ] {
                 let mid = get_name_id(name);
@@ -1860,7 +1862,7 @@ mod tests {
                     b"getCountry" => assert_eq!(len, 2, "getCountry \"US\""),
                     b"getLanguage" => assert_eq!(len, 2, "getLanguage \"en\""),
                     b"getNetworkType" => assert_eq!(len, 4, "getNetworkType \"WIFI\""),
-                    b"getDisplayResolution" => assert_eq!(len, 7, "getDisplayResolution \"1280x720\""),
+                    b"getDisplayResolution" => assert_eq!(len, 8, "getDisplayResolution \"1280x720\" (8 chars)"),
                     _ => assert_eq!(len, 0, "{} defaults to empty", String::from_utf8_lossy(name)),
                 }
             }
