@@ -10077,6 +10077,83 @@ mod tests {
     }
 
     #[test]
+    fn sh455_fmuscalar_fmul_double_movq_mulsd_direction() {
+        // fmul d1, d2, d3 (double=true neg=false): Dd = Dn * Dm. The scalar
+        // 2-source FP multiply — the SAME product core as Fma3 but with NO
+        // accumulate into a 4th operand (exactly 2 sources + dst). EMIT:
+        // movq_load xmm0=[0x130] (f3 48 0f 7e, Dn) + movq_load xmm1=[0x140]
+        // (f3 48 0f 7e, Dm) + `mulsd xmm0,xmm1` (f2 0f 59 c1) + movq_store
+        // [0x120] (66 48 0f d6). rd=1 rn=2 rm=3 -> Dd@0x120 Dn@0x130 Dm@0x140.
+        // A width flub (mulss on a double) or a missing/extra source shows up
+        // immediately in the exact buffer.
+        let b = tr_bytes(Inst::FmulScalar { rd: 1, rn: 2, rm: 3, double: true, neg: false });
+        assert_eq!(b, vec![
+            0xf3, 0x48, 0x0f, 0x7e, 0x83, 0x30, 0x01, 0x00, 0x00, // movq xmm0,[rbx+0x130] Dn
+            0xf3, 0x48, 0x0f, 0x7e, 0x8b, 0x40, 0x01, 0x00, 0x00, // movq xmm1,[rbx+0x140] Dm
+            0xf2, 0x0f, 0x59, 0xc1,                               // mulsd xmm0,xmm1 -> prod
+            0x66, 0x48, 0x0f, 0xd6, 0x83, 0x20, 0x01, 0x00, 0x00, // movq [rbx+0x120],xmm0
+        ]);
+        assert!(b.windows(4).any(|w| w == [0xf2, 0x0f, 0x59, 0xc1]), "fmul double = mulsd xmm0,xmm1 (f2 0f 59 c1)");
+        assert!(!b.windows(3).any(|w| w == [0xf3, 0x0f, 0x59]), "double must NOT emit mulss (f3 0f 59)");
+        assert!(!b.windows(4).any(|w| w == [0xf2, 0x0f, 0x58, 0xd0]), "fmul is a pure multiply, must NOT accumulate addsd");
+    }
+
+    #[test]
+    fn sh455_fmuscalar_fnmul_double_negate_via_pxor_sign_flip() {
+        // fnmul d1, d2, d3 (double=true neg=true): -(Dn*Dm). The negate is a
+        // SIGN-BIT FLIP, NOT Fma3's 0-sub: mov_ri64 RCX=0x8000_0000_0000_0000
+        // (48 b9 .. 80) + `movq xmm1,rcx` (66 48 0f 6e c9) + `pxor xmm0,xmm1`
+        // (66 0f ef c1) BEFORE the movq_store. The pxor-with-sign-const is the
+        // fnmul discriminator — a flub that skips it leaves the sign un-negated
+        // (the multiply of two positives stays positive).
+        let b = tr_bytes(Inst::FmulScalar { rd: 1, rn: 2, rm: 3, double: true, neg: true });
+        assert!(b.windows(10).any(|w| w == [0x48, 0xb9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80]), "fnmul double sign const = 0x8000_0000_0000_0000");
+        assert!(b.windows(5).any(|w| w == [0x66, 0x48, 0x0f, 0x6e, 0xc9]), "fnmul double = movq xmm1,rcx (66 48 0f 6e c9)");
+        assert!(b.windows(4).any(|w| w == [0x66, 0x0f, 0xef, 0xc1]), "fnmul double negates via pxor xmm0,xmm1 (66 0f ef c1)");
+        // ordering: the sign flip must precede the store.
+        let pxor_pos = b.windows(4).position(|w| w == [0x66, 0x0f, 0xef, 0xc1]).unwrap();
+        let store_pos = b.windows(5).position(|w| w == [0x66, 0x48, 0x0f, 0xd6, 0x83]).unwrap();
+        assert!(pxor_pos < store_pos, "fnmul must flip the sign before storing");
+        // neg vs non-neg (control) — the pxor must be ABSENT when neg=false.
+        let plain = tr_bytes(Inst::FmulScalar { rd: 1, rn: 2, rm: 3, double: true, neg: false });
+        assert!(!plain.windows(4).any(|w| w == [0x66, 0x0f, 0xef, 0xc1]), "plain fmul must NOT emit the negate pxor");
+    }
+
+    #[test]
+    fn sh455_fmuscalar_fmul_single_mulss_movd_width() {
+        // fmul s1, s2, s3 (double=false): the SINGLE-precision path swaps to
+        // mov_load32 + movd_xmm_r32 (66 0f 6e) + `mulss xmm0,xmm1` (f3 0f 59
+        // c1) + movd_r32_xmm (66 0f 7e) + 32-bit store (89 8b). The F3-mulss-vs-
+        // F2-mulsd prefix is the single-vs-double width discriminator (a width
+        // flub silently halves/doubles the FP multiply domain).
+        let b = tr_bytes(Inst::FmulScalar { rd: 1, rn: 2, rm: 3, double: false, neg: false });
+        assert!(b.windows(4).any(|w| w == [0x8b, 0x8b, 0x30, 0x01]), "single loads Dn via mov ecx,[rbx+0x130] (8b 8b)");
+        assert!(b.windows(3).any(|w| w == [0xf3, 0x0f, 0x59]), "single = mulss xmm0,xmm1 (f3 0f 59 c1)");
+        assert!(b.windows(4).any(|w| w == [0x66, 0x0f, 0x6e, 0xc1]), "single = movd xmm0,ecx (66 0f 6e)");
+        assert!(b.windows(4).any(|w| w == [0x66, 0x0f, 0x7e, 0xc1]), "single = movd ecx,xmm0 (66 0f 7e)");
+        assert!(b.windows(6).any(|w| w == [0x89, 0x8b, 0x20, 0x01, 0x00, 0x00]), "single stores 32-bit dst (89 8b 0x120)");
+        // width negatives.
+        assert!(!b.windows(4).any(|w| w == [0xf2, 0x0f, 0x59, 0xc1]), "single must NOT emit mulsd (f2 0f 59)");
+        assert!(!b.windows(9).any(|w| w == [0x66, 0x48, 0x0f, 0xd6, 0x83, 0x20, 0x01, 0x00, 0x00]), "single must NOT emit movq_store (66 48 0f d6)");
+    }
+
+    #[test]
+    fn sh455_fmuscalar_fnmul_single_negate_width_pxor() {
+        // fnmul s1, s2, s3 (double=false neg=true): -(S2*S3). The single negate
+        // uses the 32-bit sign constant 0x8000_0000 (mov_ri64 RCX = 00..80 00..)
+        // then `movd xmm1,ecx` (66 0f 6e c9) + `pxor xmm0,xmm1` (66 0f ef c1)
+        // then movd ecx,xmm0 + 32-bit store. The 32-bit sign const (00 00 00 80
+        // 00 00 00 00) vs the double's 64-bit (..00*7 80) is the negate-width
+        // discriminator; the movd (66 0f 6e) vs the double's movq (66 48 0f 6e)
+        // confirms it too.
+        let b = tr_bytes(Inst::FmulScalar { rd: 1, rn: 2, rm: 3, double: false, neg: true });
+        assert!(b.windows(10).any(|w| w == [0x48, 0xb9, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00]), "fnmul single sign const = 0x8000_0000 (32-bit)");
+        assert!(b.windows(4).any(|w| w == [0x66, 0x0f, 0x6e, 0xc9]), "fnmul single = movd xmm1,ecx (66 0f 6e c9)");
+        assert!(b.windows(4).any(|w| w == [0x66, 0x0f, 0xef, 0xc1]), "fnmul single negates via pxor xmm0,xmm1");
+        assert!(!b.windows(5).any(|w| w == [0x66, 0x48, 0x0f, 0x6e, 0xc9]), "single negate must NOT use movq xmm1,rcx (66 48 0f 6e)");
+    }
+
+    #[test]
     fn sh454_fma3_fmadd_double_addsd_mulsd_direction() {
         // fmadd d1, d2, d3, d4 (sz=true sub=false neg=false): Dd = Da + Dn*Dm.
         // The EMIT is: movq_load xmm0=[0x130] (f3 48 0f 7e, Dn) + movq_load
