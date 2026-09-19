@@ -1,5 +1,36 @@
 # Open Sober — Agent Handoff
 
+## SH464 (Sep 20, 2026, hermes-worker): promote the FMOD/AAudio AUDIO axis to a first-class driven substrate step (the SH418 input-twin) — real PCM -> real WAV sink
+Single-agent (cone suppressed). The SEP-18 "audio/input — each landed + green +
+committed" deliverable list is now CLOSED on the audio side: input was promoted
+(SH418); audio was NOT until now (SH132's bridge captured FMOD's data_cb but
+nothing ever invoked it headlessly — no PCM produced, WAV sink never written).
+Workspace green (cargo test --workspace EXIT 0; arm64jit lib 669->675 incl. 6
+new sh464 tests; cargo build --workspace + --example elfjit OK). Audio-axis only
+(audio.rs + session.rs); runtime deliverable (type4-frame) untouched.
+- aaudio.rs: `LiveStreamParams`+`live_stream_snapshot()` (copy-out of the first
+  live FMOD output stream's data_cb + PCM params, no lock across a guest call);
+  `AudioSink` (REAL WAV writer — open writes the 44B header, append_frames
+  writes PCM, finish patches RIFF/data sizes); `sink_path()` (JIT_AAUDIO_SINK);
+  `drain_one_buffer()` (FMOD data-callback ABI via run_guest_callback -> produced
+  PCM bytes; errors without an active image — never fabricates PCM).
+- session.rs: `drive_fmod_audio_drain()` wired into drive_routeb_session_substrate
+  right after the SH418 input loop (same post-bus trigger). Three inert guards
+  (JIT_AAUDIO_BRIDGE + a live stream snapshot + a live image) -> returns 0,
+  no guest call, no sink write. When armed: bounded (AUDIO_DRAIN_ITERS, default
+  8) runs of the captured data_cb filling a PCM buffer -> appended to the sink.
+  Single-jit_run ladder thread (SH55/64). Env-gated -> default path identical.
+- 6 new hermetic tests (5 aaudio + 1 session), parallel-safe. One transient
+  full-run flake on the DOCUMENTED pre-existing routeb sh362 test (shared 0xdead
+  cell clobbered by a sibling); passes 3/3 in isolation + clean workspace re-run
+  before commit → not a regression.
+- Honest: NOT a DM (Route-B live-DM gate UNCHANGED, structural at the write site
+  per SH462/463). LATENT-but-correct like every axis: fires the instant a real
+  SoundService session opens FMOD's output. No re-treads, not a render-plane
+  visual, not a DM seed.
+- Files: docs/frontier-sh464-audio-firstclass-substrate.md + aaudio.rs +
+  session.rs (+ sh132 doc Next closed). Commit (SH464).
+
 ## SH463 (Sep 20, 2026, hermes-worker): 3-axis HEAD re-verification + session-substrate <name,guest> contract pin
 Single-agent (cone suppressed). Recon-v3 immediate-priority deliverables
 re-verified GREEN at HEAD (capture_taskv4_frame.sh: 24 real task-driven frames

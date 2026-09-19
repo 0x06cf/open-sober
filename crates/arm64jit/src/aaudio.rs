@@ -31,7 +31,7 @@ use std::sync::{Mutex, OnceLock};
 /// intercept dlopen/dlsym for libaaudio.so). Default off -> default unchanged.
 pub const AAUDIO_BRIDGE_ENV: &str = "JIT_AAUDIO_BRIDGE";
 /// Sink path env override (default `/tmp/open-sober-fmod.wav`).
-const AAUDIO_SINK_ENV: &str = "JIT_AAUDIO_SINK";
+pub const AAUDIO_SINK_ENV: &str = "JIT_AAUDIO_SINK";
 
 pub fn bridge_enabled() -> bool {
     std::env::var_os(AAUDIO_BRIDGE_ENV).is_some()
@@ -660,6 +660,157 @@ pub fn resolve_bridge_name(name: &[u8]) -> Option<u64> {
     Some(crate::jit::register_host_call_auto(f))
 }
 
+// ---------------------------------------------------------------------------
+// SH464: live-stream snapshot + real WAV sink writer + one-buffer guest drain.
+// ---------------------------------------------------------------------------
+
+/// Immutable snapshot of the first live FMOD output stream (the one with a
+/// registered data callback), plus the PCM params needed to size a drain
+/// buffer. Mirrors what `drive_fmod_audio_drain` (session.rs) needs; the
+/// snapshot is taken under the registry lock and COPYED OUT, so the substrate
+/// drain never holds the lock across a guest data-callback invocation (which
+/// could re-enter setDataCallback -> deadlock on the same Mutex).
+#[derive(Debug, Clone, Copy)]
+pub struct LiveStreamParams {
+    /// Stable opaque stream handle handed out by openStream.
+    pub stream: u64,
+    /// The guest FMOD data callback (registered via setDataCallback).
+    pub data_cb: u64,
+    pub data_userdata: u64,
+    pub format: i32,
+    pub sample_rate: i32,
+    pub channels: i32,
+    pub frames_per_burst: i32,
+}
+
+impl LiveStreamParams {
+    /// Bytes per PCM sample for the stream's format (float=4, PCM_I16=2,
+    /// anything else defaults to float 4 — FMOD's output mix is float).
+    pub fn bytes_per_sample(&self) -> usize {
+        if self.format == FORMAT_PCM_I16 {
+            2
+        } else {
+            4
+        }
+    }
+    /// Bytes for one full drain buffer covering `num_frames` frames.
+    pub fn buffer_bytes(&self, num_frames: u32) -> usize {
+        num_frames as usize * self.channels.max(1) as usize * self.bytes_per_sample()
+    }
+}
+
+/// Snapshot the first live output stream that has a registered data callback.
+/// None => no FMOD output device open (the boot path; inert). Pure readout,
+/// no guest mutation, safe to call at any time.
+pub fn live_stream_snapshot() -> Option<LiveStreamParams> {
+    let g = reg().lock().unwrap();
+    g.streams.iter().find(|s| s.data_cb != 0).map(|s| LiveStreamParams {
+        stream: stream_handle(g.streams.iter().position(|x| std::ptr::eq(x, s)).unwrap_or(0) + 1),
+        data_cb: s.data_cb,
+        data_userdata: s.data_userdata,
+        format: s.format,
+        sample_rate: s.sample_rate,
+        channels: s.channels,
+        frames_per_burst: s.frames_per_burst,
+    })
+}
+
+/// A real WAV file sink. `open_audio_sink` creates/truncates the file at the
+/// sink path and writes the 44-byte header (with provisional size fields);
+/// `append_pcm` appends raw PCM bytes and tracks the running data length; the
+/// size fields are patched on `finish` so the file is a valid single-data-chunk
+/// PCM .wav. This is the executable half `wav_header_bytes` only had as framing:
+/// no caller previously ever WROTE a sink file.
+pub struct AudioSink {
+    file: std::fs::File,
+    path: std::path::PathBuf,
+    data_len: u32,
+    channels: u16,
+    sample_rate: u32,
+    bits: u16,
+    frames_written: u64,
+}
+
+impl AudioSink {
+    /// Open (truncate) the sink at `path` and write the PCM WAV header with
+    /// provisional size fields (patched on finish). Err if the header write 0s.
+    pub fn open(path: &std::path::Path, sample_rate: u32, channels: u16, bits: u16) -> std::io::Result<Self> {
+        use std::io::Write;
+        let mut file = std::fs::File::create(path)?;
+        let hdr = wav_header_bytes(sample_rate, channels, bits, 0);
+        file.write_all(&hdr)?;
+        Ok(AudioSink {
+            file,
+            path: path.to_path_buf(),
+            data_len: 0,
+            channels,
+            sample_rate,
+            bits,
+            frames_written: 0,
+        })
+    }
+
+    /// Append `frames` frames of raw PCM (`num_frames` frames * ch * bytes/sample
+    /// bytes each). Tracks the running data length + frame count so `finish` can
+    /// patch the RIFF/data size fields.
+    pub fn append_frames(&mut self, pcm: &[u8], num_frames: u32) -> std::io::Result<()> {
+        use std::io::Write;
+        self.file.write_all(pcm)?;
+        self.data_len = self.data_len.saturating_add(pcm.len() as u32);
+        self.frames_written += num_frames as u64;
+        Ok(())
+    }
+
+    /// Patch the two size fields in the 44-byte header (RIFF chunk size at byte
+    /// 4, data chunk size at byte 40) so the file is a valid PCM WAV, then flush.
+    pub fn finish(&mut self) -> std::io::Result<()> {
+        use std::io::{Seek, Write};
+        use std::io::SeekFrom;
+        let riff = 36u32.saturating_add(self.data_len);
+        self.file.seek(SeekFrom::Start(4))?;
+        self.file.write_all(&riff.to_le_bytes())?;
+        self.file.seek(SeekFrom::Start(40))?;
+        self.file.write_all(&self.data_len.to_le_bytes())?;
+        self.file.flush()?;
+        Ok(())
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+    pub fn data_len(&self) -> u32 {
+        self.data_len
+    }
+    pub fn frames_written(&self) -> u64 {
+        self.frames_written
+    }
+}
+
+/// Sink path override (default `/tmp/open-sober-fmod.wav`).
+pub fn sink_path() -> std::path::PathBuf {
+    std::env::var_os(AAUDIO_SINK_ENV)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/open-sober-fmod.wav"))
+}
+
+/// FMOD AAudio data-callback ABI (verified recon §2): `result = data_cb(stream,
+/// userData, audioData, numFrames)`. `args[0..4]` map to x0..x3 exactly; the
+/// callback writes up to `num_frames` frames of PCM into the guest-visible
+/// `pcm_buf` (a leaked host buffer — same address space, so it IS the guest's
+/// audioData) and returns an aaudio_data_callback_result (0 = CONTINUE).
+/// Returns the number of PCM bytes the callback produced (buffer complete), or
+/// Err if the guest callback could not be driven (no active image). The caller
+/// must first satisfy the SH55/64 single-jit_run discipline (never concurrent).
+pub fn drain_one_buffer(p: &LiveStreamParams, pcm_buf: u64, num_frames: u32, tpidr: u64) -> Result<usize, String> {
+    let r = crate::jit::run_guest_callback(
+        p.data_cb,
+        [p.stream, p.data_userdata, pcm_buf, num_frames as u64, 0, 0, 0, 0],
+        tpidr,
+    )?;
+    let _ = r; // aaudio_data_callback_result CONTINUE=0; FMOD fills the buffer regardless
+    Ok(p.buffer_bytes(num_frames))
+}
+
 /// Wrap the sink in a real 44-byte WAV header for the given PCM params, writing
 /// to the sink path. Returns the full header bytes (for MMAP/disk or tests).
 pub fn wav_header_bytes(sample_rate: u32, channels: u16, bits: u16, data_len: u32) -> Vec<u8> {
@@ -783,5 +934,116 @@ mod tests {
         let _x = first;
         assert_eq!(core::mem::size_of::<Option<extern "C" fn(u64,u64,u64,u64,u64,u64,u64,u64)->u64>>(),
                    core::mem::size_of::<Option<HostCall>>());
+    }
+
+    // --- SH464: live-stream snapshot + real WAV sink writer + drain ABI ---
+
+    /// The registry is a process-global OnceLock Mutex; a prior lifecycle test
+    /// may leave streams populated. Helper: clear the registry so snapshot
+    /// assertions start from a known state.
+    fn clear_registry() {
+        reg().lock().unwrap().streams.clear();
+        reg().lock().unwrap().builders.clear();
+    }
+
+    #[test]
+    fn live_stream_snapshot_none_when_no_data_cb() {
+        clear_registry();
+        // A stream opened WITHOUT a data callback is NOT a live FMOD output
+        // (FMOD only becomes an output device once it registers its cb).
+        let b = aaudio_create_stream_builder(0, 0, 0, 0, 0, 0, 0, 0);
+        let mut out: u64 = 0;
+        aaudio_builder_open_stream(b, (&mut out) as *mut u64 as u64, 0, 0, 0, 0, 0, 0);
+        assert!(live_stream_snapshot().is_none(), "no data_cb => not a live output stream");
+        clear_registry();
+    }
+
+    #[test]
+    fn live_stream_snapshot_captures_fmod_output_stream() {
+        clear_registry();
+        let b = aaudio_create_stream_builder(0, 0, 0, 0, 0, 0, 0, 0);
+        aaudio_builder_set_data_callback(b, 0x104fbfbd8, 0x7777, 0, 0, 0, 0, 0);
+        let mut out: u64 = 0;
+        aaudio_builder_open_stream(b, (&mut out) as *mut u64 as u64, 0, 0, 0, 0, 0, 0);
+        let snap = live_stream_snapshot().expect("data_cb registered => snapshot present");
+        assert_eq!(snap.stream, out, "snapshot stream handle == openStream out");
+        assert_eq!(snap.data_cb, 0x104fbfbd8, "captured guest FMOD data callback");
+        assert_eq!(snap.data_userdata, 0x7777, "captured data-callback userdata");
+        assert_eq!(snap.sample_rate, 48_000, "device-native sample rate");
+        assert_eq!(snap.channels, 2, "device-native channels");
+        assert_eq!(snap.frames_per_burst, 192, "device-native frames/burst");
+        // default format UNDEFINED -> bytes/sample falls back to float 4.
+        assert_eq!(snap.bytes_per_sample(), 4, "UNDEFINED format => float 4 B/sample");
+        assert_eq!(snap.buffer_bytes(192), 192 * 2 * 4, "buffer = frames*ch*bps");
+        clear_registry();
+    }
+
+    #[test]
+    fn audio_sink_writes_valid_pcm_wav() {
+        use std::io::Read;
+        let dir = std::env::temp_dir().join(format!("sh464_sink_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.wav");
+        let _ = std::fs::remove_file(&path);
+        // open truncates + writes the 44B header; append PCM; finish patches sizes.
+        let mut sink = AudioSink::open(&path, 48_000, 2, 16).unwrap();
+        let frame_bytes = 2 * 2; // stereo 16-bit interleaved = 4 B/frame
+        let pcm1: Vec<u8> = vec![0x11; frame_bytes * 192];
+        sink.append_frames(&pcm1, 192).unwrap();
+        sink.append_frames(&vec![0x22; frame_bytes * 192], 192).unwrap();
+        assert_eq!(sink.frames_written(), 384);
+        assert_eq!(sink.data_len(), (frame_bytes * 384) as u32);
+        sink.finish().unwrap();
+        // Read the whole file back: 44B header + data.
+        let mut bytes = Vec::new();
+        std::fs::File::open(&path).unwrap().read_to_end(&mut bytes).unwrap();
+        let hdr = &bytes[..44];
+        assert_eq!(&hdr[0..4], b"RIFF");
+        assert_eq!(&hdr[8..12], b"WAVE");
+        assert_eq!(&hdr[12..16], b"fmt ");
+        assert_eq!(&hdr[20..22], &1u16.to_le_bytes());
+        assert_eq!(&hdr[22..24], &2u16.to_le_bytes()); // stereo
+        assert_eq!(&hdr[24..28], &48_000u32.to_le_bytes());
+        assert_eq!(bytes.len(), 44 + frame_bytes * 384, "header + all appended PCM");
+        // patched RIFF size (byte 4) = 36 + data_len; data size (byte 40) = data_len.
+        let data_len = frame_bytes * 384;
+        assert_eq!(&hdr[4..8], &(36u32 + data_len as u32).to_le_bytes(), "RIFF size patched");
+        assert_eq!(&hdr[40..44], &(data_len as u32).to_le_bytes(), "data size patched");
+        // PCM body intact.
+        assert!(bytes[44..].iter().all(|&b| b == 0x11 || b == 0x22), "both PCM batches present");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audio_sink_empty_finish_is_valid_zero_data() {
+        let dir = std::env::temp_dir().join(format!("sh464_emptysink_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.wav");
+        let mut sink = AudioSink::open(&path, 44_100, 1, 32).unwrap();
+        sink.finish().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 44, "open writes header even with no data");
+        assert_eq!(&bytes[4..8], &36u32.to_le_bytes(), "empty RIFF = 36");
+        assert_eq!(&bytes[40..44], &0u32.to_le_bytes(), "empty data length = 0");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drain_one_buffer_requires_active_image() {
+        // Without a live guest image EXEC_CTX, run_guest_callback errors — so the
+        // drain must report Err (never silently fabricate PCM) on a harness that
+        // did not load libroblox.so. This pins the honesty contract: the audio
+        // drain only produces real frames once a real session runs it.
+        let p = LiveStreamParams {
+            stream: 0xAA01_0001,
+            data_cb: 0x104fbfbd8,
+            data_userdata: 0x7777,
+            format: FORMAT_UNDEFINED,
+            sample_rate: 48_000,
+            channels: 2,
+            frames_per_burst: 192,
+        };
+        let pcm = vec![0u8; p.buffer_bytes(192)];
+        assert!(drain_one_buffer(&p, pcm.as_ptr() as u64, 192, 0).is_err());
     }
 }

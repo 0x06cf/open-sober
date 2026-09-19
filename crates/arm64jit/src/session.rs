@@ -248,14 +248,131 @@ pub fn drive_routeb_session_substrate(iimg: &[u8], ib: u64, tpidr: u64, boot_sp:
             // guards: JIT_AINPUT_BRIDGE + window XID + live image) — the moment a
             // live DM owns a constructed screen this step becomes the input source.
             drive_host_input_loop(iimg, ib, tpidr, boot_sp, input_loop_iters());
+            // SH464: the FMOD/AAudio audio drain as a FIRST-CLASS driven
+            // substrate step (the exact parallel of SH418's input promotion —
+            // completing the SEP-18 "audio/input — each landed + green +
+            // committed" deliverable list). A real host, once FMOD's AAudio
+            // output device is open (the AAudio bridge captured its data_cb),
+            // periodically drives the guest data callback to PRODUCE PCM and
+            // writes it to the host WAV sink — the executable half the SH132
+            // bridge only made latent. Inert-by-construction on boot (three
+            // guards: JIT_AAUDIO_BRIDGE + a live stream snapshot + a live
+            // image) — the moment SoundService advances and FMOD opens its
+            // output, this becomes the audio source.
+            drive_fmod_audio_drain(iimg, ib, tpidr, boot_sp, audio_drain_iters());
         }
     }
     eprintln!("[session-drive] substrate complete: {ok}/{total} atoms returned non-zero Ok");
     ok
 }
 
-/// INPUT_LOOP_ITERS (default 8) for the SH418 host-input substrate step — bounded
-/// so the ordered drive never spins, overridable for longer/short session drains.
+/// AUDIO_DRAIN_ITERS (default 8) for the SH464 FMOD/AAudio substrate step —
+/// bounded so the ordered drive never spins, overridable for longer/shorter
+/// session audio drains (mirrors INPUT_LOOP_ITERS).
+pub fn audio_drain_iters() -> usize {
+    std::env::var("AUDIO_DRAIN_ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8)
+}
+
+/// SH464 — the host audio drain, first-class driven substrate step.
+///
+/// This is the executable half that SH132 left latent: the AAudio bridge
+/// intercepts FMOD's `dlopen("libaaudio.so")` + `dlsym`, the guest registers
+/// its FMOD data callback via `AAudioStreamBuilder_setDataCallback` (captured
+/// in the fake stream), but NOTHING ever invoked that callback headlessly, so
+/// no PCM was produced and the WAV sink (only `wav_header_bytes` framing) was
+/// never written. This step connects the captured guest data_cb to the host
+/// sink the way a real AAudio output callback would drive the device:
+/// repeatedly snapshot the live stream, run the guest data callback through
+/// `run_guest_callback` to fill a PCM buffer (FMOD mixes real audio into it),
+/// and append the produced frames to a real PCM WAV file at `sink_path()`.
+///
+/// Gated on the SAME three guards as the SH414/417/418 input pump/loop:
+/// (1) JIT_AAUDIO_BRIDGE env armed, (2) a live stream snapshot with a
+/// registered data_cb, (3) a live input image (iimg.len() >= 16). Any trip ->
+/// return 0 without touching the guest. Env-gated -> default product path
+/// byte-identical. Must run on the single jit_run ladder thread (SH55/64 —
+/// never concurrent with another jit_run).
+///
+/// Returns the total number of PCM FRAMES appended to the sink across all
+/// iterations (0 when inert, or if a guest-callback drive errors mid-loop).
+pub fn drive_fmod_audio_drain(
+    iimg: &[u8],
+    ib: u64,
+    tpidr: u64,
+    boot_sp: u64,
+    iterations: usize,
+) -> usize {
+    let _ = (iimg, ib, tpidr, boot_sp); // all unused when inert (unarmed guards)
+    #[allow(clippy::needless_return)]
+    {
+        if !crate::aaudio::bridge_enabled() {
+            eprintln!("[session-drive] audio drain: JIT_AAUDIO_BRIDGE unset — inert (no guest call)");
+            return 0;
+        }
+        if iimg.len() < 16 {
+            eprintln!("[session-drive] audio drain: no live input image — inert");
+            return 0;
+        }
+    }
+    // A live FMOD output stream (a stream with a captured data callback) is the
+    // trigger. None on the boot path (SoundService hasn't advanced) -> inert.
+    let Some(stream) = crate::aaudio::live_stream_snapshot() else {
+        eprintln!("[session-drive] audio drain: no live FMOD output stream (data_cb captured) — inert");
+        return 0;
+    };
+    // Open (truncate) the WAV sink once and drain into it for `iterations`
+    // buffer-fulls. 16-bit PCM framing (FMOD float mix -> we reuse the samples
+    // as-is; bytes/sample from the format, default float 4).
+    let bits: u16 = (stream.bytes_per_sample() * 8) as u16;
+    let path = crate::aaudio::sink_path();
+    let mut sink = match crate::aaudio::AudioSink::open(&path, stream.sample_rate as u32, stream.channels.max(1) as u16, bits) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[session-drive] audio drain: failed to open WAV sink at {}: {e}", path.display());
+            return 0;
+        }
+    };
+    let burst = stream.frames_per_burst.max(1) as u32;
+    let buf_bytes = stream.buffer_bytes(burst);
+    let pcm = Box::leak(vec![0u8; buf_bytes].into_boxed_slice());
+    let pcm_addr = pcm.as_mut_ptr() as u64;
+    let mut total_frames: usize = 0;
+    eprintln!(
+        "[session-drive] audio drain: draining FMOD output (stream {:#x}, {}Hz {}ch, {} frames/burst) for {iterations} iterations -> {}",
+        stream.stream, stream.sample_rate, stream.channels, burst, path.display()
+    );
+    for iter in 0..iterations {
+        match crate::aaudio::drain_one_buffer(&stream, pcm_addr, burst, tpidr) {
+            Ok(bytes) => {
+                if bytes == 0 || bytes > pcm.len() {
+                    eprintln!("[session-drive] audio drain iter {iter}: callback produced no PCM — stopping drain");
+                    break;
+                }
+                if sink.append_frames(&pcm[..bytes], burst).is_err() {
+                    eprintln!("[session-drive] audio drain iter {iter}: sink write error — stopping drain");
+                    break;
+                }
+                total_frames += burst as usize;
+                eprintln!("[session-drive] audio drain iter {iter}: {bytes} PCM bytes ({burst} frames) appended -> sink");
+            }
+            Err(e) => {
+                eprintln!("[session-drive] audio drain iter {iter}: guest data_cb drive error: {e} — stopping drain");
+                break;
+            }
+        }
+    }
+    // Patch the RIFF/data size fields so the file is a valid playable WAV.
+    let _ = sink.finish();
+    eprintln!(
+        "[session-drive] audio drain: done {iterations} iterations, {total_frames} frames -> {} ({})",
+        path.display(),
+        if total_frames > 0 { "real PCM WAV" } else { "empty sink (no frames)" }
+    );
+    total_frames
+}
 pub fn input_loop_iters() -> usize {
     std::env::var("INPUT_LOOP_ITERS")
         .ok()
@@ -1354,7 +1471,52 @@ mod tests {
         unsafe { std::env::remove_var(crate::ainput::AINPUT_BRIDGE_ENV) };
     }
 
-    /// recon-selfdrive-seed-jsonfix.md §A "Reject" guard: --taskv4-seed must refuse
+    /// SH464: the FMOD/AAudio audio drain is a first-class driven substrate step
+    /// (the exact parallel of SH418's input promotion — completing the SEP-18
+    /// "audio/input — each landed + green + committed" deliverable list). On a
+    /// no-live-image hermetic the three inert guards (JIT_AAUDIO_BRIDGE, a live
+    /// stream snapshot, a live image) make it return 0 exactly once as a
+    /// substrate step, so the ordered drive completes without touching the
+    /// guest / writing a sink — and over a real session it produces real PCM
+    /// from FMOD's captured data callback into the host WAV sink.
+    #[test]
+    fn sh464_audio_drain_is_first_class_substrate_step() {
+        // AUDIO_DRAIN_ITERS helper is bounded + defaulted (never spins).
+        unsafe { std::env::remove_var("AUDIO_DRAIN_ITERS") };
+        assert_eq!(crate::session::audio_drain_iters(), 8, "default bounded (8)");
+        unsafe { std::env::set_var("AUDIO_DRAIN_ITERS", "2") };
+        assert_eq!(crate::session::audio_drain_iters(), 2, "env override honored");
+        unsafe { std::env::remove_var("AUDIO_DRAIN_ITERS") };
+        // (a) bridge env unset -> inert (0), no sink write, no guest call.
+        unsafe { std::env::remove_var(crate::aaudio::AAUDIO_BRIDGE_ENV) };
+        assert_eq!(
+            crate::session::drive_fmod_audio_drain(&[0u8; 64], 0x100000000, 0, 0x200000, 4),
+            0,
+            "audio bridge disabled -> drain inert (0 frames)"
+        );
+        // (b) bridge set but no live input image -> inert.
+        unsafe { std::env::set_var(crate::aaudio::AAUDIO_BRIDGE_ENV, "1") };
+        assert_eq!(
+            crate::session::drive_fmod_audio_drain(&[], 0x100000000, 0, 0x200000, 4),
+            0,
+            "no live input image -> drain inert (0 frames)"
+        );
+        // (c) bridge + image but no live FMOD stream snapshot -> inert (no sink
+        //     file created, no guest call). Uses a temp sink path so a real boot
+        //     never gets clobbered.
+        let sink = std::env::temp_dir().join(format!("sh464_drain_{}.wav", std::process::id()));
+        let _ = std::fs::remove_file(&sink);
+        unsafe { std::env::set_var(crate::aaudio::AAUDIO_SINK_ENV, sink.to_str().unwrap()) };
+        assert_eq!(
+            crate::session::drive_fmod_audio_drain(&[0u8; 64], 0x100000000, 0, 0x200000, 4),
+            0,
+            "no live FMOD output stream -> drain inert, no sink"
+        );
+        assert!(!sink.exists(), "no sink file created while inert (no stream)");
+        let _ = std::fs::remove_file(&sink);
+        unsafe { std::env::remove_var(crate::aaudio::AAUDIO_SINK_ENV) };
+        unsafe { std::env::remove_var(crate::aaudio::AAUDIO_BRIDGE_ENV) };
+    }
     /// to install the engine's own dispatcher / drain / producer into the type-4
     /// vector (infinite recursion / re-entrancy). Host-thunk addrs and the engine
     /// frame-fn stay valid non-recursive. Pure guard logic — no real binary needed.

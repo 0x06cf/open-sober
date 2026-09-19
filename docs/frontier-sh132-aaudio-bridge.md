@@ -64,8 +64,14 @@ reached.
   binary's actual ABI, not an assumption.
 
 ## Next (audio direction)
-- When the session advances and FMOD's AAudio output device is actually opened,
-  wire a non-concurrent PCM drain from the host buffer to the WAV sink.
+- CLOSED by SH464 (promote audio to a first-class driven substrate step): the
+  FMOD AAudio output device, once opened, is drained by `drive_fmod_audio_drain`
+  (session.rs) — a bounded substrate step that runs FMOD's captured data_cb via
+  `run_guest_callback` to fill a PCM buffer and writes it to a REAL WAV sink
+  (`AudioSink`, aaudio.rs). Non-concurrent (single jit_run ladder thread), gated
+  on JIT_AAUDIO_BRIDGE + a live stream snapshot + a live image. Inert on the
+  current boot path (SoundService hasn't advanced); fires the instant a real
+  session opens FMOD's output.
 
 ## SH213 addendum — first-contact anchor pins + bridge A/B measurement (Sep 16)
 
