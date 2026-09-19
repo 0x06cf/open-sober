@@ -1,9 +1,9 @@
 # Frontier SH383 — pin the GENUINE LocalStorageManager constructor (0x1db0dfc) as the manufacture target the MIGRATION directive demands
 
 Date: Sep 20, 2026, hermes-worker. Single-agent (cone suppressed). Workspace green
-(re-confirmed at start: cargo test --workspace EXIT 0, 617/0; arm64jit lib 437/0;
-elfjit example 160/0 before +sh383, now 161/0). recon-v3 self-driven-frame +
-JSON deliverables re-verified green at HEAD this cycle (capture_taskv4_frame.sh
+(re-confirmed at start: cargo test --workspace EXIT 0, 617/0; arm64jit lib 437/0,
+now 438/0 incl the new sh383 hermetic). recon-v3 self-driven-frame + JSON
+deliverables re-verified green at HEAD this cycle (capture_taskv4_frame.sh
 attempt 1: 24 real task-driven frames swap Ok(0x1), 197 node pops, 0 json abort,
 0 crash).
 
@@ -71,7 +71,9 @@ pinned genuine-ctor target above; re-driving it must be via the real ctor, not a
 skip or a map/seed repair of the same lane.
 
 ## Files
-- crates/arm64jit/examples/elfjit.rs: +hermetic `sh383_lsm_ctor_manufacture_target_pinned`
-  (sh115_tests module, 161/0) — real-image byte pins on 0x1db0dfc + inner 0x1db0748
-  + SH285 leaf 0x1d9a15c, skip-if-absent.
+- crates/arm64jit/src/jit.rs: +hermetic `sh383_lsm_ctor_manufacture_target_pinned`
+  (jit::tests module, arm64jit lib 437->438) — real-image byte pins on 0x1db0dfc + inner
+  0x1db0748 + SH285 leaf 0x1d9a15c (file-offset pattern, skip-if-absent). The example
+  elfjit.rs was left at its 1MiB-adjacent size (reverted clean after a first attempt there);
+  the hermetic lives in the lib like sh371/sh372/sh375.
 - No production path / JIT hook / guest byte touched.

@@ -1,5 +1,19 @@
 # Open Sober — Agent Handoff
 
+## SH383 (Sep 20, 2026, hermes-worker): pin the GENUINE LocalStorageManager constructor (0x1db0dfc) as the MIGRATION-directive manufacture target — the persistence funnel (SH285 reader/pop wall, [obj+0x50]=0xff..ff) was only ever skipped (SH348 leaf-ret) or map-seeded (SH267/285); SH383 byte-pins the real vtable-owning object ctor (this=x0, vt 0x10635b000+0xd58 & +0xe68, reads [x1+8]/[x1+16]/[x1+32], inner ctor 0x1db0748, SH285 byte-copy leaf 0x1d9a15c) so a future run_guest_callback drive is byte-anchored
+Single-agent (cone suppressed). recon-v3 self-driven-frame + JSON deliverables
+re-verified green at HEAD (capture_taskv4_frame.sh attempt 1: 24 real task-driven
+frames swap Ok(0x1), 197 node pops, 0 json abort, 0 crash). New hermetic
+`sh383_lsm_ctor_manufacture_target_pinned` (arm64jit lib 437->438, real-image
+file-offset pins on 0x1db0dfc/0x1db0e34/0x1db0e84/0x1db0e98/0x1db0748/0x1d9a15c,
+skip-if-absent) + frontier doc. NO production path / JIT hook / guest byte touched.
+Driver note: the hornshot first attempt placed the hermetic in the 1MiB-adjacent
+elfjit example (1,048,526 B, ~50B headroom) and was reverted clean; the hermetic
+lives in the lib (jit.rs) like sh371/sh372/sh375. Workspace green (cargo test
+--workspace EXIT 0; 438 arm64jit lib; 160 elfjit example). Route-B live-DM
+structural gate UNCHANGED (DM-root [0x106a68818]=0, MH_* false, AppBridgeV2 0).
+SH174 capture-latch stays the single forward observer. Do-not-re-tread unchanged
+(incl. once-lambda store seeding SH381).
 ## SH382 (Sep 20, 2026, hermes-worker): fold the SH381 once-slot reconciliation into the latent session-gated type-4 producer (recon-v3 §A end-state) — live-DM classifier now also reads the once-lambda's REAL write target [0x106a68408] and explicitly rejects the 0x400000b "Execute" sentinel; recon-v3 deliverables re-verified green at HEAD
 Single-agent (cone suppressed). Pure-predicate change (elfjit.rs): added
 `live_dm_cell_value_ok(v)` (rejects the <0x100000000 0x400000b sentinel) and made
