@@ -9498,4 +9498,84 @@ mod tests {
         let z = tr_bytes(Inst::FcvtToInt { rd: 0, rn: 1, mode: 0, sf: true, unsigned: true, src_sng: false, fbits: 0 });
         assert!(!z.windows(4).any(|w| w == [0xf2, 0x0f, 0x59, 0xc1]), "fbits=0 must NOT emit mulsd (no fixed-point scale)");
     }
+
+    #[test]
+    fn sh447_fpunary_fneg_2s_flips_sign_via_xor_and_stores32() {
+        // fneg V1.2s, V2.2s (rd=1 rn=2 op=0 esize=4 q=false): per-lane the FP
+        // bit-pattern is moved into RAX, sign halfword(bit31) const is XOR'd in
+        // (48 31 c8), moved back, then stored 32-bit (89 83). Full-buffer exact.
+        let b = tr_bytes(Inst::SimdFpUnary { rd: 1, rn: 2, op: 0, esize: 4, q: false });
+        assert_eq!(b, vec![
+            0xf3, 0x48, 0x0f, 0x7e, 0x83, 0x30, 0x01, 0x00, 0x00, // movq xmm0,[0x130] Vn lane0
+            0x66, 0x48, 0x0f, 0x7e, 0xc0,                         // movq rax,xmm0
+            0x48, 0xb9, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, // mov rcx,0x80000000
+            0x48, 0x31, 0xc8,                                     // xor rax,rcx (fneg: flip bit31)
+            0x66, 0x48, 0x0f, 0x6e, 0xc0,                         // movq xmm0,rax
+            0x66, 0x0f, 0x7e, 0xc0,                               // movd eax,xmm0
+            0x89, 0x83, 0x20, 0x01, 0x00, 0x00,                   // mov [0x120],eax Vd lane0
+            0xf3, 0x48, 0x0f, 0x7e, 0x83, 0x34, 0x01, 0x00, 0x00, // movq xmm0,[0x134] lane1
+            0x66, 0x48, 0x0f, 0x7e, 0xc0,
+            0x48, 0xb9, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00,
+            0x48, 0x31, 0xc8,
+            0x66, 0x48, 0x0f, 0x6e, 0xc0,
+            0x66, 0x0f, 0x7e, 0xc0,
+            0x89, 0x83, 0x24, 0x01, 0x00, 0x00,                   // mov [0x124],eax lane1
+        ]);
+        // single width: stores are 32-bit (89 83), never the 16-bit 66 89 form.
+        assert!(!b.windows(8).any(|w| w == [0x66, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00, 0xf3]));
+    }
+
+    #[test]
+    fn sh447_fpunary_fabs_clears_sign_through_not_and_never_xor() {
+        // fabs V1.2s, V2.2s (op=1): sign cleared via mov rdx,const; not rdx
+        // (48 f7 d2); and rax,rdx (48 21 d0). The and+not (NOT xor) is the
+        // fneg-vs-fabs discriminator.
+        let b = tr_bytes(Inst::SimdFpUnary { rd: 1, rn: 2, op: 1, esize: 4, q: false });
+        // const 0x80000000 -> rdx (48 ba), not rdx, and rax,rdx
+        assert!(b.windows(16).any(|w| w == [0x48, 0xba, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x48, 0xf7, 0xd2, 0x48, 0x21, 0xd0]));
+        // fabs must NEVER emit the xor-flip (48 31 c8) that fneg uses.
+        assert!(!b.windows(3).any(|w| w == [0x48, 0x31, 0xc8]), "fabs clears via and, never flips via xor");
+    }
+
+    #[test]
+    fn sh447_fpunary_fsqrt_2d_sqrtsd_no_gpr_sign_manip() {
+        // fsqrt V1.2d V2.2d q=false (op=2): 1 lane, movq xmm0 -> sqrtsd
+        // (f2 0f 51 c0) -> movq store (66 48 0f d6). Double width; NO GPR
+        // sign-bit manipulation at all (fsqrt never touches rax/rcx).
+        let b = tr_bytes(Inst::SimdFpUnary { rd: 1, rn: 2, op: 2, esize: 8, q: false });
+        assert_eq!(b, vec![
+            0xf3, 0x48, 0x0f, 0x7e, 0x83, 0x30, 0x01, 0x00, 0x00, // movq xmm0,[0x130]
+            0xf2, 0x0f, 0x51, 0xc0,                               // sqrtsd xmm0,xmm0
+            0x66, 0x48, 0x0f, 0xd6, 0x83, 0x20, 0x01, 0x00, 0x00, // movq [0x120],xmm0
+        ]);
+        assert!(!b.windows(3).any(|w| w == [0x48, 0xb9, 0x00]), "fsqrt emits no sign const (mov rcx)");
+        assert!(!b.windows(4).any(|w| w == [0x48, 0x31, 0xc8]), "fsqrt emits no xor-flip");
+    }
+
+    #[test]
+    fn sh447_fpunary_esize_width_discriminator_sign_const_and_store() {
+        // The sign-const AND store width both discriminate esize: esize=8 loads
+        // the full 64-bit sign (0x8000_0000_0000_0000 -> imm 00*7 80) + 64-bit
+        // movq store; esize=4 loads bit31 (0x8000_0000) + 32-bit store; esize=2
+        // loads bit15 (0x8000) + 16-bit 66 89 store.
+        let d = tr_bytes(Inst::SimdFpUnary { rd: 1, rn: 2, op: 0, esize: 8, q: true });
+        assert!(d.windows(16).any(|w| w == [0x48, 0xb9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x48, 0x31, 0xc8, 0x66, 0x48, 0x0f]), "esize=8 const = 0x8000..0x00 (bit63)");
+        assert!(d.windows(9).any(|w| w == [0x66, 0x48, 0x0f, 0xd6, 0x83, 0x28, 0x01, 0x00, 0x00]), "esize=8 stores 64-bit movq (66 48 0f d6), lane1 at +8");
+
+        let h = tr_bytes(Inst::SimdFpUnary { rd: 1, rn: 2, op: 0, esize: 2, q: false });
+        assert!(h.windows(10).any(|w| w == [0x48, 0xb9, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]), "esize=2 const = 0x8000 (bit15)");
+        assert!(h.windows(7).any(|w| w == [0x66, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00]), "esize=2 stores 16-bit (66 89 83)");
+    }
+
+    #[test]
+    fn sh447_fpunary_q_lane_advance_4s_stores_advance_by_esize() {
+        // fabs V1.4s V2.4s (q=true): 4 lanes, loads 0x130/0x134/0x138/0x13c,
+        // stores 0x120/0x124/0x128/0x12c — every lane advances +esize.
+        let b = tr_bytes(Inst::SimdFpUnary { rd: 1, rn: 2, op: 1, esize: 4, q: true });
+        for (i, lo) in [0x30u32, 0x34, 0x38, 0x3c].iter().enumerate() {
+            assert!(b.windows(9).any(|w| w == &[0xf3, 0x48, 0x0f, 0x7e, 0x83, *lo as u8, 0x01, 0x00, 0x00]), "q lane {i} source at 0x130+{i}*4");
+        }
+        assert!(b.windows(6).any(|w| w == [0x89, 0x83, 0x28, 0x01, 0x00, 0x00]), "lane2 store 0x128");
+        assert!(b.windows(6).any(|w| w == [0x89, 0x83, 0x2c, 0x01, 0x00, 0x00]), "lane3 store 0x12c");
+    }
 }
