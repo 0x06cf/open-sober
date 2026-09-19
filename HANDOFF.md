@@ -1,5 +1,41 @@
 # Open Sober — Agent Handoff
 
+## SH431 (Sep 19, 2026, hermes-worker): hermetic coverage of the bitmask-immediate LOGIC + high-widen MULTIPLY codegen families (translate.rs LogicImm, MulHigh) — 4 exact-byte pins: the `mov xD,#imm` = ORR xzr alias with rn==31 read as XZR-not-SP (mask materialized in RCX + no [rbx+0xf8] access), the flag-setting ANDS w32 form as the ONLY LogicImm op that emits the full store_nzcv pack (C-store 89 93 08 01 00 00 to [rbx+0x108] + caller pop), and the umulh `mul rcx` /4 vs smulh `imul rcx` /5 high-half-in-RDX distinction (mov [rbx],rdx 48 89 13)
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+re-verified green at this exact HEAD first (capture_taskv4_frame.sh attempt 1:
+24 real task-driven frames `present swap Ok(0x1)`, 194 node pops, 0 json abort,
+0 crash, EXIT 124). Workspace green (cargo test --workspace EXIT 0; arm64jit lib
+550/0 incl. 4 new sh431 pins, was 546; cargo build --example elfjit OK).
+Production code ONLY in translate.rs `#[cfg(test)]` addition (translator core
+body byte-untouched; jit.rs/elfjit.rs/session.rs unchanged).
+- SH430 pinned the MulDiv/MulLong/ClzCls arithmetic + B/Cbz/Tbz control-flow
+  families; the two adjacent families it did NOT cover had zero direct byte
+  tests: LogicImm (AND/ORR/EOR/ANDS with the encoded bitmask immediate — incl.
+  the `mov xD,#imm` = ORR xD,xzr,#imm alias compilers use to load constants) and
+  MulHigh (umulh/smulh, the high-64 half of every 64x64 multiply). SH431 pins
+  them:
+  (1) orr x0,xzr,#7 (op=1, rn==31): rn==31 reads as XZR (zero) — `mov rax,0`,
+  never the SP slot — + asserts no [rbx+0xf8] access anywhere; the bitmask imm
+  is materialized in RCX (`mov rcx,7`), `or rax,rcx`, store.
+  (2) ANDS w0,w1,#5 (op=3, sf=false): `and rax,rcx` then the full store_nzcv
+  pack (pushfq + 4-bit NZCV extraction ending with the C-store 89 93 08 01 00 00
+  to [rbx+0x108] + caller pop 5a 59 58), then the 32-bit zero-extend
+  (`mov eax,eax`) + store. Pins that ANDS is the ONLY LogicImm op emitting the
+  nzcv pack (and/orr/eor don't).
+  (3/4) umulh (48 f7 e1, `mul rcx` /4 unsigned) vs smulh (48 f7 e9, `imul rcx`
+  /5 signed): high half lands in RDX, stored `mov [rbx],rdx` (48 89 13). A /4-vs
+  -/5 flub silently corrupts the high half of every signed wide multiply.
+- 4 exact-byte pins via synthetic `Inst` -> translate() -> CodeBuf.as_slice()
+  (zero-pc 0x1000 = deterministic). [RBX]=CpuState; slot g = [RBX+g*8].
+  Deterministic, no image, no env, parallel-safe.
+- Honest: NOT a DM (SH415 probe re-confirms DM-root [0x106a68818]=0x0 under the
+  complete substrate; Route-B live-DM gate UNCHANGED). BUILD-THE-RUNTIME
+  codegen-surface coverage completion (bitmask-immediate logic + high-widen
+  multiply), continuing the SH427/428/429/430 translator-core lineage. No
+  re-treads (distinct families).
+- Files: docs/frontier-sh431-translator-logicimm-mulhigh.md +
+  crates/arm64jit/src/translate.rs (`#[cfg(test)]` only). Commit (pending).
+
 ## SH430 (Sep 19, 2026, hermes-worker): hermetic coverage of the MUL/DIV/LONG arithmetic + branch control-flow codegen families (translate.rs MulDiv, MulLong, ClzCls, B/Cbz/Tbz) — 13 exact-byte pins incl. the two documented historical-bug discriminators (the msub `ra - product` direction fix, the clz REX.W-after-F3 order fix) + the ra==31-XZR-not-SP accumulate skip + the call/jmp/jcc fixup-shape pins
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 re-verified green at this exact HEAD first (capture_taskv4_frame.sh attempt 1:

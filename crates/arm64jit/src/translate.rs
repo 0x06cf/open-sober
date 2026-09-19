@@ -7366,6 +7366,74 @@ mod tests {
         c.as_slice().to_vec()
     }
 
+    #[test]
+    fn sh431_logicimm_orr_xzr_mov_alias_materializes_mask() {
+        // `mov x0,#7` = ORR x0,xzr,#7 (op=1, rn==31): rn==31 must read as XZR
+        // (zero), so RAX is `mov rax,0` (never the SP slot), the bitmask
+        // immediate is materialized in RCX (mov rcx,7), then `or rax,rcx`,
+        // store slot0. Pins the bitmask-immediate materialization + the
+        // xzr-not-SP read of rn==31.
+        let b = tr_bytes(Inst::LogicImm { rd: 0, rn: 31, mask: 7, op: 1, sf: true });
+        assert_eq!(b, vec![
+            0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rax,0 (XZR, NOT SP)
+            0x48, 0xb9, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rcx,7 (bitmask imm)
+            0x48, 0x09, 0xc8, // or rax,rcx
+            0x48, 0x89, 0x03, // mov [rbx],rax (store rd=0)
+        ]);
+        assert!(!b.windows(4).any(|w| w == [0x48, 0x8b, 0x83, 0xf8]),
+            "rn==31 must be XZR (zero), not the SP slot");
+    }
+
+    #[test]
+    fn sh431_logicimm_ands_w32_flag_setting_nzcv() {
+        // ANDS w0,w1,#5 (op=3, sf=false): `and rax,rcx` then store_nzcv (the
+        // pushfq + 4-bit NZCV pack ending with the C-store `89 93 08 01 00 00`
+        // to [rbx+0x108] + caller pop), then the 32-bit zero-extend (mov eax,eax)
+        // and store. Pins that the flag-setting ANDS form is the ONLY LogicImm
+        // op that emits the nzcv pack (and/orr/eor do not).
+        let b = tr_bytes(Inst::LogicImm { rd: 0, rn: 1, mask: 5, op: 3, sf: false });
+        assert_eq!(&b[0..17], &[
+            0x48, 0x8b, 0x43, 0x08, // mov rax,[rbx+0x08] (rn=1)
+            0x48, 0xb9, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rcx,5 (mask)
+            0x48, 0x21, 0xc8, // and rax,rcx
+        ]);
+        // the nzcv tail packs NZCV and stores C to [rbx+0x108], pops caller regs,
+        // then the final 32-bit zero-extend store. Pin the real trailing 5 bytes
+        // (mov eax,eax then mov [rbx],rax) and the nzcv C-store just before them.
+        assert_eq!(&b[b.len() - 5..], &[0x89, 0xc0, 0x48, 0x89, 0x03], "W zero-ext + store");
+        assert_eq!(&b[b.len() - 14..b.len() - 8], &[0x89, 0x93, 0x08, 0x01, 0x00, 0x00], "nzcv C-store");
+        assert_eq!(&b[b.len() - 8..b.len() - 5], &[0x5a, 0x59, 0x58], "caller regs restored");
+    }
+
+    #[test]
+    fn sh431_mulhigh_umulh_unsigned_high_half_in_rdx() {
+        // umulh x0,x1,x2: one-operand UNSIGNED multiply `mul rcx` (48 f7 e1),
+        // high half lands in RDX, stored to slot0 via `mov [rbx],rdx` (48 89 13).
+        // Pin the /4 (mul) discriminator against the signed /5 (imul) case.
+        let b = tr_bytes(Inst::MulHigh { rd: 0, rn: 1, rm: 2, signed: false });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x43, 0x08, // mov rax,[rbx+0x08] (rn=1 multiplicand)
+            0x48, 0x8b, 0x4b, 0x10, // mov rcx,[rbx+0x10] (rm=2 multiplier)
+            0x48, 0xf7, 0xe1, // mul rcx  (/4 unsigned; RDX:RAX = RAX*RCX)
+            0x48, 0x89, 0x13, // mov [rbx],rdx (store high 64 -> rd=0)
+        ]);
+    }
+
+    #[test]
+    fn sh431_mulhigh_smulh_signed_high_half_in_rdx() {
+        // smulh x0,x1,x2: same load pair, but the SIGNED one-operand `imul rcx`
+        // (48 f7 e9, /5) puts the high half in RDX. The /5 discriminator is what
+        // separates smulh from umulh — a flub here silently corrupts the high
+        // half of every signed wide multiply.
+        let b = tr_bytes(Inst::MulHigh { rd: 0, rn: 1, rm: 2, signed: true });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x43, 0x08, // mov rax,[rbx+0x08] (rn=1)
+            0x48, 0x8b, 0x4b, 0x10, // mov rcx,[rbx+0x10] (rm=2)
+            0x48, 0xf7, 0xe9, // imul rcx  (/5 signed)
+            0x48, 0x89, 0x13, // mov [rbx],rdx (store high 64 -> rd=0)
+        ]);
+    }
+
     fn tr_bytes_fx(inst: Inst) -> (Vec<u8>, Vec<Fixup>) {
         let mut c = crate::x86::CodeBuf::new();
         let mut fx = Vec::new();
