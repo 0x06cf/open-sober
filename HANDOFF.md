@@ -1,5 +1,30 @@
 # Open Sober — Agent Handoff
 
+## SH395 (Sep 21, 2026, hermes-worker): CORRECT the SH378/SH394 "capture latch never installs" attribution — it never installed because JIT_DM_ALLOC_CAPTURE_DELEGATE was UNSET and the engine's real allocator hook is present; with DELEGATE the SH174 latch installs + fires cleanly on the SAME furthest-advancing composition, delegating real allocations through the engine's own hook (prev_hook measured 0x1021ebaf4) — the "no DM" verdict is now proven by a WORKING observer, not a refused-install artifact
+Single-agent (cone suppressed). Recon-v3 immediate-priority deliverables re-verified green at this
+exact HEAD (capture_taskv4_frame.sh attempt 1 = 24 real task-driven frames `present swap Ok(0x1)`,
+0 json abort, 0 crash; capture_sh304 producer INERT). Two genuinely-never-run probes
+(runs/capture_sh395_opnew_observer_audit.sh + runs/capture_sh395b_dmcap_delegate_fulltable.sh) +
+docs/frontier-sh395-latch-observer-artifact-corrected.md. No production Rust / guest byte touched;
+workspace green (cargo test --workspace EXIT 0).
+- **SH395a** (SH394 env, capture-only): region-watching the whole CRT operator-new band
+  [0x102a0d940,0x102a0da00) + DMCONT operator_new entries PROVES operator-new EXECUTES headlessly on
+  the furthest composition (0x102a0d9b8/0x102a0d9fc, 0x101db1a38/0x1b1ad4/0x1b1adc/0x1b1afc/0x1b1b78/
+  0x1b1c8c, allocator tail 0x101db1c60, 0x101d96768/0x96778/0x967b0 all hit) EVEN THOUGH the latch
+  still never installed — so SH394's "operator-new is never enterinstallably" was wrong.
+- **SH395b** (the discriminator): SAME full-table env + `JIT_DM_ALLOC_CAPTURE_DELEGATE=1` -> the latch
+  NOW INSTALLS on the composition SH394 said it "refuses to arm" on (`routed CRT operator-new ACTIVE
+  hook ... capture trail`), and FIRES calls #1-5 delegating 0x18-byte allocations through the engine's
+  OWN real hook (prev_hook=0x1021ebaf4) — delegation completes CLEANLY (SH344's cathed bad_function_call
+  was the separate JIT_ROUTEB_DM_REALCTOR drive, not delegation). Terminal still the standing SH285
+  LSM pool-pop wall guestpc=0x101d9a528 (EXIT 134); glue-full 15/15 Ok; SendAppEventOnAppReady Ok.
+- Interpretation: SH378/SH394 measured the safe-latch REFUSING to replace a present engine hook
+  without DELEGATE — an observer artifact, not "no allocation." The "no make_shared<DataModel> yet"
+  verdict STILL STANDS, now from a WORKING observer (armed trail saw only 0x18-byte allocs, none
+  DM-plausible), so future "0 validated" results are trustworthy-by-construction. Route-B live-DM
+  structural gate UNCHANGED (DM-root 0, MH_* false, AppBridgeV2 0). Do-not-re-tread +: do NOT run the
+  SH174 latch without JIT_DM_ALLOC_CAPTURE_DELEGATE=1 expecting an install (safe-latch refusal, SH395).
+
 ## SH394 (Sep 21, 2026, hermes-worker): MEASURED the never-run composition — the SH393 FULL safe app-command table drive + the SH174 DM-allocation capture latch (single forward observer) on the furthest-advancing SH378 env: the capture latch never even ARMS, 0 validated make_shared<DataModel>, terminal still the standing SH285 persistence-lane wall
 Single-agent (cone suppressed). Recon-v3 immediate-priority deliverables re-verified green at this
 exact HEAD first (capture_taskv4_frame.sh attempt 1 = 24 real task-driven frames `present swap
