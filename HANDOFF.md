@@ -1,5 +1,35 @@
 # Open Sober — Agent Handoff
 
+## SH421 (Sep 19, 2026, hermes-worker): wire the recon-v3 §A "Reject" rule into code — `--taskv4-seed <guest-hex>` now REFUSES the engine's own dispatcher 0x10285371c / drain 0x102856e40 / producer 0x10285682c (infinite recursion / re-entrancy), leaving the type-4 vector [0x106829ea8] cleared instead of seeding a runaway recursive handler; session.rs taskv4_seed_rejected + hermetic (arm64jit lib 477->478), elfjit.rs pulled under the 1MiB hook (1,048,392 B) by condensing two SH-prose comments
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+re-verified green at this HEAD first AND after (capture_taskv4_frame.sh: 24
+real task-driven frames `present swap Ok(0x1)`, 197 node pops, 0 json abort, 0
+crash — the deliverable's seed block is untouched because `--taskv4-seed
+frame/session` take the safe host-thunk branches). Workspace green (cargo test
+--workspace EXIT 0; arm64jit lib 478/0 incl. new sh421 hermetic; cargo build
+--example elfjit OK). Production code in session.rs (off-hook, 62KB) +
+elfjit.rs (intro rejects the three recursive engine addrs; jit.rs untouched.
+- The recon-v3 doc's §A "Reject" (seed = engine's own 0x10285371c = infinite
+  recursion, seed drain itself = re-entrant) was documented but NEVER enforced:
+  the raw-hex --taskv4-seed branch accepted any guest addr, so seeding
+  0x10285371c would recurse the popped-task deque forever on the builder thread.
+  session.rs now exports `taskv4_seed_rejected(addr)` (denies dispatcher/drain/
+  producer; accepts host-thunk addrs + the engine frame-fn 0x105b32c00, which the
+  thunk calls via run_guest_callback and is never the vector entry). elfjit.rs
+  parses the hex, refuses rejected addrs (`REJECTED ... vector left 0`) and dips
+  under the 1MiB hook (24B over at mid-edit) by condensing the taskv4 + deque-probe
+  SH-prose comments (addresses kept).
+- MEASURED on real libroblox.so (full render env): `--taskv4-seed 0x10285371c` ->
+  `[elfjit:taskv4] REJECTED ... vector left 0` + `seeded ... [0x106829ea8] = 0x0
+  (cleared)`; `--taskv4-seed 0x105b32c00` -> normally seeded (valid path unregressed).
+- Honest: NOT a DM (DM-root [0x106a68818]=0, MH_GAME_LOADED false). Route-B
+  live-DM structural gate UNCHANGED; re-confirmed this cycle — the SH415 do-init
+  probe under the complete substrate shows the runtime surface fully exercised
+  (substrate 11/16 Ok, MH_FLAGS_LOADED/ENGINE_INITIALIZED/APP_READY all latch
+  true, AppBridgeV2 genuine vt 0x1063a3410) yet DM-root stays 0: a live DM needs
+  a real session ctor the JIT cannot reproduce headlessly. No re-treads.
+- Files: docs/frontier-sh421-taskv4-seed-reject-guard.md + session.rs + elfjit.rs.
+
 ## SH420 (Sep 26, 2026, hermes-worker): a `__stack_chk_fail` host shim NAMES the GENUINE canary `*** stack smashing ***` wall's failing frame — the STATUS-#2 "distinct store on the deeper nativeGameGlobalInit ladder" finally measured against ITS OWN canary slot, with an instrument that fires ONCE (zero scheduling perturbation)
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 re-verified green at HEAD (capture_taskv4_frame.sh: real task-driven frames

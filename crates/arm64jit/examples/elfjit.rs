@@ -8897,11 +8897,8 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                 eprintln!("[elfjit:deque-node-live] gave up after 400 ticks");
             });
         }
-        // --taskv4-seed <probe|guest-hex>: populate the dispatcher's TYPE-4 popped-task
-        // handler vector at guest BSS 0x106829ea8 (dispatcher 0x10285371c w4=4 path:
-        // `adrp x8,6829000; ldr x3,[x8,#3752]; br x3` @file 0x2853788/0x28537b8). Headless
-        // boot leaves it 0 (a NULL .bss fn-ptr a real producer installs); seeding with a
-        // registered HOST-THUNK probe pops REAL dispatcher w4=4 plane nodes into the vector.
+        // --taskv4-seed <probe|frame|session|guest-hex>: seed the dispatcher TYPE-4
+        // vector 0x106829ea8 (a w4=4 pop calls it; NULL .bss fn-ptr a producer installs).
         if let Some(spec) = std::env::args()
             .position(|a| a == "--taskv4-seed")
             .and_then(|i| std::env::args().nth(i + 1))
@@ -8941,7 +8938,14 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                 );
                 f
             } else {
-                u64::from_str_radix(spec.trim_start_matches("0x"), 16).expect("--taskv4-seed needs 'probe', 'frame', or a hex guest fn addr")
+                let h = u64::from_str_radix(spec.trim_start_matches("0x"), 16).expect("--taskv4-seed needs 'probe', 'frame', or a hex guest fn addr");
+                if arm64jit::session::taskv4_seed_rejected(h) {
+                    // recon-selfdrive-seed-jsonfix.md §A Reject (recursion / re-entrancy).
+                    eprintln!("[elfjit:taskv4] REJECTED seed {h:#x} (engine dispatcher/drain/producer recurses) — vector left 0");
+                    0
+                } else {
+                    h
+                }
             };
             unsafe {
                 *(TASKV4 as *mut u64) = seed;
@@ -8951,11 +8955,8 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                 );
             }
         }
-        // --deque-probe: convert the forced-pop sentinel fault into a CONTROLLED type-4 dispatch:
-        // pop-loop 0x2856f94 dispatches [node+112]&~0x3f -> vt; handler=[vt+40]; if [node+40]!=0 &&
-        // handler, handler([vt+16],consumer,[node+32]&~1,node,w4=4). Idle head = SENTINEL ([node+112]=
-        // 0x106829f00 -> 0x10285371c strlen-faults). REPOINT sentinel [node+112] to a WE-controlled vt
-        // whose [vt+40] = host-thunk probe; <hex> writes ctx into [node+32].
+        // --deque-probe: re-point the idle SENTINEL [node+112]=0x106829f00 (->0x10285371c strlen-fault)
+        // to a WE-controlled vt whose [vt+40]=host-thunk probe; pop-loop 0x2856f94 calls handler(node,w4=4).
         if std::env::args().any(|a| a == "--deque-probe") {
             let ctx = std::env::args()
                 .position(|a| a == "--deque-probe")

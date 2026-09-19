@@ -818,6 +818,15 @@ fn window_xid() -> u64 {
     crate::shims::anativewindow_xid()
 }
 
+/// recon-selfdrive-seed-jsonfix.md §A "Reject": the type-4 vector handler must be
+/// a registered non-recursive leaf HOST-THUNK. Seeding the engine's own dispatcher
+/// (0x10285371c) re-enters the popped-task deque infinitely; the drain pop-loop
+/// (0x102856e40) or producer (0x10285682c) is re-entrant (self-drive while draining).
+/// Returned host-thunk addrs and the engine frame-fn are valid non-recursive seeds.
+pub fn taskv4_seed_rejected(addr: u64) -> bool {
+    matches!(addr, 0x10285371c | 0x102856e40 | 0x10285682c)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1217,5 +1226,21 @@ mod tests {
         );
         crate::shims::set_anativewindow_xid(prev_xid);
         unsafe { std::env::remove_var(crate::ainput::AINPUT_BRIDGE_ENV) };
+    }
+
+    /// recon-selfdrive-seed-jsonfix.md §A "Reject" guard: --taskv4-seed must refuse
+    /// to install the engine's own dispatcher / drain / producer into the type-4
+    /// vector (infinite recursion / re-entrancy). Host-thunk addrs and the engine
+    /// frame-fn stay valid non-recursive. Pure guard logic — no real binary needed.
+    #[test]
+    fn taskv4_seed_rejects_recursive_engine_entries() {
+        assert!(
+            super::taskv4_seed_rejected(0x10285371c),
+            "engine dispatcher 0x10285371c re-enters the popped-task deque infinitely"
+        );
+        assert!(super::taskv4_seed_rejected(0x102856e40), "drain pop-loop = re-entrant drain");
+        assert!(super::taskv4_seed_rejected(0x10285682c), "producer = re-entrant push into the vector");
+        assert!(!super::taskv4_seed_rejected(0x7f0000000000), "host-thunk base is the sanctioned non-recursive leaf");
+        assert!(!super::taskv4_seed_rejected(0x105b32c00), "engine frame-fn is called FROM the thunk, never seeded as the vector entry");
     }
 }
