@@ -1,5 +1,18 @@
 # Open Sober — Agent Handoff
 
+## SH477 (Sep 20, 2026, hermes-worker): complete the android/os/LocaleList display surface — getLocales() -> LocaleList.size()==1 -> get(0) -> Locale.getLanguage()="en"/getCountry()="US"
+The locale chain (recon-framework-boot-order) was half-wired: `getLocales` returned a fake object and
+`getLanguage`/`getCountry` served en/US globally, but `LocaleList.size()` (int) fell through to 0 and
+`LocaleList.get(int)` (object) to NULL — so the engine saw ZERO locales and the Locale chain died at
+get(0), making getLanguage/getCountry UNREACHABLE on the real path. Fixed in `crates/arm64jit/src/jni.rs`
+with the SH476 object-scoping idiom: dedicated `locale_list_handle()`/`locale_handle()` that
+`getLocales` returns and that `CallIntMethod("size")`/`CallObjectMethod("get")` key on; a generic fake
+object's `size`/`get` stays 0/NULL. `jni_call_int_method` signature `_obj` -> `obj` to carry the scoping.
+New hermetic `locale_list_object_chain_resolves_scoped` pins the full chain through the real fn-table
+thunks + the SCOPING guard + `getFlagsCount` unrotted (Route-B ladder gate). arm64jit 683/0 green;
+full workspace green. **Do NOT collapse generic `size`/`get` into locale values** (name-only dispatch is
+the unsafe pattern this lineage exists to avoid). Files: jni.rs +138, docs/frontier-sh477-locale-list-chain.md.
+
 ## SH476 (Sep 20, 2026, hermes-worker): wire the PlatformParams viewport{Width,Height}Mm display surface — getScreenPhysicalSizeInMillimeters (Java static) -> Point -> x/y int FIELDS, scoped to a dedicated Point object
 Single-agent (cone suppressed). Workspace green (arm64jit lib 681->682 incl. 1
 new SH476 hermetic; cargo test --workspace EXIT 0; cargo build --workspace +

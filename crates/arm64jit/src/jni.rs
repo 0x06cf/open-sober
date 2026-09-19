@@ -693,7 +693,7 @@ fn assets_root_cstr() -> Option<&'static [u8]> {
 /// CallObjectMethod(env, obj, methodID, ...): return a real jstring handle for
 /// the AppBridge params string getters; 0 for anything else (unchanged legacy).
 extern "C" fn jni_call_object_method(
-    _e: u64, _obj: u64, mid: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+    _e: u64, obj: u64, mid: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
 ) -> u64 {
     if let Some(name) = method_id_name(mid) {
         if let Some(val) = auto_value_string_getter(&name) {
@@ -701,6 +701,20 @@ extern "C" fn jni_call_object_method(
                 eprintln!("[jni] CallObjectMethod getter {} -> {}B string handle", String::from_utf8_lossy(&name), val.len());
             }
             return str_handle(val);
+        }
+        // LocaleList.get(int) -> the single Locale (recon: size=1) — scoped to the
+        // dedicated locale-list object so a generic `get` on any other fake object
+        // stays honest (the SH476 idiom).
+        if obj == locale_list_handle() && name == b"get" {
+            return locale_handle();
+        }
+        // getLocales() -> the DEDICATED android/os/LocaleList object (recon: the
+        // engine then calls LocaleList.size()/get(int) on it, then getLanguage/
+        // getCountry on the resulting Locale). Returning the stable locale-list
+        // handle here — instead of a fresh generic fake — is what makes the
+        // size()/get() scoping above match.
+        if name == b"getLocales" {
+            return locale_list_handle();
         }
         // SH-x recon-framework-boot-order: the engine reads its DISPLAY/CONFIG
         // session-content via an object chain — Activity.getResources() ->
@@ -749,10 +763,14 @@ extern "C" fn jni_call_boolean_method(
 /// CallIntMethod(env, obj, methodID, ...): the AppBridge params integer
 /// getters. getMembershipType default 0. Unrecognized -> 0.
 extern "C" fn jni_call_int_method(
-    _e: u64, _obj: u64, mid: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+    _e: u64, obj: u64, mid: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
 ) -> u64 {
     match method_id_name(mid).as_deref() {
         Some(b"getMembershipType") => 0,
+        // android/os/LocaleList.size() -> 1 (recon: a single Locale). Scoped to
+        // the dedicated locale-list object so a generic `size` int read on any
+        // other object stays 0 (the SH476 scoping idiom).
+        Some(b"size") if obj == locale_list_handle() => 1,
         // Route-B (recon-routeB-globaltinit-unblock.md): nativeInitializeNativeFlags
         // (0x10232048c) reads FlagsInterface.getFlagsCount() and bails early when it
         // returns 0. Returning >=1 lets it walk its flags chain that writes the
@@ -992,6 +1010,24 @@ extern "C" fn jni_get_long_field(
     _e: u64, _obj: u64, _fid: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
 ) -> u64 {
     0
+}
+
+/// android/os/LocaleList (recon-framework-boot-order): `getLocales()` returns a
+/// LocaleList `(size=1, get(i)->Locale, getLanguage="en", getCountry="US")`. The
+/// getLanguage/getCountry string getters are served globally (auto_value_string_getter);
+/// the two OBJECT-SHAPE methods — `size()` (int) and `get(int)` (returns a Locale) —
+/// need a DISTINCT LocaleList object so a generic `size`/`get` read on any other fake
+/// object stays honest (the SH476 viewport-Point scoping idiom).
+fn locale_list_handle() -> u64 {
+    static LL: OnceLock<u64> = OnceLock::new();
+    *LL.get_or_init(new_fake_object)
+}
+
+/// The single Locale the LocaleList holds (index 0): a distinct fake object whose
+/// getLanguage/getCountry read as "en"/"US" via the global string-getter dispatch.
+fn locale_handle() -> u64 {
+    static L: OnceLock<u64> = OnceLock::new();
+    *L.get_or_init(new_fake_object)
 }
 
 /// The distinct fake `android/graphics/Point` object that
@@ -2398,5 +2434,52 @@ mod tests {
             );
             assert_eq!(g_som2(env, 0x1234, other_mid, 0, 0, 0, 0, 0), 0, "unrecognized static -> NULL");
         }
+    }
+
+    /// android/os/LocaleList object chain (recon-framework-boot-order: getLocales() ->
+    /// LocaleList with size()==1, and get(0) -> a Locale whose getLanguage()/getCountry()
+    /// serve en/US). Scope BOTH the int `size` read and the object `get` dispatch to the
+    /// dedicated locale-list handle (the SH476 idiom) so a generic fake object's `size`/
+    /// `get` stays 0/NULL.
+    #[test]
+    fn locale_list_object_chain_resolves_scoped() {
+        let (env, _vm) = super::build_jni();
+        unsafe {
+        let get = |i: usize| -> u64 { *(*(env as *const *const u64)).add(i) };
+        let nmid = |name: &[u8]| -> u64 {
+            let b = unsafe { alloc_zeroed(Layout::array::<u8>(name.len() + 1).unwrap()) };
+            unsafe { std::ptr::copy_nonoverlapping(name.as_ptr(), b, name.len()) };
+            super::jni_get_method_id(0, 0, b as u64, 0, 0, 0, 0, 0)
+        };
+
+        // getLocales() -> the DEDICATED locale-list handle (not a fresh generic fake).
+        let ll = super::jni_call_object_method(env, 0x4321, nmid(b"getLocales"), 0, 0, 0, 0, 0);
+        assert_ne!(ll, 0, "getLocales resolves to a locale-list handle");
+        assert_eq!(ll, super::locale_list_handle(), "stable dedicated locale-list");
+
+        // LocaleList.size() (int) on that object -> 1 (recon: a single Locale).
+        let (g_im, _) = host_call_at(get(CALL_INT_METHOD)).expect("CallIntMethod thunk");
+        assert_eq!(g_im(env, ll, nmid(b"size"), 0, 0, 0, 0, 0), 1, "LocaleList.size() == 1");
+
+        // LocaleList.get(0) (object) -> the single Locale.
+        let (g_om, _) = host_call_at(get(CALL_OBJECT_METHOD)).expect("CallObjectMethod thunk");
+        let loc = g_om(env, ll, nmid(b"get"), 0, 0, 0, 0, 0);
+        assert_ne!(loc, 0, "get(0) resolves to a Locale handle");
+        assert_eq!(loc, super::locale_handle(), "stable dedicated Locale");
+
+        // Locale.getLanguage()/getCountry() serve en/US (auto-value string getters).
+        let (g_sl, _) = host_call_at(get(GET_STRING_UTF_LEN)).expect("GetStringUTFLength thunk");
+        let hlang = super::jni_call_object_method(env, loc, nmid(b"getLanguage"), 0, 0, 0, 0, 0);
+        let hcountry = super::jni_call_object_method(env, loc, nmid(b"getCountry"), 0, 0, 0, 0, 0);
+        assert_eq!(g_sl(env, hlang, 0, 0, 0, 0, 0, 0), 2, "getLanguage = 'en'");
+        assert_eq!(g_sl(env, hcountry, 0, 0, 0, 0, 0, 0), 2, "getCountry = 'US'");
+
+        // CRITICAL SCOPING: a generic fake object must NOT report size=1 or resolve `get`.
+        let other = super::new_fake_object();
+        assert_ne!(other, ll, "generic fake distinct from the locale-list");
+        assert_eq!(g_im(env, other, nmid(b"size"), 0, 0, 0, 0, 0), 0, "generic object size stays 0");
+        assert_eq!(g_om(env, other, nmid(b"get"), 0, 0, 0, 0, 0), 0, "generic object get stays NULL");
+        assert_eq!(g_im(env, 0x4321, nmid(b"getFlagsCount"), 0, 0, 0, 0, 0), 1, "getFlagsCount untouched");
+        } // unsafe
     }
 }
