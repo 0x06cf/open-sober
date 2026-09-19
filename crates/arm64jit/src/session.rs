@@ -204,10 +204,73 @@ pub fn drive_routeb_session_substrate(iimg: &[u8], ib: u64, tpidr: u64, boot_sp:
         // a real do-init populates it — honest).
         if atom.guest == 0x102ba5bb8 {
             drive_data_model_binder(iimg, ib, tpidr, boot_sp, h.env, h.thiz);
+            // SEP-17 SESSION-CTOR directive also names nativeAppBridgeAppStart
+            // (V1 0x102338510, SH336 ABI) as a component to drive. With the
+            // MessageBus.subscribe registry populated (SH337 measured 0->12 after
+            // the bus), the V1 app-start walk runs with a real registry — the same
+            // post-bus order SH337 proved. Drive it here as a first-class step, not
+            // a probe rung (the sh399 abi_slots<=5 hermetic keeps it out of the
+            // substrate table; it needs x2..x7 = 6 jstrings + jbool, abi_slots 7).
+            drive_native_app_start(iimg, ib, tpidr, boot_sp, h.env, h.thiz);
         }
     }
     eprintln!("[session-drive] substrate complete: {ok}/{total} atoms returned non-zero Ok");
     ok
+}
+
+/// SEP-17 nativeAppBridgeAppStart (V1, guest 0x102338510, SH336/SH337 ABI) as a
+/// first-class post-substrate step. ABI x0=env, x1=thiz, x2..x7 = 5 jstrings +
+/// x5-ish jbool(false); gates on version [0x10683d350]. Driven AFTER MessageBus.subscribe
+/// so the app-start walk sees a populated registry (SH337: registry 0->12 after the
+/// bus), the order that gives the walk real content. Reports the registry count +
+/// DM-root so the app-start's registration effect is observable in the readback.
+/// Inert by itself (app-start registers services, does not construct a DataModel).
+pub fn drive_native_app_start(
+    iimg: &[u8],
+    ib: u64,
+    tpidr: u64,
+    boot_sp: u64,
+    env_ptr: u64,
+    thiz: u64,
+) -> u64 {
+    let s = |b: &[u8]| crate::jni::new_string_utf_handle(b);
+    let mut st = CpuState::new();
+    st.tpidr = tpidr;
+    st.x[31] = boot_sp;
+    st.x[0] = env_ptr;
+    st.x[1] = thiz;
+    st.x[2] = s(b"");
+    st.x[3] = s(b"");
+    st.x[4] = 0; // jboolean false
+    st.x[5] = s(b"");
+    st.x[6] = s(b"");
+    st.x[7] = s(b"");
+    eprintln!(
+        "[session-drive] nativeAppBridgeAppStart (V1 0x102338510) with populated registry @ entry (env={env_ptr:#x} thiz={thiz:#x})"
+    );
+    let r = match jit_run(iimg, ib, 0x102338510, &mut st as *mut CpuState) {
+        Err(e) => {
+            eprintln!("[session-drive] nativeAppBridgeAppStart stopped: {e}");
+            0
+        }
+        Ok(r) => {
+            let reg = if routeb_ensure_writable(0x106fe2f08) {
+                unsafe { std::ptr::read_unaligned(0x106fe2f08u64 as *const u32) }
+            } else {
+                0
+            };
+            let dm = if routeb_ensure_writable(0x106a68818) {
+                unsafe { std::ptr::read_unaligned(0x106a68818u64 as *const u64) }
+            } else {
+                0
+            };
+            eprintln!(
+                "[session-drive] nativeAppBridgeAppStart returned Ok({r:#x}); registry={reg} DM-root={dm:#x}"
+            );
+            r
+        }
+    };
+    r
 }
 
 /// SEP-17 dataModel-bindings LIVE BINDER — the ordered drive's first-class RECEIVE
@@ -370,6 +433,11 @@ mod tests {
         let _sig: fn(&[u8], u64, u64, u64, u64, u64) -> u64 =
             crate::session::drive_data_model_binder;
         let _ = _sig;
+        // SEP-17 nativeAppBridgeAppStart (V1 0x102338510) is the second named component
+        // driven as a post-substrate step — same signature shape.
+        let _app_start: fn(&[u8], u64, u64, u64, u64, u64) -> u64 =
+            crate::session::drive_native_app_start;
+        let _ = _app_start;
         // The trigger site stays in the ordered substrate: MessageBus.subscribe.
         assert!(
             ROUTEB_SESSION_SUBSTRATE
