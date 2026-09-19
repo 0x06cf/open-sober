@@ -64,12 +64,19 @@ named host producers overall: `boot.mempool_calloc` 50x + slot 0x7f0000002488
 ## Honest
 NOT a DM (DM-root [0x106a68818]=0, no make_shared, MH_GAME_LOADED false). Route-B
 live-DM structural gate UNCHANGED. This NAMES the host-call producer of the canary
-pointer (the SH4xx frontier's exact recorded next); it does NOT fix the wall —
-the run still terminates in the standing SH285 pool-pop SIGSEGV (guestpc
-0x101d96868, fault=0x0, no `stack smashing` line), and under identity-mapping a
-mempool host pointer is a *valid* guest pointer, so whether sanitizing/masking the
-return is the right fix (vs. leaving real host allocator pointers intact) is the
-follow-up. No re-treads.
+pointer (the SH4xx frontier's exact recorded next); it does NOT fix the wall.
+**IMPORTANT anti-tread refinement: the round-tripped store is a FALSE POSITIVE as a
+canary clobber.** `boot.mempool_calloc` (jit.rs:7497, `route_mempool_big_alloc_to_host`)
+is a HOST-INJECTED shim that routes the guest's unseeded TLS-block pool big-allocator
+to host `calloc(1,size)` and returns a HOST-heap pointer into guest x0 BY DESIGN (the
+guest==host identity mapping makes it a valid guest pointer). The store at 0x101d99e70
+writes it into a host-heap pool object (`dst`/`x29` are 0x5647… host heap, not a guarded
+guest frame), so the store-watch's `is_canary_slot=true` heuristic over-flags here.
+=> The mempool/LSM lane is NOT the canary source; the genuine `*** stack smashing ***`
+clobber (when it fires on the deeper nativeGameGlobalInit ladder, SH97/98 class) is a
+DISTINCT store on that deeper path. The correct follow-up is to arm the store-watch on
+the ladder where __stack_chk_fail actually fires and correlate against ITS canary-slot
+[matching] content, not chase the mempool pool-pop. No re-treads.
 
 ## Files
 docs/frontier-sh4xx-host-return-leak-watch.md + runs/capture_host_return_leak_watch.sh.

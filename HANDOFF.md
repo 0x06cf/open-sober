@@ -34,8 +34,15 @@ addresses kept); elfjit.rs untouched.
   mempool_calloc 50x + slot 0x7f0000002488 57x (unresolved-name slots).
 - Honest: NOT a DM (DM-root 0, no make_shared, MH_GAME_LOADED false). Route-B
   live-DM structural gate UNCHANGED. The watch NAMES the producer; it does not fix
-  the wall (under identity-mapping a mempool host pointer is a valid guest pointer,
-  so the sanitize-vs-leave fix is the follow-up). No re-treads.
+  the wall. **Anti-tread refinement: the round-tripped mempool store is a FALSE
+  POSITIVE as a canary clobber** — `boot.mempool_calloc` is a HOST-INJECTED shim
+  (route_mempool_big_alloc_to_host) that returns a host `calloc` pointer into guest
+  x0 BY DESIGN (identity-mapping makes it a valid guest pointer, injected because
+  the real pool-init never runs); the store writes into a host-heap pool object,
+  not a guarded guest frame. So the mempool/LSM lane is NOT the canary source; the
+  genuine `stack smashing` clobber (deeper nativeGameGlobalInit ladder, SH97/98)
+  is a DISTINCT store — the next step arms the store-watch on the ladder where
+  __stack_chk_fail fires and correlates against THAT canary slot. No re-treads.
 - Files: docs/frontier-sh4xx-host-return-leak-watch.md + runs/capture_host_return_leak_watch.sh.
 
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified green at HEAD first (capture_taskv4_frame.sh attempt 1: real task-driven frames `present swap Ok(0x1)`, 0 json abort, 0 crash). New off-hook code in translate.rs (484KB, well under the 1MiB hook; jit.rs/elfjit.rs untouched, at/near the hook). Workspace green (cargo test --workspace EXIT 0; arm64jit lib 475/0 incl. 2 new hermetics).
