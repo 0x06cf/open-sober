@@ -10077,6 +10077,85 @@ mod tests {
     }
 
     #[test]
+    fn sh460_dupgp_esize_mask_and_esize8_no_mask() {
+        // dup V1.2D/V1.4S/..., W3/X3: broadcast the element read from GPR rn
+        // into every lane of Vd. For rn=3 the GPR slot is [rbx+0x18] (3*8).
+        // esize<8 ZERO-EXTENDS Wn (mov eax,eax 89 c0) then ANDs the element
+        // mask (48 81 ef ff ff ff ff for esize=4), then stores the same value
+        // to every lane. esize=8 loads Xn raw (48 8b 43 18) with NO mask.
+        // A missing mask would leak the high garbage bits of Wn into each lane
+        // (silent broadcast corruption); a missing zero-extend would leave a
+        // sign-extended value.
+        // (a) esize=4 q=false: 2 lanes, before each 32-bit store the AND.
+        let s4 = tr_bytes(Inst::SimdDupGp { rd: 1, rn: 3, esize: 4, q: false });
+        assert!(s4.windows(3).any(|w| w == [0x48, 0x8b, 0x43]), "dup loads the GPR via mov rax,[rbx+rn*8] (48 8b 43 18)");
+        assert!(s4.windows(2).any(|w| w == [0x89, 0xc0]), "esize<8 zero-extends Wn (mov eax,eax 89 c0)");
+        assert!(s4.windows(7).any(|w| w == [0x48, 0x81, 0xe0, 0xff, 0xff, 0xff, 0xff]), "esize=4 ANDs the 32-bit element mask 0xffffffff");
+        assert!(s4.windows(6).any(|w| w == [0x89, 0x83, 0x20, 0x01, 0x00, 0x00]), "lane0 32-bit store to 0x120");
+        assert!(s4.windows(6).any(|w| w == [0x89, 0x83, 0x24, 0x01, 0x00, 0x00]), "lane1 32-bit store to 0x124");
+        // (b) esize=8 q=false: 1 lane, NO zero-extend, NO mask.
+        let d8 = tr_bytes(Inst::SimdDupGp { rd: 1, rn: 3, esize: 8, q: false });
+        assert!(d8.windows(3).any(|w| w == [0x48, 0x8b, 0x43]), "esize=8 loads Xn raw");
+        assert!(!d8.windows(2).any(|w| w == [0x89, 0xc0]), "esize=8 must NOT zero-extend (full Xn)");
+        assert!(!d8.windows(6).any(|w| w == [0x48, 0x81, 0xe0, 0xff, 0xff]), "esize=8 must NOT AND a 32-bit mask");
+        assert!(d8.windows(7).any(|w| w == [0x48, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00]), "esize=8 stores the 64-bit broadcast to 0x120");
+    }
+
+    #[test]
+    fn sh460_dupgp_lanelayout_esize_and_q() {
+        // dup V1.T, W3: the lane layout (store count + stride) is the q/esize
+        // discriminator — esize=2 q=false = 4 halfword stores at +2
+        // (0x120/0x122/0x124/0x126) with the 0xffff mask (48 81 e0 ff ff 00 00);
+        // esize=1 q=true = 16 byte stores at +1 (0x120..0x12f) with the 0xff
+        // mask (48 81 e0 ff 00 00 00). A lane-count or stride flub broadcasts
+        // into the wrong slots.
+        let h2 = tr_bytes(Inst::SimdDupGp { rd: 1, rn: 3, esize: 2, q: false });
+        assert!(h2.windows(7).any(|w| w == [0x48, 0x81, 0xe0, 0xff, 0xff, 0x00, 0x00]), "esize=2 ANDs the 0xffff mask");
+        assert!(h2.windows(6).any(|w| w == [0x66, 0x89, 0x83, 0x24, 0x01, 0x00]), "esize=2 lane2 halfword at 0x124");
+        let b1 = tr_bytes(Inst::SimdDupGp { rd: 1, rn: 3, esize: 1, q: true });
+        assert!(b1.windows(7).any(|w| w == [0x48, 0x81, 0xe0, 0xff, 0x00, 0x00, 0x00]), "esize=1 ANDs the 0xff mask");
+        assert!(b1.windows(6).any(|w| w == [0x88, 0x83, 0x2f, 0x01, 0x00, 0x00]), "esize=1 q=true lane15 BYTE store at 0x12f");
+        // mask VARY by esize — the esize=4 mask is NOT present here.
+        assert!(!h2.windows(7).any(|w| w == [0x48, 0x81, 0xe0, 0xff, 0xff, 0xff, 0xff]), "esize=2 must NOT AND the 32-bit mask");
+    }
+
+    #[test]
+    fn sh460_fmovimm_broadcast_immediate() {
+        // fmov V1.1D/V1.2S, #imm: broadcast the FP immediate bit-pattern into
+        // every lane of Vd. esize=8 materializes the full 64 bits (48 b8 .. f0
+        // 3f for 1.0) + 64-bit stores; esize=4 materializes the low 32 bits
+        // (48 b8 00 00 80 3f 00 00 00 00 for 1.0f, zero-extended) + 32-bit
+        // stores. The 64-vs-32-bit materialization + store width are the
+        // esize discriminators — a flub broadcasts a truncated/expanded value.
+        // (a) esize=8 q=false: one 64-bit store at 0x120.
+        let d = tr_bytes(Inst::SimdFmovImm { rd: 1, esize: 8, value_bits: 0x3ff0_0000_0000_0000, q: false });
+        assert!(d.windows(8).any(|w| w == [0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]), "fmov double materializes mov rax,imm (48 b8)");
+        assert!(d.windows(8).any(|w| w == [0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]) || d.windows(6).any(|w| w == [0x48, 0x89, 0x83, 0x20, 0x01]) , "fmov double stores 64-bit at 0x120");
+        // (b) esize=4 q=true: four 32-bit stores 0x120/0x124/0x128/0x12c of 1.0f.
+        let s = tr_bytes(Inst::SimdFmovImm { rd: 1, esize: 4, value_bits: 0x3f80_0000, q: true });
+        assert!(s.windows(10).any(|w| w == [0x48, 0xb8, 0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x00]), "fmov single materializes the zero-extended 32-bit imm (1.0f = 48 b8 00 00 80 3f ...)");
+        assert!(s.windows(6).any(|w| w == [0x89, 0x83, 0x2c, 0x01, 0x00, 0x00]), "fmov single lane3 32-bit store at 0x12c");
+        assert!(!s.windows(7).any(|w| w == [0x48, 0x89, 0x83, 0x20, 0x01]), "fmov single must NOT mov_store64");
+    }
+
+    #[test]
+    fn sh460_orr16_128bit_or() {
+        // orr V1.16B, V2.16B, V3.16B: OR all 16 bytes, 8 at a time — two passes
+        // loading R/X halves (0x130/0x138 from Vn, 0x140/0x148 from Vm) each
+        // `or rax,rcx` (48 09 c8) + 64-bit store (0x120/0x128). The rm==rn
+        // (vmov copy) form is NOT special-cased — it emits the same OR (V|V=V),
+        // so the SIMD-OR emission is the same regardless. The 8-vs-16-byte
+        // store granularity is the 128-bit discriminato — a 16B-wide OR with a
+        // 64-bit lo hi flub corrupts the upper half.
+        let or = tr_bytes(Inst::SimdOrr16 { rd: 1, rn: 2, rm: 3 });
+        assert!(or.windows(3).any(|w| w == [0x48, 0x09, 0xc8]), "orr16 computes or rax,rcx (48 09 c8)");
+        assert!(or.windows(7).any(|w| w == [0x48, 0x8b, 0x83, 0x30, 0x01, 0x00, 0x00]), "loads Vn low 64 from 0x130");
+        assert!(or.windows(7).any(|w| w == [0x48, 0x8b, 0x8b, 0x48, 0x01, 0x00, 0x00]), "loads Vm high 64 from 0x148");
+        assert!(or.windows(7).any(|w| w == [0x48, 0x89, 0x83, 0x28, 0x01, 0x00, 0x00]), "stores high 64 result to 0x128");
+        assert!(!or.windows(8).any(|w| w == [0x66, 0x0f, 0xeb]), "16-byte OR must not degrade to a 128-bit SSE por (66 0f eb) — this path uses two 64-bit ORs");
+    }
+
+    #[test]
     fn sh459_satnarrow_sqshrn_signed_lane0_full_emit() {
         // sqshrn v1.4H, v2.4S, #6 (src_esize=4 dst_esize=2 shift=6 src_signed=
         // dst_signed=true q=false): shift each 32-bit src right by 6 then
