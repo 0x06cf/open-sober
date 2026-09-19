@@ -10077,6 +10077,50 @@ mod tests {
     }
 
     #[test]
+    fn sh458_lanes_esize8_index0_full_buffer() {
+        // mov D1.1D, v2.1D[0] (esize=8 index=0): copy a 64-bit element to the
+        // DEST FP slot's low bytes. EMIT: mov rax,[0x130] (48 8b 83, src =
+        // Vn + index*8 = 0x130) + mov [0x120],rax (48 89 83, dst = Vd slot).
+        // rd=1 rn=2 -> Vn@0x130 Vd@0x120. The DEST is FIXED at f(rd) — only the
+        // index moves the source.
+        let b = tr_bytes(Inst::SimdLaneS { rd: 1, rn: 2, esize: 8, index: 0 });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x83, 0x30, 0x01, 0x00, 0x00, // mov rax,[rbx+0x130] src el 0
+            0x48, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00, // mov [rbx+0x120],rax dst
+        ]);
+        assert!(b.windows(7).any(|w| w == [0x48, 0x8b, 0x83, 0x30, 0x01, 0x00, 0x00]), "esize=8 src loads via mov_load64 (48 8b 83)");
+        assert!(b.windows(7).any(|w| w == [0x48, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00]), "esize=8 dst stores via mov_store64 (48 89 83)");
+    }
+
+    #[test]
+    fn sh458_lanes_index_moves_source_dst_fixed() {
+        // mov D1.1D, v2.1D[1] (esize=8 index=1): index advances the SOURCE by
+        // +esize (0x130 -> 0x138) while the DEST stays at f(rd)=0x120. A flub
+        // that also advances the dest (or misses the source advance) copies the
+        // wrong element.
+        let b = tr_bytes(Inst::SimdLaneS { rd: 1, rn: 2, esize: 8, index: 1 });
+        assert!(b.windows(7).any(|w| w == [0x48, 0x8b, 0x83, 0x38, 0x01, 0x00, 0x00]), "index=1 reads source 0x138 (Vn + 1*8)");
+        assert!(b.windows(7).any(|w| w == [0x48, 0x89, 0x83, 0x20, 0x01, 0x00, 0x00]), "dest stays at Vd 0x120 regardless of index");
+        assert!(!b.windows(7).any(|w| w == [0x48, 0x89, 0x83, 0x28, 0x01, 0x00, 0x00]), "index must NOT advance the DEST (dst stays fixed at f(rd))");
+        // control: index=0 reads 0x130.
+        let lo = tr_bytes(Inst::SimdLaneS { rd: 1, rn: 2, esize: 8, index: 0 });
+        assert!(lo.windows(7).any(|w| w == [0x48, 0x8b, 0x83, 0x30, 0x01, 0x00, 0x00]), "index=0 reads source 0x130");
+    }
+
+    #[test]
+    fn sh458_lanes_esize4_width_and_index_stride() {
+        // mov S1.1S, v2.1S[idx] (esize=4): the 32-bit width — mov_load32 (8b 83)
+        // + mov_store32 (89 83), and index strides the source by +4 (0x130 ->
+        // 0x134). The 89-vs-48 89 store (32-vs-64-bit) is the esize width
+        // discriminator — a width flub silently half/doubles the copied element.
+        let b = tr_bytes(Inst::SimdLaneS { rd: 1, rn: 2, esize: 4, index: 1 });
+        assert!(b.windows(6).any(|w| w == [0x8b, 0x83, 0x34, 0x01, 0x00, 0x00]), "esize=4 index=1 reads source 0x134 (Vn + 1*4)");
+        assert!(b.windows(6).any(|w| w == [0x89, 0x83, 0x20, 0x01, 0x00, 0x00]), "esize=4 dst stores via mov_store32 (89 83)");
+        assert!(!b.windows(6).any(|w| w == [0x48, 0x8b, 0x83, 0x38, 0x01]), "esize=4 must NOT mov_load64 (48 8b 83)");
+        assert!(!b.windows(7).any(|w| w == [0x48, 0x89, 0x83, 0x20, 0x01]), "esize=4 must NOT mov_store64 (48 89 83)");
+    }
+
+    #[test]
     fn sh457_pmull_low64_movq_pclmulq_128bit_store() {
         // pmull v1.1Q, v2.1D, v3.1D (hi=false): 64x64 carry-less (polynomial)
         // multiply -> 128-bit via x86 PCLMULQDQ imm=0x00. EMIT: movq_load
