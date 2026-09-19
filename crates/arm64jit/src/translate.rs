@@ -10077,6 +10077,32 @@ mod tests {
     }
 
     #[test]
+    fn sh461_sha_hostcall_dispatch_shape() {
+        // sha1/sha256... Vd, Vn, Vm: a HOST-call thunk. EMIT shape:
+        // `mov rdi,rbx` (48 89 df = CpuState* arg0) + `mov rsi,<packed>` (48
+        // be, arg1 = mode<<24|rd<<16|rn<<8|rm) + `mov rax,<host-fn>` (48 b8,
+        // the guest_sha1stem helper address — a HOST pointer, not pinned) +
+        // `sub rsp,8` (48 81 ec 08 00 00 00 = RSP-align to 16 at the SysV
+        // call site; the block body runs at RSP≡8, host calls need ≡0) +
+        // `call rax` (ff d0) + `add rsp,8` (48 81 c4 08 00 00 00). rd=1 rn=2
+        // rm=3 -> packed low bytes [03 02 01]. The packed contention of the
+        // mode nibble into the imm is the mode discriminator.
+        let b = tr_bytes(Inst::Sha { mode: 0, rd: 1, rn: 2, rm: 3 });
+        // fixed prologue: state ptr + packed arg.
+        assert!(b.windows(3).any(|w| w == [0x48, 0x89, 0xdf]), "sha passes CpuState* via mov rdi,rbx (48 89 df)");
+        assert!(b.windows(8).any(|w| w == [0x48, 0xbe, 0x03, 0x02, 0x01, 0x00, 0x00, 0x00]), "sha packs [rm=03,rn=02,rd=01] into the imm (48 be low bytes)");
+        // the call site shape + RSP alignment round-trip.
+        let sub_pos = b.windows(4).position(|w| w == [0x48, 0x81, 0xec, 0x08]).unwrap();
+        let call_pos = b.windows(2).position(|w| w == [0xff, 0xd0]).unwrap();
+        let add_pos = b.windows(4).position(|w| w == [0x48, 0x81, 0xc4, 0x08]).unwrap();
+        assert!(sub_pos < call_pos && call_pos < add_pos, "sub rsp,8 -> call rax -> add rsp,8 (SysV RSP-align)");
+        // mode is the top byte of the packed imm — mode=3 -> imm byte at index 8 is 0x03.
+        let m3 = tr_bytes(Inst::Sha { mode: 3, rd: 1, rn: 2, rm: 3 });
+        assert!(m3.windows(9).any(|w| w == [0x48, 0xbe, 0x03, 0x02, 0x01, 0x03, 0x00, 0x00, 0x00]), "mode=3 sets the 4th imm byte (mode<<24)");
+        assert!(!m3.windows(9).any(|w| w == [0x48, 0xbe, 0x03, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00]), "mode=3 must NOT have a zero mode byte");
+    }
+
+    #[test]
     fn sh460_dupgp_esize_mask_and_esize8_no_mask() {
         // dup V1.2D/V1.4S/..., W3/X3: broadcast the element read from GPR rn
         // into every lane of Vd. For rn=3 the GPR slot is [rbx+0x18] (3*8).
