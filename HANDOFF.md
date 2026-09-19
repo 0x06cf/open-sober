@@ -1,5 +1,33 @@
 # Open Sober — Agent Handoff
 
+## SH357 (Sep 19, 2026, hermes-worker): root-cause + fix the intermittent whole-suite SIGSEGV + PoisonError cascade (test-harness race on shared routeb state) — serialize routeb page-map/mprotect under one PAGE_LOCK, route ALL test env mutations through locked crate-scope helpers, consolidate the four routeb family test locks into one shared process-state lock
+Single-agent (cone suppressed). While confirming the already-implemented recon-v3
+deliverables (self-driven frame `--taskv4-seed frame` + `JIT_JSON_ZERO_FIX`), cargo
+test --workspace failed intermittently (420/1) and SIGSEGV'd. Root-caused: (1)
+`routeb_ensure_writable` did an unsynchronized mmap(MAP_FIXED)+mprotect+racy
+/proc/self/maps probe — thread A's MAP_FIXED remap of shared fixed-guest page
+(0x1067333000) racing thread B = UB (signal 11) and transient false returns; (2)
+the four routeb family test locks were SEPARATE Mutexes but every family mutated
+the same overlapping fixed pages + process env, so `routeb_doinit_next3` panicked
+mid-lock and POISONED it for 7 siblings. Fixes: PAGE_LOCK in routeb_ensure_writable
+(prod untouched, single jit_run thread); crate-scope `env_test_set`/`env_test_remove`
+(one ENV_TEST_LOCK) routing ALL test env mutations (unsafe in edition 2024);
+`ROUTEB_PROC_TEST_LOCK` consolidating the 4 family locks; sh165's order-dependent
+'page must be absent' precondition dropped (all behavioral asserts kept); futex
+CMP_REQUEUE WAKE got the SH346 bounded spin. Measured: default-8-thread stress —
+segv 0 (was signal 11), flake ~1/40 (was ~1/15; residual = documented real-kernel
+futex timing class SH345/346); --test-threads=32 PoisonError cascade 8/8 -> 0.
+Workspace green (arm64jit lib 421/0; cargo test --workspace exit 0).
+
+### The forward this cycle
+A real harness-determinism correctness defect, root-caused and fixed; the recon-v3
+immediate-priority deliverables it surfaced around were confirmed already
+implemented and green. No Route-B forward this cycle.
+
+### Honest
+Does NOT manufacture a DataModel. Route-B live-DM structural gate UNCHANGED
+(DM-root 0, MH_* false); SH174 capture-latch stays the single forward hook.
+
 ## SH356 (Sep 19, 2026, hermes-worker): implement + MEASURE the SH355-specified frame-accurate EC reader-gate re-attack — it fires 0/3 on the real binary, proving the reader-gate block 0x2e24694 is NEVER entered (control diverges to the SH285 persistence-lane wall), CLOSING the EC-reader line with evidence
 Single-agent (cone suppressed). New default-inert `routeb_ec_world_reader_gate_frame_guard`
 (jit.rs, opt-in `JIT_ROUTEB_EC_READERGATE_FRAME`) + hermetic
