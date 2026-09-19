@@ -741,10 +741,21 @@ static MH_FLAGS_LOADED: AtomicU8 = AtomicU8::new(0);
 static MH_ENGINE_INITIALIZED: AtomicU8 = AtomicU8::new(0);
 static MH_APP_READY: AtomicU8 = AtomicU8::new(0);
 static MH_GAME_LOADED: AtomicU8 = AtomicU8::new(0);
+// Login-vs-home gate (SH410): onDidLogInReceived is VOID-with-String (disasm
+// deleg_2e852a9c / trigger-map 0x50a545). The String payload carries the login
+// token; a fresh session with no persisted credential must steer to LOGIN, so
+// the host delivers an EMPTY payload -> not logged in -> engine builds its own
+// login GuiObject tree (the operator's "login renders" first screen). We record
+// both "the callback arrived" and "logged-in?" so the session-advance can
+// choose login-vs-home from a real host signal instead of guessing.
+static MH_LOGIN_RECEIVED: AtomicU8 = AtomicU8::new(0);
+static MH_LOGGED_IN: AtomicU8 = AtomicU8::new(0);
 pub fn nativehelper_flags_loaded() -> bool { MH_FLAGS_LOADED.load(AtOrd::Relaxed) != 0 }
 pub fn nativehelper_engine_initialized() -> bool { MH_ENGINE_INITIALIZED.load(AtOrd::Relaxed) != 0 }
 pub fn nativehelper_app_ready() -> bool { MH_APP_READY.load(AtOrd::Relaxed) != 0 }
 pub fn nativehelper_game_loaded() -> bool { MH_GAME_LOADED.load(AtOrd::Relaxed) != 0 }
+pub fn nativehelper_login_received() -> bool { MH_LOGIN_RECEIVED.load(AtOrd::Relaxed) != 0 }
+pub fn nativehelper_logged_in() -> bool { MH_LOGGED_IN.load(AtOrd::Relaxed) != 0 }
 
 /// Force a NativeHelper `gameActivity_*` lifecycle milestone through the SAME
 /// registered JNI CallVoidMethod shim (slot 61) the engine uses, so the MH_*
@@ -763,6 +774,21 @@ pub fn fire_nativehelper_milestone(name: &[u8]) -> u64 {
     jni_call_void_method(0, 0, mid, 0, 0, 0, 0, 0)
 }
 
+/// Fire `onDidLogInReceived` with a real login-payload jstring (SH410). The
+/// callback is VOID-with-String `(Ljava/lang/String;)V`; the host delivers the
+/// login token in a3 so the dispatcher records login_received and logged-in?.
+/// An EMPTY payload = no persisted credential -> steer to the LOGIN screen (a
+/// fresh headless session's first screen); a non-empty payload = remembered
+/// sign-in -> HOME. This is the BYPASS-agnostic host surface: it does not boot
+/// Lua itself (that still needs a completed do-init) but it makes the login-vs-
+/// home discriminator read a real host signal instead of guessing. Inert unless
+/// the session drive calls it.
+pub fn fire_nativehelper_login_payload(payload: &[u8]) -> u64 {
+    let mid = str_handle(b"gameActivity_onDidLogInReceived");
+    let p = new_string_utf_handle(payload);
+    jni_call_void_method(0, 0, mid, p, 0, 0, 0, 0)
+}
+
 /// CallVoidMethod(env, obj, methodID, ...): the NativeHelper `gameActivity_*`
 /// callbacks fire through here. All five are VOID-descriptor, so the return is
 /// always 0; the load-bearing effect is the milestone signal (the session-advance
@@ -770,7 +796,7 @@ pub fn fire_nativehelper_milestone(name: &[u8]) -> u64 {
 /// (void no-op, identical to the old `ok` stub) so unrelated CallVoidMethod sites
 /// are untouched.
 extern "C" fn jni_call_void_method(
-    _e: u64, _obj: u64, mid: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+    _e: u64, _obj: u64, mid: u64, a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
 ) -> u64 {
     match method_id_name(mid).as_deref() {
         Some(name) if name == b"gameActivity_onFlagsLoaded" || name == b"onFlagsLoaded" => {
@@ -787,10 +813,25 @@ extern "C" fn jni_call_void_method(
         }
         // NOTE (subagent deleg_2e852a9c, disasm-verified): onDidLogInReceived is
         // (Ljava/lang/String;)V — VOID with a String arg — NOT a jboolean. The
-        // login-vs-home choice is NOT conveyed by a return value; steer to LOGIN by
-        // keeping the flags-loaded/first-login untriggered until a real payload.
+        // login-vs-home choice is NOT conveyed by a return value. SH410: the host
+        // delivers the login-payload String in a3 (`_a3`); an EMPTY payload means
+        // no persisted credential -> NOT logged in -> steer to the LOGIN screen
+        // (the operator's "login renders" first screen); a non-empty payload means
+        // a remembered sign-in -> HOME. Record both observables (callback arrived
+        // + logged-in?) so the session-advance reads login-vs-home from a real
+        // host signal instead of guessing. The String handle itself is a readable
+        // UTF-8 buffer (new_string_utf_handle).
         Some(name) if name == b"gameActivity_onDidLogInReceived" || name == b"onDidLogInReceived" => {
-            eprintln!("[jni:nativehelper] onDidLogInReceived (login-state callback)");
+            MH_LOGIN_RECEIVED.store(1, AtOrd::Relaxed);
+            let payload = read_cstr(a3).unwrap_or_default();
+            let logged_in = !payload.is_empty();
+            MH_LOGGED_IN.store(logged_in as u8, AtOrd::Relaxed);
+            eprintln!(
+                "[jni:nativehelper] onDidLogInReceived ({}B payload) -> logged_in={}; {} screen",
+                payload.len(),
+                logged_in,
+                if logged_in { "home" } else { "login" }
+            );
         }
         Some(name) if name == b"gameActivity_onGameLoaded" || name == b"onGameLoaded" => {
             MH_GAME_LOADED.store(1, AtOrd::Relaxed);

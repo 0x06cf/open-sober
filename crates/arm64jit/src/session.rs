@@ -222,6 +222,21 @@ pub fn drive_nativehelper_lifecycle() {
             crate::jni::nativehelper_app_ready()
         );
     }
+    // SH410: onDidLogInReceived is the login-vs-home gate (VOID-with-String,
+    // trigger-map 0x50a545). After onAppReady (surface attached), a fresh
+    // headless session has NO persisted credential, so the host delivers an
+    // EMPTY login payload -> not-logged-in -> the session-advance steers to the
+    // LOGIN screen (the operator's "login renders" first screen). This is the
+    // same BUILD-THE-RUNTIME surface: it records a real host login signal
+    // (login_received=true, logged_in=false) so the discriminator reads it
+    // instead of guessing; it does NOT boot Lua (still a completed do-init).
+    let r = crate::jni::fire_nativehelper_login_payload(b"");
+    eprintln!(
+        "[session-drive] lifecycle milestone 'gameActivity_onDidLogInReceived' fired (ret={r}); MH_LOGIN_RECEIVED={} MH_LOGGED_IN={} -> {} screen",
+        crate::jni::nativehelper_login_received(),
+        crate::jni::nativehelper_logged_in(),
+        if crate::jni::nativehelper_logged_in() { "home" } else { "login" }
+    );
 }
 
 #[cfg(test)]
@@ -300,5 +315,10 @@ mod tests {
         assert!(crate::jni::nativehelper_flags_loaded(), "onFlagsLoaded fired first");
         assert!(crate::jni::nativehelper_engine_initialized(), "onEngineInitialized fired");
         assert!(crate::jni::nativehelper_app_ready(), "onAppReady fired last (app ready)");
+        // SH410: the login-vs-home gate — the drive delivers an EMPTY login
+        // payload (fresh headless session, no persisted credential), so the
+        // callback must be recorded as received AND steered to LOGIN (not home).
+        assert!(crate::jni::nativehelper_login_received(), "onDidLogInReceived fired (login-state callback arrived)");
+        assert!(!crate::jni::nativehelper_logged_in(), "empty login payload steers to LOGIN (not home)");
     }
 }
