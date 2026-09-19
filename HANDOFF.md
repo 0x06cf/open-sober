@@ -1,5 +1,40 @@
 # Open Sober — Agent Handoff
 
+## SH356 (Sep 19, 2026, hermes-worker): implement + MEASURE the SH355-specified frame-accurate EC reader-gate re-attack — it fires 0/3 on the real binary, proving the reader-gate block 0x2e24694 is NEVER entered (control diverges to the SH285 persistence-lane wall), CLOSING the EC-reader line with evidence
+Single-agent (cone suppressed). New default-inert `routeb_ec_world_reader_gate_frame_guard`
+(jit.rs, opt-in `JIT_ROUTEB_EC_READERGATE_FRAME`) + hermetic
+`sh355_frame_accurate_ec_reader_gate_seeds_live_frame_slot` + run-loop wiring. Fires INSIDE
+the reader-gate block (pc 0x102e24694 / 0x102e246b0) using the LIVE x[29], fabricating a
+coherent zeroed object at [x29,#104] ([+0x20]==0 -> cbz @0x2e246dc TAKEN) — eliminating
+sh302's entry-frame (entry_sp+8) concern. Workspace green (arm64jit lib 421/0; cargo test
+--workspace exit 0). Route-B live-DM gate UNCHANGED (DM-root 0, MH_* false); SH174
+capture-latch stays the single forward observer.
+
+### The forward this cycle
+sh355 pinned that the reader-gate block starts at 0x2e24694 (interior bl-return boundary) and
+the gate is a live-object `cbz` on [[x29,#104]+0x20], so the ONLY legitimate re-attack is a
+value seed that FABRICATES that object INSIDE the block. SH356 implemented exactly that
+frame-accurate seed.
+
+### MEASURED (real libroblox.so, capture_sh302_readergate.sh + JIT_ROUTEB_EC_READERGATE_FRAME, 3/3)
+- All entry-pc seeds fire 3/3 (sh298 arg1, sh299 arg0vt, sh300 realsession, sh302 entry
+  reader-gate) at EC-world entry block 0x102e24598.
+- **`[routeb-sh355] FRAME-ACCURATE EC reader-gate` fires 0/3.** Since the frame-accurate
+  guard fires only when the reader-gate BLOCK at 0x102e24694/0x102e246b0 is actually entered
+  (live x[29] captured from that executing frame), 0 fires is the proof that block is never
+  entered headlessly — a REACHABILITY problem, not a value problem.
+- Run sequence: EC entry (seeds fire) -> SH296 dmfn returned Ok -> control DIVERGES into
+  app-start (sh248e once-cell + sh248f lifecycle adapter fire) -> SIGSEGV at the SH285
+  persistence-lane wall guestpc=0x101db1b08 (fault 0xff..ff). EXIT 134.
+- Conclusion: the reader 0x2e246f4 sits behind a block the EC body does not fall through to
+  in this harness — control leaves EC world into app-start/persistence and dies at SH285.
+  This refines sh302's "wrong frame" verdict to "block never entered" (SH174/204 class).
+
+### Honest
+Does NOT manufacture a DataModel. Route-B live-DM structural gate UNCHANGED (DM-root
+0x106a68818=0, MH_* false). The EC-reader re-attack line is now measured-closed at one level
+deeper than sh302; do NOT re-attack [x29,#104]+0x20 fabrication. +frontier-sh356.
+
 ## SH355 (Sep 19, 2026, hermes-worker): CORRECT the EC-world reader-gate record — fresh disasm refutes sh301/302's "internal soft-return" premise (no `ret` in [0x2e245f4,0x2e246e0)); the reader 0x2e246f4 is gated by a real `cbz x0` on the live-object slot `[[x29,#104]+0x20]` == 0, a SH174/SH204-class value seed, not a compile-block early-exit. recon-v3 self-driven frame deliverable re-verified green.
 Single-agent (cone suppressed). One new hermetic `sh355_ec_reader_block_no_softreturn_gate_is_live_object_slot`
 (arm64jit lib real-image pins: zero `ret` scanned across [0x2e245f4,0x2e246e0); gate loads
