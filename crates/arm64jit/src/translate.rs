@@ -8231,4 +8231,65 @@ mod tests {
         assert!(b.windows(4).any(|w| w == [0x49, 0x0f, 0x42, 0xc2]), "unsigned underflow cmovb -> r10 (0)");
         assert!(!b.windows(4).any(|w| w == [0x49, 0x0f, 0x4f, 0xc2]), "no signed smax clamp in unsigned lane");
     }
+// SH433: hermetic coverage of the SIMD FP multiply-accumulate (Fmla/FmlaEl)
+    // codegen — the single most render-heavy family (matrix/vertex/lighting
+    // transforms accumulate as SIMD FMAs). The family had no direct byte tests.
+    // SH433 pins the discriminators a byte error silently corrupts: the product
+    // DIRECTION (mulss/mulsd dst=CREG=1, src=0 => xmm1 = Vn*Vm, so the accumulate
+    // addss/addsd into xmm0 (Vd) has the CORRECT fmls sign — Vd +/- Vn*Vm, NOT
+    // Vn*Vm - Vd), the add-vs-sub accumulate opcode (addss 0x58 / subss 0x5C),
+    // the single- (F3+movd) vs double- (.2d, F2+movq) lane width, and the
+    // FmlaEl by-element broadcast into xmm2 (movd xmm2,../66 0F 6E D0) + mulss
+    // xmm1,xmm2 (F3 0F 59 CA). Exact-byte window asserts (multi-lane).
+
+    #[test]
+    fn sh433_fmla_2s_add_product_direction_and_accumulate() {
+        // .2s fmla: per-lane movd Vn->xmm0, Vm->xmm1, mulss xmm1,xmm0 (product
+        // in xmm1), reload Vd->xmm0, addss xmm0,xmm1 => Vd += Vn*Vm.
+        let b = tr_bytes(Inst::Fmla { rd: 0, rn: 1, rm: 2, el64: false, q: false, sub: false });
+        assert!(b.windows(4).any(|w| w == [0xf3, 0x0f, 0x59, 0xc8]), "mulss xmm1,xmm0 (Vn*Vm into xmm1)");
+        assert!(b.windows(4).any(|w| w == [0xf3, 0x0f, 0x58, 0xc1]), "addss xmm0,xmm1 (accumulate into Vd)");
+        // the accumulate must come AFTER the product so the sign is right for fmls
+        let prod = b.windows(4).position(|w| w == [0xf3, 0x0f, 0x59, 0xc8]).unwrap();
+        let acc = b.windows(4).position(|w| w == [0xf3, 0x0f, 0x58, 0xc1]).unwrap();
+        assert!(prod < acc, "product must be computed before the accumulate");
+        assert!(!b.windows(4).any(|w| w == [0xf3, 0x0f, 0x5c, 0xc1]), "no subss in an add-form fmla");
+    }
+
+    #[test]
+    fn sh433_fmla_2s_sub_uses_subss_not_subtrahend_swap() {
+        // .2s fmls: identical layout but subss xmm0,xmm1 (Vd - Vn*Vm). The
+        // discriminator 0x5C vs 0x58; a 'Vn*Vm - Vd' swap would corrupt sign.
+        let b = tr_bytes(Inst::Fmla { rd: 0, rn: 1, rm: 2, el64: false, q: false, sub: true });
+        assert!(b.windows(4).any(|w| w == [0xf3, 0x0f, 0x59, 0xc8]), "product mulss xmm1,xmm0");
+        assert!(b.windows(4).any(|w| w == [0xf3, 0x0f, 0x5c, 0xc1]), "subss xmm0,xmm1 (Vd - Vn*Vm)");
+        assert!(!b.windows(4).any(|w| w == [0xf3, 0x0f, 0x58, 0xc1]), "no addss in a sub-form fmla");
+    }
+
+    #[test]
+    fn sh433_fmla_2d_double_lanes_no_single_precision() {
+        // .2d fmla: double path uses movq (F3 48 0F 7E load / 66 48 0F D6 store)
+        // and mulsd/addsd (F2 0F 59/58), never the .2s single-precision
+        // F3+movd/mulss. A width flub silently halves/squares transform math.
+        let b = tr_bytes(Inst::Fmla { rd: 0, rn: 1, rm: 2, el64: true, q: false, sub: false });
+        assert!(b.windows(4).any(|w| w == [0xf3, 0x48, 0x0f, 0x7e]), "movq xmm,[mem] double load");
+        assert!(b.windows(4).any(|w| w == [0x66, 0x48, 0x0f, 0xd6]), "movq [mem],xmm double store");
+        assert!(b.windows(4).any(|w| w == [0xf2, 0x0f, 0x59, 0xc8]), "mulsd xmm1,xmm0 double product");
+        assert!(b.windows(4).any(|w| w == [0xf2, 0x0f, 0x58, 0xc1]), "addsd xmm0,xmm1 double accumulate");
+        assert!(!b.windows(4).any(|w| w == [0xf3, 0x0f, 0x59, 0xc8]), "no single-precision mulss in .2d");
+        assert!(!b.windows(3).any(|w| w == [0x66, 0x0f, 0x6e]), "no movd (32-bit) path in .2d");
+    }
+
+    #[test]
+    fn sh433_fmlael_2s_broadcasts_element_then_mulss_by_it() {
+        // fmla Vd, Vn, Vm.el[idx] (.2s): first broadcast the element into xmm2
+        // (movd xmm2,eax = 66 0F 6E D0), then per lane mulss xmm1,xmm2 (F3 0F 59
+        // CA) and accumulate. The broadcast-target + rm=xmm2 is the discriminator
+        // vs the 3-operand Fmla (which multiplies by a full Vm lane in xmm1).
+        let b = tr_bytes(Inst::FmlaEl { rd: 0, rn: 1, vlm: 2, idx: 1, el64: false, q: false, sub: false });
+        assert!(b.windows(4).any(|w| w == [0x66, 0x0f, 0x6e, 0xd0]), "broadcast element into xmm2 (movd xmm2,eax)");
+        assert!(b.windows(4).any(|w| w == [0xf3, 0x0f, 0x59, 0xca]), "mulss xmm1,xmm2 (Vn[l]*Vm.el)");
+        assert!(b.windows(4).any(|w| w == [0xf3, 0x0f, 0x58, 0xc1]), "addss xmm0,xmm1 accumulate");
+        assert!(!b.windows(4).any(|w| w == [0xf3, 0x0f, 0x59, 0xc8]), "element-form must NOT scale by full Vm lane");
+    }
 }

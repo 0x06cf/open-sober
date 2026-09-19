@@ -1,5 +1,38 @@
 # Open Sober — Agent Handoff
 
+## SH433 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD FP multiply-accumulate codegen family (translate.rs Fmla, FmlaEl) — 4 exact-byte pins of the most render-heavy translate.rs surface (matrix/vertex/lighting transforms accumulate as SIMD FMAs): the product DIRECTION (mulss/mulsd targets xmm1 => the accumulate addss into xmm0 gives fmls the CORRECT sign — Vd − Vn·Vm, never Vn·Vm − Vd), the add-vs-sub accumulate opcode (addss 0x58 / subss 0x5C), the .2s single- (F3+movd) vs .2d double- (F2+movq) lane width (a width flub silently halves/squares transform math), and the FmlaEl by-element broadcast into xmm2 (movd xmm2,eax 66 0F 6E D0) + mulss xmm1,xmm2 (F3 0F 59 CA) vs the 3-operand Fmla's full-Vm-lane multiply (F3 0F 59 C8)
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+re-verified green at this exact HEAD first (capture_taskv4_frame.sh attempt 1:
+24 real task-driven frames `present swap Ok(0x1)`, 194 node pops, 0 json abort,
+0 crash, EXIT 124). Workspace green (cargo test --workspace EXIT 0; arm64jit lib
+560/0 incl. 4 new sh433 pins, was 556; cargo build --example elfjit OK).
+Production code ONLY in translate.rs `#[cfg(test)]` addition (translator core
+body byte-untouched; jit.rs/elfjit.rs/session.rs unchanged).
+- The Fmla/FmlaEl family had no direct byte tests (decode pins decode, jit
+  pins runtime, but the EMISSION between them was unpinned — STATUS next-forward
+  #5). SH433 pins the semantically-critical discriminators a byte error
+  silently corrupts: (1) Fmla .2s add — per-lane `movd xmm0=Vn; movd xmm1=Vm;
+  mulss xmm1,xmm0` (F3 0F 59 C8, product into xmm1) then reload `movd xmm0=Vd;
+  addss xmm0,xmm1` (F3 0F 58 C1), pinned product-before-accumulate so the fmls
+  sign is Vd − Vn·Vm not the reverse; (2) Fmla .2s sub — identical layout but
+  `subss xmm0,xmm1` (F3 0F 5C C1), the 0x5C-vs-0x58 accumulate discriminator;
+  (3) Fmla .2d double — movq load/store (F3 48 0F 7E / 66 48 0F D6) + mulsd/
+  addsd (F2 0F 59/58), never the .2s F3+movd/mulss path (asserts no movd and no
+  mulss); (4) FmlaEl .2s — broadcasts Vm.el[idx] into xmm2 (movd xmm2,eax =
+  66 0F 6E D0) once then per-lane `mulss xmm1,xmm2` (F3 0F 59 CA), the
+  broadcast-target/rm vs the 3-operand Fmla's full-lane multiply (C8).
+- 4 exact-byte pins via synthetic `Inst` -> translate() -> CodeBuf.as_slice()
+  (zero-pc 0x1000 = deterministic); subsequence-window asserts for the
+  multi-lane bodies. [RBX]=CpuState; vector slot v[t]=VECTOR_BASE(0x110)+t*16.
+  Deterministic, no image, no env, parallel-safe.
+- Honest: NOT a DM (SH415 probe re-confirms DM-root [0x106a68818]=0x0 under the
+  complete substrate; Route-B live-DM gate UNCHANGED). BUILD-THE-RUNTIME
+  codegen-surface coverage completion on the SIMD FP multiply-accumulate
+  geometry-math family, continuing the SH427-432 translator-core lineage. No
+  re-treads (distinct from SH432's integer-lane SimdVLog/SminMax/SimdSatAdd).
+- Files: docs/frontier-sh433-translator-simd-fma.md +
+  crates/arm64jit/src/translate.rs (`#[cfg(test)]` only). Commit (pending).
+
 ## SH432 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD/vector-ALU codegen families (translate.rs SimdVLog, SminMax, SimdSatAdd) — 6 exact-byte pins of the emission that carries real rendered geometry/color lane math: the pand/por/pxor/pandn opcode discriminator (66 0F DB/EB/EF/DF; a /r-flub maps Vd&Vm to Vd^Vm), the SminMax cmov condition byte selecting max-vs-min AND signed-vs-unsigned (cmovg 0x4F / cmovb 0x42 vs cmovl 0x4C — a flub returns the wrong lane or clamps the wrong direction), the movsxd presence flips sub-byte saturating lanes, and the smax-vs-smin CONSTANT+cmov pairing in SimdSatAdd that decides which bound signed overflow clamps to
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 re-verified green at this exact HEAD first (capture_taskv4_frame.sh attempt 1:
