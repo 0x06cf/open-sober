@@ -1,6 +1,34 @@
 # Open Sober — Agent Handoff
 
-## SH442 (Sep 19, 2026, hermes-worker): hermetic coverage of the scalar FcvtToInt ROUNDING-mode paths (translate.rs mode 2 `fcvtau` / mode 3 `fcvtpu`,`fcvtps` / mode 4 `fcvtmu`,`fcvtms`) — 5 exact-byte pins
+## SH443 (Sep 19, 2026, hermes-worker): hermetic coverage of the BYTE-REVERSE codegen family (translate.rs SimdRev `rev64`/`rev32`/`rev16`) — 4 exact-byte pins
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+unchanged-green (24 real task-driven frames `present swap Ok(0x1)`, 0 json
+abort, 0 crash — SH442/441 baseline unchanged). Workspace green (cargo test
+--workspace EXIT 0; arm64jit lib 603/0 incl. 4 new sh443 pins, was 599; cargo
+build --workspace + --example elfjit OK). Production code ONLY in translate.rs
+`#[cfg(test)]` addition (translator core body byte-untouched; jit.rs
+1,048,390 B < 1MiB hook unchanged; elfjit.rs/session.rs unchanged).
+- SimdRev (byte-reverse within granule) had no direct byte tests. SH443 pins
+  the exact emit (rd=1, rn=2; Vn@0x130, Vd@0x120): (1) rev64 (granule 8, q=0)
+  = mov rax,[0x130] + bswap-r64 (48 0f c8) + mov [0x120],rax; (2) rev64 q=1 =
+  TWO 8B granules, second reads Vn+8 (0x138) + stores Vd+8 (0x128) — pins the
+  whole-register reversal; (3) rev32 (granule 4, q=0) = bswap-r32 (0f c8, NO
+  0x48 REX.W), two 4B granules 0x130->0x120 + 0x134->0x124; the 0f c8-vs-
+  48 0f c8 opcode is the 4-vs-8-granule discriminator; (4) rev16 (granule 2,
+  q=0) = four 2B granules via movzx + rol eax,8 (66 c1 c0 08, halfword
+  byte-swap) + 16-bit 66 89 stores at 2-apart dst (0x120..0x126); the
+  rol-imm8-by-8 vs bswap is the 2-granule discriminator.
+- Deterministic: synthetic Inst -> translate() -> CodeBuf.as_slice() (zero-pc
+  0x1000); [RBX]=CpuState, vector slot v[t]=VECTOR_BASE(0x110)+t*16. Trunk
+  verified by a one-off eprintln dump (removed before commit) so pins match the
+  real emission.
+- Honest: NOT a DM (SH415 probe re-confirms DM-root [0x106a68818]=0x0 under the
+  complete substrate; Route-B live-DM gate UNCHANGED). BUILD-THE-RUNTIME
+  codegen-surface coverage completion on the byte-reverse family. No re-treads.
+- Files: docs/frontier-sh443-translator-simdrev.md + crates/arm64jit/src/
+  translate.rs (`#[cfg(test)]` only). Commit 1894893.
+
+## SH442 onward (see commit history for the full lantern ledger)
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 unchanged-green (24 real task-driven frames `present swap Ok(0x1)`, 0 json
 abort, 0 crash — SH441/440 baseline unchanged). Workspace green (cargo test
