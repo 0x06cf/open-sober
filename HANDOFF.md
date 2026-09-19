@@ -1,5 +1,25 @@
 # Open Sober — Agent Handoff
 
+## SH360 (Sep 20, 2026, hermes-worker): implement + MEASURE the operator's EXECUTE-DO-INIT-GATES empty-vector gate seed — the do-init app-shell band's 0x20-stride vector walker at [0x106dcb160] collapses its constructed-empty begin==end host-heap pointer pair to NULL (behavior-preserving), default-inert JIT_ROUTEB_DOINIT_EMPTYVEC, fires at the two real block-entry pcs on the full ladder
+Single-agent (cone suppressed). One new guard `routeb_doinit_emptyvec_gate`
+(jit.rs) + one hermetic sh360 (arm64jit lib 422->423) + probe script; elfjit.rs
+unchanged; workspace green (cargo test --workspace exit 0).
+- Disasm: `adrp x19,6dcb000; add x19,#0x160 -> ldp x20,x21,[x19] -> cmp x20,x21;
+  b.eq` (file 0x2208e4c..eac) — a 0x20-stride vector walker whose populate +
+  teardown loops both `b.eq`-early-exit when begin==end. Seeding [{0x106dcb160}]
+  = {0,0} lets both take the empty-vector exit instead of walking/destroying
+  garbage. The operator named this gate; it was NOT previously implemented.
+- MEASURED (full --v2boot-session send-appevent ladder, 2/2): the guard fires at
+  the real BLOCK-ENTRY pcs 0x102208e4c/0x102208e88 (interior e58/e84 are NOT block
+  boundaries) and collapses the ALREADY-constructed-empty begin==end==host-heap
+  pointer pair to {0,0} — behavior-preserving (the walker compares equality). A
+  populated begin!=end live pair is left untouched (tested idempotent).
+- Completing ladder stays confirmed-green with the gate armed: EXIT 124, SH155
+  DM-root probe=1, 0 SIGSEGV/ABRT. Route-B live-DM structural gate UNCHANGED
+  (DM-root [0x106a68818]=0, MH_* false); the full ladder still ABRTs at the SH285
+  persistence wall (0x101db1b08) past this walker on the app-start arm.
+- Files: docs/frontier-sh360-doinit-emptyvec-gate.md, runs/capture_sh360_doinit_emptyvec.sh.
+
 ## SH359 (Sep 20, 2026, hermes-worker): measured negative on the SH358 NULL-JNIEnv lane's root cause — the JNI_OnLoad cached-JavaVM cell [0x107275550] is NOT causal (GetEnv 11x with AND without the seed on pure boot; the 0x1021e1c00 fault needs the full ladder); both recon-v3 deliverables re-verified green at HEAD; production code unchanged (seed tried + reverted after control refuted it)
 Single-agent (cone suppressed). No production path edited (elfjit.rs/jit.rs product
 identical to HEAD SH358). Workspace green (cargo test --workspace exit 0).

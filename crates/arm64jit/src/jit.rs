@@ -1118,6 +1118,66 @@ fn routeb_startluaapp_invoke_guard(state: *mut CpuState, pc: u64) {
     );
 }
 
+/// SH360 (operator EXECUTE-DO-INIT-GATES): seed the do-init app-shell band's 0x20-stride
+/// VECTOR WALKER at [0x106dcb160] to a clean EMPTY vector (begin==end==NULL) so both of its
+/// loops early-exit (`b.eq`) instead of walking/dispatching garbage when the real vector was
+/// never constructed. Disasm of the app-shell/GlobalInit band (file 0x2208e4c..0x2208eac,
+/// guest 0x102208e58 walker): `adrp x19,6dcb000; add x19,x19,#0x160` (x19=0x106dcb160),
+/// `ldp x20,x21,[x19]` (begin=x20,end=x21), `cmp x20,x21; b.eq +0x2a80` (populate loop
+/// 0x2208e58..e80 dispatches `blr [obj+0x18]` per 0x20-stride entry when begin!=end), then a
+/// second walk 0x2208e88..ea0 (`sub x20,#0x20; bl 0x21c7948` teardown). With begin==end==NULL
+/// both take `b.eq` -> clean early-exit. Default-inert, opt-in JIT_ROUTEB_DOINIT_EMPTYVEC.
+/// Idempotent (writes only while the pair is 0/sub-image); page-writable guarded. The cell is
+/// true .bss behind the app-shell band the completing ladder already enters (SH340 measured
+/// the band runs 77 blocks deep), so this closes a host-garbage iterate/dispatch that the
+/// band previously reached with unconstructed vector internals.
+fn routeb_doinit_emptyvec_gate(state: *mut CpuState, pc: u64) {
+    // Read env fresh each entry (not cached in an OnceLock) so tests can toggle the flag
+    // across phases; the single-jit_run production reader is unaffected.
+    if std::env::var_os("JIT_ROUTEB_DOINIT_EMPTYVEC").is_none() {
+        return;
+    }
+    // Fire at the real BLOCK-ENTRY pcs into the walker region (measured via region-watch on the
+    // full ladder): 0x102208e4c (`adrp x19,6dcb000; add x19,#0x160` establishes x19=0x106dcb160
+    // then `ldp x20,x21,[x19]` reads begin/end — seeding before that ldp makes begin==end==NULL
+    // so the populate loop's cmp/b.eq early-exits) and 0x102208e88 (teardown re-read
+    // `ldp x21,x20,[x19]`). The interior pcs 0x102208e58/0x102208e84 are NOT block-entry
+    // boundaries (verified 0 hits on the full ladder) — the whole walker is one translated block
+    // entered at e4c. Seeding at block entry lets both loops see an empty vector.
+    if pc != 0x102208e4c && pc != 0x102208e88 {
+        return;
+    }
+    let _s = unsafe { &*state };
+    let cell = 0x106dcb160u64;
+    // Map/mprotect the cell page writable (the SH156/.bss-page pattern) rather than a
+    // read-only /proc/self/maps probe — at runtime the walker's own `ldp [x19]` proves the
+    // page is readable, but it may be file-backed read-only (SH116 class), so a read-only
+    // `page_writable_rw` returns false and the seed would silently never land. routeb_ensure_writable
+    // COWs the page RW; a fresh anon mapping under it still keeps guest==host identity.
+    if !crate::jit::routeb_ensure_writable(cell) {
+        return;
+    }
+    let begin = unsafe { std::ptr::read_unaligned(cell as *const u64) };
+    let end = unsafe { std::ptr::read_unaligned((cell + 8) as *const u64) };
+    // Collapse to empty when the pair is (a) sub-image garbage OR (b) begin==end — the walker
+    // runs `cmp x20,x21; b.eq` (equal ptrs = empty vector, early-exit), so zeroing an
+    // equal-pointer pair that points at host-heap (constructed-empty or dangling) is
+    // behavior-preserving AND removes the host-heap read; a begin!=end pair where both are
+    // live (>=0x100000000) is a REAL populated vector — leave it.
+    let sub_image = |p: u64| p == 0 || (p < 0x100000000 && p != 0);
+    let collapse = begin == end || sub_image(begin) || sub_image(end);
+    if !collapse {
+        return; // real populated vector (begin!=end, both live) — leave it.
+    }
+    unsafe {
+        std::ptr::write_unaligned(cell as *mut u64, 0);
+        std::ptr::write_unaligned((cell + 8) as *mut u64, 0);
+    }
+    eprintln!(
+        "[routeb-doinit] SH360 empty-vector gate @0x{cell:x} = {{0,0}} (begin={begin:#x} end={end:#x}) at pc={pc:#x} -> app-shell band 0x20-stride walker early-exits (b.eq begin==end==NULL)"
+    );
+}
+
 /// SH123: the leaked coherent EMPTY String-hash-set substituted for a dangling host
 /// container at the generic `.find()` leaf. Zeroed 0x30 bytes: +0x08 count=0 (canonical
 /// empty -> `cbz` returns NULL), +0x18/+0x20 = Roblox SSO empty String (flags 0, len 0).
@@ -6706,6 +6766,7 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
             routeb_tail_trace(state, pc);
         }
         routeb_appevent_w19_guard(state, pc); // SH339 (JIT_ROUTEB_APPEVENT_W19): mid-execution capture of the SendAppEventOnAppReady discriminator w19 at the JOIN 0x102bb47d0 (settles SH308's open ABI question; read-only, once)
+        routeb_doinit_emptyvec_gate(state, pc); // SH360 (JIT_ROUTEB_DOINIT_EMPTYVEC): seed the do-init app-shell band's 0x20-stride vector walker @[0x106dcb160] to empty (begin==end==NULL) so both loops early-exit instead of walking/dispatching garbage
         routeb_lsm_keytrace_guard(state, pc); // SH341 (JIT_ROUTEB_LSM_KEYTRACE): attribute which LSM pool-pop call site passes a poisoned .text KEY (root-cause of the SH268 unwritable-write wall; READ-ONLY)
         routeb_lsm_keyfix_guard(state, pc); // SH341-cross (JIT_ROUTEB_LSM_KEYFIX): redirect the LSM pop's write-target away from a poisoned .text key so the pop completes and the full-ladder Route-B route passes the persistence-lane terminal wall
         routeb_appstart_408_guard(state, pc); // SH330: seed [AppStarted+0x408] (runtime heap x19) benign vt[+136] leaf at the 0x25f5050 gate (JIT_ROUTEB_APPSART_408SEED, standalone)
@@ -7779,6 +7840,71 @@ mod tests {
         // x0=0 (no object) must also be safe (guarded read).
         let mut s0 = CpuState::new();
         routeb_busrecv_holder_guard(&mut s0, 0x102bd7474);
+    }
+
+    /// SH360 (JIT_ROUTEB_DOINIT_EMPTYVEC): the do-init app-shell band's 0x20-stride vector
+    /// walker gate is default-inert and fires only at the two real BLOCK-ENTRY pcs (measured),
+    /// seeding [0x106dcb160]={0,0} (begin==end==NULL) so both populate/teardown loops `b.eq` out.
+    /// Real-image pin: disasm confirms the walker `adrp x19,6dcb000; add x19,x19,#0x160 ->
+    /// ldp x20,x21,[x19]` at file 0x2208e4c (guest 0x102208e4c), teardown re-read at 0x2208e88
+    /// (guest 0x102208e88). The guard must: (1) be inert without env (no write, no fire),
+    /// (2) be inert at a non-entry pc, (3) fire + zero the pair at the block entry, (4) be
+    /// idempotent (a non-sub-image begin/end is left alone).
+    #[test]
+    fn doinit_emptyvec_gate_inert_and_fires() {
+        let _g = ROUTEB_PROC_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Ensure the cell page is mapped+rw so the guard's ::page_writable_rw accepts it.
+        crate::jit::routeb_ensure_writable(0x106dcb160);
+        // sub-image sentinel (0x1000: in-image-range "garbage" the guard WILL zero) for the
+        // inert/fire phases; a live (non-sub-image) value only for the idempotency check.
+        unsafe { std::ptr::write_unaligned(0x106dcb160u64 as *mut u64, 0x1000) }
+        unsafe { std::ptr::write_unaligned(0x106dcb168u64 as *mut u64, 0x1000) }
+
+        // (1) inert without env.
+        unsafe { env_test_remove("JIT_ROUTEB_DOINIT_EMPTYVEC") };
+        let mut s = CpuState::new();
+        routeb_doinit_emptyvec_gate(&mut s, 0x102208e4c);
+        let b0 = unsafe { std::ptr::read_unaligned(0x106dcb160u64 as *const u64) };
+        assert_eq!(b0, 0x1000, "inert-without-env writes nothing");
+
+        // (2) inert at a non-entry pc (env on).
+        unsafe { env_test_set("JIT_ROUTEB_DOINIT_EMPTYVEC", "1") };
+        routeb_doinit_emptyvec_gate(&mut s, 0x102208e58);
+        let b1 = unsafe { std::ptr::read_unaligned(0x106dcb160u64 as *const u64) };
+        assert_eq!(b1, 0x1000, "non-entry pc (env on) writes nothing");
+
+        // (3) fires at the block entry -> both words zeroed.
+        routeb_doinit_emptyvec_gate(&mut s, 0x102208e4c);
+        let b2 = unsafe { std::ptr::read_unaligned(0x106dcb160u64 as *const u64) };
+        let e2 = unsafe { std::ptr::read_unaligned(0x106dcb168u64 as *const u64) };
+        assert_eq!(b2, 0, "begin zeroed at block entry");
+        assert_eq!(e2, 0, "end zeroed at block entry");
+
+        // (4) idempotent: a real POPULATED vector (begin!=end, both live) is left alone.
+        unsafe {
+            std::ptr::write_unaligned(0x106dcb160u64 as *mut u64, 0x1234567810000000);
+            std::ptr::write_unaligned(0x106dcb168u64 as *mut u64, 0x1234567810000020);
+        }
+        routeb_doinit_emptyvec_gate(&mut s, 0x102208e88);
+        let b3 = unsafe { std::ptr::read_unaligned(0x106dcb160u64 as *const u64) };
+        assert_eq!(b3, 0x1234567810000000, "populated vector untouched (begin!=end live)");
+        // An equal live pointer pair (constructed-empty vector, begin==end==host-heap) IS
+        // collapsed to NULL — the walker compares equality so this is behavior-preserving.
+        unsafe {
+            std::ptr::write_unaligned(0x106dcb160u64 as *mut u64, 0x7f344401c870);
+            std::ptr::write_unaligned(0x106dcb168u64 as *mut u64, 0x7f344401c870);
+        }
+        routeb_doinit_emptyvec_gate(&mut s, 0x102208e88);
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned(0x106dcb160u64 as *const u64) },
+            0,
+            "equal-pointer empty vector collapsed to NULL at teardown re-read"
+        );
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned(0x106dcb168u64 as *const u64) },
+            0,
+            "equal-pointer end collapsed to NULL"
+        );
     }
 
     #[test]
