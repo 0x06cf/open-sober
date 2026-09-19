@@ -14479,6 +14479,12 @@ mod routeb_lsm_keyfix_guard_tests {
 mod fp16_and_fabd_fccmp_exec {
     use super::*;
 
+    /// SH354: shared serialization lock for tests that mutate the global
+    /// `fsmap` root override (`set_root_for_tests`), so parallel unit tests
+    /// (sh351, sh354, and any future fsmap-root test in this module) never
+    /// clobber each other's override mid-test.
+    static FS_ROOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn h(f: f32) -> u16 {
         // f32 -> IEEE half (round-to-nearest-even; only exact small values used).
         let b = f.to_bits();
@@ -16497,9 +16503,7 @@ mod fp16_and_fabd_fccmp_exec {
     /// two staged names even with no live image.
     #[test]
     fn sh351_r1_stage_core_scripts_writes_both_candidates() {
-        use std::sync::OnceLock;
-        static GUARD: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-        let _g = GUARD.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap();
+        let _g = FS_ROOT_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("os-r1-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -16524,6 +16528,48 @@ mod fp16_and_fabd_fccmp_exec {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SH354: prove the R1 content half is SERVICEABLE end-to-end — a guest `open`/`openat` of the
+    /// EXACT files-dir CoreScript path (`/data/user/0/com.roblox.client/files/scripts/CoreScripts/
+    /// <Name>.lua`) resolves through `fsmap::remap_path` to the staged host mirror under
+    /// `staging_root`. SH351 tested the STAGING write only; nothing pinned the SERVE lookup that the
+    /// engine's resolver uses the instant a live DM drives the loader. This closes that link, so the
+    /// content half is proven attenuated (staged + resolvable + readable), leaving only the live-DM
+    /// session half as the Route-B gate.
+    #[test]
+    fn sh354_r1_core_script_is_serviceable_through_remap() {
+        let _g = FS_ROOT_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("os-r1-serve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::fsmap::set_root_for_tests(dir.clone());
+        // Stage the R1 module (writes both candidates to the mirror).
+        let written = crate::jit::stage_r1_core_scripts();
+        assert_eq!(written.len(), 2, "expected 2 staged candidates, got {written:?}");
+        for name in ["AppShell.lua", "CoreScripts.lua"] {
+            // The very path the engine resolver would open once a live DM drives the loader.
+            let guest = format!(
+                "/data/user/0/com.roblox.client/files/scripts/CoreScripts/{name}"
+            );
+            let guest_c = std::ffi::CString::new(guest.clone()).unwrap();
+            // Serve lookup: the guest path must resolve under the staging root...
+            let rm = crate::fsmap::remap_path(guest_c.as_ptr())
+                .unwrap_or_else(|| panic!("remap_path must resolve {guest}"));
+            let host = rm.host_path().to_path_buf();
+            // ...exactly to the mirror where stage_r1_core_scripts wrote the module...
+            let expect = dir
+                .join("data/user/0/com.roblox.client/files/scripts/CoreScripts")
+                .join(name);
+            assert_eq!(host, expect, "remap of {guest} must be the staged mirror");
+            // ...and the file is actually readable & self-constructing (a guest open succeeds).
+            let body = std::fs::read_to_string(&host)
+                .unwrap_or_else(|e| panic!("staged {name} not readable via remap: {e} path={host:?}"));
+            assert!(body.contains("ScreenGui"), "{name} must define a ScreenGui");
+            assert!(body.contains("R1HostScreen"), "{name} must name the ScreenGui");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::fsmap::set_root_for_tests(std::path::PathBuf::new()); // clear override
     }
 
     /// SH351: the /proc/self/maps read-write check is a pure helper; it must report the writable
