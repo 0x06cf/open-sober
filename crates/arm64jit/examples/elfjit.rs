@@ -1353,6 +1353,44 @@ fn routeb_patch_startapp_init3_gates() {
     arm64jit::jit::block_cache_drop_region(0x102e9fcb0, 0x102ea3b40); // widen: whole governor tail + validator (SH160+ 0x102e9fcc4 block-cache race)
 }
 
+/// SH348 (opt-in JIT_ROUTEB_LSM_INIT_SKIP=1, default-INERT): leaf `ret` LocalStorageManager
+/// initStorageManagerNative (entry 0x101d9d8b0) so the Session-CTOR continuation does NOT die in the
+/// SH285 persistence-lane wall (byte-copy @0x101db1b08 through unconstructed [obj+0x50]=0xff..ff on
+/// the DMCONT drive, SH344c's terminal one hop before app-start 0x2bd2058). CAUSE-level skip (SH117
+/// line-cross), NOT a live-object repair (SH248h trap). Ret-args: caller's bl returns with the manager
+/// this (nonzero => success), control flows to the next Session-CTOR step. Idempotent, env-gated.
+fn routeb_patch_lsm_init_skip() {
+    if std::env::var_os("JIT_ROUTEB_LSM_INIT_SKIP").is_none() {
+        return;
+    }
+    const ENTRY: u64 = 0x101_d9d8_b0; // LocalStorageManager::initStorageManagerNative
+    const PROLOGUE: u32 = 0xa9bd_7bfd; // stp x29,x30,[sp,#-0x30]!
+    const RET: u32 = 0xd65f_03c0; // ret
+    let page = ENTRY & !0xfff;
+    unsafe {
+        if libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_WRITE) != 0 {
+            eprintln!("[elfjit:routeb] WARN SH348 mprotect RW failed @0x{ENTRY:x} errno={}", std::io::Error::last_os_error());
+            return;
+        }
+        let before = *(ENTRY as *const u32);
+        if before == PROLOGUE {
+            *(ENTRY as *mut u32) = RET;
+            eprintln!("[elfjit:routeb] SH348 leaf-`ret` initStorageManagerNative @0x{ENTRY:x} ({before:08x} -> {RET:08x}) — Session-CTOR skips the SH285 persistence lane to reach app-start 0x2bd2058");
+        } else if before == RET {
+            eprintln!("[elfjit:routeb] SH348 initStorageManagerNative @0x{ENTRY:x} already `ret`");
+        } else {
+            eprintln!("[elfjit:routeb] WARN SH348 initStorageManagerNative @0x{ENTRY:x} unexpected prologue {before:08x}, not patched");
+        }
+        libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_EXEC);
+    }
+    // Drop the cached translated blocks for the whole initStorageManagerNative body (entry 0x101d9d8b0
+    // through past the SH285 reader site 0x101db1b08) PLUS the sh324-style caller 0x102256608, so the
+    // JIT re-translates with the patched `ret` and no pre-patch cached interior block (like the deep
+    // byte-copy at 0x101db1b08) is reachable.
+    arm64jit::jit::block_cache_drop_region(0x101_d9d_000u64, 0x101_dbe_000u64);
+    arm64jit::jit::block_cache_drop_region(0x102_256_500u64, 0x102_256_700u64);
+}
+
 /// SH327: force AppStarted factory 0x2e890c4 construction DETERMINISTICALLY (0x1025f5300 gate
 /// needs [appstart+24]!=0; 0x2e890f4 b.ne->ret when tag==2 returned unconstructed).
 fn routeb_patch_appstart_construct_force() {
@@ -6574,6 +6612,9 @@ fn main() {
             // (PLT strlen) puts a HOST pointer in x20 -> `ldr x24,[x20]` faults.
             // The read is null-guarded (intended value 0); force it.
             routeb_patch_keyed_registry_x24_load();
+            // SH348 (opt-in JIT_ROUTEB_LSM_INIT_SKIP=1): leaf-`ret` initStorageManagerNative so the
+            // SESSION-CTOR continuation skips the SH285 persistence-lane wall and reaches app-start.
+            routeb_patch_lsm_init_skip();
             let boot_sp = st.x[31];
             let tpidr = arm64jit::jit::current_guest_tp();
             let ib = base;
@@ -15369,10 +15410,7 @@ mod sh115_tests {
     #[test]
     fn sh265_gameloaded_binder_receive_pinned() {
         // SH265: pin the dataModel-bindings live-binder receive
-        // nativeAppBridgeV2SendAppEventOnGameLoaded (guest 0x102bb429c) - OnAppReady's sibling;
-        // --v2boot-send-game-loaded drives it as a real guest entry. entry 0x102bb429c = sub sp,#0x110.
-        // event vtable [+0x20/+0x28] measured loader-populated with REAL teardown (0x102bb782c/7834),
-        // not the all-zero SH126 class (packed-RELA: on-disk zeros, load_elf_image applies addends).
+        // (collapsed)
         // Route-B gate UNCHANGED; SH174 latch stays forward hook.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
@@ -15425,9 +15463,7 @@ mod sh115_tests {
     #[test]
     fn sh266_messagebus_subscribe_jni_receive_pinned() {
         // SH266: the SEP-17 messageBus receive MessageBus_subscribe (guest 0x102ba5bb8, driven
-        // by --v2boot-session-bus). Pin ABI: entry 0x102ba5bb8=0xd10643ff (sub sp,#0x190); JNI slot
-        // ldr x8,[x0]/ldr x8,[x8,#248]/blr @0x2ba5bf4/f8/fc; op_new 0x28 @0x2ba5d34 bl 0x1d96768
-        // (headless-alloc wall SH245-248 - live-object gate, NOT a new seed)
+        // (collapsed)
         // REAL app-start driver bl 0x2343c10 @0x2ba5e14 = 0x97de777f. Route-B gate UNCHANGED.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
@@ -15509,10 +15545,7 @@ mod sh115_tests {
     #[test]
     fn sh285_lsm_reader_pop_settings_state_cross_terminal_pinned() {
             // SH285: engine's OWN initEngine_ settings self-drive (state=9->10, SH284) peaks
-            // SH267 LSM_NODES seed. A/B (3x real so): A (off) SIGSEGV guestpc=
-            // 0x101db1d04 = LSM insert-leaf (SH260, fault=0). B (+LSM_NODES) SIGSEGV
-            // 0x101db1b08 = LSM READER/pop, one fencepost deeper (insert-leaf CROSSED), a
-            // DIFFERENT reader than SH268's free-list pop 0x101d9a528; still SH174/204
+            // (collapsed)
             // live-object class; REGRESSION pin, not forward. Seed = SH267's. Skip-if-absent.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
@@ -15544,13 +15577,31 @@ mod sh115_tests {
     }
 
     #[test]
+    fn sh348_lsm_init_skip_patches_persistence_fn() {
+        // SH348: JIT_ROUTEB_LSM_INIT_SKIP leaf-`ret`s initStorageManagerNative (entry 0x101d9d8b0,
+        // (collapsed)
+        // check the prologue is the exact byte we patch).
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            assert_eq!(word(0x101_d9d8_b0), 0xa9bd7bfd, "sh348 initStorageManagerNative prologue stp x29,x30,[sp,#-0x30]!");
+            assert_eq!(word(0x102_2_56608), 0x97ed1caa, "sh348 caller bl LocalStorageManager_initStorageManagerNative 0x1d9d8b0");
+            assert_eq!(word(0x101_db1_b08), 0xd10083a2, "sh348 SH285 reader/pop terminal site (sub x2,x0,#0x20, the persistence-lane wall)");
+            assert_eq!(word(0x102_bd2_058u64) & 0xfc000000, 0x94000000, "sh348 app-start bl region past the LSM call (b-format word)");
+            eprintln!("sh348 initStorageManagerNative leaf-ret persistence-lane skip pinned (SH285 wall -> app-start 0x2bd2058).");
+        } else {
+            eprintln!("sh348 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
     fn sh289_worker_consume_queue_cell_attribution_corrected() {
         // SH288 left work-flag open + mislabeled item-proc 0x221942c as "GlobalInit sub".
-        // Fresh disasm: cond-wait predicate=[queue 0x106863a70+0xa98]=[0x106864508];
-        // item-proc once-guard=[0x106a63b08] (ldarb 0x2207980) - the ACTUAL gate;
-        // old probe [0x106863b08] is NEITHER (0x200000 apart) - explains SH288's
-        // "work-flag read 0 yet consumer proceeded".
-        // 0x22079e8 `bl 0x221942c` CLOCK helper (bl 0x6201fc8 clock_gettime
+        // (collapsed)
         // family), NOT a DM world-build. Pin the corrected contract.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
@@ -15598,10 +15649,7 @@ mod sh115_tests {
     #[test]
     fn sh290_itemproc_oncebuild_cell_and_targets_pinned() {
         // SH290 (default-inert --v2boot-session-itemproc): drive the engine's OWN
-        // worker item-PROCESSOR 0x102207950 in isolation (zeroed item -> both indir
-        // blr dispatches cbz-skip) once-guard [0x106a63b08] __call_once
-        // (0x284ce54/0x284cf5c) runs its once-body and stores the string-map insert (0x2173b3c) result
-        // session cell [0x106a63b00]. MEASURED (2/3 clean readback): item-proc Ok + once-guard
+        // (collapsed)
         // 0 -> 0x101 + [0x106a63b00]=0x800000c. Pin the once-body so future cycles catch target drift.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
@@ -15632,9 +15680,7 @@ mod sh115_tests {
     #[test]
     fn sh291_itemproc_guardlatched_reentry_idempotent() {
         // SH291 (default-inert --v2boot-session-itemproc): a SECOND drive with the
-        // once-guard latched (0x101) must SKIP the once-body (the `tbz w8,#0` @0x2207af0
-        // not taken) and fall to the shared per-item tail (0x2207bc0+: clock 0x22193a0,
-        // canary, ret), NOT re-running the string-map insert - so [0x106a63b00] stays
+        // (collapsed)
         // (the "second half" SH290 deferred). Pin guard-check branch, tail entry, target.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
@@ -15665,10 +15711,7 @@ mod sh115_tests {
     #[test]
     fn sh292_itemproc_peritem_dispatch_sites_pinned() {
         // SH292 (default-inert): pin item-proc 0x102207950's REAL per-item dispatch sites -
-        // [item+32]->vt[+48] blr @0x22079cc and [item+48]->bl 0x22193a0 @0x22079e0. NOT the
-        // 0x2207cb0/0x207ce0 blrs sh291 pinned (those are fn 0x2207bbc's, a SEPARATE once-guard,
-        // only-called-from 0x2dadb90). Rung sources item[+32] from routeb_singleton_obj_addr()
-        // vt[+48] blr runs via a benign host leaf. Guard the dispatch sites + targets + a
+        // (collapsed)
         // SEPARATE fn-0x2207bbc pin + benign-dispatcher object/vtable resolution.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
@@ -15702,10 +15745,7 @@ mod sh115_tests {
     #[test]
     fn sh293_item48_continuation_mechanism_closed() {
         // SH293: item-proc 0x102207950's LAST edge - [item+48]->`bl 0x22193a0` (0x22079e0).
-        // mechanism-pins it so item-proc's state machine is fully closed (SH290/291/292
-        // driven, this pinned). NOTE (corrected by SH294): 0x22076e8 tail-TRAMPOLINE
-        // `b 0x2850ef0`, NOT a canary-[frame+8] blr (that's fn 0x22076f8), and the registry
-        // cell subpaths deref is 0x1068262e8 (WRITABLE .data), not 0x1068266e8. The edge
+        // (collapsed)
         // still converges nativeOnDestroyed (SH273) live-object wall.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
@@ -15757,9 +15797,7 @@ mod sh115_tests {
     #[test]
     fn sh294_item48_corrected_cell_and_dispatch() {
         // SH294: corrects SH293 [item+48] mis-attributions. (1) lifecycle-registry fn-ptr cell =
-        // guest 0x1068262e8 (adrp 0x6826000 +#744), file-backed WRITABLE .data (NOT 0x1068266e8);
-        // deref `cbz x8,skip; blr x8` = SH292 benign-leaf (was JUDGMENT). (2) 0x22076e8 tail-TRAMP
-        // `mov x3,xzr; b 0x2850ef0` dispatcher; 0x22193a0 flows in (w2==0 -> bl 0x28511c4 =
+        // (collapsed)
         // live-object vt[+112]). Converging-wall HOLDS, for the right reason.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
@@ -15804,9 +15842,7 @@ mod sh115_tests {
     #[test]
     fn sh295_item48_edge_driven_to_wall() {
         // SH295 (--v2boot-session-itemproc): drive the last never-driven item-proc edge [item+48].
-        // item[+48]=benign obj makes `bl 0x22193a0` EXECUTE -> trampoline 0x22076e8 -> dispatcher
-        // 0x2850ef0 -> cbz w8 -> bl 0x28511c4 = vt[+112] LIVE-OBJECT wall (SH294's benign-cell
-        // subpaths unreachable). MEASURED 3/3: STABLE SIGSEGV guestpc=0x1028511f8 fault=0x50 -
+        // (collapsed)
         // engine's OWN [item+48] continuation runs to the live-object gate headlessly.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
@@ -15848,10 +15884,7 @@ mod sh115_tests {
     #[test]
     fn sh296_dm_construction_handler_dispatch_table_pinned() {
         // SH296: the DM-CONSTRUCTION handler 0x1023f03b4 (front-door app-shell session-ctor,
-        // calls nativeAppBridgeAppStart + the EC-world marshaler) sits in a method-dispatch
-        // HANDLER TABLE at vaddr 0x73fa4d0 entry[4] (slot +0x50, file 0x68ea538); SH255 proved
-        // it indirect-dispatch-only. --v2boot-session-dmfn drives it DIRECTLY. Pins: entry
-        // 0x23f03b4=0xfc190fe8; vt[32] selector ldr/ldr/blr @0x23f03f4/f8/fc; cbz @0x23f0400;
+        // (collapsed)
         // marshaler bl 0x23f075c=0x940002ad; table entry[4]==0x23f03b4 on-disk.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
@@ -15879,9 +15912,7 @@ mod sh115_tests {
     #[test]
     fn sh297_dmfn_construction_body_arg1_clobber_pinned() {
         // SH297: SH296's stage-2 seed (this+136/144=singleton) NO-OP - construction body
-        // 0x23f0484 reads ldp x21,x24,[x22,#8] (x22=ARG1=x1) then stp them to [x20,#136]:
-        // it CLOBBERS this+136/144 from arg1[8]/arg1[16]. SH296's zeroed arg1 -> cbz x21
-        // safety-epilogue before any this-field read. SH297 seeds arg1[8]=[arg1+16]=singleton
+        // (collapsed)
         // + this+120 + this+128 (refcount factory 0x2b4ea48). Pins arg1-read + clobber-store.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
@@ -15912,10 +15943,7 @@ mod sh115_tests {
     #[test]
     fn sh298_registration_ec_world_reach_pinned() {
         // SH298 (--v2boot-session-dmfn + JIT_ROUTEB_DMFN_REGISTER): construction body calls reg-fn
-        // 0x21e45c8 @0x23f05b8 with x0=[arg1[8]] (DOUBLE deref). SH297 arg1[8]=singleton ->
-        // x0=singleton VTABLE -> faults [x22+24]. SH298 arg1[8]=CELL->obj R ([R+8]=singleton host obj)
-        // -> 0x21e45c8 COMPLETES past SH297's wall into EC world: 3/3 terminal SIGSEGV guestpc=
-        // 0x102e245f4 (EC entry 0x102e24598 = SH235 genuine DM-creation world) in 0x1023f1354 at
+        // (collapsed)
         // NULL+0x48 live-object deref. FIRST EC penetration.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
@@ -15946,10 +15974,7 @@ mod sh115_tests {
     #[test]
     fn sh268_lsm_freelist_terminal_mechanism_pinned() {
         // SH268: pin the NEW terminal after the SH267 insert-leaf crossing.
-        // With JIT_ROUTEB_APPSART_LSM_NODES=1 the lane crosses the insert-leaf (fault=0x0
-        // @0x101db1d04) but advances to LSM FREE-LIST/pop: SIGSEGV fault=0x101d968e4
-        // guestpc=0x101d9a528 (sub_1d9a4e0 tail), x19=host heap, x20=x1=0x101d968e4. pop tail
-        // `str x8,[x1] @0x1d9a568` writes free-list link into *x1==map key (file 0x1d968e4, R-E exec
+        // (collapsed)
         // seg write:off) -> faults (SH249/258 unwritable). Regression pin only.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
@@ -16042,9 +16067,7 @@ mod sh115_tests {
     #[test]
     fn sh261_appstart_drain_surface_advances_past_lsm_wall_pinned() {
         // SH261: app-start walks DEEP into its self-drive drain after SH260 parked the LSM
-        // insert-leaf: region-watch fires 100+ pcs incl. drain 0x233bc88..0x233bcf0 (once-check
-        // 0x21dae90 + registry 0x21daef8), reads [[0x6a70c90]+0] + blr vt+48 (LIVE heap dispatch).
-        // TERMINAL run-variable: (a) LSM insert SIGSEGV 0x101db1d04 (dominant), (b) empty
+        // (collapsed)
         // std::function, or (c) 0x1021748a4. HONEST: no DM; Route-B gate UNCHANGED.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
@@ -16087,9 +16110,7 @@ mod sh115_tests {
     #[test]
     fn sh236_startluaappdm_receivecall_dispatch_softreturns_before_marshaler() {
         // SH236: EC world's only headless front-door (StartLuaAppDM -> bl marshaler 0x1023f1210
-        // @0x1023f075c) is gated by receiveCall's dispatch. Measured: [0x1023efe2c,0x1023f0800) fires
-        // 14 block pcs, last 0x1023f01e4; StartLuaAppDM benign-soft-returns; marshaler NEVER entered
-        // (dispatch dies in helper 0x1023f00f8 before building StartAppParams). Pins: entry d10183ff,
+        // (collapsed)
         // dispatch d63f0100, helpers 0x1023eff4c=d10603ff/0x1023f00f8=d101c3ff, last 0x1023f01e4.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
@@ -16128,10 +16149,7 @@ mod sh115_tests {
     #[test]
     fn sh237_startluaappdm_receivecall_dispatch_slot_union_zero_and_helper_realsub() {
         // SH237: receiveCall select table = LOADER-SYNTHESIZED .data.rel.ro (slots = std::function
-        // pair 0x1db2cf0/0x21e96f8 = SH231 EC machinery; entry 0x23efe90 stacks union 0x10635dd68);
-        // helper 0x1023f00f8 = V2Init copy + FMOD tail (corrects SH236). Pins:
-        // union store 0x1023efe9c=0xf90003e8, self-ref 0x1023efea0=0xf90013f4,
-        // string inits 0x1023f013c/0x1023f01b0=0x97f998f5/0x97f998d8, copy 0x1023f01e0=0x97ff44e5,
+        // (collapsed)
         // FMOD tail 0x1023f01f0=0x94f9ed38, band+reloc-zero [0x635dc00,0x6360000).
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
@@ -16157,9 +16175,7 @@ mod sh115_tests {
                 assert!(guest & 3 == 0, "sh237 {name} {guest:#x} 4-aligned");
             }
             // (A) union-table band select slots: the loader's OWN relocation decoder
-            // (read_elf_relocations) is authoritative (readelf -rW fails on packed-RELA). The band
-            // carries R_AARCH64_RELATIVE relocs synthesized at load, NOT session-written; zero on raw
-            // file bytes = [file 0x635d970, 0x635e700). Assert the loader's reloc list covers the
+            // (collapsed)
             // select slots [0x10635dd68+0x20] and [+0x28].
             let (band_lo, band_hi) = (0x635d970u64, 0x635e700u64);
             use libloader::android_relocs::{read_elf_relocations, R_AARCH64_RELATIVE};
@@ -16194,10 +16210,7 @@ mod sh115_tests {
     #[test]
     fn sh239_doinit_oncelambda_intern_store_and_ctor_deep_body_pinned() {
         // SH239 (real-image). Two facts qualify "do-init never completes app-shell":
-        // (1) once-lambda stores __call_once result at 0x2206d74 `str x0,[x23,#1032]`
-        // (x23=6a68000 => [0x106a68408]); live result = intern 0x400000b, NOT a DM =>
-        // "LET once-lambda populate [0x106a68818]" FALSIFIED (A/B: no seed -> [0x106a68818]==0
-        // even though once-lambda runs). (2) With the SH156 seed, app-shell ctor 0x102207b50 runs
+        // (collapsed)
         // 61+ blocks to 0x102208eac + tails FMOD iterate 0x5fb30b4; the DM never make_shared.
         let p = std::path::Path::new(
             "/home/hermes-worker/.cache/open-sober/robbox/libroblox.so",
@@ -16373,9 +16386,7 @@ mod sh115_tests {
     #[test]
     fn sh118_canary_guard_slots_reasserted_to_stable_pointer() {
         // SH118: guest 0x1067d16f0 is BOTH the __stack_chk_guard GOT slot AND the
-        // render-ctx singleton (SH14/SH106 dual-use). A canary fn whose body
-        // re-publishes the slot mid-execution false-fails. Fix: seed both guard
-        // slots to a stable leaked pointer whose deref is constant. Pin the slots
+        // (collapsed)
         // + the guard constant.
         assert_eq!(0x67d16f0u64 + 0x1_0000_0000, 0x1067d16f0u64, "pervasive guard GOT slot");
         assert_eq!(0x631aa30u64 + 0x1_0000_0000, 0x10631aa30u64, "JNI_OnLoad guard slot");
@@ -16414,9 +16425,7 @@ mod sh115_tests {
     #[test]
     fn sh115_repoints_early_return_branches_off_the_store_slot() {
         // Each site has TWO early-return branches (b.eq + cbz x19) that target the
-        // patched store slot (window_start+6*4). They must be repointed one word
-        // forward to the epilogue early/no-op path doesn't store through a
-        // stale x9. Pull exact branch words real disasm.
+        // (collapsed)
         // (branch_file_addr, original_word, expected_target, epilogue_guest)
         let cases: [(u64, u32, u64, u64); 6] = [
             // V2Init A
@@ -16448,9 +16457,7 @@ mod sh115_tests {
     #[test]
     fn sh121_taskscheduler_flags_gate_tbz_nop() {
         // SH121: TaskScheduler ctor's "flags loaded" gate (0x10224fa20 `ldrb w8,[x8,#2516]`;
-        // 0x10224fa24 `tbz w8,#0,0x224fc80` fatal -> raise(SIGTRAP)=exit 133) fires when
-        // setTaskSchedulerBM lazily constructs the scheduler - FIRST flags gate the ladder hits
-        // (gameGlobalInit returns via SH82 thread-id trick, [0x72739d4].bit0 stays 0). NOP the tbz.
+        // (collapsed)
         // Verify encodings + guest/file transform: byte 0x224fa24 e8 12 00 36 = 0x360012e8 TBZ W8,#0.
         assert_eq!(0x3600_12e8u32, 0x3600_12e8u32, "guest tbz word");
         // NOP is 0xd503201f.
@@ -16487,9 +16494,7 @@ mod sh115_tests {
     #[test]
     fn sh123_string_hashset_find_dangling_container_substitute() {
         // SH123 (jit.rs, JIT_ROUTEB_SETFIX): the generic String-keyed hash-set `.find()`
-        // leaf (0x10217582c) is called during DM/app-shell construction with a DANGLING
-        // HOST container (telemetry singleton, never constructed under JIT) -> SIGSEGV
-        // 0x102175854. Layout: +0 bucket array, +0x08 count, +0x18 String needle, +0x20
+        // (collapsed)
         // compare String. Fix: substitute a leaked coherent EMPTY set (count=0) at entry.
         assert_eq!(0x217582cu64 + 0x1_0000_0000, 0x10217582cu64, "String-hash-set find leaf entry");
         assert_eq!(0x2175854u64 + 0x1_0000_0000, 0x102175854u64, "fault site (ldr x23,[x20,#8])");
@@ -16508,9 +16513,7 @@ mod sh115_tests {
     #[test]
     fn sh234_recon_v3_render_side_engine_contract_pinned() {
         // SH234: recon-v3 SELF-DRIVEN FRAMES rides an engine render-side contract:
-        // type4_frame_thunk recovers RENDERCTX (real 0x48 ctx, vtable 0x106731ae0), via ctx-vt[+16]
-        // calls make-current 0x105b3b358, drives frame-fn 0x105b32c00, via ctx-vt[+24] call swap
-        // 0x105b3b408; RENDERINIT enters 0x105b3a280. SH230 pinned the DISPATCH site not these fns.
+        // (collapsed)
         // Guard as sh230-232; skip-if-absent.
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
@@ -16611,9 +16614,7 @@ mod sh126_tests {
     #[test]
     fn sh126_r0_flag_recorder_leaf_materializes_singleton() {
         // The residual rung-0 crash: virtual dispatch vt[+232] at file 0x62514e0
-        // enters flag-recorder 0x101d97c70 with this/map=0 -> null-store. The
-        // callee-entry patch materializes the stable singleton into x0 + ret so
-        // the store no-ops. Pin the addresses + the 5-slot window encodings.
+        // (collapsed)
         // caller dispatch: 0x62514d4 `ldr x8,[x8,#232]`, 0x62514e0 `blr x8`.
         assert_eq!(0x6251438u64 + 0x1_0000_0000, 0x106251438u64, "caller fn entry");
         assert_eq!(0x62514e0u64 + 0x1_0000_0000, 0x1062514e0u64, "blr x8 (vt[+232]) site");
