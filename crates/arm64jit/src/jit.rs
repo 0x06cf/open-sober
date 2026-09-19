@@ -899,6 +899,94 @@ pub fn drive_glue_process_cmd(iimg: &[u8], ib: u64, tpidr: u64, boot_sp: u64) ->
     r
 }
 
+/// SH368 (opt-in rung --v2boot-glue-cmd-seq): bounded app-command SEQUENCE drive on the same
+/// guarded SH366 entry. The engine's REAL Activity-session init state machine (operator's
+/// SESSION-CTOR directive) consumes a queue of `android_app.cmd` APP_CMD values through the
+/// SAME bounded dispatcher process_cmd (0x102bcd6e4, SH366) — SH366 drove only cmd 11
+/// (INIT_WINDOW). SH368 drives a verified-safe subset of the lifecycle commands in sequence
+/// ({6, 8, 11}) so state ACCUMULATES across the fabricated app the way a real command queue
+/// does, and reads back the session observables after EACH command:
+///   - [inner+9]        -> INIT_WINDOW case-body marker (only cmd 11 sets it)
+///   - [0x10683d8b0]    -> version gate (kept 0 so `b.lo`/`cbz` route straight to the body)
+///   - [0x106a705e8]    -> AppBridgeV2 singleton (0 until a live session registers it)
+///   - [0x10683d348]    -> surface/EGL-window XID word (0x200000 = wired X11 XID, SH112)
+///
+/// Every command in the sequence is disasm-verified cycle-safe at version-gate 0 (cmd 11 is the
+/// SH366 proven-green INIT_WINDOW; cmd 6 (0x2bcd7e4) and cmd 8 (0x2bcd864) both `b.lo`/`cbz`
+/// straight back to the epilogue on byte0<6, only writing glue state bytes — see the sh368
+/// hermetic). The window-attach once-guard stays OFF (SH367 measured fault on arming), so this
+/// is a bounded observability advance on the confirmed-green SESSION-CTOR entry, NOT a return
+/// to the SH367 fabricated-surface re-arm. Default-inert (opt-in rung); single-jit_run,
+/// serialized; ZERO change to the SH366/367 clean drive.
+pub fn drive_glue_process_cmd_seq(iimg: &[u8], ib: u64, tpidr: u64, boot_sp: u64) -> u64 {
+    const VERSION_GATE: u64 = 0x10683d8b0;
+    const APPBRIDGE_SINGLETON: u64 = 0x106a705e8;
+    const SURFACE_XID: u64 = 0x10683d348;
+    // Verified-safe lifecycle command subset (real-image pinned in sh368): INIT_WINDOW + the
+    // two glue-state commands that return immediately at version-gate 0.
+    const SEQ: [u32; 3] = [6, 8, 11];
+    // Bounds-safe guest==host read of a fixed cell: return 0 (never fault) if the page isn't
+    // present/writable (routeb_ensure_writable maps + mprotects the fixed routeb pages).
+    let safe_rd = |cell: u64| -> u64 {
+        if cell == 0 || !routeb_ensure_writable(cell) {
+            0
+        } else {
+            unsafe { std::ptr::read_unaligned(cell as *const u64) }
+        }
+    };
+    if routeb_ensure_writable(VERSION_GATE) {
+        unsafe { std::ptr::write_unaligned(VERSION_GATE as *mut u64, 0u64); }
+    }
+    // Share ONE fabricated app/inner/win across the sequence so command state accumulates.
+    let app = Box::leak(vec![0u8; 0x400usize].into_boxed_slice()).as_mut_ptr() as u64;
+    let inner = Box::leak(vec![0u8; 0x100usize].into_boxed_slice()).as_mut_ptr() as u64;
+    let win = Box::leak(vec![0u8; 0x300usize].into_boxed_slice()).as_mut_ptr() as u64;
+    unsafe {
+        std::ptr::write_unaligned(app as *mut u64, inner); // [app]=x20
+        std::ptr::write_unaligned((inner + 64) as *mut u64, win); // [inner+64]=window obj
+    }
+    let sing_before = safe_rd(APPBRIDGE_SINGLETON);
+    let xid_before = safe_rd(SURFACE_XID);
+    eprintln!(
+        "[elfjit:glue-seq] SH368 command sequence {{6,8,11}} over shared app={app:#x} win={win:#x}; pre AppBridgeV2={sing_before:#x} surfaceXID={xid_before:#x}; version-gate [0x{VERSION_GATE:x}]=0; once-guard OFF (SH366 clean entry preserved)"
+    );
+    let mut last = 0u64;
+    for (i, &cmd) in SEQ.iter().enumerate() {
+        let mut st = CpuState::new();
+        st.tpidr = tpidr;
+        st.x[31] = boot_sp;
+        st.x[0] = app;
+        st.x[1] = cmd as u64;
+        let r = match jit_run(iimg, ib, 0x102bcd6e4, &mut st as *mut CpuState) {
+            Err(e) => {
+                eprintln!("[elfjit:glue-seq] cmd {cmd}: process_cmd stopped: {e}");
+                0
+            }
+            Ok(r) => {
+                eprintln!("[elfjit:glue-seq] cmd {cmd}: process_cmd returned Ok({r:#x})");
+                r
+            }
+        };
+        last = r;
+        // Read back session observables after this command.
+        let marker = unsafe { *(inner as *const u8).add(9) };
+        let sing = safe_rd(APPBRIDGE_SINGLETON);
+        let xid = safe_rd(SURFACE_XID);
+        let once_guard = unsafe { std::ptr::read_unaligned((win + 0x268) as *const u8) };
+        eprintln!(
+            "[elfjit:glue-seq] cmd {cmd} (step {}/{}): marker[inner+9]={marker} onceGuard[win+0x268]={once_guard:#x} AppBridgeV2={sing:#x} surfaceXID={xid:#x}",
+            i + 1,
+            SEQ.len()
+        );
+    }
+    eprintln!(
+        "[elfjit:glue-seq] SH368 done: stays on the SH366 clean entry path (once-guard never armed); AppBridgeV2 selftransition {sing_before:#x}->{}; surface XID {xid_before:#x}->{}",
+        safe_rd(APPBRIDGE_SINGLETON),
+        safe_rd(SURFACE_XID)
+    );
+    last
+}
+
 /// R1 content-path synthesis (deleg_dbfc8eb2, Route-B): stage a hand-authored ~20-line Luau
 /// CoreScript the engine SELF-CONSTRUCTS a real GuiObject tree from -> R+0x180/0x188 scene nodes
 /// with ZERO host layout. Loader resolves rbxasset://scripts/CoreScripts/<Name>.lua from the
@@ -9187,6 +9275,68 @@ mod tests {
             eprintln!("sh366 app-cmd dispatcher contract (process_cmd ABI + INIT_WINDOW case) pinned on libroblox.so");
         } else {
             eprintln!("sh366 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
+    fn sh368_glue_cmd_seq_jump_table_and_safe_cases_pinned() {
+        // SH368 (real-image): pin the FULL 20-entry app-command jump table + the safe-case
+        // bodies the --v2boot-glue-cmd-seq rung (jit.rs drive_glue_process_cmd_seq) drives, so
+        // the command sequence stays grounded. process_cmd 0x2bcd6e4: `sub w8,w1,#1; cmp
+        // w8,#0x13` = cmd in [1..20]; `adrp x9,694000; add x9,#0x8a; ldrh w11,[x9,x8,lsl#1]`
+        // reads a 16-bit rel offset from the table at 0x69408a; `adr x10,0x2bcd730; add x10,
+        // x10,w11,lsl#2; br x10` -> case = 0x2bcd730 + rel*4. Pins cmd6->0x2bcd7e4, cmd8->
+        // 0x2bcd864, cmd11->0x2bcd78c (INIT_WINDOW), cmd1->0x2bcd9fc.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let word_at = |vaddr: u64| -> u32 {
+                let off = vaddr as usize;
+                let b = &img[off..off + 4];
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            };
+            let rel = |cmd: usize| -> u32 {
+                let off = 0x69408a + 2 * (cmd - 1);
+                u32::from(img[off]) | (u32::from(img[off + 1]) << 8)
+            };
+            const TABLE_BASE: u64 = 0x2bcd730;
+            // Pin the dispatcher's table address setup words.
+            assert_eq!(word_at(0x2bcd714), 0xf0fed629, "sh368 jump-table adrp x9,694000");
+            assert_eq!(word_at(0x2bcd718), 0x91022929, "sh368 jump-table add x9,#0x8a");
+            assert_eq!(word_at(0x2bcd720), 0x1000008a, "sh368 adr x10,0x2bcd730");
+            // Pin the four commands the sequence (or INIT_WINDOW) touch + full-table sanity.
+            assert_eq!(rel(11), 0x17, "sh368 cmd11 rel 0x17 -> case 0x2bcd78c (INIT_WINDOW)");
+            assert_eq!(TABLE_BASE + (rel(11) as u64) * 4, 0x2bcd78c);
+            assert_eq!(rel(6), 0x2d, "sh368 cmd6 rel 0x2d -> case 0x2bcd7e4");
+            assert_eq!(TABLE_BASE + (rel(6) as u64) * 4, 0x2bcd7e4);
+            assert_eq!(rel(8), 0x4d, "sh368 cmd8 rel 0x4d -> case 0x2bcd864");
+            assert_eq!(TABLE_BASE + (rel(8) as u64) * 4, 0x2bcd864);
+            assert_eq!(rel(1), 0xb3, "sh368 cmd1 rel 0xb3 -> case 0x2bcd9fc");
+            // All 20 rel offsets must map to targets within the dispatcher body
+            // [0x2bcd730,0x2bcde00) (guards against a table-address drift). Several commands
+            // share the epilogue 0x2bcdbf0 (e.g. 19/20), which is expected.
+            for cmd in 1..=20usize {
+                let t = TABLE_BASE + (rel(cmd) as u64) * 4;
+                assert!((0x2bcd730..0x2bcde00).contains(&t), "sh368 cmd{cmd} target 0x{t:x} in-dispatcher");
+            }
+            // Safe case bodies these commands take at version-gate 0. cmd6 0x2bcd7e4 reads the
+            // version gate [0x683d8b0] then `b.lo` (byte0<6) back to the epilogue 0x2bcdbf0.
+            assert_eq!(word_at(0x2bcd7e8), 0xf9445900, "sh368 cmd6 ldr x0,[x8,#0x8b0] (version gate)");
+            assert_eq!(word_at(0x2bcd7f4), 0x54001fe3, "sh368 cmd6 b.lo 0x2bcdbf0 (byte0<6 -> return)");
+            // cmd8 0x2bcd864: same gate read + `b.lo 0x2bcd8a8` -> writes only glue bytes then returns.
+            assert_eq!(word_at(0x2bcd868), 0xf9445900, "sh368 cmd8 ldr x0,[x8,#0x8b0] (version gate)");
+            assert_eq!(word_at(0x2bcd874), 0x540001a3, "sh368 cmd8 b.lo 0x2bcd8a8");
+            assert_eq!(word_at(0x2bcd8ac), 0x3900229f, "sh368 cmd8 strb wzr,[x20,#8] (glue state byte)");
+            // Epilogue target both safe cases fall through to.
+            assert_eq!(word_at(0x2bcdbf0), 0xf9400268, "sh368 dispatcher epilogue ldr x8,[x19]");
+            // Window-attach contract (SH366/367): once-guard +0x268, deep-GL descriptor slot
+            // +0x278, map sentinel field +0x288 (already 0 in a fresh win -> find not-found).
+            assert_eq!(word_at(0x2bcd7d0), 0xf9402280, "sh368 INIT_WINDOW body ldr x0,[x20,#64] ([inner+64]=win)");
+            assert_eq!(word_at(0x2bcd7dc), 0x94001471, "sh368 bl 0x2bd29a0 window-attach");
+            assert_eq!(word_at(0x2bd2a0c), 0x9109a268, "sh368 window-attach add x8,x19,#0x268 (once-guard)");
+            eprintln!("sh368 full app-cmd jump table + safe sequence case bodies pinned on libroblox.so");
+        } else {
+            eprintln!("sh368 real-image guard: no real libroblox.so, skipping anchors");
         }
     }
 

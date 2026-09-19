@@ -2300,13 +2300,10 @@ fn routeb_patch_cont_opnew_box() {
         let r1 = *((start + 4) as *const u32);
         let r2 = *((start + 8) as *const u32);
         libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
-        // The patched call site is MID-straight-line-block: cached under the
-        // block's ENTRY pc (0x102bd1d68 or 0x102bd1dfc per region-watch), NOT under
-        // [0x102bd2120,0x102bd212c). block_cache_drop_region matches by entry pc, so
-        // a window-only drop would leave the stale compiled block calling op_new -
-        // measured (boxpatch fires but still bad_alloc). Widen to the whole
-        // continuation region [fnB 0x102bd1d68, 0x102bd2600) so every containing
-        // block re-translates patched bytes.
+        // Patched call site is mid-straight-line-block: cached under entry pc (0x102bd1d68 or
+        // 0x102bd1dfc per region-watch), NOT [0x102bd2120,0x102bd212c); a window-only drop leaves a
+        // stale compiled block -> op_new still called (measure: bad_alloc). Widen to the whole
+        // continuation region [0x102bd1d68,0x102bd2600).
         arm64jit::jit::block_cache_drop_region(0x102bd1d68, 0x102bd2600);
         eprintln!("[elfjit:routeB] SH245-closure patched op_new @0x{start:x} 12B -> x0 = leaked 0x40 box 0x{boxp:x} (readback {r0:08x} {r1:08x} {r2:08x})");
     }
@@ -5932,13 +5929,10 @@ fn install_xvfb_reaper() {
 /// SYNCHRONOUSLY so the real window is wired before StartApp hits the EGL surface path (a racing
 /// thread would hand the sentinel). X connection leaked so the window outlives fn. Returns XID or 0.
 fn wire_real_window() -> u64 {
-    // SH112: a stale /tmp/.X11-unix/X<n> socket from a dead prior session must
-    // NOT be trusted - the old code saw the file and "broke", skipping the
-    // spawn, then every connect failed and the boot silently kept the sentinel
-    // ANativeWindow (so the render surface could never be real boot
-    // window). Rewritten to be connect-first: try the display as-is, and only
-    // if that fails unlink the stale socket and spawn our own Xvfb on it.
-    // SH303 (resource-leak fix): on exit, reap any Xvfb this run spawned.
+    // SH112: a stale /tmp/.X11-unix/X<n> socket must NOT be trusted - the old code saw it and
+    // "broke" (every connect failed, the boot kept the sentinel ANativeWindow). Connect-first:
+    // try the display as-is; only on failure unlink the stale socket + spawn our own Xvfb. SH303:
+    // reap any Xvfb this run spawned.
     install_xvfb_reaper();
     let pid = std::process::id();
     for attempt in 0..24usize {
@@ -6656,6 +6650,12 @@ fn main() {
                 if std::env::args().any(|a| a == "--v2boot-glue-cmd") {
                     arm64jit::jit::drive_glue_process_cmd(iimg, ib, tpidr, boot_sp);
                     dump("glue-cmd INIT_WINDOW");
+                }
+                // SH368 (--v2boot-glue-cmd-seq): bounded app-command SEQUENCE drive on the same
+                // guarded SH366 entry (cmds {6,8,11}, once-guard OFF), session-state readback.
+                if std::env::args().any(|a| a == "--v2boot-glue-cmd-seq") {
+                    arm64jit::jit::drive_glue_process_cmd_seq(iimg, ib, tpidr, boot_sp);
+                    dump("glue-seq cmd sequence");
                 }
                 // Route-B latch (recon-routeB-globaltinit-unblock.md): gameGlobalInit only leaves its
             // nanosleep park once [0x72739d4].bit0==1 (flags loaded). Drive nativeInitializeNativeFlags

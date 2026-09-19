@@ -1,5 +1,44 @@
 # Open Sober — Agent Handoff
 
+## SH368 (Sep 20, 2026, hermes-worker): bounded app-command SEQUENCE drive on the guarded SH366 entry — the engine's own process_cmd dispatcher drives cmds {6,8,11} cleanly (marker IN INIT_WINDOW), session observables measured after EACH command confirm the dispatcher alone does NOT self-transition AppBridgeV2/surface (SESSION-CTOR wall pinned precisely); full 20-entry jump table + window-attach contract pinned in a new real-image hermetic
+Single-agent (cone suppressed). New opt-in rung `--v2boot-glue-cmd-seq` ->
+`drive_glue_process_cmd_seq` (jit.rs) on the SAME bounded SH366 dispatcher entry (once-guard stays
+OFF — SH367 measured fault on the fabricated re-arm) + real-image hermetic
+`sh368_glue_cmd_seq_jump_table_and_safe_cases_pinned` (arm64jit lib 431) + capture
+`runs/capture_sh368_glue_seq.sh`. elfjit.rs product path unchanged (rung opt-in). Workspace green
+(cargo test --workspace EXIT 0, arm64jit 431/0).
+
+### The forward this cycle
+SH366 entered the engine's REAL app-command dispatcher (0x102bcd6e4) headlessly and delivered ONE
+APP_CMD (INIT_WINDOW, marker [inner+9]=1). The operator's SESSION-CTOR directive is to "drive the
+engine's REAL Activity-session init state machine" — a real Activity consumes a QUEUE of APP_CMD
+values. SH368 extends the confirmed-green SH366 entry to a sequence of verified-safe commands
+({6,8,11}) over a SHARED fabricated app/inner/win so command state accumulates like a real queue,
+and reads back the session observables after EACH command. cmd 6/8 are disasm-verified cycle-safe
+at version-gate 0 (b.lo straight to the epilogue / write only glue bytes); cmd 11 is the
+SH366-proven INIT_WINDOW. **MEASURED (confirm:1 on attempt 1, EXIT 124, 0 crash): all three
+commands drive cleanly `process_cmd returned Ok`; cmd 11 fires the INIT_WINDOW marker
+[inner+9]=1; once-guard stays OFF.** The observables confirm the SESSION-CTOR reading precisely:
+the real dispatcher alone does NOT self-transition AppBridgeV2 ([0x106a705e8] 0x0->0) nor the
+surface XID ([0x10683d348] stays 0x200000 = the wired X11 XID, SH112) — those move only when a
+live session/do-init builds the DM world.
+
+### Honest
+Does NOT manufacture a DataModel (DM-root [0x106a68818]=0, MH_* false, Route-B live-DM structural
+gate UNCHANGED). Does not arm the (SH367 faulting) window-attach once-guard, does not create a
+real EGL surface. It advances the "drive the engine's real command queue" half of the SESSION-CTOR
+directive with re-verifiable pinned addresses (full 20-entry jump table + window-attach contract)
+and a bounded live readback that isolates the wall to do-init's live-DM construction.
+
+### Next (unchanged, authoritative)
+Route-B live-DM structural gate stands (SESSION-CTOR / do-init four-stacked closure SH184/185;
+REG_LIVE SH352). R1 content half staged+armed+serviceable (SH351/352/354). SESSION half (do-init
+owning a live DM) remains THE wall — reached only by a REAL Activity/AppBridge session drive
+(genuine EGL surface + onAppReady + real jstring) that constructs the upstream ctor for real.
+SH174 capture-latch stays the single forward hook; bounded process_cmd is the guarded entry
+(SH366/SH368). Do NOT re-arm the fabricated once-guard (SH367); do NOT re-enter the ALooper loop
+(SH365); do NOT re-drive LSM skips (SH349/350/358).
+
 ## SH367 (Sep 19/20, 2026, hermes-worker): MEASURED NEGATIVE — arming the real window-attach GL-surface path faults (SH366 next-forward executed); the SH366 clean INIT_WINDOW drive is preserved + fault pinned one level deeper into the deep GL post-init 0x22985c0
 Single-agent (cone suppressed). One new read-only observation guard
 `routeb_glue_realattach_guard` (jit.rs, opt-in JIT_ROUTEB_GLUE_REALATTACH=1, once, ZERO guest
