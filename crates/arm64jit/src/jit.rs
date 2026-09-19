@@ -7232,6 +7232,7 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         routeb_render_memcpy16_guard(state, pc); // SH391 (JIT_ROUTEB_RENDER_MEMCPY16_GUARD): deterministically skip the SH345/SH390 render-plane memcpy16 leaf's no-op self-copy when the (self,same) dest is non-writable — kills the ~1/25 SIGSEGV-for-into-.text (fix, not retry-hide)
         routeb_lsm_keytrace_guard(state, pc); // SH341 (JIT_ROUTEB_LSM_KEYTRACE): attribute which LSM pool-pop call site passes a poisoned .text KEY (root-cause of the SH268 unwritable-write wall; READ-ONLY)
         routeb_lsm_keyfix_guard(state, pc); // SH341-cross (JIT_ROUTEB_LSM_KEYFIX): redirect the LSM pop's write-target away from a poisoned .text key so the pop completes and the full-ladder Route-B route passes the persistence-lane terminal wall
+        crate::session::routeb_lsm_bt_guard(state, pc); // SH422 (JIT_ROUTEB_LSM_BT): one-shot bp-chain walk at LSM reader 0x101d99e30 names the do-init caller chain INTO the persistence lane
         routeb_appstart_408_guard(state, pc); // SH330: seed [AppStarted+0x408] (runtime heap x19) benign vt[+136] leaf at the 0x25f5050 gate (JIT_ROUTEB_APPSART_408SEED, standalone)
         routeb_busrecv_holder_guard(state, pc); // SH347 (JIT_ROUTEB_BUSRECV): measure [DataModelBindings+16] at the messageBus experience-launch cb (file 0x2bd7474) — receive-side DM holder readback (READ-ONLY, once)
         routeb_busrecv_cb_entry_guard(state, pc); // SH364 (JIT_ROUTEB_BUSRECV): measure whether the messageBus receive cb BODY (file 0x2bd744c) is ENTERED at all headlessly — distinguishes publish-side topic-match failure from live-DM-holder-null (READ-ONLY, once)
@@ -7240,9 +7241,7 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // SH248d (opt-in JIT_ROUTEB_APPSART_JAR_SEED): seed [0x106ed7a20] cookie-jar string
         // at the nativeAppBridgeAppStart string-assign site 0x1021f4830 (was NULL -> crash).
         routeb_appstart_jar_seed_guard(state, pc);
-        // SH248e (opt-in JIT_ROUTEB_APPSART_ONCE_SEED): seed the app-start once-cell
-        // global [0x106b0bdf0] -> -1 cell so fn 0x2339208 skips its pthread_mutex_lock
-        // branch (NULL once-cell -> SIGSEGV 0x102339208 on the DMCONT continuation).
+        // SH248e (JIT_ROUTEB_APPSART_ONCE_SEED): seed app-start once-cell [0x106b0bdf0] -> -1 so 0x2339208 skips its pthread_mutex_lock (NULL once-cell -> SIGSEGV 0x102339208).
         routeb_appstart_once_seed_guard(state, pc);
         // SH248f (opt-in JIT_ROUTEB_APPSART_ADAPTER_SEED): fabricate the NULL app-lifecycle
         // adapter at [0x106b0bde0] so the continuation's app-start closure dispatch (vt[0]
@@ -7256,10 +7255,7 @@ pub fn jit_run_inner(image: &[u8], base: u64, state: *mut CpuState) -> Result<u6
         // coherent dispatch obj whose vt[+16]=ret1 leaf, so the EC marshaller's
         // `ldr x8,[x8,#16]; blr x8` returns 1 and the cbnz advances the app-request build.
         routeb_ec_world_arg0_vt_guard(state, pc);
-        // SH300 (opt-in JIT_ROUTEB_EC_REALSESSION): seed the writable .bss flag
-        // [0x106d31e28]=1 at the EC-world entry so the EC body takes its real
-        // V2Init/StartLuaAppDM branch (bl 23c5538 + bl 23f1654) instead of the
-        // benign 23c1b0c singleton path — first headless execution of those fns.
+        // SH300 (JIT_ROUTEB_EC_REALSESSION): seed [0x106d31e28]=1 so the EC body takes its real V2Init/StartLuaAppDM branch (bl 23c5538 + bl 23f1654) over 23c1b0c.
         routeb_ec_world_realsession_guard(state, pc);
         // SH302 (opt-in JIT_ROUTEB_EC_READERGATE): seed the EC reader-gate
         // caller-frame object [x29,#104]=[entry_sp+8] to a zeroed buffer so the

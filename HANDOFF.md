@@ -1,5 +1,42 @@
 # Open Sober — Agent Handoff
 
+## SH422 (Sep 19, 2026, hermes-worker): a reusable guest frame-pointer chain WALKER + one-shot default-inert guard (JIT_ROUTEB_LSM_BT=1) at the persistence-lane POOL-POP entry 0x101d9a5a0 NAMES the caller chain that drains do-init into the standing SH285/SH341 LSM lane — the loop only ever logged the terminal guestpc, never the call path INTO the lane (the MIGRATION-directive hunt's missing first datum)
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+re-verified green at this exact HEAD first (capture_taskv4_frame.sh attempt 1:
+24 real task-driven frames `present swap Ok(0x1)`, 197 node pops, 0 json abort,
+0 crash; JIT_JSON_ZERO_FIX present). Production code in session.rs (off-hook)
++ one dispatch line in jit.rs (`crate::session::routeb_lsm_bt_guard`, prose
+condensed, addresses kept — jit.rs 1,048,417 B < 1MiB hook); elfjit.rs
+untouched. Workspace green (cargo test --workspace EXIT 0; arm64jit lib 480/0
+incl. 2 new sh422 hermetics; cargo build --example elfjit OK).
+- session.rs: `bp_chain_walk(fp, max)` — pure aarch64 frame-pointer walk (saved-
+  lr collection; aarch64 grows DOWN, so each caller fp is strictly higher; stops
+  on a non-domain fp, a non-ascending fp (loop/edge), or max) + `routeb_lsm_bt_guard
+  (state, pc)` — one-shot at the pool-pop entry 0x101d9a5a0, env-gated
+  JIT_ROUTEB_LSM_BT, test override `set_lsm_bt_test`; +2 hermetics (walker
+  orders/terminates; guard inert-off / walks-live-chain-on / non-target-pc).
+- MEASURED on real libroblox.so (SH408 far-reach env, EXIT 139 downstream
+  SIGSEGV after the marker): the one-shot chain FIRES — `[routeb-lsm-bt] SH422
+  at pool-pop entry 0x101d9a5a0 .. caller chain lrs: [0]0x1021db13c <-
+  [1]0x1021daf38 <- [2]0x1021e30bc <- [3]0x1021e2fdc <- [4]0x1021e2f34 <-
+  [5]0x1021e2e40 <- [6]0x10217429c <- [7]0x0`. Guest->file (minus 0x100000000):
+  pool-pop 0x1d9a5a0 <- 0x21db13c <- 0x21daf38 <- 0x21e30bc <- 0x21e2fdc <-
+  0x21e2f34 <- 0x21e2e40 <- 0x217429c (top frame in the SH381 do-init zone, near
+  the DM-ctor 0x2173b3c). Names the concrete engine path the SH285 lane swallows.
+- Re-targeted from the SH285 reader 0x1d99e30 to the pool-pop entry 0x101d9a5a0
+  after MEASURED evidence (--v2boot capture): the reader is short-circuited
+  (lsm-map seeder NOP's the LSM init store at 0x101d975f8; 0 reader-entry hits)
+  while the pool-pop IS the genuinely-reached lane terminal.
+- Honest: NOT a live DM (DM-root [0x106a68818]=0, MH_GAME_LOADED false). Route-B
+  live-DM structural gate UNCHANGED. This is an INSTRUMENT that names the caller
+  path into the standing persistence lane (the operator's "hunt the DMCONT
+  continuation and PATH-B reconstruction INSIDE this JIT" first datum), NOT a
+  lane fix and NOT a re-tread (distinct from store-watch SH4xx, LSM map
+  manufacture SH396, LSM-ctor lane wiring SH384/385, LSM skips SH349/350/358).
+  Default-inert: product path byte-identical without the env.
+- Files: docs/frontier-sh422-lsm-caller-chain.md + runs/capture_sh422_lsm_bt.sh +
+  session.rs + jit.rs.
+
 ## SH421 (Sep 19, 2026, hermes-worker): wire the recon-v3 §A "Reject" rule into code — `--taskv4-seed <guest-hex>` now REFUSES the engine's own dispatcher 0x10285371c / drain 0x102856e40 / producer 0x10285682c (infinite recursion / re-entrancy), leaving the type-4 vector [0x106829ea8] cleared instead of seeding a runaway recursive handler; session.rs taskv4_seed_rejected + hermetic (arm64jit lib 477->478), elfjit.rs pulled under the 1MiB hook (1,048,392 B) by condensing two SH-prose comments
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 re-verified green at this HEAD first AND after (capture_taskv4_frame.sh: 24

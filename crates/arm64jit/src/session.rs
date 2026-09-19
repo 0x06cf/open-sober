@@ -827,6 +827,101 @@ pub fn taskv4_seed_rejected(addr: u64) -> bool {
     matches!(addr, 0x10285371c | 0x102856e40 | 0x10285682c)
 }
 
+// --- SH422: name the caller CHAIN into the standing SH285/SH341 persistence lane ---
+//
+// Every do-init / app-start arm (SH404/405/407/408) drains into the LSM persistence
+// lane and the loop only ever logs the TERMINAL guestpc (0x101db1b08 / 0x101d9a528) —
+// never the call path INTO the lane. SH422 adds the missing instrument: a guest
+// frame-pointer chain walk (aarch64 bp-walk, saved-lr collection) fired ONCE at the
+// persistence-lane POOL-POP entry 0x101d9a5a0 (the reached terminal — MEASURED
+// reached on every full-boot far-reach composition; SH341 already logs its single
+// LR=0x10626b6dc but never the full caller chain), naming the do-init caller chain
+// that reaches the lane. Default-inert (JIT_ROUTEB_LSM_BT=1). The bp-walk reads
+// saved `fp`/`lr` pairs under the mapped-domain check, like the SH420 canary shim.
+// Guest window: pool-pop 0x1d9a5a0 (file) == 0x101d9a5a0 (guest). Zero guest mutation.
+
+/// SH422 test override (process-wide, mirrors shims::STACKCHK_TEST_OVERRIDE so a
+/// hermetic can pin the flag without racing parallel tests on std::env).
+static LSM_BT_TEST_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0); // 0=no override, 1=override ON, 2=override OFF
+
+#[doc(hidden)]
+pub fn set_lsm_bt_test(on: bool) {
+    LSM_BT_TEST_OVERRIDE.store(if on { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[doc(hidden)]
+pub fn lsm_bt_test_override() -> bool {
+    LSM_BT_TEST_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) != 0
+}
+
+/// Whether the SH422 backtrace guard is active: test-override pinned, else the
+/// production env gate (cached once).
+fn lsm_bt_active() -> bool {
+    use std::sync::atomic::Ordering;
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let ov = LSM_BT_TEST_OVERRIDE.load(Ordering::Relaxed);
+    if ov != 0 {
+        ov == 1
+    } else {
+        *GATE.get_or_init(|| std::env::var("JIT_ROUTEB_LSM_BT").ok().as_deref() == Some("1"))
+    }
+}
+
+/// Pure aarch64 frame-pointer chain walk: from `fp`, collect the saved return
+/// addresses of the caller frames (aarch64 grows DOWNWARD, so a caller fp is at a
+/// HIGHER address and the walk must strictly ascend; stop on a non-domain fp, a
+/// non-ascending fp, or after `max_frames`). `out[0]` is the current frame's
+/// saved-lr = the return address INTO the function that called the sampled site.
+fn bp_chain_walk(mut fp: u64, max_frames: usize) -> Vec<u64> {
+    let domain = |p: u64| p != 0 && p >= 0x100000000 && (p >> 48) as u16 != 0xffff;
+    let mut out = Vec::with_capacity(max_frames);
+    for _ in 0..max_frames {
+        if !domain(fp) {
+            break;
+        }
+        // SAFETY: fp is domain-checked (guest image / JIT-mapped guest stack range);
+        // same trust convention as read_visible_u64 / the SH420 canary shim.
+        let next = unsafe { std::ptr::read_unaligned(fp as *const u64) };
+        let ra = unsafe { std::ptr::read_unaligned((fp + 8) as *const u64) };
+        out.push(ra);
+        if !domain(next) || next <= fp {
+            break; // non-descending fp = frame chain edge or cycle
+        }
+        fp = next;
+    }
+    out
+}
+
+/// SH422 block-entry guard: at the persistence-lane POOL-POP entry 0x101d9a5a0,
+/// walk the live bp chain (x[29]) once per run and log the caller lrs. Read-only.
+pub fn routeb_lsm_bt_guard(state: *mut crate::jit::CpuState, pc: u64) {
+    if !lsm_bt_active() {
+        return;
+    }
+    const LSM_POP_ENTRY: u64 = 0x101d9a5a0; // SH285/SH341 persistence-lane pool-pop entry (guest)
+    if pc != LSM_POP_ENTRY {
+        return;
+    }
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ONCE: AtomicBool = AtomicBool::new(false);
+    if ONCE.swap(true, Ordering::Relaxed) {
+        return; // one-shot: the FIRST entry's chain names the path into the lane
+    }
+    let st = unsafe { &*state };
+    let chain = bp_chain_walk(st.x[29], 32);
+    let chain_fmt = chain
+        .iter()
+        .enumerate()
+        .map(|(i, ra)| format!("[{i}]{ra:#x}"))
+        .collect::<Vec<_>>()
+        .join(" <- ");
+    eprintln!(
+        "[routeb-lsm-bt] SH422 at pool-pop entry {pc:#x} sp={:#x} fp={:#x}: caller chain lrs: {}",
+        st.x[31], st.x[29], chain_fmt
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1242,5 +1337,75 @@ mod tests {
         assert!(super::taskv4_seed_rejected(0x10285682c), "producer = re-entrant push into the vector");
         assert!(!super::taskv4_seed_rejected(0x7f0000000000), "host-thunk base is the sanctioned non-recursive leaf");
         assert!(!super::taskv4_seed_rejected(0x105b32c00), "engine frame-fn is called FROM the thunk, never seeded as the vector entry");
+    }
+
+    /// SH422 bp-chain walker: from a leaked host frame chain (ascending aarch64
+    /// frames), collect the saved-lr caller chain in order; terminate on a loop /
+    /// non-ascending fp / non-domain fp. Pure — no env, no guest bytes.
+    #[test]
+    fn sh422_bp_chain_walk_orders_and_terminates() {
+        let mem = Box::leak(vec![0u64; 0x200].into_boxed_slice());
+        let base = mem.as_mut_ptr() as usize;
+        // aarch64: current (deepest) frame has the LOWEST fp; each caller's
+        // saved-fp sits at a strictly HIGHER address (current < caller < top).
+        let cur = base;
+        let cal = base + 0x80;
+        let top = base + 0x100;
+        unsafe {
+            let w = |a: usize, v: u64| std::ptr::write_unaligned(a as *mut u64, v);
+            w(top, 0u64); // top frame: no caller -> chain edge
+            w(top + 8, 0x10222222);
+            w(cal, top as u64);
+            w(cal + 8, 0x10211111);
+            w(cur, cal as u64);
+            w(cur + 8, 0x10200000);
+        }
+        let chain = bp_chain_walk(cur as u64, 32);
+        assert_eq!(
+            chain,
+            vec![0x10200000, 0x10211111, 0x10222222],
+            "walk collects saved-lrs from current (deepest) outward, in call order"
+        );
+        // Loop protection: point the caller frame's saved-fp BACK at the current fp.
+        unsafe { std::ptr::write_unaligned(cal as *mut u64, cur as u64); }
+        let cyc = bp_chain_walk(cur as u64, 32);
+        assert_eq!(cyc.len(), 2, "non-ascending fp terminates the walk (no infinite loop)");
+        // Non-domain fp (below the guest window) terminates immediately.
+        assert!(bp_chain_walk(1u64, 32).is_empty(), "sub-domain fp stops the walk");
+    }
+
+    /// SH422 guard gating: inert (no panic) when the override is OFF even at the
+    /// reader pc; when ON it walks the LIVE bp chain from the CpuState and returns
+    /// 0; a non-reader pc stays inert even when ON. Uses the process-local override
+    /// so a hermetic pins the flag without racing parallel tests on std::env.
+    #[test]
+    fn sh422_guard_inert_unless_override_and_reads_live_chain() {
+        let mem = Box::leak(vec![0u64; 0x200].into_boxed_slice());
+        let base = mem.as_mut_ptr() as usize;
+        let cur = base;
+        let cal = base + 0x80;
+        let top = base + 0x100;
+        unsafe {
+            let w = |a: usize, v: u64| std::ptr::write_unaligned(a as *mut u64, v);
+            w(top, 0u64);
+            w(top + 8, 0x10222222);
+            w(cal, top as u64);
+            w(cal + 8, 0x10211111);
+            w(cur, cal as u64);
+            w(cur + 8, 0x10200000);
+        }
+        let mut st = crate::jit::CpuState::new();
+        st.x[29] = cur as u64;
+        st.x[31] = cur as u64;
+        let pop_entry = 0x101d9a5a0u64;
+        // OFF -> inert even at the target pc (no panic).
+        set_lsm_bt_test(false);
+        routeb_lsm_bt_guard(&mut st as *mut _, pop_entry);
+        // ON -> walks the live chain from the CpuState and returns 0 (no panic).
+        set_lsm_bt_test(true);
+        routeb_lsm_bt_guard(&mut st as *mut _, pop_entry);
+        // Non-target pc stays inert even when ON.
+        routeb_lsm_bt_guard(&mut st as *mut _, 0x101d99e30);
+        set_lsm_bt_test(false);
     }
 }
