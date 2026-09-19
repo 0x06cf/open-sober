@@ -3122,17 +3122,13 @@ fn routeb_dm_ctor_driver_guard(_state: *mut CpuState, pc: u64) {
     });
 }
 
-/// SH187 (recon deleg_1c244411, authoritative): drive the REAL DM ctor wrapper guest
-/// 0x1023f5ff8 (which `bl 0x23f6038` -> the DataModel ctor) via run_guest_callback so the JIT
-/// CONSTRUCTS a genuine DataModel through its real code (the operator's "dynamic DM-ctor trace"),
-/// rather than only hand-planting a manufactured vptr set. The wrapper's builder-descriptor ABI
-/// (decoded): desc[+0]=P0 -> small struct (subobject-init arg), desc[+8]=&A(u64), desc[+16]=&B(u32),
-/// desc[+24]=&C(u64), desc[+32]=&D(u64), each a pointer to a small guest cell; object size >= 0x998
-/// (stores to +0x990). If the drive survives, verify obj's first three words are the GENUINE vptr
-/// set {0x67162e8, 0x67163a0, 0x67163f8} and report. default-inert (env JIT_ROUTEB_DM_REALCTOR=1),
-/// scoped to StartLuaAppDM entry. Best-effort: any guest-side fault returns Ok from the drive and
-/// is reported, never propagated. This is a diagnostic route-B lever; the runner owns empiral
-/// verification.
+/// SH187 (deleg_1c244411): drive the REAL DM ctor wrapper 0x1023f5ff8 (bl 0x23f6038 = DataModel ctor)
+/// via run_guest_callback so the JIT CONSTRUCTS a genuine DM through its real code (the operator's
+/// "dynamic DM-ctor trace"), not only hand-planting a vptr set. Wrapper builder-descriptor ABI:
+/// desc[+0]=P0 (subobject-init arg), desc[+8]=&A(u64), desc[+16]=&B(u32), desc[+24]=&C(u64),
+/// desc[+32]=&D(u64); object size >=0x998. On survivor verify the first 3 words are the GENUINE vptr
+/// set {0x67162e8,0x67163a0,0x67163f8}. default-inert (JIT_ROUTEB_DM_REALCTOR=1), scoped to
+/// StartLuaAppDM entry. Best-effort: any guest fault returns Ok, never propagated.
 fn routeb_dm_real_ctor_drive_guard(_state: *mut CpuState, pc: u64) {
     if std::env::var_os("JIT_ROUTEB_DM_REALCTOR").is_none() {
         return;
@@ -3144,23 +3140,18 @@ fn routeb_dm_real_ctor_drive_guard(_state: *mut CpuState, pc: u64) {
     }
     const DM_WRAPPER: u64 = 0x1023f5ff8; // wrapper: loads descriptor, bl 0x23f6038, returns obj+0x1f0
     const OBJ_SZ: u64 = 0xb00;
-    // SH187 follow-up (recon deleg_fa2be765, authoritative): the ctor body 0x1023f6038..0x23f6130
-    // is BRANCH-FREE straight-line code; the drive halts INSIDE `bl 0x23f6b0c` (subobject ctor) at
-    // guest 0x1023f60b8 (opcode 0x94000295) — it does not return in the JIT (EXIT 124), it does
-    // NOT take an early-return branch. To fall through to the genuine-vptr writes at 0x23f6130,
-    // NOP `bl 0x23f6b0c` (aarch64 NOP = 0xd503201f). The subobject ctor's own protected vcall path
-    // (blr [vt+2]) is guarded by cbz/cbnz x20 (seeds to 0 = skipped), and its __stack_chk_fail
-    // guard reads the global 0x67d1000+0x6f0 canary — both non-issues once NOP'd (it never runs).
+    // SH187 follow-up (deleg_fa2be765): ctor body 0x1023f6038..0x23f6130 is BRANCH-FREE straight-line;
+    // the drive halts INSIDE `bl 0x23f6b0c` (subobject ctor) at 0x1023f60b8 (opcode 0x94000295) — no
+    // early-return branch. To fall through to the genuine-vptr writes at 0x23f6130, NOP `bl 0x23f6b0c`
+    // (NOP = 0xd503201f). The subobject's vcall path (blr [vt+2]) is cbz/cbnz x20-seeded to 0 (skipped)
+    // and its __stack_chk_fail reads global 0x67d1000+0x6f0 canary — both non-issues once NOP'd.
     const NOP_SUBOBJ: u64 = 0x1023f60b8; // `bl 0x23f6b0c` insn slot
-    // SH229 (this cycle): opt-in FULL ctor. SH187 only ever measured the PARTIAL DM produced by
-    // NOP'ing `bl 0x23f6b0c`. That subobject ctor (recon sh189) builds the DM's INTERNAL 361-entry
-    // class/instance index (bl 0x2374c90, xo=obj+0x2a0, w1=0x169, x2=&stack-pair) after a base
-    // subobject init (bl 0x5e18df4). Disasm of both callees shows each can RETURN cleanly when the
-    // source-pair pointer it walks is a coherent zeroed buffer (the per-iteration refcount blt
-    // 0x2b9e950 is skipped when the 8-byte pair second word == 0), so under this env we leave the
-    // `bl 0x23f6b0c` INTACT and drive the ctor with the extraneous pair-slots seeded, letting the
-    // subobject run to completion. This is a NEW measurement (SH187 never ran the full ctor) — the
-    // operator's "drive its ctor world-build further" line.
+    // SH229: opt-in FULL ctor. SH187 only measured the PARTIAL DM (NOP'd bl 0x23f6b0c). That subobject
+    // ctor (sh189) builds the DM's internal 361-entry class/instance index (bl 0x2374c90, xo=obj+0x2a0,
+    // w1=0x169, x2=&stack-pair) after base subobject init (bl 0x5e18df4). Each callee RETURNS cleanly
+    // when its source-pair pointer is a coherent zeroed buffer (refcount blt 0x2b9e950 skipped when the
+    // pair second word==0), so under FULL we leave `bl 0x23f6b0c` INTACT + seed the pair-slots, letting
+    // the subobject run to completion — a NEW measurement (SH187 never ran the full ctor).
     let full_subobj_env = std::env::var_os("JIT_ROUTEB_DM_REALCTOR_FULL").is_some();
     use std::sync::OnceLock;
     static DRIVEN: OnceLock<()> = OnceLock::new();
@@ -3358,20 +3349,17 @@ fn routeb_lsm_ctor_manufacture_drive(_state: *mut CpuState, pc: u64) {
 }
 
 /// SH189 (Route-B): the genuine DM's service container ([dm+0x68] singly-linked list,
-/// [dm+0x78] 16-byte-stride class-descriptor vector) is built LAZYLY by name-resolution,
-/// and the global class-name registry (header guest 0x106dca0e70, resolver 0x102373dec)
-/// is .bss-zeroed until a class-registration once-init runs. PlayerGui/CoreGui/ScreenGui
-/// are NEVER constructed in the DM ctor (SH189 recon deleg_58cfcb06 authoritative) — the
-/// first unsynthesized object on the path to an engine-self-constructed GuiObject is the
-/// PlayerGui class descriptor in that registry, populated by the register stub
-/// 0x10201fda4 (guard 0x6c980b8, classid 0x87e, typeid 0x298, name 0x10595eeb). This guard,
-/// armed on the SH187-constructed genuine DM holder (*0x106391908 == ctor ret == obj+0x1f0),
-/// (1) hangs a coherent EMPTY service list on the DM so the walkers
-/// (0x105e09bc8 / 0x10237da38) never NULL-walk, and (2) DRIVES the real PlayerGui register
-/// stub through the JIT to populate the global class-name registry, then probes the
-/// registry element count. default-inert (env JIT_ROUTEB_DM_SERVICES=1), idempotent,
-/// best-effort (any guest fault returns Ok and is reported). The manual loop resolves the
-/// one-next-unsynthesized-object.
+/// [dm+0x78] 16-byte-stride class-descriptor vector) is built LAZILY by name-resolution, and the
+/// global class-name registry (header 0x106dca0e70, resolver 0x102373dec) is .bss-zeroed until a
+/// class-registration once-init. PlayerGui/CoreGui/ScreenGui are NEVER constructed in the DM ctor
+/// (deleg_58cfcb06) — the first unsynthesized object on the path to an engine-self-constructed
+/// GuiObject is the PlayerGui class descriptor, populated by register stub 0x10201fda4 (guard
+/// 0x6c980b8, classid 0x87e, typeid 0x298, name 0x10595eeb). Armed on the SH187 genuine DM holder
+/// (*0x106391908 == ctor ret == obj+0x1f0), this guard (1) hangs a coherent EMPTY service list so
+/// the walkers (0x105e09bc8/0x10237da38) never NULL-walk, and (2) DRIVES the real PlayerGui register
+/// stub through the JIT to populate the registry, then probes the element count. default-inert
+/// (JIT_ROUTEB_DM_SERVICES=1), idempotent, best-effort (any guest fault returns Ok and is reported).
+/// The manual loop resolves the one-next-unsynthesized-object.
 fn routeb_dm_service_seed_guard(_state: *mut CpuState, pc: u64) {
     if std::env::var_os("JIT_ROUTEB_DM_SERVICES").is_none() {
         return;
@@ -3671,8 +3659,7 @@ fn routeb_dm_instance_ctor_capture(state: *mut CpuState, pc: u64) {
 /// 0x23737d4-0x23737dc) then bl 0x21daef8 — different from the loop's *0x106391908 holder. So
 /// plant *(0x107333948)=constructed DM, then drive the PlayerGui pair-consumer 0x10255d0e4
 /// (w0=typeid 0x298, w3=classid 0x87e, x4=ctor-functor 0x255d1b4, x5=&{dm,classid}, x8=&out via
-/// run_guest_callback_x8). default-inert (env JIT_ROUTEB_DM_INSTANCE=1). The instance
-/// construction itself is the Route-B frontier; this is the first headless instance-ctor drive.
+/// run_guest_callback_x8). default-inert (JIT_ROUTEB_DM_INSTANCE=1). First headless instance-ctor drive.
 fn routeb_dm_instance_guard(_state: *mut CpuState, pc: u64) {
     if std::env::var_os("JIT_ROUTEB_DM_INSTANCE").is_none() {
         return;
@@ -3841,28 +3828,21 @@ fn routeb_dm_instance_guard(_state: *mut CpuState, pc: u64) {
     });
 }
 
-/// SH191 (Route-B service-node attach): after SH190e self-constructs a real
-/// RBX::PlayerGui INSTANCE (engine-authored, [obj+0]=0x106648950), make it a real
-/// PlayerGui SERVICE NODE on the genuine DM's service list [dm+0x68] ([node+0x18]
-/// classid==0x87e), then drive the engine's OWN getService walker 0x105e09bc8 to
-/// RESOLVE "PlayerGui" -> classid and MATERIALIZE the instance into its out-pair.
-///
-/// This closes the exact SH190e-documented gap ("PlayerGui not a service NODE on
-/// [dm+0x68] ([node+0x18]==0x87e)") USING the engine-authored instance (not a
-/// fabricated one): the node's [node+8]= the captured PlayerGui obj (vptr
-/// 0x106648950), so the walker's materializer 0x2377600 reads {instance, refcount}
-/// at [node+8]/[node+16] and returns the SELF-constructed instance from the genuine
-/// DM. Host work = link the thin node only; the instance + resolution are engine.
-///
-/// WALKER ABI (disasm 0x5e09bc8): x0=dm, x1=&name (libc++ std::string), x8=&out
-/// (16-byte {item,refcount}). It resolves name->classid via the class-name registry
-/// 0x106dca0e70 (resolver 0x2373cec), then walks [dm+0x68] singly-linked (node[+0x18]==classid,
-/// node[+0x68]=next) and on match calls materializer 0x2377600(node,&out) copying [node+8]/[node+16].
-/// NAME decode (0x5e09bfc): `ldrb w8,[x1]; lsr w8,#1` — byte0=(cap|bit0=long); long => data at [x1+16].
-/// Fabricate long-form name {__cap_=0x13 (long), __size_=9, __data_=&"PlayerGui"} -> walker passes key
-/// ptr+len=9 -> resolver matches the engine's own "PlayerGui" key (9 chars).
-/// default-inert (env JIT_ROUTEB_DM_SERVICE_NODE=1). Node thin+host-leaked; gated on genuinely
-/// constructed instance (vptr 0x106648950).
+/// SH191 (Route-B service-node attach): after SH190e self-constructs a real RBX::PlayerGui
+/// INSTANCE (engine-authored, [obj+0]=0x106648950), make it a real PlayerGui SERVICE NODE on the
+/// genuine DM's [dm+0x68] list ([node+0x18]==0x87e), then drive the engine's OWN getService walker
+/// 0x105e09bc8 to RESOLVE "PlayerGui" -> classid and MATERIALIZE it into its out-pair. Closes the
+/// SH190e gap ("PlayerGui not a service NODE on [dm+0x68]") USING the engine-authored instance (not
+/// a fabricated one): [node+8]= the captured PlayerGui obj, so materializer 0x2377600 reads
+/// {instance,refcount} at [node+8]/[node+16] and returns the SELF-constructed instance. Host work =
+/// link the thin node only; instance+resolution are engine.
+/// WALKER ABI (0x5e09bc8): x0=dm, x1=&name (libc++ std::string), x8=&out (16-byte {item,refcount}).
+/// Resolves name->classid via registry 0x106dca0e70 (resolver 0x2373cec), walks [dm+0x68] (node[+0x18]
+/// ==classid, [node+0x68]=next), on match materializer 0x2377600 copies [node+8]/[node+16].
+/// NAME decode (0x5e09bfc): `ldrb w8,[x1]; lsr w8,#1` — byte0=(cap|bit0=long); long => [x1+16].
+/// Fabricate long-form name {__cap_=0x13 (long), __size_=9, __data_=&"PlayerGui"} -> key ptr+len=9 ->
+/// resolver matches engine's own "PlayerGui" key (9 chars). default-inert (JIT_ROUTEB_DM_SERVICE_NODE=1).
+/// Node thin+host-leaked; gated on genuinely constructed instance (vptr 0x106648950).
 fn routeb_dm_service_resolve_guard(_state: *mut CpuState, pc: u64) {
     if std::env::var_os("JIT_ROUTEB_DM_SERVICE_NODE").is_none() {
         return;
@@ -4501,15 +4481,11 @@ fn dm_capture_worth(bytes: usize, base_ok: bool) -> bool {
 /// Default-inert (env off -> no seed, no trailing; the fast/live allocator path is
 /// byte-identical). Idempotent.
 ///
-/// SH169 DELEGATION EXTENSION: replacing the engine's own nonzero ACTIVE hook with a host-calloc
-/// trail guest-SIGABRTs the free-path (EXIT 134, SH167) — engine allocations come from its own
-/// pool, so a host-calloc result is un-freable by the engine's free. Delegation fixes it: when
-/// ACTIVE is nonzero, SAVE it into PREV_DM_ALLOC_HOOK before installing the trail; whenever a
-/// prev hook exists the trail performs the real allocation by calling THROUGH the JIT to the
-/// engine's hook (run_guest_callback) — so the returned base is from the engine's pool, its free
-/// path stays valid. Captures+validates the base (vt word in-image) instead of blindly logging.
-/// Capture-only DELEGATION (the SH167-correct migration-time design), not replacement. Latent
-/// until a real session's make_shared<DataModel> runs.
+/// SH169 DELEGATION: replacing a nonzero engine ACTIVE hook with host-calloc guest-SIGABRTs the
+/// free-path (EXIT 134, SH167) — engine allocs come from its own pool. So SAVE ACTIVE to
+/// PREV_DM_ALLOC_HOOK before installing; with a prev hook the trail calls THROUGH the JIT
+/// (run_guest_callback) so the base is from the engine's pool and its free stays valid; falls back
+/// to host-calloc only when no engine hook. Capture-only delegation (SH167-correct), not replacement.
 extern "C" fn routeb_dm_alloc_capture(
     a0: u64,
     a1: u64,
@@ -17778,6 +17754,32 @@ mod fp16_and_fabd_fccmp_exec {
             );
         } else {
             eprintln!("sh402 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
+    fn sh403_startapp_pipe_then_doinit_reach_pinned() {
+        // SH403: StartApp boot body advances past sh402's last pc (0x258b268) through 0x10258b3a0,
+        // enters app-bridge pipe `bl 0x10258b2dc -> 0x2baeeec` (RECON-V3: -> do-init 0x2206c40),
+        // then do-init 0x102206c40 + deep body + post-do-init worker 0x1023eff4c (2/2, EXIT 124,
+        // 0 crash). SH361 dispatch fires but 0x10258b5d8 body never entered (SH362 holds);
+        // DMCONT 0x102bd1d68 = 0. Byte-pin the chain.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let word_at = |vaddr: u64| -> u32 {
+                let off = (vaddr & 0xffff_ffff) as usize;
+                let b = &img[off..off + 4];
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            };
+            // pipe prologue d10143ff; boot bl 0x2baeeec @0x10258b2dc; do-init d10303ff; post d10603ff.
+            assert_eq!(word_at(0x102baeeec), 0xd101_43ff, "sh403 pipe prologue");
+            assert_eq!(word_at(0x10258b2dc), 0x9418_8f04, "sh403 boot bl to pipe");
+            assert_eq!(word_at(0x102206c40), 0xd103_03ff, "sh403 do-init prologue");
+            assert_eq!(word_at(0x1023eff4c), 0xd106_03ff, "sh403 post-doinit prologue");
+            eprintln!("[abi] sh403 StartApp boot body -> pipe 0x2baeeec -> do-init 0x2206c40 -> post-doinit 0x1023eff4c pinned");
+        } else {
+            eprintln!("sh403 real-image guard: no real libroblox.so, skipping anchors");
         }
     }
 

@@ -1,5 +1,26 @@
 # Open Sober — Agent Handoff
 
+## SH403 (Sep 20, 2026, hermes-worker): the StartApp boot body advances into the app-bridge pipe -> do-init chain — the RECON-V3 convergence line now runs headlessly through the SH400 ordered substrate; DMCONT 0x102bd1d68 + the 0x10258b5d8 dispatch body remain the two un-reached do-init construction gates
+Single-agent (cone suppressed). Disasm traced the StartApp boot body interior -> `bl 0x2baeeec`
+@0x10258b2dc = the app-bridge pipe RECON-V3 names ("StartAppWithParams 0x258b144 AND StartLuaAppDM
+converge on the app-bridge pipe bl 0x2baeeec -> do-init 0x2206c40"). MEASURED (real libroblox.so,
+2/2, EXIT 124, 0 crash): StartApp boot body runs PAST SH402's last block-entry pc (0x258b268)
+through 0x10258b3a0; the app-bridge pipe 0x102baeeec is ENTERED; do-init 0x102206c40 runs its DEEP
+body (20 block-entry pcs 0x102206c40..0x102206fac); the post-do-init worker 0x1023eff4c runs; the
+SH361 DM-ctor trace fires (container+32 non-NULL -> vt[+48]=0x10258b5d8 @0x2206e24). So the
+RECON-V3 convergence chain StartApp boot body -> pipe -> do-init -> post-do-init worker now
+executes headlessly — do-init + its worker were never reached via the StartApp path before (only
+via Standalone StartLuaAppDM). DMCONT 0x102bd1d68 = 0 hits (standing next gate); the 0x10258b5d8
+dispatch BODY still never entered (SH362 holds — parks cleanly EXIT 124, no fault). Also MEASURED
+two never/now-run compositions (genuine-single + old SH371 DMCONT rungs; plain SH371 re-run) both
+abort at the run-variable live-object arm 0x10284cfa0 (EXIT 134). New real-image hermetic sh403
+(arm64jit lib 451->452) byte-pins the pipe (0x2baeeec d10143ff) / boot `bl 0x2baeeec` @0x10258b2dc
+(94188f04) / do-init prologue (0x102206c40 d10303ff) / post-doinit worker (0x1023eff4c d10603ff);
++2 capture scripts + frontier doc. Honest: no DM (DM-root 0, MH_* false, AppBridgeV2 vt 0x1063a3410
+unchanged). The forward: the do-init construction line is now reachable from the StartApp path;
+DMCONT + 0x258b5d8 body are the two un-reached gates. Workspace green (632/0; jit.rs 31 B under
+the 1MiB hook after condensing SH-prose comments, elfjit.rs untouched).
+
 ## SH402 (Sep 20, 2026, hermes-worker): CORRECTED SH401's StartAppWithParams attribution + MEASURED the REAL StartApp boot body + app-shell band reach through the ordered substrate; DMCONT 0x102bd1d68 remains the standing next gate (0 hits)
 Single-agent (cone suppressed). SH401 measured the governor reach but mis-attributed the
 governor's `bl 0x258c6e4` as a "StartAppWithParams entry" — RECON-V3's prose already flagged
