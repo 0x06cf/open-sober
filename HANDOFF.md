@@ -1,5 +1,27 @@
 # Open Sober — Agent Handoff
 
+## SH413 (Sep 22, 2026, hermes-worker): land the INPUT runtime axis — the SEP-18 BUILD-THE-RUNTIME surface the operator names last ("session boot, then screens, then audio, then input"); audio (SH132) was done, input had ZERO guest-facing wiring (input-wrapper crate orphaned dead code + no host path into the guest's GameActivity input natives). New off-hook module ainput.rs mirrors the SH132 fake-AAudio pattern: env-gated (JIT_AINPUT_BRIDGE), latent-but-correct, hermetic-ABI + real-image-pinned to the actual instruction bytes
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified green first
+(capture_taskv4_frame.sh attempt 1: 24 real task-driven frames `present swap Ok(0x1)`, 197 node pops,
+0 json abort, 0 crash). Production code only in the new off-hook module ainput.rs (+ one-line
+`pub mod ainput` in lib.rs); jit.rs/elfjit.rs untouched (at/near the 1MiB hook, byte-unchanged).
+Workspace green (arm64jit lib 465/0 incl. the new 6 ainput hermetics; cargo test --workspace EXIT 0).
+- MEASURED (hermetic + real 109MB APK .so): the 6 ainput tests pass, and the real-image pin asserts
+  byte-exact instruction words at the guest input-native addresses — nativePassInput @0x2bbba88
+  prologue 0xd10143ff, nativePassMouseMove @0x2bbbcf4 0xd10143ff, input consumer leaf 0x2e4e68c
+  0xd10503ff, internal `bl 0x2e4e68c` = 0x940a4aed @ nativePassInput+0x50. Verifies the input
+  delivery ABI (env, this, action, pointerId, float x/y in s0/s1) on verified bytes.
+- ainput.rs: `marshal_touch` (places int args in x2/x3 + packs float x/y into the SIMD v-lanes the
+  JIT's `fmov s8,s1; fmov s9,s0` reads), `fire_touch` (drives a translated touch into guest
+  nativePassInput via fresh CpuState + jit_run; NOP/Ok(0) when bridge env unset or no live image),
+  `translate_pointer`/`translate_motion` binding the previously-orphaned input-wrapper translation to
+  a real guest delivery target. 6 hermetic tests.
+- Honest: latent-but-correct, exactly like SH132 — input only matters once a live session owns a
+  screen (Route-B live-DM gate UNCHANGED: DM-root 0, MH_GAME_LOADED false). The bridge is the correct
+  host-side capability on the input direction; inert behind the env gate (default product path
+  byte-identical). No re-treads (input axis, not DM/LSM/glass). recon-v3 deliverables unchanged-green.
+- Files: docs/frontier-sh413-input-bridge.md + runs/capture_ainput_bridge.sh. Commit (pending).
+
 ## SH412 (Sep 19, 2026, hermes-worker): promote the G3 CONTENT surface — the engine's own files-dir libc++ string [0x10726d600] + the R1 CoreScript stage — into the ordered session substrate as a first-class driven runtime step (SH407/408 measured the equivalent --v2boot-set-filesdir/--v2boot-r1-stage rungs NEVER fire on reaching envs; wiring it into drive_routeb_session_substrate right after the MessageBus.subscribe atom makes it a driven step, exactly as SH411/411b promoted the binder + app-start)
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified green first
 (capture_taskv4_frame.sh attempt 1: 24 real task frames `present swap Ok(0x1)`, 197 pops, 0 json
