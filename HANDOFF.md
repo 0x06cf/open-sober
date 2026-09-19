@@ -1,5 +1,59 @@
 # Open Sober — Agent Handoff
 
+## SH436 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD bitwise-select + high-narrow codegen families (translate.rs SimdSel, SimdHighNarrow) — 4 exact-byte pins of the 3-input bitwise select (bsl/bit/bif) and narrowing add (addhn/raddhn) that drive blend masks + byte-level color/normal packing: the BSL (Rn&Rd)|(~Rd&Rm) full-buffer pins the exact pand/pandn/por operand mapping (pandn dst=xmm2 rm=xmm1); the BIT/BIF op=1 inverts the operand ORDER (leads pandn xmm0,xmm1 ~Rm&Rn then pand xmm2,xmm1, never BSL's Rn&Rd first — a transposed mask picks the wrong source); addhn no-round shr-by-dst_bits with no round-carry + Q=0 zeroes the Vd upper half (mov rax,0 + mov [Vd+8],rax); raddhn adds 1<<(dst_bits-1)=0x8000 BEFORE the narrowing shift — round-carry presence + position is the raddhn-vs-addhn discriminator
+Single-agent (cone suppressed). recon-v3 deliverables re-verified green at the
+SH435 HEAD first (capture_taskv4_frame.sh attempt 1: 24 real task-driven frames
+`present swap Ok(0x1)`, 194 node pops, 0 json abort, 0 crash, EXIT 124).
+Workspace green (cargo test --workspace EXIT 0; arm64jit lib 577/0 incl. 4 new
+sh436 pins, was 573; cargo build --example elfjit OK). Production code ONLY in
+translate.rs `#[cfg(test)]` addition (translator core byte-untouched; jit.rs
+1,048,390 B < 1MiB hook; elfjit.rs/session.rs unchanged).
+- SimdSel (bsl/bit/bif) and SimdHighNarrow (addhn/raddhn) had no direct byte
+  tests. SH436 pins the semantically-critical discriminators a byte error
+  silently corrupts: (1) SimdSel op=0 BSL full-buffer — load Rn@0x120(xmm0)/
+  Rm@0x130(xmm1)/Vd@0x110(xmm2), `pand xmm0,xmm2` (Rn&Rd) then `pandn xmm2,
+  xmm1` (~Rd&Rm, dst=xmm2/rm=xmm1) then `por xmm0,xmm2`, store Vd; (2) op=1
+  BIT/BIF — window discriminator: op=1 LEADS `pandn xmm0,xmm1` (~Rm&Rn) then
+  `pand xmm2,xmm1` (Rd&Rm), never BSL's Rn&Rd first; (3) addhn no-round —
+  add rax,rcx + `shr rax,16` (dst_bits) with NO round-carry + Q=0 zeroes the
+  Vd upper half (mov rax,0 + mov [Vd+8],rax = the C7-imm form is NOT used);
+  (4) raddhn — `mov r10,0x8000` (=1<<(dst_bits-1)) added BEFORE the narrowing
+  shift; round-carry presence + position is the discriminator.
+- 4 exact-byte pins via synthetic `Inst` -> translate() -> CodeBuf.as_slice()
+  (zero-pc 0x1000 = deterministic); full-buffer + subsequence-window asserts.
+  [RBX]=CpuState; vector slot v[t]=VECTOR_BASE(0x110)+t*16. A one-off
+  dump_sh436 example established two exact byte forms during development (the
+  bare 4-byte pandn xmm0,xmm1 = 66 0F DF C1, and the Q=0 upper-half zero via
+  mov rax,0 + mov [Vd+8],rax) and was removed before commit — the tree ships
+  only the `#[cfg(test)]` additions.
+- Honest: NOT a DM (SH415 probe re-confirms DM-root [0x106a68818]=0x0 under the
+  complete substrate; Route-B live-DM gate UNCHANGED). BUILD-THE-RUNTIME
+  codegen-surface coverage completion, continuing the SH427-435 translator-core
+  lineage. No re-treads (distinct from SH432 SminMax/SimdSatAdd, SH434 shifts,
+  SH435 fcvt, SH433 Fmla).
+- Files: docs/frontier-sh436-translator-simdsel-highnarrow.md +
+  crates/arm64jit/src/translate.rs (`#[cfg(test)]` only). Commit 4d52dae.
+
+## SH435 (Sep 19, 2026, hermes-worker): hermetic coverage of the FP conversion codegen families (translate.rs Fcvt, FcvtTzReg, FcvtHalf) — 7 exact-byte pins of the widen/narrow/trunc/FP16 conversions every color-intensity/light/texture-sample path leans on: the S->D widen (movd xmm0,eax + F3 cvtss2sd + movq 64-bit store) vs D->S narrow (F3 48 0F 7E movq_load + F2 cvtsd2ss + movd + 32-bit store) — the F3-vs-F2 opcode + lane-width discriminator; fcvtzs uses cvttsd2si (F2 48 0F 2C) DIRECTLY (x86 already trunc-toward-zero, no pre-round); SIGNED vs UNSIGNED — fcvtzu appends the clamp (test rax,rax 48 85 C0 / cmovs 48 0F 48 C1) so negatives become 0, the cmovs presence is the discriminator; FcvtHalf FP16 via F16C vcvtph2ps promote (c4 e2 79 13) / vcvtps2ph demote (c4 e3 79 1d), H->D wides after promote, D->H narrows before demote
+Single-agent (cone suppressed). recon-v3 deliverables re-verified green at the
+SH434 HEAD first (capture_taskv4_frame.sh attempt 1: 24 real task-driven frames
+`present swap Ok(0x1)`, 194 node pops, 0 json abort, 0 crash, EXIT 124).
+Workspace green (cargo test --workspace EXIT 0; arm64jit lib 573/0 incl. 7 new
+sh435 pins, was 566; cargo build --example elfjit OK). Production code ONLY in
+translate.rs `#[cfg(test)]` addition (translator core body byte-untouched;
+jit.rs 1,048,390 B < 1MiB hook; elfjit.rs/session.rs unchanged). Two of my
+initial window-width assertions were corrected during development (a bare
+4-byte op needs windows(4), not windows(3)) — the shipped tests pin the real
+emission. 7 exact-byte pins via synthetic Inst -> translate() ->
+CodeBuf.as_slice() (zero-pc 0x1000 = deterministic); [RBX]=CpuState; vector
+slot v[t]=VECTOR_BASE(0x110)+t*16. Honest: NOT a DM (DM-root [0x106a68818]=0x0
+under the complete substrate; Route-B live-DM gate UNCHANGED).
+BUILD-THE-RUNTIME codegen-surface coverage completion on the FP conversion
+families, continuing the SH427-434 translator-core lineage. No re-treads
+(distinct from SH433 Fmla FP FMA, SH434 integer shifts). Files:
+docs/frontier-sh435-translator-fcvt-conversions.md + crates/arm64jit/src/
+translate.rs (`#[cfg(test)]` only). Commit 00cd1f7.
+
 ## SH434 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD shift-and-accumulate codegen families (translate.rs SimdShl, SimdShr, SimdShrAcc) — 6 exact-byte pins of the integer shift/rounding math every vertex-index/packed-color/image-lane path leans on: the shl-vs-shr opcode byte (shl C1/E0 vs unsigned shr C1/E8 vs signed arithmetic sar C1/F8 — a shift-direction flub moves every lane the wrong way), the SIGN-extend-before-arithmetic-shift requirement (sshr esize=4 movsxd 48 63 then sar; ushr zero-extend movzx + shr, never movsxd — a zero-extended negative element flips its sign bit), the shift>=esize-bits guard (unsigned xor-to-zero 48 31 C0 vs signed all-ones sign-fill sar,63 48 C1 F8 3F — a bare x86 imm clamps instead), and the SimdShrAcc accumulate ordering (Vd read AFTER the shift, add rcx,rax 48 01 C1, re-store — separates usra/ssra from a plain overwrite)
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 re-verified green at this exact HEAD first (capture_taskv4_frame.sh attempt 1:
