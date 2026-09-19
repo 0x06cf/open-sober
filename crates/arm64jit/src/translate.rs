@@ -8548,4 +8548,87 @@ mod tests {
         assert!(d.windows(4).any(|w| w == [0xf2, 0x0f, 0x5a, 0xc0]), "D->H narrows via cvtsd2ss");
         assert!(d.windows(6).any(|w| w == [0xc4, 0xe3, 0x79, 0x1d, 0xc0, 0x00]), "D->H then demotes via vcvtps2ph");
     }
+
+// SH436: hermetic coverage of the SIMD bitwise-select + high-narrow codegen
+    // families (translate.rs SimdSel, SimdHighNarrow) — the 3-input bitwise
+    // select (bsl/bit/bif) and the narrowing add/sub that drive blend masks
+    // and byte-level color/normal packing in rendered content. These had no
+    // direct byte tests. SH436 pins the discriminators a byte error silently
+    // corrupts: (1) SimdSel BSL (op=0) = (Rn & Rd) | (~Rd & Rm) vs BIT/BIF
+    // (op=1) = (~Rm & Rn) | (Rd & Rm) — the operand ORDER of the pandn/pand
+    // pair is the semantic separator (a transposed mask picks the wrong
+    // source vector); (2) SimdHighNarrow addhn (no-round) does add + NO round-
+    // width add, vs raddhn (round) that adds 1<<(dst_bits-1) BEFORE the shr —
+    // the round-carry presence is the discriminator, and the shr_ri8 by
+    // dst_bits (a width flub drops the wrong high half); (3) SimdHighNarrow
+    // Q=0 zeroes the upper half of Vd (`mov qword [rd+8],0`) vs Q=1 (upper)
+    // which does not — the upper-half clear is the Q discriminator.
+    // Exact-byte full-buffer + window asserts; synthetic Inst -> translate()
+    // (tr_bytes); deterministic, no image/env. [RBX]=CpuState; vector slot
+    // v[t] = VECTOR_BASE(0x110) + t*16.
+
+    // SimdSel op=0 (BSL): Vd = (Rn & Vd) | (~Vd & Rm). Loads Rn@0x120 (xmm0),
+    // Rm@0x130 (xmm1), Vd@0x110 (xmm2 via R10); then pand xmm0,xmm2 (Rn&Rd),
+    // pandn xmm2,xmm1 (~Rd&Rm — NOTE the dst=xmm2/rm=xmm1 order), por xmm0,
+    // xmm2, store Vd. Full-buffer pin (rd=0,rn=1,rm=2):
+    #[test]
+    fn sh436_simdsel_bsl_and_then_nand_vd_wins_source() {
+        let b = tr_bytes(Inst::SimdSel { rd: 0, rn: 1, rm: 2, op: 0 });
+        assert_eq!(b, vec![
+            0xf3, 0x0f, 0x6f, 0x83, 0x20, 0x01, 0x00, 0x00, // movdqu xmm0,[rbx+0x120]  Rn
+            0xf3, 0x0f, 0x6f, 0x8b, 0x30, 0x01, 0x00, 0x00, // movdqu xmm1,[rbx+0x130]  Rm
+            0xf3, 0x44, 0x0f, 0x6f, 0x93, 0x10, 0x01, 0x00, 0x00, // movdqu xmm2,[rbx+0x110] (Vd)
+            0x66, 0x41, 0x0f, 0xdb, 0xc2,             // pand xmm0,xmm2  (Rn & Rd)
+            0x66, 0x44, 0x0f, 0xdf, 0xd1,             // pandn xmm2,xmm1  (~Rd & Rm: dst=xmm2, rm=xmm1)
+            0x66, 0x41, 0x0f, 0xeb, 0xc2,             // por xmm0,xmm2  (final union)
+            0xf3, 0x0f, 0x7f, 0x83, 0x10, 0x01, 0x00, 0x00, // movdqu [rbx+0x110],xmm0  Vd
+        ]);
+    }
+
+    // SimdSel op=1 (BIT/BIF): Vd = (~Rm & Rn) | (Rd & Rm). The pand+AND-pandn
+    // operand order is INVERTED vs BSL: first pandn (~Rm & Rn, dst=xmm0,
+    // rm=xmm1) then pand (Rd & Rm, dst=xmm2, rm=xmm1). A transposed order
+    // picks the wrong source vector. Window discriminator vs op=0.
+    #[test]
+    fn sh436_simdsel_bit_bif_nand_then_and_operand_order() {
+        let b = tr_bytes(Inst::SimdSel { rd: 0, rn: 1, rm: 2, op: 1 });
+        // op1 starts the union with the NAND, not the AND:
+        assert!(b.windows(4).any(|w| w == [0x66, 0x0f, 0xdf, 0xc1]), "BIT/BIF must lead with ~Rm & Rn (pandn xmm0,xmm1)");
+        assert!(b.windows(5).any(|w| w == [0x66, 0x44, 0x0f, 0xdb, 0xd1]), "BIT/BIF then Rd & Rm (pand xmm2,xmm1)");
+        assert!(!b.windows(5).any(|w| w == [0x66, 0x41, 0x0f, 0xdb, 0xc2]), "BIT/BIF must NOT do BSL's Rn & Rd first");
+        // the final union is still por xmm0,xmm2
+        assert!(b.windows(5).any(|w| w == [0x66, 0x41, 0x0f, 0xeb, 0xc2]), "both ends in por xmm0,xmm2");
+    }
+
+    // SimdHighNarrow addhn (no round) .4s->dst_esize=2, 8 src byte-pairs: 2
+    // dst lanes, add RAX+RCX then shr rax,16 (2*dst_bits? no — dst_esize=2,
+    // dst_bits=16, shr by dst_bits=16). NO round-carry add before the shr.
+    // Q=0 also zeroes the upper half (mov qword [Vd+8],0).
+    #[test]
+    fn sh436_simdhighnarrow_addhn_no_round_shr_by_dst_bits() {
+        let b = tr_bytes(Inst::SimdHighNarrow { rd: 0, rn: 1, rm: 2, dst_esize: 2, sub: false, round: false, q: false });
+        assert!(b.windows(3).any(|w| w == [0x48, 0x01, 0xc8]), "addhn adds src lanes (add rax,rcx)");
+        assert!(b.windows(4).any(|w| w == [0x48, 0xc1, 0xe8, 0x10]), "addhn must shr by dst_bits=16 (0x10) to take the high half");
+        // NO round-carry: a bare c1 e8 0x10 must appear directly after the add,
+        // never preceded by an add of 1<<(dst_bits-1)
+        let shr_off = b.windows(4).position(|w| w == [0x48, 0xc1, 0xe8, 0x10]).unwrap();
+        assert!(!b[..shr_off].windows(3).any(|w| w == [0x48, 0x01, 0xd0]), "addhn must NOT have a round-carry add before the shift");
+        // Q=0 zeroes the upper half of Vd (mov rax,0 then mov [Vd+8],rax)
+        assert!(b.windows(10).any(|w| w == [0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0]), "addhn Q=0 must load a 0 upper-half");
+        assert!(b.windows(7).any(|w| w == [0x48, 0x89, 0x83, 0x18, 0x01, 0x00, 0x00]), "addhn Q=0 must store 0 to [Vd+8] (the upper half)");
+    }
+
+    // SimdHighNarrow raddhn (round): same add + shr, but a round-carry
+    // `add rax, 1<<(dst_bits-1)` is inserted BEFORE the shr. The round-carry
+    // presence is the raddhn-vs-addhn discriminator.
+    #[test]
+    fn sh436_simdhighnarrow_raddhn_rounds_before_shr() {
+        let b = tr_bytes(Inst::SimdHighNarrow { rd: 0, rn: 1, rm: 2, dst_esize: 2, sub: false, round: true, q: false });
+        assert!(b.windows(4).any(|w| w == [0x48, 0xc1, 0xe8, 0x10]), "raddhn still shr by dst_bits=16");
+        // round carry = 1<<(16-1) = 0x8000 added to the sum BEFORE the shift
+        assert!(b.windows(10).any(|w| w == [0x49, 0xba, 0x00, 0x80, 0, 0, 0, 0, 0, 0]), "raddhn must add 1<<(dst_bits-1)=0x8000 (mov r10,0x8000)");
+        let round = b.windows(10).position(|w| w == [0x49, 0xba, 0x00, 0x80, 0, 0, 0, 0, 0, 0]).unwrap();
+        let shr = b.windows(4).position(|w| w == [0x48, 0xc1, 0xe8, 0x10]).unwrap();
+        assert!(round < shr, "round-carry must be added before the narrowing shift");
+    }
 }
