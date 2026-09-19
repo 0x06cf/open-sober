@@ -8,12 +8,10 @@ use arm64jit::shims::set_anativewindow_xid;
 use input_wrapper::x11;
 use std::io::Read;
 
-// Guest-arena: allocate guest-visible RW buffer (node/vtable for the deque
-// injector) in the reserved guest RW tail, allocated address (a) is a
-// stable guest address < 2^48 (the deque's low48 head-packing keeps only
-// bits 47..0, so host-heap 0x7f2a... nodes get MANGLED on pop) and (b) is
-// mapped, guest's `ldr [vt+40]` derefs real RW memory instead of
-// reading garbage. Bump a tick counter tail base.
+// Guest-arena: allocate guest-visible RW buffer (deque node/vtable) in the
+// reserved guest RW tail. Addr must be (a) <2^48 (deque low48 head-packing, else
+// host-heap 0x7f.. nodes get MANGLED on pop) and (b) mapped so guest `ldr [vt+40]`
+// derefs real RW memory. Bump a tick counter tail base.
 static GUEST_ARENA_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static GUEST_ARENA_TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -1161,11 +1159,9 @@ pub fn routeb_seed_game_global_vector() -> u64 {
                 a
             });
         // SH101: dispatch-1's virtual at [0x106846980] must be the SCRATCH leaf
-        // (returns a dedicated writable pointer != obj), because dispatch-1's
-        // return in x0 becomes the guest memzero base (x11=x0+(x25<<4), x25=0);
-        // the identity leaf returning obj would let the memzero wipe obj[0] and
-        // make dispatch-2 fault [0x18]. dispatch-2's slot ([0x106846988]) keeps
-        // the identity leaf (its return goes into a branch, not a memzero).
+        // (returns a writable ptr != obj): its return becomes the memzero base
+        // (x11=x0+(x25<<4), x25=0), so returning obj wipes obj[0] → dispatch-2
+        // faults [0x18]. dispatch-2's slot keeps the identity leaf.
         let disp1_leaf = arm64jit::jit::register_host_call_auto(routeb_disptch1_scratch_leaf);
         eprintln!("[elfjit:routeB] SH101 dispatch-1 scratch leaf registered at {disp1_leaf:#x}");
         let obj = Box::leak(vec![0u8; 0x70usize].into_boxed_slice()).as_mut_ptr() as u64;
@@ -1173,12 +1169,9 @@ pub fn routeb_seed_game_global_vector() -> u64 {
             *(0x106dcae08u64 as *mut u64) = node; // +0x00 end
             *(0x106dcae10u64 as *mut u64) = node; // +0x08 begin
             *(0x106dcae18u64 as *mut u64) = node; // +0x10 cap
-            // Dispatch target [0x106dcae20] must be a COHERENT OBJECT: the block does
-            // `ldr x10,[x0]` (x10=*obj = vtable) then `ldr x8,[x10,#0x10]` then `blr x8`
-            // - so obj+0 vtable pointer whose +0x10 slot benign leaf, and
-            // the leaf receives the args the caller left. (SH99 begin-seed advanced
-            // the fault from 0x0 to 0x10; this shapes obj +0x10 virtual deref
-            // lands leaf, not address 0.)
+            // Dispatch target [0x106dcae20] must be a COHERENT OBJECT:
+                // `ldr x10,[x0]` (vtable) `ldr x8,[x10,#0x10]` `blr x8` — obj+0 vtable
+                // whose +0x10 slot is a benign leaf receiving the caller's args.
             let vtab = Box::leak(vec![0u8; 0x30usize].into_boxed_slice()).as_mut_ptr() as u64;
             for i in 0..(0x30 / 8) {
                 *((vtab + i as u64 * 8) as *mut u64) = leaf;
@@ -1678,12 +1671,11 @@ fn routeb_patch_keyed_registry_x24_load() {
 }
 
 fn routeb_patch_map_dispatch() {
-    // Two dispatch `blr x8` sites in the Roblox string/span hash-map family, each the
+    // Roblox string/span hash-map family has two `blr x8` dispatch sites, each the
     // optional-hash2 branch of `ldp x1,x8,[x19,#16]; cbz x8;<tail>blr x1`: FIND/grow
     // 0x1029f4280 (SH87); INSERT 0x1029f3f78 (SH89). Forcing `blr x1` at both is
-    // behavior-preserving: hash2 is redundant (observed = `br x1` aliasing primary), the hash
-    // only picks a bucket probe (correctness via key-eq comparator at map+0x08), so garbage
-    // +0x18 is never branched to.
+    // behavior-preserving: hash2 is redundant (observed = `br x1` aliasing primary),
+    // hash only picks a bucket probe (correctness via key-eq at map+0x08).
     const FIND_BLR: (u64, u64) = (0x1029f4280, 0x29f4280);
     const INSERT_BLR: (u64, u64) = (0x1029f3f78, 0x29f3f78);
     let want = 0xd63f_0020u32; // blr x1
@@ -1734,12 +1726,10 @@ fn routeb_seed_task_singletons() {
         eprintln!("[elfjit:routeB] benign singleton virtual registered at {a:#x}");
         a
     });
-    // SH111: differential 0x580 vtable (blanketed identity-widening regressed
-    // nativeInitializeNativeFlags - SH110 - so widen selectively). Baseline = the
-    // 0x60 identity leaf (current clean); deep slots tried + REVERTED (ANY widening
-    // past 0x60 makes nativeInit hard-crash before StartLuaAppDM - vtable SHARED
-    // with nativeInit; stays clean only via the 0x60 baseline). V2Start/V2Init
-    // soft-return is benign. Keep the 0x60 baseline.
+    // SH111: differential 0x580 vtable — blanket identity-widening regressed
+        // nativeInit (SH110), so widen selectively. Baseline = 0x60 identity leaf
+        // (current clean); ANY deeper slot hard-crashes nativeInit (vtable SHARED
+        // with it). V2Start/V2Init soft-return benign. Keep the 0x60 baseline.
     let vtable: &'static mut [u8] = Box::leak(vec![0u8; 0x60].into_boxed_slice());
     {
         let mut fill = |i: u64, v: u64| unsafe {
@@ -6203,13 +6193,10 @@ fn main() {
     // backed by real mapped RW memory.
     guest_arena_set_base(tail_start as u64);
 
-    // Route the LocalStorageManager static hash-map's bucket-array allocator
-    // (`0x1d97744`, receives its byte size in x0) to host calloc, so the
-    // unseeded per-object MemoryPool empty free-list returns a real zeroed
-    // buffer. The map's lazy init then stores a valid non-NULL bucket array
-    // into its header global (0x726f8c0) NULL, hash-lookup
-    // reader (0x1d99e30: `ldr x8,[0x726f8c0]; ...; ldar x8,[x8]; ldr x0,[x8,idx<<3]`)
-    // finds a real map derefing a NULL bucket.
+    // Route the LocalStorageManager static hash-map bucket allocator
+    // (0x1d97744, size in x0) to host calloc so the empty free-list returns a
+    // real zeroed buffer; the reader 0x1d99e30 then finds a real map instead of
+    // derefing a NULL bucket at header 0x726f8c0.
     match arm64jit::jit::route_allocator_x0_to_calloc(el.guest_of(0x1d97744), 0x1_0000_0000) {
         Ok(tp) => println!("[lsm-map] allocator 0x1d97744 routed to host calloc(x0) (thunk @ {tp:#x})"),
         Err(e) => eprintln!("[lsm-map] warn: allocator route skipped: {e}"),
@@ -6762,16 +6749,31 @@ fn main() {
                     dump("session-substrate-drive");
                 }
                 // SH416 (--v2boot-input-poll): one-shot real X event-source poll on the
-                // registered ANativeWindow. The input delivery path (deliver_motion ->
-                // nativePassInput) was complete but never fed real desktop events; this
-                // drains one non-blocking batch of pointer/button motion from the runtime's
-                // own window into the guest. Inert unless JIT_AINPUT_BRIDGE + real XID
-                // (no live DM yet -> 0 on this boot path; fires once a screen exists).
+                // registered ANativeWindow (deliver_motion -> nativePassInput). Inert
+                // unless JIT_AINPUT_BRIDGE + real XID (no live DM yet -> 0 on boot).
                 if std::env::args().any(|a| a == "--v2boot-input-poll") {
                     let delivered =
                         arm64jit::session::drive_host_input_poll(iimg, ib, tpidr, boot_sp);
                     eprintln!(
                         "[elfjit:v2boot-input-poll] SH416 one-shot real-input poll delivered {delivered} events"
+                    );
+                }
+                // SH417 (--v2boot-input-loop): persistent-tracker host-input LOOP
+                // (STATUS next-forward #3). SH416's one-shot poll rebuilt the tracker
+                // each call (cross-poll press DOWN then MOVE were mistracked); this
+                // keeps ONE tracker across INPUT_LOOP_ITERS (default 8) non-blocking
+                // drains of the registered window -> guest nativePassInput. Bounded,
+                // inert (0, no X connect) unless JIT_AINPUT_BRIDGE + window XID +
+                // live image. See session.rs drive_host_input_loop.
+                if std::env::args().any(|a| a == "--v2boot-input-loop") {
+                    let iters: usize = std::env::var("INPUT_LOOP_ITERS")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(8);
+                    let delivered =
+                        arm64jit::session::drive_host_input_loop(iimg, ib, tpidr, boot_sp, iters);
+                    eprintln!(
+                        "[elfjit:v2boot-input-loop] SH417 persistent-tracker host-input loop over {iters} iterations delivered {delivered} events"
                     );
                 }
                 // SH269 (--v2boot-skip-appstart): the two app-start self-driver rungs

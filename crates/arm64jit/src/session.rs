@@ -501,11 +501,17 @@ pub fn drive_host_input_pump(
 ///
 /// This is a poll step (one batch per call), so a host loop calls it repeatedly
 /// while a session owns a screen — the natural integration point once a live DM
-/// advances. Inert-by-construction on the current boot path (no live DM, so no
-/// constructed login/home screen yet): it is gated on the SAME three guards as
-/// the SH414 pump (bridge env armed + a real registered window XID + a live input
-/// image), so it returns 0 without touching the guest when any trip. Env-gated
+/// advances ([`drive_host_input_loop`] wraps it with a persistent tracker).
+/// Inert-by-construction on the current boot path (no live DM, so no constructed
+/// login/home screen yet): it is gated on the SAME three guards as the SH414
+/// pump (bridge env armed + a real registered window XID + a live input image),
+/// so it returns 0 without touching the guest when any trip. Env-gated
 /// (JIT_AINPUT_BRIDGE) -> default product path byte-identical.
+///
+/// NOTE: each call builds a FRESH tracker, so a single poll is only valid as an
+/// event-source smoke test. A real host loop must keep ONE tracker across
+/// iterations (a press's DOWN in poll i and its MOVE in poll i+1 are the same
+/// pointer) — that is [`drive_host_input_loop`].
 pub fn drive_host_input_poll(
     iimg: &[u8],
     ib: u64,
@@ -555,6 +561,91 @@ pub fn drive_host_input_poll(
             delivered
         }
     }
+}
+
+/// SH417 — the real host input LOOP (STATUS next-forward #3): a persistent-tracker
+/// poll loop that drives real desktop events into the guest `nativePassInput`.
+///
+/// [`drive_host_input_poll`] is the event-source smoke test — it builds a FRESH
+/// `PointerTracker` every call, so a press's DOWN and its MOVE across two polls
+/// are mistracked as two different pointers. A real host loop must keep ONE
+/// tracker for the whole session so pointer-down state (active pointer id,
+/// down-position, multi-touch press count) survives across poll iterations.
+/// This step provides exactly that: it owns the tracker, selects input on the
+/// registered ANativeWindow XID **once**, then drains N non-blocking batches
+/// through the SAME tracker, marshalling each translated MotionEvent into the
+/// guest native via the exact SH413/414 ABI (deliver_motion -> nativePassInput).
+///
+/// Bounded by `iterations` so a harness never spins; each iteration is a
+/// non-blocking drain (safe to call at session frame cadence). Returns the total
+/// events delivered across all iterations. Inert-by-construction on the current
+/// boot path (no live DM -> no constructed login/home screen to deliver to): it
+/// is gated on the SAME three guards as the SH414 pump (bridge env armed + a
+/// real registered window XID + a live input image), so it returns 0 without
+/// touching the guest when any trip (checked once up front). Env-gated
+/// (JIT_AINPUT_BRIDGE) -> default product path byte-identical.
+pub fn drive_host_input_loop(
+    iimg: &[u8],
+    ib: u64,
+    tpidr: u64,
+    boot_sp: u64,
+    iterations: usize,
+) -> usize {
+    if !crate::ainput::bridge_enabled() {
+        eprintln!(
+            "[session-drive] host-input loop: JIT_AINPUT_BRIDGE unset — inert (no guest call)"
+        );
+        return 0;
+    }
+    let xid = window_xid();
+    if xid == 0 {
+        eprintln!(
+            "[session-drive] host-input loop: no registered ANativeWindow XID — inert"
+        );
+        return 0;
+    }
+    if iimg.len() < 16 {
+        eprintln!("[session-drive] host-input loop: no live input image — inert");
+        return 0;
+    }
+    let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
+    // ONE tracker for the whole loop: pointer-down state must survive across
+    // iterations (a press in iter i and its MOVE in iter i+1 are the same pointer).
+    let mut tracker = input_wrapper::input::PointerTracker::default();
+    let mut total: usize = 0;
+    eprintln!(
+        "[session-drive] host-input loop: polling real window 0x{xid:x} on {display} for {iterations} iterations (persistent tracker, bridge armed)"
+    );
+    for iter in 0..iterations {
+        let mut events: Vec<input_wrapper::input::MotionEvent> = Vec::new();
+        let drained = input_wrapper::x11::pump_registered_window(
+            Some(&display),
+            xid as u32,
+            &mut tracker,
+            &mut |e| events.push(e.clone()),
+        );
+        // A mid-loop X error (e.g. the server closed the window) must not abort
+        // the session arbitrarily — log and stop the loop, keeping what we have.
+        let raw_count = match drained {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "[session-drive] host-input loop: X poll error at iter {iter} on {display}: {e:?} — stopping loop (kept {total} delivered)"
+                );
+                break;
+            }
+        };
+        let delivered = drive_host_input_pump(iimg, ib, tpidr, boot_sp, &events);
+        total += delivered;
+        eprintln!(
+            "[session-drive] host-input loop iter {iter}: {raw_count} raw -> {} translated -> {delivered} delivered (running total {total})",
+            events.len()
+        );
+    }
+    eprintln!(
+        "[session-drive] host-input loop: done {iterations} iterations, {total} real events delivered -> nativePassInput (window xid={xid:#x})"
+    );
+    total
 }
 
 /// EXECUTE-DO-INIT-GATES live-DM completion probe (RECON-V3, authoritative).
@@ -928,6 +1019,51 @@ mod tests {
             crate::session::drive_host_input_poll(&[0u8; 64], 0x100000000, 0, 0x200000),
             0,
             "no registered ANativeWindow XID -> inert (0 delivered), no X connect"
+        );
+        // Restore prior XID/env so parallel tests observe clean state.
+        crate::shims::set_anativewindow_xid(prev_xid);
+        unsafe { std::env::remove_var(crate::ainput::AINPUT_BRIDGE_ENV) };
+    }
+
+    /// SH417: the persistent-tracker host input LOOP (STATUS next-forward #3) is
+    /// inert unless ALL three guards hold — same contract as the SH416 poll, and
+    /// checked ONCE up front so a disabled bridge / unmatched window / empty
+    /// image never tentatively enters the pump loop. No X server needed: all
+    /// three guard trips return 0 BEFORE `pump_registered_window` is reached, so
+    /// the loop is provably a no-op on the current boot path (no live DM, no
+    /// constructed screen to deliver to) and cannot hang a harness.
+    #[test]
+    fn sh417_host_input_loop_inert_without_all_guards() {
+        let prev_xid = crate::shims::anativewindow_xid();
+        // (a) bridge env unset -> inert regardless of XID.
+        unsafe { std::env::remove_var(crate::ainput::AINPUT_BRIDGE_ENV) };
+        crate::shims::set_anativewindow_xid(0x2e00000du64);
+        assert_eq!(
+            crate::session::drive_host_input_loop(&[0u8; 64], 0x100000000, 0, 0x200000, 8),
+            0,
+            "bridge disabled -> loop inert (0 delivered), no X connect"
+        );
+        // (b) bridge set but no registered window XID -> inert, no X connect.
+        unsafe { std::env::set_var(crate::ainput::AINPUT_BRIDGE_ENV, "1") };
+        crate::shims::set_anativewindow_xid(0);
+        assert_eq!(
+            crate::session::drive_host_input_loop(&[0u8; 64], 0x100000000, 0, 0x200000, 8),
+            0,
+            "no registered ANativeWindow XID -> loop inert (0 delivered), no X connect"
+        );
+        // (c) window armed but no live input image -> inert, no X connect.
+        crate::shims::set_anativewindow_xid(crate::jit::HOST_THUNK_BASE | 0x2000);
+        assert_eq!(
+            crate::session::drive_host_input_loop(&[], 0x100000000, 0, 0x200000, 8),
+            0,
+            "no live input image -> loop inert (0 delivered), no X connect"
+        );
+        // (d) even a zero-iteration loop with all guards met is bounded (no hang).
+        crate::shims::set_anativewindow_xid(0x2e00000du64);
+        assert_eq!(
+            crate::session::drive_host_input_loop(&[0u8; 64], 0x100000000, 0, 0x200000, 0),
+            0,
+            "0 iterations -> 0 delivered, bounded"
         );
         // Restore prior XID/env so parallel tests observe clean state.
         crate::shims::set_anativewindow_xid(prev_xid);
