@@ -8779,4 +8779,82 @@ mod tests {
         let post_seq = [0x48, 0x8b, 0x43, 0x08, 0x48, 0x81, 0xc0, 0x20, 0x00, 0x00, 0x00, 0x48, 0x89, 0x43, 0x08];
         assert!(b.windows(post_seq.len()).any(|w| w == post_seq), "post-increment mov-load + add imm32 + store-back of rn slot [rbx+8]");
     }
+
+// SH439: hermetic coverage of the float-to-int UNSIGNED BIG-PATH codegen
+    // family (translate.rs FcvtToInt over [2^63, 2^64) and the fixed-point
+    // scale) — the fcvtzu emission SH435 deliberately left as "the unsigned
+    // big-path" next-forward. A byte error here silently corrupts the high
+    // half of every unsigned float->u64 conversion the real client does on
+    // timing/URLOpen/color-of-light paths. SH439 pins the discriminators that
+    // separate fcvtzu (unsigned big-path) from the plain signed fcvtzs, and
+    // the fbits>0 fixed-point scale:
+    // (1) fcvtzu vs fcvtzs: fcvtzu EMITS the range gate — the 2^63 float const
+    //   (mov rcx,0x43e0_0000_0000_0000), the `comisd xmm0,xmm1` (66 0F 2F)
+    //   compare, the JB-to-signed-path rel32 (0F 82), the big-path `subsd`
+    //   (F2 0F 5C) that computes d-2^63, the `add rax,rcx` (48 01 C8, +2^63
+    //   restore) and the u64::MAX saturation (mov rax,-1) — plus the cmovs
+    //   clamp (48 0F 48 C1) in BOTH the signed fall-through and the (implicit)
+    //   2^63 add; the SIGNED fcvtzs NEVER emits comisd/subsd/2^63-add/u64::MAX
+    //   — it is movq_load + a single cvttsd2si + store. Presence of the
+    //   comisd gate is the fcvtzu-vs-fcvtzs discriminator.
+    // (2) fbits>0 fixed-point: the 2^fbits double scale is materialized
+    //   (mov rax,const), moved to xmm1 (66 48 0F 6E C8), and MULt into xmm0
+    //   (mulsd F2 0F 59 C1) BEFORE truncation — the mulsd presence is the
+    //   fixed-point discriminator (fbits=0 must NOT mulsd).
+    // Exact-byte window asserts via synthetic Inst -> translate() (tr_bytes);
+    // deterministic, no image/env. [RBX]=CpuState; vector slot v[t] =
+    // VECTOR_BASE(0x110)+t*16; rn=1 -> slot v1 @ 0x120 (d-src low 8B).
+    #[test]
+    fn sh439_fcvtztoint_fcvtzu_unsigned_bigpath_comisd_gate_and_clamp() {
+        // fcvtzu x0, d1 (unsigned, d-src, mode 0 = trunc-toward-zero):
+        // d -> load low 8B of v1, then the [0,2^64) range gate.
+        let b = tr_bytes(Inst::FcvtToInt { rd: 0, rn: 1, mode: 0, sf: true, unsigned: true, src_sng: false, fbits: 0 });
+        // d-source loads low 8B of v1 @0x120 (movq xmm0,[rbx+0x120], F3 48 0F 7E)
+        assert!(b.windows(9).any(|w| w == [0xf3, 0x48, 0x0f, 0x7e, 0x83, 0x20, 0x01, 0x00, 0x00]), "fcvtzu d-src = movq xmm0,[rbx+0x120]");
+        // the 2^63 double constant materialized in RCX (mov rcx,0x43e0_0000_0000_0000)
+        assert!(b.windows(10).any(|w| w == [0x48, 0xb9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe0, 0x43]), "fcvtzu gates on 2^63 (mov rcx,0x43e0_0000_0000_0000)");
+        // the signed compare comisd xmm0,xmm1 (66 40 0F 2F C1, REX always
+        // present) -> CF=1 iff d<2^63
+        assert!(b.windows(5).any(|w| w == [0x66, 0x40, 0x0f, 0x2f, 0xc1]), "fcvtzu compares via comisd xmm0,xmm1 (66 40 0F 2F C1)");
+        // the JB branch to the signed path (0F 82) and the big-path subsd (F2 0F 5C)
+        assert!(b.windows(2).any(|w| w == [0x0f, 0x82]), "fcvtzu JB?s to the signed path (0F 82 rel32)");
+        assert!(b.windows(4).any(|w| w == [0xf2, 0x0f, 0x5c, 0xc1]), "fcvtzu big-path computes d-2^63 (subsd xmm0,xmm1)");
+        // the unsigned clamp applies in BOTH arms so negatives never reach the
+        // unsigned dst: cmovs rax,rcx (48 0F 48 C1) must appear
+        assert!(b.windows(4).any(|w| w == [0x48, 0x0f, 0x48, 0xc1]), "fcvtzu clamps negative to 0 (cmovs rax,rcx)");
+        // u64::MAX saturation for d>=2^64 (mov rax,-1 = 48 B8 FF..)
+        let sat = [0x48, 0xb8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        assert!(b.windows(10).any(|w| w == sat), "fcvtzu saturates d>=2^64 to u64::MAX");
+    }
+
+    #[test]
+    fn sh439_fcvttoint_signed_fcvtzs_omits_unsigned_bigpath_entirely() {
+        // fcvtzs x0, d1 (signed, mode 0): the plain trunc path. It must be a
+        // bare movq_load + single cvttsd2si + store — NO comisd range gate,
+        // NO subsd 2^63 subtract, NO 2^63 add-restore, NO u64::MAX, NO cmovs.
+        let b = tr_bytes(Inst::FcvtToInt { rd: 0, rn: 1, mode: 0, sf: true, unsigned: false, src_sng: false, fbits: 0 });
+        assert!(b.windows(9).any(|w| w == [0xf3, 0x48, 0x0f, 0x7e, 0x83, 0x20, 0x01, 0x00, 0x00]), "signed fcvtzs loads via movq xmm0,[rbx+0x120]");
+        assert!(b.windows(5).any(|w| w == [0xf2, 0x48, 0x0f, 0x2c, 0xc0]), "signed fcvtzs truncs via cvttsd2si rax,xmm0");
+        assert!(b.windows(3).any(|w| w == [0x48, 0x89, 0x03]) || b.windows(4).any(|w| w == [0x48, 0x89, 0x83, 0x10]), "signed fcvtzs stores the 64-bit trunc to the integer dst slot (stg)");
+        assert!(!b.windows(5).any(|w| w == [0x66, 0x40, 0x0f, 0x2f, 0xc1]), "signed fcvtzs must NOT emit the comisd range gate");
+        assert!(!b.windows(4).any(|w| w == [0xf2, 0x0f, 0x5c, 0xc1]), "signed fcvtzs must NOT emit the 2^63 subtract (subsd)");
+        assert!(!b.windows(4).any(|w| w == [0x48, 0x0f, 0x48, 0xc1]), "signed fcvtzs must NOT clamp via cmovs");
+        assert!(!b.windows(10).any(|w| w == [0x48, 0xb8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]), "signed fcvtzs must NOT saturate to u64::MAX");
+    }
+
+    #[test]
+    fn sh439_fcvtztoint_fixed_point_fbits_scales_by_2pown_mulsd() {
+        // fcvtzu x0, s1, #4 (fixed-point, fbits=4): result = Fn * 2^4.
+        // The scale const (2^4 = 16.0 double = 0x4030_0000_0000_0000) is
+        // materialized, moved to xmm1 (66 48 0F 6E C8), and MULt into xmm0
+        // (mulsd F2 0F 59 C1) BEFORE truncation. fbits=0 must NOT mulsd.
+        let f = tr_bytes(Inst::FcvtToInt { rd: 0, rn: 1, mode: 0, sf: true, unsigned: true, src_sng: false, fbits: 4 });
+        assert!(f.windows(10).any(|w| w == [0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x40]), "fixed-point materializes 2^4 as double (mov rax,0x4030_0000_0000_0000)");
+        assert!(f.windows(5).any(|w| w == [0x66, 0x48, 0x0f, 0x6e, 0xc8]), "fixed-point moves the scale to xmm1 (movq xmm1,rax)");
+        assert!(f.windows(4).any(|w| w == [0xf2, 0x0f, 0x59, 0xc1]), "fixed-point multiplies BEFORE trunc (mulsd xmm0,xmm1)");
+        assert!(f.windows(5).any(|w| w == [0x66, 0x40, 0x0f, 0x2f, 0xc1]), "fixed-point unsigned still carries the comisd range gate AFTER the scale");
+        // fbits=0 must be a single-slippery path the trunc never pre-scales:
+        let z = tr_bytes(Inst::FcvtToInt { rd: 0, rn: 1, mode: 0, sf: true, unsigned: true, src_sng: false, fbits: 0 });
+        assert!(!z.windows(4).any(|w| w == [0xf2, 0x0f, 0x59, 0xc1]), "fbits=0 must NOT emit mulsd (no fixed-point scale)");
+    }
 }
