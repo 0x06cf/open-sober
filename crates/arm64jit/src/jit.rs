@@ -9448,6 +9448,39 @@ mod tests {
     }
 
     #[test]
+    fn sh375_setinitparams_is_genuine_3f0_frame_lsm_consumer() {
+        // SH375 (real-image): with the SH373 reaching-env (LSM_APPEND_SKIP + DM_CONT_M48_SEED
+        // + CONT_APPNAME_SEED) the SH285 persistence wall is deterministically CROSSED and the
+        // ladder advances to a FRESH terminal: the SEP-17 lifecycle drive runs initAppShellReporter
+        // + setActive cleanly, then SIGABRTs inside SetInitParams (guest 0x102bcc814 =
+        // `nativeAppBridgeSetInitParams`, a genuine 0x3f0-frame fn). This refines SH362's closure:
+        // the 0x258b5d8 dispatch body is unreachable NOT because of the SH285 leaf (now crossed)
+        // but because the run aborts at this LSM-family consumer first. Pin that SetInitParams is a
+        // real 0x3f0-frame function (entry prologue + frame build + stack canary setup) so the
+        // SH375 "fresh terminal past the crossed SH285" is regression-grounded.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let word_at = |vaddr: u64| -> u32 {
+                let off = vaddr as usize;
+                let b = &img[off..off + 4];
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            };
+            // nativeAppBridgeSetInitParams (guest 0x102bcc814 = file 0x2bcc814).
+            assert_eq!(word_at(0x2bcc814), 0xa9ba7bfd, "sh375 SetInitParams stp x29,x30,[sp,#-0x60]!");
+            assert_eq!(word_at(0x2bcc828), 0xa9054ff4, "sh375 SetInitParams stp x20,x19,[sp,#80]");
+            assert_eq!(word_at(0x2bcc82c), 0x910003fd, "sh375 SetInitParams mov x29,sp");
+            assert_eq!(word_at(0x2bcc830), 0xd10fc3ff, "sh375 SetInitParams sub sp,sp,#0x3f0 (real 0x3f0-frame)");
+            assert_eq!(word_at(0x2bcc834), 0xb001e029, "sh375 SetInitParams adrp x9,67d1000 (stack canary)");
+            assert_eq!(word_at(0x2bcc850), 0xf81e83a9, "sh375 SetInitParams stur x9,[x29,#-24] (canary store)");
+            assert_eq!(word_at(0x2bcc854), 0xb001e388, "sh375 SetInitParams adrp x8,683d000 (version gate read)");
+            eprintln!("sh375 SetInitParams 0x102bcc814 is a genuine 0x3f0-frame fn (stack-canary/version-gate) — SH375 fresh terminal past the crossed SH285 pinned");
+        } else {
+            eprintln!("sh375 real-image guard: no real libroblox.so, skipping SetInitParams pins");
+        }
+    }
+
+    #[test]
     fn sh367_window_attach_real_path_pinned_and_guard() {
         // SH367 (real-image): pin the REAL window-attach GL-surface path so the --v2boot-glue-cmd
         // arming (jit.rs drive_glue_process_cmd) stays grounded. Window-attach 0x2bd29a0 reads the

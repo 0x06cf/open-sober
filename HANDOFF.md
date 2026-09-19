@@ -1,5 +1,33 @@
 # Open Sober — Agent Handoff
 
+## SH374/SH375 (Sep 20, 2026, hermes-worker): MEASURED map-completions under the SH373 reaching-env — EC-world reader-gate still never entered AND the 0x258b5d8 dispatch body still never fires even with SH285 deterministically crossed (both prior closures re-tested on the env that crosses the SH285 leaf, refining their premises); recon-v3 deliverables re-verified green
+Single-agent (cone suppressed). Two new probes (runs/capture_sh374_ec_dmfn_reaching.sh +
+runs/capture_sh375_dispatch_body_reaching.sh) + live captures (gitignored) +
+docs/frontier-sh374-sh375-reaching-env-closures.md + sh375_new hermetic (arm64jit lib
+434->435). No production path edited (both probes combine the shipped SH373 crossing env
++ existing default-inert guards). Workspace green (cargo test --workspace EXIT 0).
+
+- **SH374**: SH373's reaching-env (LSM_APPEND_SKIP over the SH371 M+0x48/appname seeds)
+  combined with the DMFN/EC-world drive: the EC-world ENTRY guards fire every run
+  (routeb-sh298/299/300 @0x102e24598), but the reader-gate block 0x2e24694 STILL never
+  enters and the run terminals at 0x101d9a708 (pack helper, same unconstructed-LSM
+  family). Crossing SH285 does NOT make the EC marshaller interior reachable — control
+  drains into the persistence family first. SH356's "reader-gate = reachability problem"
+  re-strengthened from the crossing env.
+- **SH375**: SH362 attributed the 0x258b5d8 dispatch-body unreachability to "run dies at
+  SH285 first." With SH285 now deterministically CROSSED (sh285=0 all 3 runs), the ladder
+  ADVANCES PAST it — StartApp Ok, lifecycle drive (initAppShellReporter + setActive) clean —
+  and then SIGABRTs at a FRESH terminal, SetInitParams (0x102bcc814, `nativeAppBridgeSetInitParams`,
+  a genuine 0x3f0-frame fn, pinned by the sh375_new hermetic). The 0x258b5d8 body STILL
+  never fires: its blocker is NOT the SH285 leaf (crossed) but this SetInitParams LSM-family
+  abort that runs first. Refines SH362's premise; does not overturn the standing
+  measured-closed LSM family.
+- Both confirm the persistence/LSM unconstructed-object family is PATH-INDEPENDENT and
+  swallows every Route-B ladder arm (do-init dispatch, EC marshaller, SetInitParams)
+  before any live DM construction. No DataModel (DM-root 0, MH_* false); SH174 capture-latch
+  stays the single forward hook. recon-v3 deliverables re-verified green (24 real task-driven
+  frames, swap Ok(0x1), 0 json abort, 0 crash).
+
 ## SH373 (Sep 20, 2026, hermes-worker): MEASURED — SH285 CROSSOVER from the SH371 reaching-env (the standing SH285 persistence leaf is deterministically crossed 5/5, terminal advances to 0x101d9a708 in the SAME measured-closed LSM unconstructed family); recon-v3 + sh372 green
 Single-agent (cone suppressed). One new probe runs/capture_sh373_cont_appendskip.sh + live
 captures (gitignored) + docs/frontier-sh373-sh285-crossover-continuation.md. No production
