@@ -8631,4 +8631,86 @@ mod tests {
         let shr = b.windows(4).position(|w| w == [0x48, 0xc1, 0xe8, 0x10]).unwrap();
         assert!(round < shr, "round-carry must be added before the narrowing shift");
     }
+
+    // SH437: hermetic coverage of the SIMD lane-COPY codegen family
+    // (translate.rs SimdInsD — `mov Vd.T[dst], Vn.T[src]`): the per-element
+    // lane move used to splat/broadcast/shuffle one value across a vector
+    // (color/texel lane packing + 8-bit channel moves on render data paths).
+    // Byte-map ([RBX]=CpuState, vector slot v[t]=VECTOR_BASE 0x110 + t*16):
+    //   src = 0x110 + rn*16 + src_idx*esize ;  dst = 0x110 + rd*16 + dst_idx*esize
+    // The element size selects FOUR distinct load/store byte forms — a width
+    // flub copies the wrong byte count and silently corrupts the lane:
+    //   esize=8 -> mov_load64 (48 8B) + mov_store64 (48 89)
+    //   esize=4 -> mov_load32 (8B, zero-ext) + mov_store32 (89)
+    //   esize=2 -> movzx_word_mem (0F B7) + mov_store16 (66-prefixed 89)
+    //   esize=1 -> movzx_byte_mem (0F B6) + mov_store8 (88)
+    //
+    // SH437-1: d-lane copy (esize=8) rd=0 rn=1 dst_idx=1 src_idx=0. Actual
+    // source address = 0x110 + 0x10*1 + 0 = 0x120; dest = 0x110 + 0 + 8 = 0x118.
+    #[test]
+    fn sh437_simdinsd_d_lane_copies_full_64bit() {
+        let b = tr_bytes(Inst::SimdInsD { rd: 0, rn: 1, dst_idx: 1, src_idx: 0, esize: 8 });
+        assert_eq!(b, vec![
+            0x48, 0x8b, 0x83, 0x20, 0x01, 0x00, 0x00, // mov rax,[rbx+0x120]  (Vn.s[0] d-lane)
+            0x48, 0x89, 0x83, 0x18, 0x01, 0x00, 0x00, // mov [rbx+0x118],rax  (Vd.d[1])
+        ]);
+    }
+
+    // SH437-2: s-lane copy (esize=4) rd=2 rn=3 dst_idx=1 src_idx=0. Source =
+    // 0x110+0x30 = 0x140; dest = 0x110+0x20+4 = 0x134. 32-bit load zero-extends
+    // (no REX.W) and the store is the 32-bit 89 form — NOT the 8B/48-8B d-lane form.
+    #[test]
+    fn sh437_simdinsd_s_lane_zero_extends_32bit() {
+        let b = tr_bytes(Inst::SimdInsD { rd: 2, rn: 3, dst_idx: 1, src_idx: 0, esize: 4 });
+        assert_eq!(b, vec![
+            0x8b, 0x83, 0x40, 0x01, 0x00, 0x00, // mov eax,[rbx+0x140]  (Vn.s[0])
+            0x89, 0x83, 0x34, 0x01, 0x00, 0x00, // mov [rbx+0x134],eax  (Vd.s[1])
+        ]);
+        assert!(!b.windows(2).any(|w| w == [0x48, 0x8b]), "s-lane must NOT emit the REX.W d-lane mov");
+    }
+
+    // SH437-3: h-lane copy (esize=2) rd=0 rn=1 dst_idx=3 src_idx=1. Source =
+    // 0x110+0x10+2 = 0x122; dest = 0x110+0+6 = 0x116. 16-bit movzx (0F B7) on the
+    // load and the 16-bit 0x66-prefixed store (66 89) — the only esize form whose
+    // store carries the 66 operand-size prefix.
+    #[test]
+    fn sh437_simdinsd_h_lane_uses_movzx_word_and_66_store() {
+        let b = tr_bytes(Inst::SimdInsD { rd: 0, rn: 1, dst_idx: 3, src_idx: 1, esize: 2 });
+        assert_eq!(b, vec![
+            0x0f, 0xb7, 0x83, 0x22, 0x01, 0x00, 0x00, // movzx eax,word [rbx+0x122]  (Vn.h[1])
+            0x66, 0x89, 0x83, 0x16, 0x01, 0x00, 0x00, // mov [rbx+0x116],ax  (Vd.h[3], 66-prefixed)
+        ]);
+    }
+
+    // SH437-4: b-lane copy (esize=1) rd=1 rn=0 dst_idx=4 src_idx=2. Source =
+    // 0x110+0+2 = 0x112; dest = 0x110+0x10+4 = 0x124. Byte movzx (0F B6) + byte
+    // store (88) — the narrowest form; a width flub here would over-read/write
+    // the neighbouring byte channel.
+    #[test]
+    fn sh437_simdinsd_b_lane_uses_movzx_byte_and_byte_store() {
+        let b = tr_bytes(Inst::SimdInsD { rd: 1, rn: 0, dst_idx: 4, src_idx: 2, esize: 1 });
+        assert_eq!(b, vec![
+            0x0f, 0xb6, 0x83, 0x12, 0x01, 0x00, 0x00, // movzx eax,byte [rbx+0x112]  (Vn.b[2])
+            0x88, 0x83, 0x24, 0x01, 0x00, 0x00, // mov [rbx+0x124],al  (Vd.b[4], 88 byte store)
+        ]);
+        assert!(!b.windows(2).any(|w| w == [0x48, 0x8b]), "b-lane must not emit a 64-bit mov");
+    }
+
+    // SH437-5: lane-ADDRESSING discriminator — the source offset follows
+    // src_idx*esize and the dest follows rd*16 + dst_idx*esize independently.
+    // Stepping src_idx by one d-lane (esize=8) moves ONLY the source disp, and by
+    // exactly esize bytes (0x110+Vn*16+{idx}) — never a fixed/vt-stale stride.
+    #[test]
+    fn sh437_simdinsd_lane_index_addresses_scale_by_esize() {
+        let b0 = tr_bytes(Inst::SimdInsD { rd: 0, rn: 3, dst_idx: 0, src_idx: 0, esize: 8 });
+        let b1 = tr_bytes(Inst::SimdInsD { rd: 0, rn: 3, dst_idx: 0, src_idx: 1, esize: 8 });
+        // src0 addr 0x110+0x30 = 0x140 ; src1 addr 0x110+0x30+8 = 0x148.
+        let m0 = b0.windows(7).position(|w| w == [0x48, 0x8b, 0x83, 0x40, 0x01, 0x00, 0x00]).expect("Vn.s[0] load");
+        let m1 = b1.windows(7).position(|w| w == [0x48, 0x8b, 0x83, 0x48, 0x01, 0x00, 0x00]).expect("Vn.s[1] load");
+        assert!(m0 < b0.len() && m1 < b1.len(), "lane-addressed loads present");
+        // dest writes land at the same rd slot (0x110) regardless of src_idx.
+        let d0 = b0.windows(7).position(|w| w == [0x48, 0x89, 0x83, 0x10, 0x01, 0x00, 0x00]).expect("Vd store");
+        let d1 = b1.windows(7).position(|w| w == [0x48, 0x89, 0x83, 0x10, 0x01, 0x00, 0x00]).expect("Vd store");
+        assert!(d0 < b0.len() && d1 < b1.len(), "dest disp fixed at VECTOR_BASE+rd*16");
+    }
 }
