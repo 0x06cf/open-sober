@@ -7563,6 +7563,93 @@ mod tests {
         assert!(!b.windows(7).any(|w| w == [0x89, 0x83, 0x24, 0x01, 0x00, 0x00]));
     }
 
+    // SH442: hermetic coverage of the scalar FcvtToInt ROUNDING-mode paths
+    // (translate.rs FcvtToInt mode 2 fcvtau / mode 3 fcvtpu,ps / mode 4
+    // fcvtmu,ms). SH435 pinned mode 0 (fcvtzs/fcvtzu trunc) and SH439 pinned
+    // fcvtzu's [2^63,2^64) big-path; the ROUND-before-truncate modes had zero
+    // direct byte tests. SH442 pins the exact emitted x86 (rd=0, rn=1 d-src,
+    // src slot = VECTOR_BASE 0x110+1*16=0x120, dst slot g0):
+    //  (1) fcvtau (unsigned, mode 2) = roundsd NEAREST-EVEN (imm8 0x00) then
+    //      cvttsd2si — and NO cmovs clamp (the comment documents the accepted
+    //      saturation edge). The imm8 0x00 vs 0x01/0x02 is the mode-2
+    //      discriminator.
+    //  (2) fcvtpu (unsigned, mode 3, +inf) = roundsd CEIL (imm8 0x02) +
+    //      cvttsd2si + the negative clamp pair (xor rcx,rcx; test rax,rax;
+    //      cmovs rax,rcx = 48 0f 48 c1). The unsigned clamp presence separates
+    //      the unsigned from the signed mode-3 path.
+    //  (3) fcvtmu (unsigned, mode 4, -inf) = roundsd FLOOR (imm8 0x01) +
+    //      cvttsd2si + same clamp. The imm8 0x01 (floor) vs 0x02 (ceil) is the
+    //      fcvtmu-vs-fcvtpu discriminator.
+    //  (4) signed mode 3/4 (fcvtps/fcvtms) = same roundsd but NO clamp — the
+    //      unsigned-cmovs absence is the signed discriminator.
+    // Each test pins the exact full emit AND the imm8 + clamp discriminators
+    // so a wrong rounding direction or a missing negative-clamp silently
+    // mis-converts a render/lighting value.
+    #[test]
+    fn sh442_fcvtau_rounds_nearest_even_no_unsigned_clamp() {
+        let b = tr_bytes(Inst::FcvtToInt { rd: 0, rn: 1, mode: 2, sf: true, unsigned: true, src_sng: false, fbits: 0 });
+        assert_eq!(b, vec![
+            0xf3, 0x48, 0x0f, 0x7e, 0x83, 0x20, 0x01, 0x00, 0x00, // movq xmm0,[rbx+0x120]
+            0x66, 0x0f, 0x3a, 0x0b, 0xc0, 0x00,                  // roundsd xmm0,xmm0,0x00 nearest-even
+            0xf2, 0x48, 0x0f, 0x2c, 0xc0,                         // cvttsd2si rax,xmm0
+            0x48, 0x89, 0x03,                                     // mov [rbx],rax  dst g0
+        ]);
+        assert!(b.windows(6).any(|w| w == [0x66, 0x0f, 0x3a, 0x0b, 0xc0, 0x00]),
+            "fcvtau must roundsd nearest-even (imm8 0x00)");
+        assert!(!b.windows(4).any(|w| w == [0x48, 0x31, 0xc9, 0x00]) && !b.windows(4).any(|w| w == [0x48, 0x0f, 0x48, 0xc1]),
+            "fcvtau must NOT emit the unsigned cmovs clamp");
+    }
+
+    #[test]
+    fn sh442_fcvtpu_rounds_ceil_with_unsigned_clamp() {
+        let b = tr_bytes(Inst::FcvtToInt { rd: 0, rn: 1, mode: 3, sf: true, unsigned: true, src_sng: false, fbits: 0 });
+        assert_eq!(b, vec![
+            0xf3, 0x48, 0x0f, 0x7e, 0x83, 0x20, 0x01, 0x00, 0x00, // movq xmm0,[rbx+0x120]
+            0x66, 0x0f, 0x3a, 0x0b, 0xc0, 0x02,                  // roundsd xmm0,xmm0,0x02 CEIL (+inf)
+            0xf2, 0x48, 0x0f, 0x2c, 0xc0,                         // cvttsd2si rax,xmm0
+            0x48, 0x31, 0xc9,                                     // xor rcx,rcx
+            0x48, 0x85, 0xc0,                                     // test rax,rax
+            0x48, 0x0f, 0x48, 0xc1,                               // cmovs rax,rcx  (neg -> 0)
+            0x48, 0x89, 0x03,                                     // mov [rbx],rax
+        ]);
+        assert!(b.windows(6).any(|w| w == [0x66, 0x0f, 0x3a, 0x0b, 0xc0, 0x02]),
+            "fcvtpu must roundsd ceil (imm8 0x02)");
+        assert!(b.windows(4).any(|w| w == [0x48, 0x0f, 0x48, 0xc1]),
+            "unsigned fcvtpu must clamp negatives to 0");
+    }
+
+    #[test]
+    fn sh442_fcvtmu_rounds_floor_with_unsigned_clamp() {
+        let b = tr_bytes(Inst::FcvtToInt { rd: 0, rn: 1, mode: 4, sf: true, unsigned: true, src_sng: false, fbits: 0 });
+        // Same shape as fcvtpu but roundsd imm8 0x01 (floor, -inf).
+        assert!(b.windows(6).any(|w| w == [0x66, 0x0f, 0x3a, 0x0b, 0xc0, 0x01]),
+            "fcvtmu must roundsd floor (imm8 0x01)");
+        assert!(!b.windows(6).any(|w| w == [0x66, 0x0f, 0x3a, 0x0b, 0xc0, 0x02]),
+            "fcvtmu must not roundsd ceil (0x02)");
+        assert!(b.windows(4).any(|w| w == [0x48, 0x0f, 0x48, 0xc1]),
+            "unsigned fcvtmu must clamp negatives to 0");
+    }
+
+    #[test]
+    fn sh442_signed_fcvtps_ms_no_unsigned_clamp_discriminator() {
+        let p = tr_bytes(Inst::FcvtToInt { rd: 0, rn: 1, mode: 3, sf: true, unsigned: false, src_sng: false, fbits: 0 });
+        // signed fcvtps = roundsd ceil (0x02) + cvttsd2si, NO clamp.
+        assert!(p.windows(6).any(|w| w == [0x66, 0x0f, 0x3a, 0x0b, 0xc0, 0x02]));
+        assert!(!p.windows(4).any(|w| w == [0x48, 0x0f, 0x48, 0xc1]),
+            "signed fcvtps must NOT emit the unsigned cmovs clamp");
+        assert!(p.windows(4).any(|w| w == [0xf2, 0x48, 0x0f, 0x2c]),
+            "signed fcvtps truncs via cvttsd2si");
+    }
+
+    #[test]
+    fn sh442_signed_fcvtms_floors_no_clamp() {
+        let m = tr_bytes(Inst::FcvtToInt { rd: 0, rn: 1, mode: 4, sf: true, unsigned: false, src_sng: false, fbits: 0 });
+        assert!(m.windows(6).any(|w| w == [0x66, 0x0f, 0x3a, 0x0b, 0xc0, 0x01]),
+            "signed fcvtms must roundsd floor (imm8 0x01)");
+        assert!(!m.windows(4).any(|w| w == [0x48, 0x0f, 0x48, 0xc1]),
+            "signed fcvtms must NOT emit the unsigned cmovs clamp");
+    }
+
     #[test]
     fn sh431_logicimm_orr_xzr_mov_alias_materializes_mask() {
         // `mov x0,#7` = ORR x0,xzr,#7 (op=1, rn==31): rn==31 must read as XZR
