@@ -65,7 +65,9 @@ pub const R15: u8 = 15;
 
 /// REX prefix. `w`=64-bit operand, `r`=extended modrm.reg reg, `x`,`b`=extended.
 fn rex(w: bool, r: u8, x: u8, b: u8) -> u8 {
-    0x40 | ((w as u8) << 3) | (if r & 8 != 0 { 0x04 } else { 0 }) | (if x & 8 != 0 { 0x02 } else { 0 })
+    0x40 | ((w as u8) << 3)
+        | (if r & 8 != 0 { 0x04 } else { 0 })
+        | (if x & 8 != 0 { 0x02 } else { 0 })
         | (if b & 8 != 0 { 0x01 } else { 0 })
 }
 
@@ -353,16 +355,16 @@ impl CodeBuf {
     }
 
     /// pandn xmm, xmm : dst = ~dst & src (66 0F DF /r). Confirmed encoding:
-        /// `pandn xmm1, xmm0` = 66 0F DF C8 (modrm reg=xmm1=DST, rm=xmm0=SRC).
-        pub fn pandn(&mut self, dst: u8, src: u8) {
-            self.b(0x66);
-            if dst >= 8 || src >= 8 {
-                self.b(rex(false, dst, 0, src));
-            }
-            self.b(0x0F);
-            self.b(0xDF);
-            self.b(modrm(3, dst & 7, src & 7));
+    /// `pandn xmm1, xmm0` = 66 0F DF C8 (modrm reg=xmm1=DST, rm=xmm0=SRC).
+    pub fn pandn(&mut self, dst: u8, src: u8) {
+        self.b(0x66);
+        if dst >= 8 || src >= 8 {
+            self.b(rex(false, dst, 0, src));
         }
+        self.b(0x0F);
+        self.b(0xDF);
+        self.b(modrm(3, dst & 7, src & 7));
+    }
 
     // ---- scalar double-precision (FP64) ----
     /// movq xmm, [mem] : 64-bit load (F3 48 0F 7E xmm, r/m64)
@@ -449,15 +451,15 @@ impl CodeBuf {
         self.b(modrm(3, dst & 7, src & 7));
     }
     // (Intel: ModRM.reg = DST, r/m = SRC) — so mulsd(0,1) => F2 0F 59 C1 => xmm0 = xmm0*xmm1.
-        fn sd(&mut self, op: u8, dst: u8, src: u8) {
-            self.b(0xF2);
-            if dst >= 8 || src >= 8 {
-                self.b(rex(false, dst, 0, src));
-            }
-            self.b(0x0F);
-            self.b(op);
-            self.b(modrm(3, dst & 7, src & 7));
+    fn sd(&mut self, op: u8, dst: u8, src: u8) {
+        self.b(0xF2);
+        if dst >= 8 || src >= 8 {
+            self.b(rex(false, dst, 0, src));
         }
+        self.b(0x0F);
+        self.b(op);
+        self.b(modrm(3, dst & 7, src & 7));
+    }
     pub fn addsd(&mut self, dst: u8, src: u8) {
         self.sd(0x58, dst, src);
     }
@@ -593,36 +595,36 @@ impl CodeBuf {
         self.b(modrm(3, 5, rm & 7));
     }
     /// movsxd r64, r/m32 — sign-extend a 32-bit operand into r64. 48 63 /r.
-        pub fn movsxd_r64_r32(&mut self, rd: u8, rs: u8) {
-            self.b(0x48);
-            self.b(0x63);
-            self.b(modrm(3, rd & 7, rs & 7));
-        }
-        /// movq xmm, r64  (66 48 0F 6E /r) — move a GPR's bits into the low 8B of an XMM.
-        pub fn movq_xmm_r64(&mut self, xmm: u8, r64: u8) {
-            self.b(0x66);
-            self.b(rex(true, xmm, 0, r64)); // W=1 (64-bit), r=xmm ext, b=r64 exts
-            self.b(0x0F);
-            self.b(0x6E);
-            self.b(modrm(3, xmm & 7, r64 & 7));
-        }
-        /// movq r64, xmm  (66 48 0F 7E /r) — move an XMM's low 8B bits into a GPR.
-        pub fn movq_r64_xmm(&mut self, r64: u8, xmm: u8) {
-            self.b(0x66);
-            self.b(rex(true, r64, 0, xmm)); // W=1, modrm.reg=r64 (bit3), rm=xmm (bit3)
-            self.b(0x0F);
-            self.b(0x7E);
-            self.b(modrm(3, r64 & 7, xmm & 7));
-        }
-        /// comisd xmm_a, xmm_b  (66 0F 2F /r) — signed compare; sets CF/ZF (CF=1 if a<b).
-        pub fn comisd(&mut self, a: u8, b: u8) {
-            self.b(0x66);
-            self.b(rex(false, a, 0, b)); // r=a (high xmm), b=b (high xmm)
-            self.b(0x0F);
-            self.b(0x2F);
-            self.b(modrm(3, a & 7, b & 7));
-        }
-        /// comiss xmm_a, xmm_b  (0F 2F /r) — single-precision order compare.
+    pub fn movsxd_r64_r32(&mut self, rd: u8, rs: u8) {
+        self.b(0x48);
+        self.b(0x63);
+        self.b(modrm(3, rd & 7, rs & 7));
+    }
+    /// movq xmm, r64  (66 48 0F 6E /r) — move a GPR's bits into the low 8B of an XMM.
+    pub fn movq_xmm_r64(&mut self, xmm: u8, r64: u8) {
+        self.b(0x66);
+        self.b(rex(true, xmm, 0, r64)); // W=1 (64-bit), r=xmm ext, b=r64 exts
+        self.b(0x0F);
+        self.b(0x6E);
+        self.b(modrm(3, xmm & 7, r64 & 7));
+    }
+    /// movq r64, xmm  (66 48 0F 7E /r) — move an XMM's low 8B bits into a GPR.
+    pub fn movq_r64_xmm(&mut self, r64: u8, xmm: u8) {
+        self.b(0x66);
+        self.b(rex(true, r64, 0, xmm)); // W=1, modrm.reg=r64 (bit3), rm=xmm (bit3)
+        self.b(0x0F);
+        self.b(0x7E);
+        self.b(modrm(3, r64 & 7, xmm & 7));
+    }
+    /// comisd xmm_a, xmm_b  (66 0F 2F /r) — signed compare; sets CF/ZF (CF=1 if a<b).
+    pub fn comisd(&mut self, a: u8, b: u8) {
+        self.b(0x66);
+        self.b(rex(false, a, 0, b)); // r=a (high xmm), b=b (high xmm)
+        self.b(0x0F);
+        self.b(0x2F);
+        self.b(modrm(3, a & 7, b & 7));
+    }
+    /// comiss xmm_a, xmm_b  (0F 2F /r) — single-precision order compare.
     pub fn comiss(&mut self, a: u8, b: u8) {
         self.b(rex(false, a, 0, b));
         self.b(0x0F);
@@ -680,7 +682,7 @@ impl CodeBuf {
         self.b(0x5D);
         self.b(modrm(3, a & 7, b & 7));
     }
-        /// cvttsd2si r64, xmm  (F2 48 0F 2C /r) — truncate toward zero
+    /// cvttsd2si r64, xmm  (F2 48 0F 2C /r) — truncate toward zero
     pub fn cvttsd2si(&mut self, rd: u8, xmm: u8) {
         self.b(0xF2);
         self.b(0x48);
@@ -1101,8 +1103,8 @@ impl CodeBuf {
         self.b(disp);
     }
     /// cmovcc r64, r/m64  (0F 40+cc), `cc` = cmov-ccode 2nd byte *after* jcc-0x40
-/// (e.g. 0x45 = cmovne). ModRM reg=rd(dst), rm=rs(src). Caller passes
-/// `x86_cc_for_cond(cond) - 0x40`.
+    /// (e.g. 0x45 = cmovne). ModRM reg=rd(dst), rm=rs(src). Caller passes
+    /// `x86_cc_for_cond(cond) - 0x40`.
     pub fn cmov_rr64(&mut self, cc: u8, rd: u8, rs: u8) {
         if rd >= 8 || rs >= 8 {
             self.b(rex(true, rd, 0, rs));
@@ -1170,4 +1172,193 @@ pub fn patch_rel32(buf: &mut Vec<u8>, off: usize, from: usize, target: usize) {
     let next = from + off + 4;
     let disp = (target as i64).wrapping_sub(next as i64) as u32;
     buf[off + from..off + from + 4].copy_from_slice(&disp.to_le_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// REX prefix computation: the extended-register (r/x/b) high bits, the
+    /// W (64-bit operand) bit, and the base 0x40 nibble.
+    #[test]
+    fn rex_prefix_bitfields() {
+        // W=0, no extensions.
+        assert_eq!(rex(false, 0, 0, 0), 0x40);
+        // W=1 (64-bit operand).
+        assert_eq!(rex(true, 0, 0, 0), 0x48);
+        // r-extended (rd >= 8): reg high bit sets 0x04.
+        assert_eq!(rex(false, 8, 0, 0), 0x44);
+        // x-extended: 0x02.
+        assert_eq!(rex(false, 0, 8, 0), 0x42);
+        // b-extended (base >= 8): 0x01.
+        assert_eq!(rex(false, 0, 0, 8), 0x41);
+        // All three + W.
+        assert_eq!(rex(true, 8, 8, 8), 0x4F);
+        assert_eq!(rex(true, 9, 10, 11), 0x4F); // 9,10,11 all have high bit 8
+    }
+
+    /// ModRM byte: mod in top-2, reg in middle-3, rm in low-3.
+    #[test]
+    fn modrm_byte_fields() {
+        assert_eq!(modrm(0, 0, 0), 0x00);
+        assert_eq!(modrm(3, 0, 0), 0xC0); // mod=3 (register direct)
+        assert_eq!(modrm(0, 7, 0), 0x38); // reg=RDI(7)
+        assert_eq!(modrm(0, 0, 7), 0x07); // rm=RDI(7)
+        assert_eq!(modrm(1, 7, 7), 0x7F); // mod=1 + reg=7 + rm=7
+        assert_eq!(modrm(2, 6, 4), 0xB4); // mod=2 (disp32) + reg=RSI + rm=RSP
+        assert_eq!(modrm(3, 2, 3), 0xD3); // register-direct /r -> EDX, rm -> RBX
+    }
+
+    /// disp_mod: 0 = no displacement, 1 = disp8, 2 = disp32.
+    #[test]
+    fn disp_mod_classification() {
+        assert_eq!(disp_mod(0), 0);
+        assert_eq!(disp_mod(1), 1);
+        assert_eq!(disp_mod(-1), 1);
+        assert_eq!(disp_mod(127), 1);
+        assert_eq!(disp_mod(-128), 1);
+        assert_eq!(disp_mod(128), 2);
+        assert_eq!(disp_mod(-129), 2);
+        assert_eq!(disp_mod(0x7FFF_FFFF), 2);
+    }
+
+    /// mov r64, imm64 — 48 B8+rd imm64.
+    #[test]
+    fn mov_ri64_encoding() {
+        let mut c = CodeBuf::new();
+        c.mov_ri64(RDI, 0xDEADBEEF_CAFEF00D);
+        let e = c.as_slice();
+        assert_eq!(e[0], 0x48);
+        assert_eq!(e[1], 0xBF); // 0xB8 + RDI(7)
+        assert_eq!(&e[2..], &0xDEADBEEF_CAFEF00Du64.to_le_bytes());
+    }
+
+    /// mov r64, imm64 with an r8-register forces a REX.B (49).
+    #[test]
+    fn mov_ri64_rex_b_for_high_register() {
+        let mut c = CodeBuf::new();
+        c.mov_ri64(R8, 0x1);
+        let e = c.as_slice();
+        assert_eq!(e[0], 0x49, "R8 needs a REX prefix with B set");
+        assert_eq!(e[1], 0xB8); // R8 & 7 == 0
+        assert_eq!(&e[2..], &0x1u64.to_le_bytes());
+    }
+
+    /// mov r64, imm32 sign-extended — 48 C7 /0 imm32.
+    #[test]
+    fn mov_ri32_encoding() {
+        let mut c = CodeBuf::new();
+        c.mov_ri32(RAX, 0x1234_5678);
+        let e = c.as_slice();
+        assert_eq!(e, &[0x48, 0xC7, 0xC0, 0x78, 0x56, 0x34, 0x12]);
+    }
+
+    /// mov r64, r64 — 48 89 /r.
+    #[test]
+    fn mov_rr64_encoding() {
+        // No REX needed (both low regs).
+        let mut c = CodeBuf::new();
+        c.mov_rr64(RDX, RDI);
+        assert_eq!(c.as_slice(), &[0x48, 0x89, 0xFA]); // modrm(3, src=RDI=7, dst=RDX=2)
+
+        // R8 <- R9 forces REX.R+B.
+        let mut c2 = CodeBuf::new();
+        c2.mov_rr64(R8, R9);
+        assert_eq!(c2.as_slice(), &[0x4D, 0x89, 0xC8]); // rex(true, r=1,b=0), modrm(3,1,0)
+
+        // Same-register is a no-op.
+        let mut c3 = CodeBuf::new();
+        c3.mov_rr64(RAX, RAX);
+        assert_eq!(c3.len(), 0, "identical registers emit nothing");
+    }
+
+    /// mov r64, [base+disp] — 48 8B /r with the matching ModRM/disp form.
+    #[test]
+    fn mov_load64_mem_forms() {
+        // disp == 0 with a non-RBP base: mod=00, no displacement.
+        let mut c = CodeBuf::new();
+        c.mov_load64(RDI, RSI, 0);
+        assert_eq!(c.as_slice(), &[0x48, 0x8B, 0x3E]); // modrm(0, RDI=7, RSI=6)
+
+        // disp8.
+        let mut c2 = CodeBuf::new();
+        c2.mov_load64(RAX, RSI, 8);
+        assert_eq!(c2.as_slice(), &[0x48, 0x8B, 0x46, 0x08]);
+
+        // disp32.
+        let mut c3 = CodeBuf::new();
+        c3.mov_load64(RAX, RSI, 0x1234);
+        assert_eq!(c3.as_slice(), &[0x48, 0x8B, 0x86, 0x34, 0x12, 0x00, 0x00]);
+
+        // Negative disp8.
+        let mut c4 = CodeBuf::new();
+        c4.mov_load64(RAX, RSI, -4);
+        assert_eq!(c4.as_slice(), &[0x48, 0x8B, 0x46, 0xFC]);
+    }
+
+    /// mov [base+disp], r64 — 48 89 /r.
+    #[test]
+    fn mov_store64_mem_forms() {
+        // disp == 0, low regs, no REX needed beyond the default 48.
+        let mut c = CodeBuf::new();
+        c.mov_store64(RSI, 0, RAX);
+        assert_eq!(c.as_slice(), &[0x48, 0x89, 0x06]); // modrm(0, src=RAX=0, RSI=6)
+
+        // disp8 with a high src register (REX.B).
+        let mut c2 = CodeBuf::new();
+        c2.mov_store64(RSI, 8, R8);
+        // base=RSI=6 <8, src=R8=8 >=8 => REX W.R -> 4C (same as expect).
+        assert_eq!(c2.as_slice(), &[0x4C, 0x89, 0x46, 0x08]);
+    }
+
+    /// mov_eax_imm32 zero-extends: 0xB8+rd imm32, no REX (32-bit op).
+    #[test]
+    fn mov_eax_imm32_encoding() {
+        let mut c = CodeBuf::new();
+        c.mov_eax_imm32(RDX, 0x89AB_CDEF);
+        assert_eq!(c.as_slice(), &[0xBA, 0xEF, 0xCD, 0xAB, 0x89]);
+    }
+
+    /// cqo / cdq — signing helpers.
+    #[test]
+    fn cqo_cdq_encoding() {
+        let mut c = CodeBuf::new();
+        c.cqo();
+        assert_eq!(c.as_slice(), &[0x48, 0x99]);
+        let mut c2 = CodeBuf::new();
+        c2.cdq();
+        assert_eq!(c2.as_slice(), &[0x99]);
+    }
+
+    /// patch_rel32 computes disp = target - (from + off + 4) and stores LE.
+    /// `from` is the guest address of the instruction; `off` is how far into
+    /// the (address-subtended) buffer the disp field sits, i.e. it writes at
+    /// buf[off+from..]. This test treats the buffer as if mapped at `from = 0`.
+    #[test]
+    fn patch_rel32_disp_calculation() {
+        let mut buf = vec![0u8; 32];
+        // A disp32 placeholder at buffer offset 4 (from=0 => writes buf[4..8]).
+        buf[4..8].copy_from_slice(&0u32.to_le_bytes());
+        let from = 0usize;
+        // Target just past the disp => disp = target - (from+off+4).
+        let off = 4usize;
+        let target = from + off + 4 + 0x10; // a forward jump of +0x10
+        patch_rel32(&mut buf, off, from, target);
+        let disp = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        assert_eq!(disp, 0x10);
+        assert_eq!(
+            disp as i64,
+            (target as i64) - (from as i64 + off as i64 + 4)
+        );
+
+        // Backward fill: target BEFORE the disp.
+        let mut b2 = vec![0u8; 32];
+        b2[0..4].copy_from_slice(&0u32.to_le_bytes());
+        let from2 = 0usize;
+        let off2 = 0usize;
+        let target2 = from2.wrapping_add(4).wrapping_sub(8); // -8 (backward)
+        patch_rel32(&mut b2, off2, from2, target2);
+        let d2 = u32::from_le_bytes([b2[0], b2[1], b2[2], b2[3]]) as i32;
+        assert_eq!(d2, -8);
+    }
 }

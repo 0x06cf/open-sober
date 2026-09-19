@@ -1,51 +1,62 @@
 # Open-Sober run status (hermes-worker)
 
-Updated 2026-09-22, this cycle: SH415 — make do-init COMPLETION a first-class
-observable of the ordered session substrate. SH400-414 built the executable
-ordered session-drive (session boot, G3 content, DM binder, app-start, onAppReady
-lifecycle, login gate, input pump), but the EXECUTE-DO-INIT-GATES live-DM markers
-were only ever inferred from scattered probes. SH415 adds session.rs
-`probe_doinit_completion()` (page-guarded readout of once-guard [0x106a68410].bit0,
-DM-root [0x106a68818] + in-image vt, app-DM counter [0x106dca0e88]) wired into the
-substrate right after the two do-init-reaching atoms (StartLuaAppDM +
-V2StartAppWithParams), reporting do-init completion per-atom instead of guessing.
+Updated this cycle: SH426 — hermetic coverage of the x86-64 code emitter backend
+(x86.rs). The final codegen surface every translated block emits bytes through
+(CodeBuf + rex/modrm/disp_mod ModRM resolution + the mov* family + patch_rel32
+for internal control-flow) had ZERO tests; SH426 pins all of it byte-exactly
+with 12 deterministic hermetics (REX.W/R/X/B bit layout, ModRM field placement,
+disp8-vs-disp32 selection, REX insertion for r8-r15, mov imm64/imm32/rr64/load/
+store/eax32, cqo/cdq, rel32 displacement arithmetic forward & backward).
+recon-v3 deliverables re-verified green at this HEAD (capture_taskv4_frame.sh
+attempt 1: 24 real task-driven frames, 196 node pops, 0 json abort, 0 crash).
+Workspace green (cargo test --workspace EXIT 0; arm64jit lib 502/0 incl. 12 new
+sh426 hermetics; cargo build --workspace OK). Production code only in x86.rs
+(off-hook; jit.rs/elfjit.rs byte-unchanged).
 
 ## Current state
 
-- `dev` HEAD: SH415. Production code only in session.rs (off the 1MiB hooks);
-  jit.rs/elfjit.rs untouched. Workspace green (arm64jit lib 469/0; cargo test
-  --workspace EXIT 0).
-- recon-v3 deliverables re-verified green at HEAD: capture_taskv4_frame.sh
-  attempt 1 = 24 real task frames `swap Ok(0x1)`, 197 node pops, 0 json abort,
-  0 crash.
+- `dev` HEAD: SH426. recon-v3 immediate-priority deliverables green at HEAD
+  (capture_taskv4_frame.sh: 24 real task-driven frames, 196 node pops, 0 json
+  abort, 0 crash). Workspace green (arm64jit lib 502/0; cargo build --workspace
+  OK). jit.rs 1,048,417 B < 1MiB hook; elfjit.rs untouched (at/near the hook).
+- x86-64 emitter backend now hermetically pinned (was ZERO tests): 12 new tests
+  cover REX/modrm/disp_mod encoding, the mov* family (imm64/imm32/rr64/load/
+  store/eax32 + REX insertion for r8-r15), cqo/cdq, and patch_rel32.
+- Live-DM gate UNCHANGED: the SH415 do-init probe under the COMPLETE substrate
+  (11/16 Ok, MH_FLAGS_LOADED/ENGINE_INITIALIZED/APP_READY all latch true,
+  AppBridgeV2 genuine vt 0x1063a3410) still reports DM-root [0x106a68818]=0x0,
+  vt=0x0, app-DM-counter=0 -> LIVE DM = false. Runtime surface complete +
+  exercised; a live DM needs a real session ctor the JIT cannot reproduce
+  headlessly.
 
 ## This cycle's advance
 
-- **SH415**: do-init completion is now a REPORTED observable of the runtime.
-  MEASURED on real libroblox.so (complete substrate, EXIT clean): substrate 11/16
-  Ok; the probe fires twice and reports the same honest verdict — once-guard
-  seeded (0x101 bit0=1, the FIRST EXECUTE-DO-INIT-GATES precondition now MET under
-  the full substrate) yet DM-root=0, counter=0, LIVE DM=false. Per-run proof the
-  do-init once-path constructs nothing live (SH381 consistent). Host lifecycle
-  fires (MH_FLAGS/ENGINE_INITIALIZED/APP_READY true, AppBridgeV2 genuine vt).
+- SH426: BUILD-THE-RUNTIME codegen-surface coverage completion on x86.rs (the
+  x86-64 emitter every translated block encodes through) — previously exercised
+  nowhere of its own. 12 deterministic hermetics in `x86::tests`; no production
+  path / guest byte / JIT-hook-default changed.
 
 ## Honest status
 
-- No DM (DM-root [0x106a68818]=0, no make_shared, MH_GAME_LOADED false). Route-B
-  live-DM structural gate UNCHANGED. The probe moved no guest byte (pure readout) —
-  it makes the completion gate measurable per-run, not a DM advance. The live DM
-  still requires the engine's own session to construct it (SEP-18 cause-not-symptom).
+- No DM (DM-root [0x106a68818]=0, no make_shared, MH_GAME_LOADED false) —
+  Route-B live-DM structural gate UNCHANGED. Content (fsmap remap, R1
+  CoreScript stage both-roots, G3 files-dir), lifecycle (MH_*), input
+  (ainput bridge + X11 loop), audio (SH132 AAudio), boot-stack, signal core,
+  and now the x86 emitter are all latent-but-correct, firing the instant a live
+  DM owns a session.
 
 ## Next-forward candidates
 
-1. (standing, TOP — Route B) do-init completeness / live-DM: the substrate now
-   REPORTS the completion markers; keep the SEP-18 runtime build (real
-   Activity/AppBridge/JNI-lifecycle/GLES drive) so the engine's own session ctor
-   constructs the DM world.
-2. DMCONT 0x102bd1d68 = 0 from the MAIN arm.
-3. Feed real X-window events into `drive_host_input_pump` on the render/host loop
-   (the natural integration point once a live DM advances).
-4. Do NOT re-tread: setDataModelToCurrent (SH388), LSM crossings (SH385/393/396),
-   SH285/SH341 family, EC reader-gate, window-attach real (SH367), ALooper (SH365),
-   governor-gates (SH379).
-5. Do NOT run the SH174 latch without JIT_DM_ALLOC_CAPTURE_DELEGATE=1 (SH395).
+1. (standing, TOP — Route B) do-init completeness / live-DM. SUBSTRATE REPORTS the
+   markers; marker non-live until the engine's own session ctor builds the DM world.
+2. GENUINE canary wall NAMED (SH420): a `__stack_chk_fail` host shim pins the real
+   wall to `__guest_pc=0x102206d90` = nativeGameGlobalInit body, canary slot
+   [x29,#-8] ZEROED during the do-init once-path. CLOSED as separate-seedable-wall:
+   disassembly of the four between-store/compare callees shows small frames writing
+   own-locals only — the zeroing is a SYMPTOM of the deep do-init once-lambda
+   dispatch draining into the SH285/LSM lane (the Route-B once-path itself). Do NOT
+   spend a narrow store-watch on it (re-tread).
+3. DMCONT 0x102bd1d68 = 0 from the MAIN arm (unchanged standing gate).
+4. Do-not-re-tread unchanged: LSM skips/rebuilds, setDataModelToCurrent, EC
+   reader, window-attach real, ALooper, governor gates.
+5. Do NOT run the SH174 latch without JIT_DM_ALLOC_CAPTURE_DELEGATE=1.

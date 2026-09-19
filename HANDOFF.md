@@ -1,5 +1,30 @@
 # Open Sober — Agent Handoff
 
+## SH426 (Sep 19, 2026, hermes-worker): hermetic coverage of the x86-64 code emitter backend (x86.rs) — the final codegen surface every translated block emits bytes through (CodeBuf + rex/modrm/disp_mod ModRM resolution + the mov* family + patch_rel32 for internal control-flow) had ZERO tests; SH426 pins all of it byte-exactly with 12 deterministic hermetics (REX.W/R/X/B bit layout, ModRM field placement, disp8-vs-disp32 selection, REX insertion for r8-r15, mov imm64/imm32/rr64/load/store/eax32, cqo/cdq, rel32 displacement arithmetic forward & backward)
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+re-verified green at this exact HEAD first (capture_taskv4_frame.sh attempt 1:
+24 real task-driven frames `present swap Ok(0x1)`, 196 node pops, 0 json abort,
+0 crash). Workspace green (cargo test --workspace EXIT 0; arm64jit lib 502/0
+incl. 12 new sh426 hermetics; cargo build --workspace OK, 0 errors).
+Production code ONLY in x86.rs (off the 1MiB hooks; jit.rs/elfjit.rs
+byte-unchanged). Pure `#[cfg(test)]` addition (+12 hermetics), no production
+path / guest byte / JIT-hook-default changed.
+- x86.rs is the x86-64 emitter: CodeBuf + register constants + rex/modrm/
+  disp_mod ModRM resolution + the mov* family + patch_rel32 for encoding
+  internal control-flow. Every translated block emits bytes through it before
+  execution — the single most load-bearing encoder in the runtime, ZERO tests.
+- Genuine gap: an encoder this foundational was only validated implicitly by
+  whether a translated block ran; a byte error would decode-ambiguously or fault
+  at runtime with no code-level anchor. SH426 pins it byte-exactly (SH423-425
+  coverage lineage). 12 hermetics: rex bitfields, modrm fields, disp_mod
+  boundary, mov_ri64 (+REX.B high reg), mov_ri32, mov_rr64, mov_load64 all four
+  ModRM forms, mov_store64 (+REX.W.R), mov_eax_imm32, cqo/cdq, patch_rel32
+  forward & backward. Deterministic, no real binary, no env.
+- Honest: NOT a DM (SH415 probe re-confirms DM-root [0x106a68818]=0x0 under the
+  complete substrate; Route-B live-DM gate unchanged). BUILD-THE-RUNTIME
+  codegen-surface coverage completion, not a re-tread.
+- Files: docs/frontier-sh426-x86-emitter-hermetics.md + crates/arm64jit/src/x86.rs
+
 ## SH425 (Sep 19, 2026, hermes-worker): hermetic coverage of the guest signal-delivery core (signals.rs) — rt_sigaction/sigprocmask install-query + BLOCK/UNBLOCK/SETMASK with silent SIGKILL/SIGSTOP drop, pending/deliverable ascending-order hold-and-release, and the full installed-handler dispatch → sigreturn context-restore ABI (x0=signo/x1=siginfo/x2=ucontext/x30=SIGRET) had ZERO tests; SH425 pins all of it with 5 deterministic hermetics. The surface a real client leans on for fatal-path diagnostics (SIGTRAP default-terminate exit 133) and cross-thread cooperative signal pickup
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 re-verified green at this exact HEAD first (capture_taskv4_frame.sh attempt 1:
