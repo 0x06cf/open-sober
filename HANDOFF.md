@@ -1,5 +1,36 @@
 # Open Sober — Agent Handoff
 
+## SH376 (Sep 20, 2026, hermes-worker): CORRECT the SH375 terminal attribution + MEASURED governor/preload cross under the crossing-env — the real terminal after SH285-crossing is the governor NULL-DM deref (0x102ea0b9c, SH269), not a "SetInitParams abort"; arming GOVFLAG+PRELOAD_VALUECELL advances SendAppEventOnAppReady past governor+preload to the SH350 pack-helper (closed)
+Single-agent (cone suppressed). Two probes (runs/capture_sh376_govflag_crossing.sh +
+runs/capture_sh376b_combined.sh) + live captures (gitignored) + docs/frontier-sh376-governor-null-dm-terminal-corrected.md
++ sh376_new hermetic (arm64jit lib 435->436, read-only governor word-pins). No production
+path edited (probes use only existing default-inert guards SH269/GOVFLAG + SH307/PRELOAD_VALUECELL
++ SH349 append-skip + SH371 crossing seeds). Workspace green (cargo test --workspace EXIT 0,
+arm64jit 436/0).
+
+- **SH375's "SetInitParams SIGABRT" is a MISREAD.** Reading the FULL SH375 live log: SetInitParams
+  (0x102bcc814) and V2InitWithParams BOTH soft-RETURN benignly (`pc 0x3d0/0x4a0 outside image`,
+  the SH331 leaked-host-pc class). The genuine SIGSEGV is the **governor NULL-app-DM deref
+  guestpc=0x102ea0b9c fault=0x0** (`ldr x0,[x21,#1032]`=[controller+0x408]=0), then SIGABRT.
+- That is SH269's wall (predicate byte [0x106a64da0]), already armed behind
+  `JIT_ROUTEB_APPSART_GOVFLAG` but NOT set in the SH375 env.
+- Arming GOVFLAG on the crossing-env (4/4): the 0x102ea0b9c deref is GONE; terminal ADVANCES to
+  `0x102bb803c` (SH307 preload-valuecell wall).
+- Arming GOVFLAG + PRELOAD_VALUECELL (4/4): the preload wall ALSO crosses
+  (`SendAppEventOnAppReady returned`); terminal moves to `0x101d9a708` (SH350 pack-helper, the
+  known-closed LSM lane).
+- Corrected terminal sequence past crossed-SH285: governor NULL-DM (SH269) -> preload valuecell
+  (SH307) -> pack-helper (SH350, closed). Do NOT re-drive LSM skips (SH349/350/358/373/375 stand).
+
+### Honest
+Does NOT manufacture a DataModel (DM-root [0x106a68818]=0, MH_* false). Route-B live-DM
+structural gate UNCHANGED. This is a map-completion + attribution correction + new hermetic;
+the completed SendAppEventOnAppReady still re-enters the closed persistence lane (0x101d9a708),
+so no live-DM gate moved. The correction matters: SH362/SH375's "0x258b5d8 blocked by SetInitParams
+abort" premise is obsolete, but the corrected blocker is SH269-armed and passes cleanly — the
+0x258b5d8 body's real (still-unreached) blocker is the SH350 pack-lane. SH174 capture-latch stays
+the single forward hook.
+
 ## SH374/SH375 (Sep 20, 2026, hermes-worker): MEASURED map-completions under the SH373 reaching-env — EC-world reader-gate still never entered AND the 0x258b5d8 dispatch body still never fires even with SH285 deterministically crossed (both prior closures re-tested on the env that crosses the SH285 leaf, refining their premises); recon-v3 deliverables re-verified green
 Single-agent (cone suppressed). Two new probes (runs/capture_sh374_ec_dmfn_reaching.sh +
 runs/capture_sh375_dispatch_body_reaching.sh) + live captures (gitignored) +

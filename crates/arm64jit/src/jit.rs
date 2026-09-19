@@ -9481,6 +9481,47 @@ mod tests {
     }
 
     #[test]
+    fn sh376_governor_predicate_flags_null_dm_and_session_advances() {
+        // SH376 (real-image): correct the SH375 ledger attribution. SH375 recorded the terminal
+        // after SH285-crossing as "SetInitParams SIGABRT", but real runs (capture_sh376_govflag_)
+        // show SetInitParams (0x2bcc814) and V2InitWithParams both soft-RETURN benignly (pc 0x3d0 /
+        // 0x4a0 outside-image); the genuine SIGSEGV is the governor NULL-DM deref at guest 0x102ea0b9c
+        // (`ldr x0,[x21,#1032]` reads the app-DM controller = 0 -> NULL). That is SH269's wall, gated
+        // on the fixed-.bss predicate byte [0x106a64da0]; arming JIT_ROUTEB_APPSART_GOVFLAG routes the
+        // REAL live governor object (mov x0,x21; bl 0x2ea3a84) instead of the NULL controller. Pin the
+        // governor ABI so the SH269/SH376 session drive stays grounded: the predicate read, the cbz fork,
+        // the NULL-controller clear-branch deref, and the helper branch.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let word_at = |vaddr: u64| -> u32 {
+                let off = vaddr as usize;
+                let b = &img[off..off + 4];
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            };
+            const G: u64 = 0x2ea0b48; // governor fn entry (file; guest 0x102ea0b48)
+            for v in [G, G + 4, G + 0x2c, G + 0x30, G + 0x38, G + 0x54, G + 0x60, G + 0x78] {
+                assert!(v % 4 == 0, "sh376 pin {v:#x} 4-aligned");
+            }
+            assert_eq!(word_at(G), 0xd10203ff, "sh376 governor sub sp,sp,#0x80");
+            assert_eq!(word_at(G + 4), 0xa9047bfd, "sh376 governor stp x29,x30,[sp,#64]");
+            assert_eq!(word_at(G + 0x30), 0xf9401015, "sh376 governor ldr x21,[x0,#32]");
+            assert_eq!(word_at(G + 0x38), 0xb40000f3, "sh376 governor cbz x19->0x2ea0b9c");
+            assert_eq!(word_at(0x2ea0b9c), 0x9001de28, "sh376 governor adrp x8,6a64000 (predicate page)");
+            assert_eq!(word_at(0x2ea0ba8), 0x39768108, "sh376 governor ldrb w8,[x8,#3488] (=0x106a64da0)");
+            // The clear-branch NULL-controller deref (the crash): ldr x0,[x21,#1032] @0x2ea0bd0
+            assert_eq!(word_at(0x2ea0bd0), 0xf94206a0, "sh376 governor clear-branch ldr x0,[x21,#1032] (NULL app-DM controller deref = the SH269 wall)");
+            // The helper branch (GOVFLAG routed): mov x0,x21; bl 0x2ea3a84 @0x2ea0bc4/8
+            assert_eq!(word_at(0x2ea0bc4), 0xaa1503e0, "sh376 governor helper-branch mov x0,x21");
+            assert_eq!(word_at(0x2ea0bc8), 0x94000baf, "sh376 governor helper-branch bl 0x2ea3a84 (preload-overrides, real live gov)");
+            eprintln!("sh376 governor predicate ABI pinned (0x102ea0b9c NULL app-DM controller deref = SH269 GOVFLAG wall; helper branch 0x2ea3a84 routes the real live governor)");
+        } else {
+            eprintln!("sh376 real-image guard: no real libroblox.so, skipping governor pins");
+        }
+    }
+    // [removed sh376 delta_ok helper — unused]
+
+    #[test]
     fn sh367_window_attach_real_path_pinned_and_guard() {
         // SH367 (real-image): pin the REAL window-attach GL-surface path so the --v2boot-glue-cmd
         // arming (jit.rs drive_glue_process_cmd) stays grounded. Window-attach 0x2bd29a0 reads the
