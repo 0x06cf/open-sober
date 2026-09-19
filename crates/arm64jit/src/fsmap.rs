@@ -55,6 +55,19 @@ pub fn set_root_for_tests(root: PathBuf) {
     *override_root().lock().unwrap() = Some(root);
 }
 
+/// Shared serialization lock for the parallel test harness: every test that
+/// mutates the global fsmap root override (`set_root_for_tests`) must hold this
+/// SAME lock for its whole critical section, so tests across modules (jit.rs,
+/// fsmap.rs, session.rs's R1 stage/serve) never clobber each other's override
+/// mid-test. Before this was shared, jit.rs (FS_ROOT_LOCK), fsmap.rs
+/// (FSMAP_ROOT_LOCK) and session.rs (CACHE_LOCK) used three independent locks
+/// and a jit.rs fsmap test could race the sh419 session test (both write the
+/// override concurrently) -> intermittent sh419 failure.
+pub(crate) fn test_root_mutex() -> &'static std::sync::Mutex<()> {
+    static ROOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    &ROOT_LOCK
+}
+
 fn override_root() -> &'static std::sync::Mutex<Option<PathBuf>> {
     static OVR: OnceLock<std::sync::Mutex<Option<PathBuf>>> = OnceLock::new();
     OVR.get_or_init(|| std::sync::Mutex::new(None))
@@ -171,11 +184,9 @@ pub fn ensure_parents(path: Option<&RemappedPath>, create: bool) {
 mod tests {
     use super::*;
 
-    /// Serialize fsmap-root tests: each mutates the process-global override
-    /// cell (`set_root_for_tests` / `override_root`), so parallel runs would
-    /// clobber each other mid-test (mirrors jit.rs's FS_ROOT_LOCK).
-    static FSMAP_ROOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// Idealize: fsmap-root override mutation serializes on the shared
+    /// `test_root_mutex` (see fsmap.rs) — the same lock jit.rs + session.rs
+    /// fsmap-root tests hold, so this module's tests can't race theirs.
     /// SH423: the durable persistence contract (objective 2b "remembers
     /// sign-in") is proven at the fsmap layer: a guest datastore path under a
     /// mapped Android root resolves to a REAL host file on disk, and a value
@@ -185,7 +196,7 @@ mod tests {
     /// exercised nowhere (jit.rs only harnesses fsmap for R1 CoreScript staging).
     #[test]
     fn sh423_durable_datastore_write_survives_remap_restart() {
-        let _g = FSMAP_ROOT_LOCK.lock().unwrap();
+        let _g = test_root_mutex().lock().unwrap();
         // A persistent HOST root that must outlive the writes (real disk dir).
         let root = std::env::temp_dir().join(format!("os-fsmap-durable-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -249,7 +260,7 @@ mod tests {
     /// unmapped absolute roots (`/proc`, `/system`) pass through unchanged.
     #[test]
     fn sh423_remap_precedence_and_passthrough() {
-        let _g = FSMAP_ROOT_LOCK.lock().unwrap();
+        let _g = test_root_mutex().lock().unwrap();
         let root = std::env::temp_dir().join(format!("os-fsmap-prec-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();

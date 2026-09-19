@@ -16219,12 +16219,10 @@ mod routeb_lsm_keyfix_guard_tests {
 mod fp16_and_fabd_fccmp_exec {
     use super::*;
 
-    /// SH354: shared serialization lock for tests that mutate the global
-    /// `fsmap` root override (`set_root_for_tests`), so parallel unit tests
-    /// (sh351, sh354, and any future fsmap-root test in this module) never
-    /// clobber each other's override mid-test.
-    static FS_ROOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// Shared test lock for fsmap-root-override mutation lives in fsmap.rs
+    /// (`crate::fsmap::test_root_mutex`); every test across modules serializes on
+    /// it so a jit.rs fsmap test can't race session.rs's sh419 (both write the
+    /// process-global override concurrently).
     fn h(f: f32) -> u16 {
         // f32 -> IEEE half (round-to-nearest-even; only exact small values used).
         let b = f.to_bits();
@@ -18480,7 +18478,7 @@ mod fp16_and_fabd_fccmp_exec {
     /// two staged names even with no live image.
     #[test]
     fn sh351_r1_stage_core_scripts_writes_both_candidates() {
-        let _g = FS_ROOT_LOCK.lock().unwrap();
+        let _g = crate::fsmap::test_root_mutex().lock().unwrap();
         let dir = std::env::temp_dir().join(format!("os-r1-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -18516,7 +18514,7 @@ mod fp16_and_fabd_fccmp_exec {
     /// session half as the Route-B gate.
     #[test]
     fn sh354_r1_core_script_is_serviceable_through_remap() {
-        let _g = FS_ROOT_LOCK.lock().unwrap();
+        let _g = crate::fsmap::test_root_mutex().lock().unwrap();
         let dir = std::env::temp_dir().join(format!("os-r1-serve-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

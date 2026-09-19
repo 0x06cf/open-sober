@@ -1079,8 +1079,7 @@ mod tests {
     #[test]
     fn sh419_r1_cache_mirror_serves_both_roots() {
         use std::ffi::CString;
-        static CACHE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = CACHE_LOCK.lock().unwrap();
+        let _g = crate::fsmap::test_root_mutex().lock().unwrap();
         let dir = std::env::temp_dir().join(format!("os-r1-cache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
