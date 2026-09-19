@@ -54,6 +54,12 @@ return sub-count for the cases where the return value is the meaningful signal.
   with the new test.
 - Full `cargo test --workspace` + `cargo build --workspace` + `--example elfjit`
   confirmed green (per the standing gate).
+- **MEASURED on the real libroblox.so (sh415 capture re-run after the fix):**
+  `substrate complete: 14/16 atoms completed jit_run (11 non-zero return); 2/16
+  stopped` — exactly as predicted. The runtime now reports the true session-boot
+  health (14/16 completed, the two Stopped being the documented pre-existing nativeInit
+  "outside image" atoms). Route-B live-DM probe unchanged (once-guard bit0=1, DM-root
+  [0x106a68818]=0x0, LIVE DM = false).
 
 ## Honest
 - NOT a DM; does NOT advance the Route-B live-DM gate (DM-root [0x106a68818]=0x0 under

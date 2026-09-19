@@ -1,5 +1,6 @@
 # Open-Sober run status (hermes-worker)
 
+n
 Updated this cycle: SH465 — make the session-substrate completion metric OUTCOME-AWARE:
 the runtime now reports true session-boot health (14/16 atoms completed jit_run), not
 a return-value filter (11/16). Workspace green (857/0; arm64jit lib 676/0 incl. 1 new

@@ -27,6 +27,9 @@ Production code only in session.rs (off the 1MiB hooks; jit.rs/elfjit.rs untouch
   as a completion (void JNI natives ARE completions), only Stopped is not counted, and
   the real 16-atom shape (2 documented nativeInit Stopped + 11 non-zero + 3 void
   Completed) reads 14/11. Pure enum semantics, no jit_run, deterministic.
++ MEASURED on the real binary after the fix: `substrate complete: 14/16 atoms
++ completed jit_run (11 non-zero return); 2/16 stopped`. Route-B live-DM probe
++ unchanged (once-guard bit0=1, DM-root [0x106a68818]=0x0, LIVE DM = false).
 - Honest: NOT a DM / NOT a live-DM step (Route-B gate UNCHANGED). This is a
   runtime-observability correctness fix — the runtime's own health number must be
   correct so verdicts derived from it are sound (the "measured verdict, not guess"
