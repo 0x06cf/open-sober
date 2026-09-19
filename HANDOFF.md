@@ -1,5 +1,35 @@
 # Open Sober — Agent Handoff
 
+## SH349 (Sep 19, 2026, hermes-worker): CROSS the long-standing SH285 terminal — RET the faulty LSM byte-copy sub-call 0x101d9a15c; persistence lane advances one fencepost to a GOT/canary read wall at 0x101d9a708
+Single-agent (cone suppressed). Default-inert opt-in `JIT_ROUTEB_LSM_APPEND_SKIP=1`
+(`routeb_patch_lsm_append_skip`, elfjit.rs — RETs the `ldr w8,[x2]` byte-copy sub-call that the
+SH285 fault lives inside) + `sh349` hermetic (real-image pins: append prologue / SH285 caller bl
+0x97ffa192 / fault store 0x381ff54b / natural ret) + runs/capture_sh349_lsm_append_skip.sh.
+Workspace green (elfjit example 157/0; arm64jit 416/0).
+
+### The forward this cycle (the stated SH348 next step, now implemented + measured)
+SH348 showed the SH285 SIGSEGV (guestpc=0x101db1b08) survives a whole-init leaf-ret because the
+caller block is reached by a mid-function direct jump past the entry patch. So the skip must
+target the FAILING SUB-CALL itself. `routeb_patch_lsm_append_skip` RETs only the one byte-copy
+leaf (0x101d9a15c, pure memcpy, zero observable side effects) -> EVERY path into the fault is
+stubbed regardless of how the caller block is reached.
+
+### MEASURED (real libroblox.so, full SH285-B/SH343-346 ladder env + LSM_NODES + both skips, 3/3)
+- OLD terminal GONE: no more `SIGSEGV guestpc=0x101db1b08` (every SH260/284/285/3444/348 run died there).
+- NEW terminal (3/3): `SIGSEGV guestpc=0x101d9a708 fault=0xffffffffffffffff` — a stack-canon
+  name/version-packing helper reading a `.got` slot [0x1067d16f0] as its canary pointer. The
+  persistence lane advances one full fencepost past the returned wall.
+- DM-root [0x106a68818]=0, MH_* all false. DMCONT continuation still not at app-start 0x2bd2058.
+
+### Conclusion + next
+SH349 is a real, measured forward: the SH285 wall family is crossed for the first time. The new
+terminal 0x101d9a708 is another SH285-class live-object wall but its pin is a `.got` canary slot
+(0x67d16f0) with on-disk value 0x1 / undefined `__stack_chk_guard` and NO static reloc — so the
+next measurement is whether seeding [0x1067d16f0] to a valid host canary makes the ladder advance
+(relocation/dispatch gap -> real loader work, the migration-gate conscience requires hunting it)
+or reveals the next live-object wall (one node in the family). Route-B live-DM gate UNCHANGED;
+SH174 capture-latch stays the single forward hook.
+
 ## SH348 (Sep 19, 2026, hermes-worker): measured negative — leaf-`ret`ing initStorageManagerNative does NOT clear the SH285 terminal (the byte-copy @0x101db1b08 is reachable past its own entry)
 Single-agent (cone suppressed). Default-inert opt-in `JIT_ROUTEB_LSM_INIT_SKIP=1`
 (`routeb_patch_lsm_init_skip`, elfjit.rs) + `sh348` hermetic (real-image pins: entry prologue

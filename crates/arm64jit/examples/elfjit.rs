@@ -1354,11 +1354,9 @@ fn routeb_patch_startapp_init3_gates() {
 }
 
 /// SH348 (opt-in JIT_ROUTEB_LSM_INIT_SKIP=1, default-INERT): leaf `ret` LocalStorageManager
-/// initStorageManagerNative (entry 0x101d9d8b0) so the Session-CTOR continuation does NOT die in the
-/// SH285 persistence-lane wall (byte-copy @0x101db1b08 through unconstructed [obj+0x50]=0xff..ff on
-/// the DMCONT drive, SH344c's terminal one hop before app-start 0x2bd2058). CAUSE-level skip (SH117
-/// line-cross), NOT a live-object repair (SH248h trap). Ret-args: caller's bl returns with the manager
-/// this (nonzero => success), control flows to the next Session-CTOR step. Idempotent, env-gated.
+/// initStorageManagerNative (entry 0x101d9d8b0) so the Session-CTOR continuation skips the SH285
+/// persistence-lane wall (byte-copy @0x101db1b08) toward app-start 0x2bd2058. CAUSE-level skip
+/// (SH117), NOT a live-object repair (SH248h). Caller's bl returns w0=manager this (nonzero=ok).
 fn routeb_patch_lsm_init_skip() {
     if std::env::var_os("JIT_ROUTEB_LSM_INIT_SKIP").is_none() {
         return;
@@ -1383,12 +1381,43 @@ fn routeb_patch_lsm_init_skip() {
         }
         libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_EXEC);
     }
-    // Drop the cached translated blocks for the whole initStorageManagerNative body (entry 0x101d9d8b0
-    // through past the SH285 reader site 0x101db1b08) PLUS the sh324-style caller 0x102256608, so the
-    // JIT re-translates with the patched `ret` and no pre-patch cached interior block (like the deep
-    // byte-copy at 0x101db1b08) is reachable.
+    // Re-translate the whole init body + sh324 caller with the patched `ret`.
     arm64jit::jit::block_cache_drop_region(0x101_d9d_000u64, 0x101_dbe_000u64);
     arm64jit::jit::block_cache_drop_region(0x102_256_500u64, 0x102_256_700u64);
+}
+
+/// SH349 (opt-in JIT_ROUTEB_LSM_APPEND_SKIP=1, default-INERT): RET the faulty byte-copy sub-call
+/// 0x101d9a15c the SH285 fault lives inside. SH348 showed the fault survives a whole-init leaf-ret
+/// (caller block reached by mid-function direct jump past the entry), so skip the FAILING SUB-CALL:
+/// this pure-memcpy leaf is ret'd, stubbing EVERY path into the 0x101db1b08
+/// strb. CAUSE-level (SH117), NOT a live-object repair (SH248h).
+fn routeb_patch_lsm_append_skip() {
+    if std::env::var_os("JIT_ROUTEB_LSM_APPEND_SKIP").is_none() {
+        return;
+    }
+    const ENTRY: u64 = 0x101_d9a_15c; // LSM append byte-copy: ldr w8,[x2] (the SH285 fault body)
+    const PROLOGUE: u32 = 0xb940_0048; // ldr w8,[x2]
+    const RET: u32 = 0xd65f_03c0; // ret
+    let page = ENTRY & !0xfff;
+    unsafe {
+        if libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_WRITE) != 0 {
+            eprintln!("[elfjit:routeb] WARN SH349 mprotect RW failed @0x{ENTRY:x} errno={}", std::io::Error::last_os_error());
+            return;
+        }
+        let before = *(ENTRY as *const u32);
+        if before == PROLOGUE {
+            *(ENTRY as *mut u32) = RET;
+            eprintln!("[elfjit:routeb] SH349 `ret` LSM append byte-copy @0x{ENTRY:x} ({before:08x}->{RET:08x}) — SH285 fault made inert");
+        } else if before == RET {
+            eprintln!("[elfjit:routeb] SH349 LSM append @0x{ENTRY:x} already `ret`");
+        } else {
+            eprintln!("[elfjit:routeb] WARN SH349 LSM append @0x{ENTRY:x} unexpected prologue {before:08x}, not patched");
+        }
+        libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_READ | libc::PROT_EXEC);
+    }
+    // Re-translate the append body + its SH285 caller block with the patch (no stale `strb` block).
+    arm64jit::jit::block_cache_drop_region(0x101_d9a_100u64, 0x101_d9a_1c0u64);
+    arm64jit::jit::block_cache_drop_region(0x101_db1_a80u64, 0x101_db1_b80u64);
 }
 
 /// SH327: force AppStarted factory 0x2e890c4 construction DETERMINISTICALLY (0x1025f5300 gate
@@ -6615,6 +6644,9 @@ fn main() {
             // SH348 (opt-in JIT_ROUTEB_LSM_INIT_SKIP=1): leaf-`ret` initStorageManagerNative so the
             // SESSION-CTOR continuation skips the SH285 persistence-lane wall and reaches app-start.
             routeb_patch_lsm_init_skip();
+            // SH349 (opt-in JIT_ROUTEB_LSM_APPEND_SKIP=1): RET the faulty byte-copy sub-call 0x101d9a15c
+            // (SH348 reached it past the entry patch via mid-function jump; this stubs every path).
+            routeb_patch_lsm_append_skip();
             let boot_sp = st.x[31];
             let tpidr = arm64jit::jit::current_guest_tp();
             let ib = base;
@@ -15578,9 +15610,9 @@ mod sh115_tests {
 
     #[test]
     fn sh348_lsm_init_skip_patches_persistence_fn() {
-        // SH348: JIT_ROUTEB_LSM_INIT_SKIP leaf-`ret`s initStorageManagerNative (entry 0x101d9d8b0,
+        // SH348: JIT_ROUTEB_LSM_INIT_SKIP leaf-`ret`s initStorageManagerNative (verify the prologue
         // (collapsed)
-        // check the prologue is the exact byte we patch).
+        // we patch is the exact byte).
         let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
         if p.exists() {
             let el = load_real_image();
@@ -15592,9 +15624,32 @@ mod sh115_tests {
             assert_eq!(word(0x102_2_56608), 0x97ed1caa, "sh348 caller bl LocalStorageManager_initStorageManagerNative 0x1d9d8b0");
             assert_eq!(word(0x101_db1_b08), 0xd10083a2, "sh348 SH285 reader/pop terminal site (sub x2,x0,#0x20, the persistence-lane wall)");
             assert_eq!(word(0x102_bd2_058u64) & 0xfc000000, 0x94000000, "sh348 app-start bl region past the LSM call (b-format word)");
-            eprintln!("sh348 initStorageManagerNative leaf-ret persistence-lane skip pinned (SH285 wall -> app-start 0x2bd2058).");
+            eprintln!("sh348 initStorageManagerNative leaf-ret persistence-lane skip pinned (SH285->app-start 0x2bd2058).");
         } else {
             eprintln!("sh348 real-image guard: no real libroblox.so, skipping anchors");
+        }
+    }
+
+    #[test]
+    fn sh349_lsm_append_subcall_pins_inert_target() {
+        // SH349: JIT_ROUTEB_LSM_APPEND_SKIP RETs the faulty LSM byte-copy sub-call 0x101d9a15c
+        // (the body the SH285 fault lives inside); SH348 measured it reachable past the entry patch
+        // via a mid-function direct jump. Pin the words we patch/inert: append prologue
+        // 0xb9400048, SH285 caller bl 0x97ffa192, fault store 0x381ff54b, natural ret 0xd65f03c0.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let el = load_real_image();
+            let word = |guest: u64| -> u32 {
+                let host = el.host_addr_of(guest).unwrap_or(0);
+                if host == 0 { 0 } else { unsafe { (host as *const u32).read_unaligned() } }
+            };
+            assert_eq!(word(0x101_d9a_15c), 0xb9400048, "sh349 append entry ldr w8,[x2] (the patched prologue)");
+            assert_eq!(word(0x101_db1_b14), 0x97ffa192, "sh349 SH285 caller bl append 0x1d9a15c (lr->0x1db1b18, the fault return)");
+            assert_eq!(word(0x101_d9a_180), 0x381ff54b, "sh349 backward-copy store strb w11,[x10],#-1 (the fault instr through [obj+0x50])");
+            assert_eq!(word(0x101_d9a_18c), 0xd65f03c0, "sh349 append natural ret (the substituted word)");
+            eprintln!("sh349 LSM append byte-copy inert-target pinned (SH285 fault body 0x101d9a15c).");
+        } else {
+            eprintln!("sh349 real-image guard: no real libroblox.so, skipping anchors");
         }
     }
 
