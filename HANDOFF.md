@@ -1,5 +1,39 @@
 # Open Sober — Agent Handoff
 
+## SH472 + SH473 + SH474 (Sep 19, 2026, hermes-worker): close the session-content fn-table DISPATCH coverage — the json-abort params, boolean/long getters, and display float-fields are now pinned through the REAL JNIEnv slots (were production arms with dead or absent pins)
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified
+GREEN at fresh HEAD first (capture_taskv4_frame.sh attempt 1: 24 real task-driven
+frames `present swap Ok(0x1)`, 197 node pops, 0 json abort, 0 crash, EXIT 124 =
+stable idle). Do-init/Route-B baseline re-probed on the real binary this cycle too
+(capture_sh415: substrate 14/16, once-guard bit0=1, DM-root [0x106a68818]=0x0 ->
+LIVE DM=false, MH_FLAGS_LOADED/ENGINE_INITIALIZED/APP_READY all true, AppBridgeV2
+vt resolved, 0 crash). Workspace green (arm64jit lib 680/0; full cargo test
+--workspace green). Production code UNCHANGED in all three — every change is a
+test-only jni.rs addition (off the 1MiB hooks; jit.rs/elfjit.rs/session.rs
+untouched; runtime byte-identical). No re-treads: each was a real, measurable,
+unexercised production arm.
+- **The defect class closed (SH472):** a systematic cross-check of the recon-named
+  session-content getter surface found getLanguage + getDisplayResolution had
+  `assert_eq!(len, …)` arms in the fn-table dispatch test but were NOT in the loop's
+  name array — the arms were DEAD. Adding them surfaced a second latent bug: the
+  getDisplayResolution arm pinned the wrong length (7; "1280x720" is 8 chars) that
+  had never fired for the same why. Both now iterate the real
+  CallObjectMethod->GetStringUTFLength path with the corrected length.
+- **SH473:** isCpu64Bit/isLowRamDevice/isMouseDevice/isPotato/isTablet/isVrDevice
+  booleans + getDeviceTotalMemoryMB=8192 long were production arms with ZERO
+  CallBooleanMethod/CallLongMethod assertion — a regressed isCpu64Bit=0 or device
+  RAM collapse would pass the whole suite. Now each is asserted through the real
+  dispatch (slots 45/52).
+- **SH474:** scaledDensity=1.0, xdpi/ydpi=96.0 float fields were production arms
+  with only `density` asserted — no GetFloatField pin. Now pinned through the
+  s0-return bridge.
+- Honest: NOT a DM (Route-B gate UNCHANGED; DM-root 0 structural per SH462/467).
+  BUILD-THE-RUNTIME test-contract completion: the entire session-content surface
+  the engine reads is now dispatch-pinned, so the json-writer can't leak and the
+  params/display values can't silently collapse. Latent-but-correct like every axis.
+- Files: docs/frontier-sh472-474-params-dispatch-pins.md + crates/arm64jit/src/
+  jni.rs (test-only). Commits 9680499, ce26ab6, ef69765.
+
 ## SH470 + SH471 (Sep 20, 2026, hermes-worker): complete the recon-named LocaleList + DeviceParams session-content read surface — getLanguage/getCountry, displayResolution, displayPhysical{Width,Height}Pixels
 Single-agent (cone suppressed). Continuation of SH469's display/config surface.
 Workspace green at final HEAD (arm64jit 680/0 incl. the sh469 hermetic).
