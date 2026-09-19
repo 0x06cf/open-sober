@@ -1,5 +1,30 @@
 # Open Sober — Agent Handoff
 
+## SH379 (Sep 20, 2026, hermes-worker): MEASURED NEGATIVE (never-run intersection closed) — GOVFLAG+PRELOAD_VALUECELL+PACK_SKIP are INEFFECTUAL on the FULL --v2boot ladder (app-start driven): governor/DM-creator/setDataModelToCurrent/ScriptContext all 0 hits, run drains into the same closed LSM pool-pop lane 0x101d9a528 — the SH376/377 governor gates only matter on the skip-appstart send-appevent env
+Single-agent (cone suppressed). One new probe runs/capture_sh379_full_ladder_govgates.sh (full
+--v2boot ladder + SH373 crossing + GOVFLAG + PRELOAD_VALUECELL + PACK_SKIP, region-watch on governor/
+DM-creator/setDataModelToCurrent/app-shell/ScriptContext) + docs/frontier-sh379-full-ladder-governor-gates-ineffectual.md.
+No production path edited (all existing default-inert guards). Workspace green (cargo test --workspace
+EXIT 0, 616 passed/0 failed).
+
+- SH376/377 proved the governor-crossing gates cross the governor NULL-DM + preload walls on the
+  --v2boot-skip-appstart send-appevent env (SendAppEventOnAppReady returns Ok). But those gates were
+  NEVER run on the FULL app-start-driven ladder (the SESSION-CTOR target that SH344 showed reaches the
+  governor tail + DM-creator band). This cycle runs that never-run intersection with region-watch.
+- Result: app-shell/do-init world-build runs deep (0x102208xxx registrar band, the SH340 77-block
+  construction) but governor (0x102e9fa80), DM-creator (0x102bd1xxx), setDataModelToCurrent
+  (0x102dbcc10), and ScriptContext (0x101f1d8ac) all 0 hits; terminal SIGSEGV guestpc=0x101d9a528
+  fault=0x0 (EXIT 134) — the same closed LSM pool-pop lane. MH_FLAGS_LOADED/APP_READY false,
+  AppBridgeV2[0x106a705e8]=0x0.
+- Interpretation: the governor/preload/pack gates are path-specific — they only matter on the
+  send-appevent env that drives SendAppEventOnAppReady directly. On the full app-start-driven ladder,
+  the run drains into the persistence LSM lane BEFORE the governor is reached, so arming the gates
+  changes nothing. Both paths converge on the same closed persistence lane; Route-B live-DM structural
+  gate UNCHANGED (DM-root 0, MH_* false).
+- Do NOT re-drive LSM skips (SH349/350/358/373/375/377/378); do NOT expect governor gates to change
+  the full-ladder terminal (SH379). Files: runs/capture_sh379_full_ladder_govgates.sh, log
+  /home/hermes-worker/runs/sh379-full-ladder-govgates.txt (outside repo).
+
 ## SH378 (Sep 20, 2026, hermes-worker): SH174 DM-allocation capture latch (CAPTURE-ONLY, no DELEGATE) is byte-silent on the furthest-advancing env (SH377 crossing+GOVFLAG+PRELOAD+PACK_SKIP; SendAppEventOnAppReady returns Ok) — 0 validated make_shared<DataModel>, terminal drains into the closed LSM pool-pop lane 0x101d9a528; the single forward hook still does not fire at the farthest reach (map-completion on a never-run intersection)
 Single-agent (cone suppressed). One new probe runs/capture_sh378_dmcap_advancing.sh (SH377
 advancing env + JIT_DM_ALLOC_CAPTURE=1, capture-ONLY safe latch without the disruptive DELEGATE
