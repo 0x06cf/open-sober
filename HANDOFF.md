@@ -1,5 +1,43 @@
 # Open Sober — Agent Handoff
 
+## SH448 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD INTEGER ARITH-UNARY codegen family (translate.rs SimdArithUnary — neg/abs Vd.T, Vn.T) — 4 exact-byte pins
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+unchanged-green (the change is `#[cfg(test)]`-only, so the runtime deliverable
+is byte-identical — SH445 capture baseline 24 real task-driven frames `present
+swap Ok(0x1)`, 0 json abort, 0 crash, EXIT 0). Workspace green (cargo test
+--workspace EXIT 0; arm64jit lib 622/0 incl. 4 new sh448 pins, was 618; cargo
+build --workspace + --example elfjit OK). Production code ONLY in translate.rs
+`#[cfg(test)]` addition (translator core body byte-untouched; jit.rs
+1,048,390 B < 1MiB hook unchanged; elfjit.rs 1,048,392 B / session.rs
+unchanged). Commit fc01a8e.
+- SimdArithUnary (the per-lane integer unary — neg op 0 / abs op 1) had zero
+  direct byte tests (STATUS next-forward #5 named `SimdFpUnary/SimdArithUnary`
+  a remaining family). SH448 pins the exact emit (rd=1 rn=2; Vn@0x130
+  Vd@0x120): (1) neg .2s full-buffer — 32-bit zero-extend load (8b 83) + `neg
+  rax` (48 f7 d8) + 32-bit store (89 83), NEVER movsxd (48 63 c0); (2) abs .2s
+  full-buffer — the `(x ^ (x ar>> w-1)) - (x ar>> w-1)` idiom: MUST `movsxd
+  rax,eax` (48 63 c0) FIRST (signed lane), then mov rcx,rax (48 89 c1) + `sar
+  rcx,31` (48 c1 f9 1f, imm=esize*8-1) + xor rax,rcx (48 31 c8) + sub rax,rcx
+  (48 29 c8), NEVER a bare neg rax (48 f7 d8); (3) esize width — 2d q=true loads
+  full 64-bit (48 8b 83) + 64-bit store (48 89 83, lane1 +8 0x128); esize=1 abs
+  loads via movsx_byte_mem (48 0f be) + `sar rcx,7` (imm 07) + byte store (88
+  83, +1/lane); (4) THE abs-vs-neg count discriminator — 4-lane .4s: neg emits
+  exactly 4 `neg rax` + 0 movsxd, abs emits exactly 4 movsxd + 0 neg (a
+  transposed op silently abs()'s a neg / negates an abs).
+- Deterministic: synthetic Inst -> translate() -> CodeBuf.as_slice() (zero-pc
+  0x1000); [RBX]=CpuState, vector slot v[t]=VECTOR_BASE(0x110)+t*16. Emission
+  captured with a one-off probe dump (removed before commit) so pins match the
+  real emission. 4 exact-byte + window + count/negative asserts. No image, no
+  env, parallel-safe.
+- Honest: NOT a DM (SH415 probe re-confirms DM-root [0x106a68818]=0x0 under the
+  complete substrate; Route-B live-DM gate UNCHANGED). BUILD-THE-RUNTIME
+  codegen-surface coverage completion on the integer neg/abs family,
+  continuing the SH427-447 translator-core lineage. No re-treads (distinct
+  from SH447 FP unary — this is the integer GPR neg / sar-xor-sub
+  absolute-value).
+- Files: docs/frontier-sh448-translator-simdarithunary.md + crates/arm64jit/
+  src/translate.rs (`#[cfg(test)]` only). Commit fc01a8e.
+
 ## SH447 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD FP UNARY codegen family (translate.rs SimdFpUnary — fneg/fabs/fsqrt Vd.T, Vn.T) — 5 exact-byte pins
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 unchanged-green (the change is `#[cfg(test)]`-only, so the runtime deliverable
