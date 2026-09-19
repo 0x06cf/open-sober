@@ -1,5 +1,29 @@
 # Open Sober — Agent Handoff
 
+## SH377 (Sep 20, 2026, hermes-worker): the corrected combined env + SH350 pack-skip advances SendAppEventOnAppReady to RETURN and lands in the known run-variable live-object family (0x10284cf5c) — confirming the pack-helper closure holds as the next wall on the corrected terminal sequence
+Single-agent (cone suppressed). One probe runs/capture_sh377_packskip_combined.sh (crossing-env +
+GOVFLAG + PRELOAD_VALUECELL + LSM_PACK_SKIP, the never-run intersection) + live capture (gitignored).
+No production path edited (existing default-inert guards only). Workspace green.
+
+- With pack-skip RET'ing the single-caller name-pack helper 0x101d9a708 (SH350's bounded-single-caller
+  skip), the corrected combined env reaches `SendAppEventOnAppReady returned` AND advances the terminal
+  past 0x101d9a708.
+- New terminal: `[SIGSEGV] guestpc=0x10284cf5c fault=0x0 x0=0x0` — a small once-style routine
+  (`stp x29,x30,[sp,#-32]!`; `stlrb w8,[x0]` @0x284cf70) called with a NULL this-pointer. This is the
+  SAME canonical run-variable live-object arm SH355 already documented ("canonical full-ladder probe
+  re-ran EXIT 134 at the run-variable live-object arm guestpc 0x10284cf5c"). NOT a fresh seedable gate:
+  the object behind x0 is only built by a real session ctor (SH174/SH204 class), run-variable across runs.
+- Confirmation: the corrected map's inference holds — the pack-helper (0x101d9a708, SH350) really
+  is the next wall past the crossed governor/preload on the SESSION-CTOR path, and it now leads into the
+  known-returned run-variable live-object family (NOT do-init -> DM). This STRENGTHENS the standing
+  verdict: the SESSION-CTOR drive, even fully crossed through governor+preload+pack, still re-enters
+  measured-returned live-object lane before any live DM construction.
+
+### Honest
+Does NOT manufacture a DataModel. Route-B live-DM structural gate UNCHANGED (DM-root 0, MH_* false).
+SH174 capture-latch stays the single forward hook. Do NOT re-drive LSM sub-call skips deeper
+(SH349/350/358/373/375/377).
+
 ## SH376 (Sep 20, 2026, hermes-worker): CORRECT the SH375 terminal attribution + MEASURED governor/preload cross under the crossing-env — the real terminal after SH285-crossing is the governor NULL-DM deref (0x102ea0b9c, SH269), not a "SetInitParams abort"; arming GOVFLAG+PRELOAD_VALUECELL advances SendAppEventOnAppReady past governor+preload to the SH350 pack-helper (closed)
 Single-agent (cone suppressed). Two probes (runs/capture_sh376_govflag_crossing.sh +
 runs/capture_sh376b_combined.sh) + live captures (gitignored) + docs/frontier-sh376-governor-null-dm-terminal-corrected.md
