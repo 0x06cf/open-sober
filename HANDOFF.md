@@ -1,5 +1,48 @@
 # Open Sober — Agent Handoff
 
+## SH469 (Sep 20, 2026, hermes-worker): wire the DisplayMetrics/Configuration session-content FIELD surface — GetIntField/GetFloatField/GetLongField + the getResources→getDisplayMetrics/getConfiguration object chain, so the engine self-constructs its login/home over REAL geometry
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverable re-verified
+GREEN at this fresh HEAD first (capture_taskv4_frame.sh attempt 1: 24 real
+task-driven frames `present swap Ok(0x1)`, 196 node pops, 0 json abort, 0 crash,
+EXIT 124 = stable idle). Workspace green (cargo test --workspace EXIT 0; arm64jit
+lib 679->680 incl. 1 new sh469 hermetic; cargo build --workspace + --example elfjit
+OK). Production code in jni.rs (off the 1MiB hooks; jit.rs/elfjit.rs untouched).
+- **The gap closed:** recon-framework-boot-order.md names DisplayMetrics/
+  Configuration as the session-content the engine reads to lay its OWN UI out over
+  (density, widthPixels, heightPixels, orientation, getLocales). Measured headlessly
+  BEFORE this the whole surface collapsed to 0/NULL: GetFloatField (JNI slot 102)
+  was NEVER serviced (fell to the voidp default -> density/xdpi/ydpi = 0), GetIntField
+  (100) routed to jni_field_0 (widthPixels/heightPixels/orientation = 0), and
+  CallObjectMethod returned NULL for getResources/getDisplayMetrics/getConfiguration/
+  getLocales, so the engine could not even obtain the objects to read fields from.
+  A self-constructed login/home would lay out at density=0 / 0x0 / orientation=0 —
+  a collapsed, unusable screen.
+- New: slot consts GET_LONG_FIELD=101 + GET_FLOAT_FIELD=102 (authoritative NDK);
+  `jni_get_int_field` (100) field-name dispatch over the recon's real geometry
+  (widthPixels=1280, heightPixels=720, densityDpi=160, screenWidthDp=1280,
+  screenHeightDp=720, orientation=2 LANDSCAPE); `jni_get_long_field` (101) honest 0;
+  `jni_get_float_field` (102) as a HostJniF32 s0-return bridge (same transport as the
+  SH134 getDpiScale CallFloatMethod) returning density=1.0, scaledDensity=1.0,
+  xdpi=96, ydpi=96; CallObjectMethod now resolves the 4 object-chain getters to a
+  new_fake_object() handle instead of NULL. Because GetFieldID routes to
+  jni_get_method_id (interns the FIELD NAME as a readable handle), the field getters
+  dispatch on the same method_id_name path as every other getter — no new ABI,
+  symmetric with the params getter table.
+- New hermetic `display_config_field_surface_roundtrip`: the 3 field-getter slots
+  serviced (GetFloatField uses the s0-return bridge, not CallObjectMethod); object
+  chain resolves; GetIntField returns the exact recon geometry (1280/720/160/1280/
+  720/2) + unknown field 0; GetFloatField density=1.0f32; GetLongField 0. Pure host
+  logic, no image/env, parallel-safe.
+- Honest: NOT a DM / NOT a live-DM step (Route-B live-DM gate UNCHANGED; DM-root
+  [0x106a68818]=0, structural per SH462/467). BUILD-THE-RUNTIME session-content
+  completion: the engine's UI layer, when a session advances it, now reads real
+  display geometry instead of a 0/0/0 collapse — a pre-condition for its OWN
+  GuiObjects to be correctly-sized. Latent-but-correct like every axis. No re-treads
+  (SH134 covered the getDpiScale METHOD; this covers the DisplayMetrics/Configuration
+  FIELD reads over the object chain). recon-v3 deliverable re-verified green.
+- Files: docs/frontier-sh469-displayconfig-field-surface.md + crates/arm64jit/src/
+  jni.rs (production field surface + hermetic). Commit (SH469).
+
 ## SH468 (Sep 20, 2026, hermes-worker): pin the FULL login-vs-home discriminator through the real NativeHelper dispatch — the HOME / remembered-sign-in branch was an untested half of the recon-named login gate
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 re-verified green at THIS fresh HEAD first (capture_taskv4_frame.sh attempt 1:

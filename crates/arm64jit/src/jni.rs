@@ -44,6 +44,8 @@ const GET_FIELD_ID: usize = 94;
 const GET_OBJ_FIELD: usize = 95;
 const GET_BOOLEAN_FIELD: usize = 96;
 const GET_INT_FIELD: usize = 100;
+const GET_LONG_FIELD: usize = 101;
+const GET_FLOAT_FIELD: usize = 102;
 const SET_OBJ_FIELD: usize = 104;
 const SET_BOOLEAN_FIELD: usize = 105;
 const GET_STATIC_METHOD_ID: usize = 113;
@@ -686,6 +688,25 @@ extern "C" fn jni_call_object_method(
             }
             return str_handle(val);
         }
+        // SH-x recon-framework-boot-order: the engine reads its DISPLAY/CONFIG
+        // session-content via an object chain — Activity.getResources() ->
+        // Resources.getDisplayMetrics()/getConfiguration(). Previously these
+        // returned 0 (NULL), so the chain died and every DisplayMetrics/Configuration
+        // field (density, widthPixels, heightPixels, orientation) collapsed to 0 —
+        // the engine could not self-construct a correctly-sized UI layer. Return a
+        // stable fake object handle so the chain RESOLVES to a real per-slot value
+        // via the field getters (GetIntField/GetFloatField) below.
+        let obj_only = matches!(
+            &name[..],
+            b"getResources" | b"getDisplayMetrics" | b"getConfiguration" | b"getLocales"
+        );
+        if obj_only {
+            let h = crate::jni::new_fake_object();
+            if std::env::var_os("JIT_TRACE").is_some() {
+                eprintln!("[jni] CallObjectMethod getter {} -> fake object handle {:#x}", String::from_utf8_lossy(&name), h);
+            }
+            return h;
+        }
     }
     0
 }
@@ -906,6 +927,56 @@ extern "C" fn jni_call_float_method(state: *mut crate::jit::CpuState) -> u32 {
     }
 }
 
+// --- DISPLAY/CONFIG FIELD GETTERS (recon-framework-boot-order.md session-content) ---
+//
+// The engine reads its UI geometry through the Java object chain
+// Activity.getResources() -> Resources.getDisplayMetrics()/getConfiguration(), then
+// GetFieldID + a typed Get<Primitive>Field on the returned object. GetFieldID is
+// routed to jni_get_method_id above, so a fieldID IS a readable name handle —
+// field-name dispatch works identically to method-name dispatch. Before this
+// surface, GetIntField/GetLongField/GetFloatField were unserviced (slot default `0`
+// via jni_field_0) and GetFloatField (slot 102) was a dead NULL — so the engine's
+// UI layer read density=0, width=0, orientation=0 and could not self-construct a
+// correctly-sized login/home. Return the recon's real session geometry so the
+// engine lays out its own GuiObjects over a live-sized surface.
+
+/// GetIntField(env,obj,fieldID): DisplayMetrics/Configuration int fields.
+extern "C" fn jni_get_int_field(
+    _e: u64, _obj: u64, fid: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    match method_id_name(fid).as_deref() {
+        Some(b"widthPixels") => 1280,
+        Some(b"heightPixels") => 720,
+        Some(b"densityDpi") => 160,
+        Some(b"screenWidthDp") => 1280,
+        Some(b"screenHeightDp") => 720,
+        Some(b"orientation") => 2, // LANDSCAPE
+        _ => 0,
+    }
+}
+
+/// GetLongField(env,obj,fieldID): no known long display fields; honest 0.
+extern "C" fn jni_get_long_field(
+    _e: u64, _obj: u64, _fid: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
+) -> u64 {
+    0
+}
+
+/// GetFloatField(env,obj,fieldID): DisplayMetrics float fields (HostJniF32,
+/// s0-return like getDpiScale). density/scaledDensity are the layout scale the
+/// UI multiplies every element by; xdpi/ydpi the touch density.
+extern "C" fn jni_get_float_field(state: *mut crate::jit::CpuState) -> u32 {
+    let st = unsafe { &*state };
+    let fid = st.x[2];
+    match method_id_name(fid).as_deref() {
+        Some(b"density") => 1.0f32.to_bits(),
+        Some(b"scaledDensity") => 1.0f32.to_bits(),
+        Some(b"xdpi") => 96.0f32.to_bits(),
+        Some(b"ydpi") => 96.0f32.to_bits(),
+        _ => 0,
+    }
+}
+
 extern "C" fn jni_register_natives(
     _e: u64, cls: u64, methods: u64, n: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64,
 ) -> u64 {
@@ -1083,7 +1154,9 @@ pub fn build_jni() -> (u64, u64) {
         functions[GET_FIELD_ID] = reg(jni_get_method_id);
         functions[GET_OBJ_FIELD] = field0;
         functions[GET_BOOLEAN_FIELD] = field0;
-        functions[GET_INT_FIELD] = field0;
+        functions[GET_INT_FIELD] = reg(jni_get_int_field);
+        functions[GET_LONG_FIELD] = reg(jni_get_long_field);
+        functions[GET_FLOAT_FIELD] = reg_jni_f32(jni_get_float_field);
         functions[SET_OBJ_FIELD] = ok;
         functions[SET_BOOLEAN_FIELD] = ok;
         functions[GET_STATIC_METHOD_ID] = reg(jni_get_method_id);
@@ -2087,5 +2160,68 @@ mod tests {
         // s0 (v0 low 32) must hold 1.0f32 bits after the dispatch.
         assert_eq!(st.v[0] & 0xffff_ffff, 1.0f32.to_bits() as u64, "s0 = getDpiScale 1.0");
         assert_eq!(st.x[0] & 0xffff_ffff, 1.0f32.to_bits() as u64, "fmov w0,s0 saw 1.0");
+    }
+
+    /// DisplayMetrics/Configuration field surface (recon-framework-boot-order): the
+    /// engine reads its UI geometry via Activity.getResources()->getDisplayMetrics()/
+    /// getConfiguration() then GetFieldID + typed Get<Primitive>Field. Before SH-469
+    /// these collapsed to 0/NULL (GetFloatField slot 102 was never serviced), so the
+    /// engine could not self-construct a correctly-sized login/home. Now the object
+    /// getters resolve to a fake object AND the field getters return the recon's real
+    /// session geometry. Pin: the three field-getter slots are serviced (not NULL),
+    /// the field NAME dispatch returns the recon values, and the object-chain getters
+    /// (getResources/getDisplayMetrics/getConfiguration) no longer return NULL.
+    #[test]
+    fn display_config_field_surface_roundtrip() {
+        use crate::jit::{jit_run, CpuState};
+        let (env, _vm) = build_jni();
+        unsafe {
+            let functions = *(env as *const u64);
+            let get = |i: usize| -> u64 { *(functions as *const u64).add(i) };
+            // The three field-getter slots must be serviced (a dead NULL -> guest abort).
+            assert_ne!(get(GET_INT_FIELD), 0, "GetIntField slot non-null");
+            assert_ne!(get(GET_LONG_FIELD), 0, "GetLongField slot non-null");
+            assert_ne!(get(GET_FLOAT_FIELD), 0, "GetFloatField slot non-null");
+            assert_ne!(get(GET_FLOAT_FIELD), get(CALL_OBJECT_METHOD), "float field uses the s0-return bridge, not CallObjectMethod");
+
+            // (1) Object getters resolve the chain instead of dying at NULL.
+            let obj_getters: &[&[u8]] = &[b"getResources", b"getDisplayMetrics", b"getConfiguration", b"getLocales"];
+            for &name in obj_getters {
+                let buf = unsafe { alloc_zeroed(Layout::array::<u8>(name.len() + 1).unwrap()) };
+                unsafe { std::ptr::copy_nonoverlapping(name.as_ptr(), buf, name.len()) };
+                let mid = super::jni_get_method_id(0, 0, buf as u64, 0, 0, 0, 0, 0);
+                let h = super::jni_call_object_method(env, 0x4321, mid, 0, 0, 0, 0, 0);
+                assert_ne!(h, 0, "{} resolves to a fake object (chain survives)", String::from_utf8_lossy(name));
+            }
+
+            // (2) GetIntField dispatches on the field name -> recon geometry.
+            let field_id = |name: &[u8]| super::jni_get_method_id(0, 0, {
+                let b = unsafe { alloc_zeroed(Layout::array::<u8>(name.len() + 1).unwrap()) };
+                unsafe { std::ptr::copy_nonoverlapping(name.as_ptr(), b, name.len()) };
+                b as u64
+            }, 0, 0, 0, 0, 0);
+            let gif = super::jni_get_int_field;
+            assert_eq!(gif(env, 0x999, field_id(b"widthPixels"), 0, 0, 0, 0, 0), 1280);
+            assert_eq!(gif(env, 0x999, field_id(b"heightPixels"), 0, 0, 0, 0, 0), 720);
+            assert_eq!(gif(env, 0x999, field_id(b"densityDpi"), 0, 0, 0, 0, 0), 160);
+            assert_eq!(gif(env, 0x999, field_id(b"screenWidthDp"), 0, 0, 0, 0, 0), 1280);
+            assert_eq!(gif(env, 0x999, field_id(b"screenHeightDp"), 0, 0, 0, 0, 0), 720);
+            assert_eq!(gif(env, 0x999, field_id(b"orientation"), 0, 0, 0, 0, 0), 2);
+            // Unknown field -> honest 0.
+            assert_eq!(gif(env, 0x999, field_id(b"someField"), 0, 0, 0, 0, 0), 0);
+
+            // (3) GetFloatField is a HostJniF32 bridge (s0-return): the bridge writes the
+            // returned u32 bits into guest s0 (v0 low 32). Call the thunk directly
+            // (env/obj/fid in x0/x1/x2) and assert the returned bits = density 1.0.
+            let mut fst = CpuState::new();
+            fst.x[0] = env;
+            fst.x[1] = 0x999;
+            fst.x[2] = field_id(b"density");
+            let bits = unsafe { super::jni_get_float_field(&mut fst as *mut CpuState) };
+            assert_eq!(bits as u64 & 0xffff_ffff, 1.0f32.to_bits() as u64, "density float = 1.0f32");
+
+            // GetLongField -> honest 0 (no known long display fields).
+            assert_eq!(super::jni_get_long_field(env, 0x999, field_id(b"anyField"), 0, 0, 0, 0, 0), 0);
+        }
     }
 }
