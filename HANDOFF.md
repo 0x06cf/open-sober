@@ -1,6 +1,11 @@
 # Open Sober — Agent Handoff
 
-## SH417 (Sep 19, 2026, hermes-worker): the persistent-tracker host input LOOP — STATUS next-forward #3 — a real host loop keeps ONE PointerTracker across poll iterations so a press's DOWN and its MOVE across frames stay the same pointer (the SH416 one-shot rebuilt the tracker each call and mistracked them); the bounded loop drains the registered ANativeWindow XID N=INPUT_LOOP_ITERS times through the exact SH413/414 bridge into guest nativePassInput, tested inert + measured on the real binary
+## SH417 (Sep 26, 2026, hermes-worker): the persistent-tracker host input LOOP — STATUS next-forward #3 — a real host loop keeps ONE PointerTracker across poll iterations so a press's DOWN and its MOVE across frames stay the same pointer (the SH416 one-shot rebuilt the tracker each call and mistracked them); the bounded loop drains the registered ANativeWindow XID N=INPUT_LOOP_ITERS times through the exact SH413/414 bridge into guest nativePassInput, tested inert + measured on the real binary
+(SH417 + SH418: SH418 promoted the loop to a FIRST-CLASS driven substrate step —
+drive_routeb_session_substrate now drives it right after the post-bus G3 content
+surface, same promotion SH411/412 gave the DM binder/app-start/content; substrate
+MEASURED 12/16 atoms non-zero Ok on the real binary, up from 11/16, no regression,
+input step inert on the no-bridge boot env. Commits fd2c5e3 + b75b336.)
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified green at HEAD first
 (capture_taskv4_frame.sh attempt 1: 24 real task frames `present swap Ok(0x1)`, 195 node pops, 0 json
 abort, 0 crash). Production code only in session.rs + elfjit.rs rung; jit.rs untouched (at the 1MiB hook).
