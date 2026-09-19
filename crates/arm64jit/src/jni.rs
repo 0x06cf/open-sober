@@ -1873,6 +1873,16 @@ mod tests {
             assert_eq!(g_bm(env, 0x4321, get_name_id(b"isUnder13"), 0, 0, 0, 0, 0), 0, "isUnder13 false");
             assert_eq!(g_bm(env, 0x4321, get_name_id(b"isTouchDevice"), 0, 0, 0, 0, 0), 0, "isTouchDevice false");
             assert_eq!(g_bm(env, 0x4321, get_name_id(b"isKeyboardDevice"), 0, 0, 0, 0, 0), 1, "isKeyboardDevice true");
+            // Remaining recon-named boolean getters (DeviceParams/StartAppParams
+            // shape) — exercised through the SAME CallBooleanMethod dispatch so a
+            // regression that flips any one of them breaks the pin (they were
+            // production arms with no fn-table coverage before SH472/473).
+            assert_eq!(g_bm(env, 0x4321, get_name_id(b"isCpu64Bit"), 0, 0, 0, 0, 0), 1, "isCpu64Bit true");
+            assert_eq!(g_bm(env, 0x4321, get_name_id(b"isLowRamDevice"), 0, 0, 0, 0, 0), 0, "isLowRamDevice false");
+            assert_eq!(g_bm(env, 0x4321, get_name_id(b"isMouseDevice"), 0, 0, 0, 0, 0), 1, "isMouseDevice true");
+            assert_eq!(g_bm(env, 0x4321, get_name_id(b"isPotato"), 0, 0, 0, 0, 0), 0, "isPotato false");
+            assert_eq!(g_bm(env, 0x4321, get_name_id(b"isTablet"), 0, 0, 0, 0, 0), 0, "isTablet false");
+            assert_eq!(g_bm(env, 0x4321, get_name_id(b"isVrDevice"), 0, 0, 0, 0, 0), 0, "isVrDevice false");
             let mid2 = get_name_id(b"getMembershipType");
             let (g_im, _) = host_call_at(get(CALL_INT_METHOD)).expect("CallIntMethod thunk");
             assert_eq!(g_im(env, 0x4321, mid2, 0, 0, 0, 0, 0), 0, "getMembershipType default 0");
@@ -1882,6 +1892,9 @@ mod tests {
             assert_eq!(g_im(env, 0x4321, get_name_id(b"getFlagsCount"), 0, 0, 0, 0, 0), 1, "getFlagsCount >=1");
             let (g_lm, _) = host_call_at(get(CALL_LONG_METHOD)).expect("CallLongMethod thunk");
             assert_eq!(g_lm(env, 0x4321, get_name_id(b"getAppUserId"), 0, 0, 0, 0, 0), 0, "getAppUserId default 0");
+            // DeviceParams.deviceTotalMemoryMB (recon v2: 8192) through the SAME
+            // CallLongMethod dispatch (was a production arm with no fn-table pin).
+            assert_eq!(g_lm(env, 0x4321, get_name_id(b"getDeviceTotalMemoryMB"), 0, 0, 0, 0, 0), 8192, "getDeviceTotalMemoryMB 8192");
             // PlatformParams.assetFolderPath points at the host assets root when
             // one is mounted (SH57 extraction) so the engine's content loader
             // finds real files; empty when unmounted (boot-safe).
