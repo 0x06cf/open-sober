@@ -1,5 +1,53 @@
 # Open Sober — Agent Handoff
 
+## SH453 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD WIDEN-AND-ADD/SUB codegen family (translate.rs SimdAddl — saddl/uaddl/subl/usubl Vd.T, Vn.T, Vm.T) — 4 exact-byte pins
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
+unchanged-green (the change is `#[cfg(test)]`-only, so the runtime deliverable
+is byte-identical — SH445 capture baseline 24 real task-driven frames `present
+swap Ok(0x1)`, 0 json abort, 0 crash, EXIT 0). Workspace green (cargo test
+--workspace EXIT 0; arm64jit lib 642/0 incl. 4 new sh453 pins, was 638; cargo
+build --workspace + --example elfjit OK). Production code ONLY in translate.rs
+`#[cfg(test)]` addition (translator core body byte-untouched; jit.rs
+1,048,390 B < 1MiB hook unchanged; elfjit.rs/session.rs unchanged). Commit
+7a75a4f +4.
+- SimdAddl (widen each esrc-byte element of Vn and Vm (low/upper half) sign-/
+  zero-extended to 2*esrc, then add or subtract into a DOUBLE-width dst; with
+  in-place-alias snapshot) had zero direct byte tests. SH453 pins the exact
+  emit (rd=1 rn=2 rm=3; Vn@0x130 Vm@0x140 Vd@0x120) with 4 exact-byte/window
+  pins:
+  (1) THE signed widen-add (load-bearing): saddl .2s esrc=4 sign=true = per lane
+  mov_load32 + `movsxd rax,eax` (48 63 c0) + mov_load32(RCX=0x140) + `movsxd
+  rcx,ecx` (48 63 c9) + `add rax,rcx` (48 01 c8) + `mov [0x120],rax` (48 89 83,
+  the 8B dst) — the movsxd + 8B store IS the widening, a zero-extend flips a
+  negative element's high bits and a 4B store truncates;
+  (2) THE add-vs-sub opcode byte: usubl sub=true = `sub rax,rcx` (48 29 c8) vs
+  uaddl `add rax,rcx` (48 01 c8) — 0x29-vs-0x01 is the semantic; unsigned word
+  sources movzx (0f b7), no movsxd;
+  (3) THE upper high-half source offset: upper=true adds +8 to the source bases
+  (Vn@0x138 Vm@0x148, NOT the low-half 0x130/0x140), signed byte sources via
+  movsx (48 0f be), negative assert the upper form must NOT read low-half
+  0x130;
+  (4) THE in-place-alias permute_source snapshot (historical gcc-bug surface):
+  when rd==rn the widened 2*esrc dst write overlaps the next lane's source, so
+  the emit snapshots the FULL 16B to perm-scratch FIRST (mov_load64 [0x120]->
+  [0x320], [0x128]->[0x328]) then reads the aliased Vn from 0x320/0x322.., while
+  the non-aliased Vm==3 is read directly at 0x140 — the [..,0x320] perm-scratch
+  reads are the alias signature.
+- Deterministic: synthetic Inst -> translate() -> CodeBuf.as_slice() (zero-pc
+  0x1000); [RBX]=CpuState, vector slot v[t]=VECTOR_BASE(0x110)+t*16. Emission
+  captured with a one-off probe test (eprintln dump, removed before commit) so
+  pins match the real emission; se=4 full-buffer assert_eq matched first try.
+  Dev-time fixes: movsx/movzx word+byte loads and 2B stores are 7-8 bytes
+  (0f b7 83 + dw / 48 0f be 83 + dw / 66 89 83 + dw) -> windows(7)/windows(8),
+  adjacent to the 6-byte 32-bit forms. 4 pins, parallel-safe, no image/env.
+- Honest: NOT a DM (SH415 probe re-confirms DM-root [0x106a68818]=0x0 under the
+  complete substrate; Route-B live-DM gate UNCHANGED). BUILD-THE-RUNTIME
+  codegen-surface coverage completion on the widen-and-add/sub family, adjacent
+  to SH452 (pairwise-add-long) and SH441 (WidenShl); distinct 3-operand
+  widen-accumulate with the alias-snapshot guard. No re-treads.
+- Files: docs/frontier-sh453-translator-addl.md + crates/arm64jit/src/
+  translate.rs (`#[cfg(test)]` only). Commit 7a75a4f +4.
+
 ## SH452 (Sep 19, 2026, hermes-worker): hermetic coverage of the SIMD PAIRWISE-ADD-LONG codegen family (translate.rs SimdAdalp — saddlp/uaddlp/sadalp/uadalp Vd.Td, Vn.Ts) — 3 exact-byte pins
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables
 unchanged-green (the change is `#[cfg(test)]`-only, so the runtime deliverable
