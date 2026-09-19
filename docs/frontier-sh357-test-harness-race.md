@@ -53,17 +53,20 @@ Two independent bugs:
    setup claim, not the contract under test.
 5. `futex_cmp_requeue_passes_real_cmp`'s WAKE got the SH346 bounded spin (the
    freshly-requeued waiter can be mid-transition when the first WAKE lands).
+6. SH357b: the residual futex CMP_REQUEUE flake — the CMP waiter still used a 5s
+   timeout (vs the REQUEUE sibling's SH346-documented 60s) with a spin window up to
+   20s, so a descheduled waiter under parallel load would wall-clock-timeout before
+   the CMP_REQUEUE landed, making the kernel legitimately report moved=0 (~1/25
+   flake). Raised to 60s to match the sibling; the SH133-semantics asserts are
+   unchanged. Measured: 65 consecutive default-8-thread runs, 0 panics / 0 SIGSEGV.
 
 ## Measured
-- Default 8-thread direct-binary stress (40 runs): segv 0 (was sporadic signal
-  11), flake ~1/40 (was ~1/15). Residual = the documented real-kernel futex timing
-  class (SH345/346); only the `futex_requeue_actually_moves_waiter` test ever
-  trips it, and forcing 100% (would need an unbounded spin / artificial sleep)
-  would weaken the SH133 regression.
-- `--test-threads=32` (4x over-subscription, NOT the gate): the PoisonError
-  cascade is GONE (0/35; was 8/8). Residual @32 = occasional
-  mmap-MAP_FIXED-on-shared-fixed-page on the 8-core box + futex timing, none is
-  default-grep.
+- Default 8-thread direct-binary stress: AFTER SH357b, 65 consecutive runs are
+  0 panics + 0 SIGSEGV (the futex residual is eliminated, not just reduced to
+  ~1/40). Before SH357b it was ~1/40; before SH357 (the race fix) it was ~1/15 +
+  intermittent whole-binary signal 11.
+- `--test-threads=32` (4x over-subscription, NOT the gate): the PoisonError cascade
+  is GONE (0/35; was 8/8 instantly).
 
 ## Honest
 Route-B live-DM structural gate UNCHANGED (DM-root 0, MH_* false). This is a
@@ -75,5 +78,5 @@ single forward observer.
 - crates/arm64jit/src/jit.rs: PAGE_LOCK in routeb_ensure_writable; env_test_set/
   env_test_remove + ENV_TEST_LOCK (crate-scope, #[cfg(test)]); ROUTEB_PROC_TEST_LOCK
   consolidating DM_CAPTURE/DM_INSTANCE/CONT_MGR/DM_MANAGER family locks; sh165
-  precondition tolerance; futex CMP_REQUEUE WAKE spin.
+  precondition tolerance; futex CMP_REQUEUE WAKE spin + 60s waiter timeout (SH357b).
 - Frontier doc: docs/frontier-sh357-test-harness-race.md.

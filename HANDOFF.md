@@ -14,10 +14,14 @@ mid-lock and POISONED it for 7 siblings. Fixes: PAGE_LOCK in routeb_ensure_writa
 (one ENV_TEST_LOCK) routing ALL test env mutations (unsafe in edition 2024);
 `ROUTEB_PROC_TEST_LOCK` consolidating the 4 family locks; sh165's order-dependent
 'page must be absent' precondition dropped (all behavioral asserts kept); futex
-CMP_REQUEUE WAKE got the SH346 bounded spin. Measured: default-8-thread stress —
-segv 0 (was signal 11), flake ~1/40 (was ~1/15; residual = documented real-kernel
-futex timing class SH345/346); --test-threads=32 PoisonError cascade 8/8 -> 0.
-Workspace green (arm64jit lib 421/0; cargo test --workspace exit 0).
+futex CMP_REQUEUE WAKE got the SH346 bounded spin. SH357b: ALSO eliminated the
+residual futex CMP_REQUEUE flake — the CMP waiter used a 5s timeout (vs the REQUEUE
+sibling's SH346-documented 60s) with a spin window up to 20s, so a descheduled
+waiter wall-clock-timed-out before the CMP_REQUEUE landed, making the kernel
+legitimately report moved=0 (~1/25 flake); raised to 60s (SH133 asserts unchanged).
+Measured: 65 consecutive default-8-thread runs are 0 panics + 0 SIGSEGV (was ~1/15
++ intermittent whole-binary signal 11 before SH357; ~1/40 after SH357). --test-threads=32
+PoisonError cascade 8/8 -> 0. Workspace green (arm64jit lib 421/0; cargo test --workspace exit 0).
 
 ### The forward this cycle
 A real harness-determinism correctness defect, root-caused and fixed; the recon-v3
