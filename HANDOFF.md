@@ -1,5 +1,30 @@
 # Open Sober — Agent Handoff
 
+## SH397 (Sep 21, 2026, hermes-worker): MEASURED (never-run intersection closed) — the SH174 DM-allocation capture latch WITH the working SH395 DELEGATE observer on the deepest do-init DISPATCH-REACHING ladder records 0 validated make_shared<DataModel>, finalizing the "no live DM" verdict AT the actual DM-ctor dispatch junction via a trustworthy observer
+Single-agent (cone suppressed). Recon-v3 immediate-priority deliverables re-verified green at this
+exact HEAD first (capture_taskv4_frame.sh attempt 1 = 24 real task-driven frames `present swap
+Ok(0x1)`, 197 node pops, 0 json abort, 0 crash; capture_sh304 producer INERT 3 UNGATED/0 GATED;
+JIT_JSON_ZERO_FIX present at 0x102355d40). New probe
+runs/capture_sh397_dmcap_delegate_doinit_dispatch.sh + docs/frontier-sh397-dmcap-delegate-doinit-dispatch.md.
+No production Rust / guest byte / JIT-hook-default touched; workspace green (cargo test --workspace
+EXIT 0, 626 passed/0 failed).
+- SH395 established the SH174 latch only arms cleanly with JIT_DM_ALLOC_CAPTURE_DELEGATE=1 (safe-latch
+  refuses over the engine's real hook 0x1021ebaf4) and that "0 validated" then is trustworthy. But
+  SH395b ran the DELEGATE observer only on the --v2boot-skip-appstart env, which NEVER reaches the
+  do-init MAIN dispatch (br x1 @0x2206e24 -> vt[+48]=0x10258b5d8) — the real DM-ctor entry
+  (SH361/SH362). The furthest-reach + working-observer composition was never run under DELEGATE.
+- SH397 runs exactly that never-run intersection: sh361's full-ladder dyn-trace env (no skip-appstart)
+  + JIT_DM_ALLOC_CAPTURE=1 DELEGATE=1. MEASURED: the do-init MAIN dispatch FIRES (SH361: container+32
+  non-NULL, [obj]vt=0x10635dde8 vt[+48]=0x10258b5d8); the DELEGATE latch INSTALLS through the engine's
+  OWN hook (prev_hook 0x1021ebaf4, delegation clean, FIRST call#1-5 all bytes=0x18 — none DM-plausible);
+  **`[validated] make_shared<DataModel>` = 0**; terminal drains to the standing SH285 persistence-lane
+  class (SIGSEGV/bad_function_call, EXIT 139); MH_FLAGS_LOADED=false MH_APP_READY=false AppBridgeV2=0.
+- Interpretation: the furthest dispatch-reaching ladder produces ZERO validated DM under a WORKING
+  observer — the deepest, most honest instrumentation depth for the Route-B live-DM verdict. The do-init
+  dispatch reaches the StartAppWithParams body (0x258b5d8) but faults in the SH285 persistence lane
+  before any live DataModel allocation. Route-B live-DM gate UNCHANGED (DM-root 0, MH_* false). This is
+  map-completion + observer-depth advance, NOT a DM advance (honest). Recon-v3 deliverables unchanged-green.
+
 ## SH396 (Sep 2026, hermes-worker): MEASURED NEGATIVE — manufacturing the LSM map-global cannot cross the SH285 reader wall (the pre-existing elfjit [lsm-map] seeder already provides a coherent empty map-global [0x10726f8c0] + per-node 0x20 cells, yet the full ladder STILL faults at guestpc=0x101db1b08 fault=0xff..ff 4/4) — closes SH384's "wire into the lane" manufacture hypothesis with execution evidence and refines SH285/SH385's path-independence verdict from a new angle
 Single-agent (cone suppressed). Recon-v3 immediate-priority deliverables re-verified green at
 this HEAD first (capture_taskv4_frame.sh attempt 1 = 24 real task-driven frames `present swap
