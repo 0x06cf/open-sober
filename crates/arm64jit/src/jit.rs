@@ -803,6 +803,62 @@ pub fn drive_messagebus_publish_receive_payload(
     }
 }
 
+/// SH366 (opt-in rung --v2boot-glue-cmd): drive the guest app-command DISPATCHER
+/// `process_cmd` (guest 0x102bcd6e4) to deliver APP_CMD_INIT_WINDOW through the engine's
+/// real window/GL-surface chain — the operator's SESSION-CTOR precondition named since SH39b
+/// (which only region-watched the glue LOOP at 0 hits) and confirmed dead-drain by SH365.
+/// Nobody has ever ENTERED this bounded fn (the infinite ALooper loop can't be jit_run; this
+/// dispatcher CAN). ABI: process_cmd(app=x0, cmd=x1). Disasm (real libroblox.so):
+///   entry sub w8,w1,#1; cmp w8,#0x13; b.hi default  -> w1 is the APP_CMD value
+///   `ldr x20,[x0]` (= [app]) then ::tbl; INIT_WINDOW(11)->x8=10->offset 0x17->case 0x2bcd78c
+///   case body: `ldr x0,[x20,#64]; strb w8,#1,[x20,#9]; bl 0x2bd29a0` (window-attach)
+///   version gate [0x10683d8b0]: byte0==6 && 0xfc00 bits -> else skip to body (keep 0 = body).
+/// Window-attach 0x2bd29a0 reads [this+0x268] once-guard; a zeroed object (guard 0) skips the
+/// once-body and rets clean. So a fabricated app ([app]=inner, inner[+64]=zeroed-window-obj)
+/// makes the dispatcher take the INIT_WINDOW body, set [inner+9]=1, and call the real
+/// window-attach path headlessly for the first time. Returns Ok(0); the [inner+9]==1 marker
+/// proves the engine's own INIT_WINDOW case EXECUTED. Single jit_run, serialized.
+pub fn drive_glue_process_cmd(iimg: &[u8], ib: u64, tpidr: u64, boot_sp: u64) -> u64 {
+    // Version gate word [0x10683d8b0]: keep 0 so `b.cc`/`cbz` route straight to the body.
+    const VERSION_GATE: u64 = 0x10683d8b0;
+    if routeb_ensure_writable(VERSION_GATE) {
+        unsafe { std::ptr::write_unaligned(VERSION_GATE as *mut u64, 0u64); }
+    }
+    // Fabricate: app = leaked 0x400 buffer; [app]=inner (0x100); [inner+64]=window obj (0x300).
+    let app = Box::leak(vec![0u8; 0x400usize].into_boxed_slice()).as_mut_ptr() as u64;
+    let inner = Box::leak(vec![0u8; 0x100usize].into_boxed_slice()).as_mut_ptr() as u64;
+    let win = Box::leak(vec![0u8; 0x300usize].into_boxed_slice()).as_mut_ptr() as u64;
+    unsafe {
+        std::ptr::write_unaligned(app as *mut u64, inner); // [app]=x20
+        std::ptr::write_unaligned((inner + 64) as *mut u64, win); // [inner+64]=window obj
+    }
+    let mut st = CpuState::new();
+    st.tpidr = tpidr;
+    st.x[31] = boot_sp;
+    st.x[0] = app;
+    st.x[1] = 11; // APP_CMD_INIT_WINDOW
+    eprintln!(
+        "[elfjit:glue-cmd] driving process_cmd @ guest 0x102bcd6e4 (app={app:#x} [app]={inner:#x} [inner+64]=win {win:#x} cmd=11 INIT_WINDOW; version-gate [0x{VERSION_GATE:x}]=0)"
+    );
+    let r = match jit_run(iimg, ib, 0x102bcd6e4, &mut st as *mut CpuState) {
+        Err(e) => {
+            eprintln!("[elfjit:glue-cmd] process_cmd stopped: {e}");
+            0
+        }
+        Ok(r) => {
+            eprintln!("[elfjit:glue-cmd] process_cmd returned Ok({r:#x})");
+            r
+        }
+    };
+    // The INIT_WINDOW case body does `strb w8,#1,[x20,#9]` where x20=[app]=inner — read it back.
+    let marker = unsafe { *(inner as *const u8).add(9) };
+    eprintln!(
+        "[elfjit:glue-cmd] INIT_WINDOW case body marker [inner+9]={marker} {}",
+        if marker == 1 { "EXECUTED (engine window-attach path entered headlessly)" } else { "not-set" }
+    );
+    r
+}
+
 /// R1 content-path synthesis (deleg_dbfc8eb2, Route-B): stage a hand-authored ~20-line Luau
 /// CoreScript the engine SELF-CONSTRUCTS a real GuiObject tree from -> R+0x180/0x188 scene nodes
 /// with ZERO host layout. Loader resolves rbxasset://scripts/CoreScripts/<Name>.lua from the
@@ -9049,6 +9105,47 @@ mod tests {
             st0.x[0] = 0;
             routeb_startapp_dispatch_body_guard(&mut st0, 0x10258b5d8);
             env_test_remove("JIT_ROUTEB_DISPATCH_BODY_TRACE");
+        }
+    }
+
+    #[test]
+    fn sh366_glue_process_cmd_abi_and_init_window_case_pinned() {
+        // SH366 (real-image): pin the guest app-command DISPATCHER contract so the
+        // --v2boot-glue-cmd rung (jit.rs drive_glue_process_cmd) stays grounded. The
+        // dispatcher 0x2bcd6e4 is process_cmd(app=x0, cmd=x1) — w1 is the APP_CMD value
+        // (`sub w8,w1,#1; cmp w8,#0x13` = command in [1..20]). INIT_WINDOW=11 -> x8=10 ->
+        // jump-table offset 0x17 (base 0x2bcd730) -> case 0x2bcd78c. That case version-gates
+        // on [0x10683d8b0] (byte0==6 && 0xfc00 bits -> else straight to body), then the body
+        // `ldr x0,[x20,#64]; strb w8,#1,[x20,#9]; bl 0x2bd29a0` (window-attach). 0x2bd29a0
+        // reads [this+0x268] once-guard and skips on 0. These pins let a fabricated app
+        // ([app]=x20, [x20+64]=zeroed window-obj) take the INIT_WINDOW body cleanly.
+        let p = std::path::Path::new("/home/hermes-worker/.cache/open-sober/robbox/libroblox.so");
+        if p.exists() {
+            let img = std::fs::read(p).expect("read real libroblox.so");
+            let word_at = |vaddr: u64| -> u32 {
+                let off = vaddr as usize;
+                let b = &img[off..off + 4];
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            };
+            // Dispatcher entry: sub w8,w1,#1; adrp x19,67d1000 (canary base).
+            assert_eq!(word_at(0x2bcd6e4), 0xd10183ff, "sh366 process_cmd prologue (sub sp,#0x60)");
+            assert_eq!(word_at(0x2bcd6fc), 0x51000428, "sh366 sub w8,w1,#0x1 (cmd in w1)");
+            assert_eq!(word_at(0x2bcd704), 0x71004d1f, "sh366 cmp w8,#0x13 (cmd<=0x14)");
+            // Jump table base (0x2bcd730) and INIT_WINDOW (cmd 11 -> index 10 -> offset 0x17):
+            // `adrp x9,694000; add x9,#0x8a; ldrh w11,[x9,x8,lsl#1]`.
+            assert_eq!(word_at(0x2bcd714), 0xf0fed629, "sh366 jump-table adrp x9,694000");
+            assert_eq!(word_at(0x2bcd718), 0x91022929, "sh366 jump-table add x9,#0x8a");
+            // Case target: table base + 0x17<<2 = 0x2bcd730 + 0x5c = 0x2bcd78c.
+            assert_eq!(word_at(0x2bcd78c), 0x9001e388, "sh366 INIT_WINDOW case adrp x8,683d000 (version gate)");
+            // Case body: ldr x0,[x20,#64] then strb w8,#1,[x20,#9] then bl window-attach 0x2bd29a0.
+            assert_eq!(word_at(0x2bcd7d0), 0xf9402280, "sh366 INIT_WINDOW body ldr x0,[x20,#64]");
+            assert_eq!(word_at(0x2bcd7d8), 0x39002688, "sh366 INIT_WINDOW body strb w8,#1,[x20,#9]");
+            assert_eq!(word_at(0x2bcd7dc), 0x94001471, "sh366 INIT_WINDOW body bl 0x2bd29a0 (window-attach)");
+            // Window-attach 0x2bd29a0: once-guard read [this+0x268] then tbz -> skip.
+            assert_eq!(word_at(0x2bd29a0), 0xd10103ff, "sh366 window-attach prologue");
+            eprintln!("sh366 app-cmd dispatcher contract (process_cmd ABI + INIT_WINDOW case) pinned on libroblox.so");
+        } else {
+            eprintln!("sh366 real-image guard: no real libroblox.so, skipping anchors");
         }
     }
 

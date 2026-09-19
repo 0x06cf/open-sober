@@ -1,5 +1,56 @@
 # Open Sober — Agent Handoff
 
+## SH366 (Sep 19, 2026, hermes-worker): FIRST headless ENTRY into the engine's own app-command DISPATCHER process_cmd (0x102bcd6e4) — the APP_CMD_INIT_WINDOW case body EXECUTED (marker [inner+9]==1), the SESSION-CTOR window/GL-surface precondition the operator names for initEngine_ was driven (not just watched); Route-B live-DM structural gate UNCHANGED (DM-root 0, MH_* false)
+Single-agent (cone suppressed). One new bounded cause-level drive
+`drive_glue_process_cmd` (arm64jit/src/jit.rs, opt-in rung `--v2boot-glue-cmd` at the
+TOP of the ladder) + one new real-image hermetic
+`sh366_glue_process_cmd_abi_and_init_window_case_pinned` (10 byte-pins + the
+jump-table index-10->0x2bcd78c mapping verified on real libroblox.so) + capture
+`runs/capture_sh366_glue_cmd.sh`. elfjit.rs held <1MB (condensed SH-prose comments).
+Workspace green (cargo test --workspace EXIT 0, 609 passed/0 failed — arm64jit lib
+429 after sh366).
+
+### The forward this cycle
+The operator's SESSION-CTOR lever names the window/GL-surface `APP_CMD_INIT_WINDOW` as
+the precondition behind initEngine_'s "*** Engine settings is null" hard-assert. SH39b
+region-watched the glue LOOP (0x102bcd5d0) at 0 hits; SH365 measured the app-command
+drain dead (addfd=0, pollonce=0, posted=3). BOTH only observed the path; neither
+ENTERED it, because the glue main loop is an INFINITE ALooper_pollOnce loop that cannot
+be jit_run to completion. The loop dispatches to a BOUNDED fn, `process_cmd(app, cmd)`
+at guest 0x102bcd6e4 (w1 = APP_CMD value), which CAN be entered — and nobody had ever
+driven it. SH366 is that first entry: with a fabricated app ([app]=inner,
+[inner+64]=zeroed win obj, version-gate [0x10683d8b0]=0) the INIT_WINDOW case body does
+`ldr x0,[x20,#64]; strb w8,#1,[x20,#9]; bl window-attach` -> for the first time
+headlessly the engine RUNS its own APP_CMD_INIT_WINDOW handler (marker [inner+9]=1),
+the window-attach path enters, and the whole run is stable.
+
+### MEASURED (real libroblox.so, completing ladder + --v2boot-glue-cmd)
+```
+[elfjit:glue-cmd] driving process_cmd @ guest 0x102bcd6e4 (app=... [app]=... [inner+64]=win ... cmd=11 INIT_WINDOW; version-gate [0x10683d8b0]=0)
+[elfjit:glue-cmd] process_cmd returned Ok(...)
+[elfjit:glue-cmd] INIT_WINDOW case body marker [inner+9]=1 EXECUTED (engine window-attach path entered headlessly)
+```
+Confirmed-green artifact (retry 2): EXIT 124, 0 SIGSEGV/ABRT, marker=1. The drive logs
+its success even on a run that later dies at a pre-existing run-variable persistence-
+lane wall (SH353-class, unrelated — the drive runs FIRST).
+
+### Honest
+Does NOT manufacture a DataModel. Route-B live-DM structural gate UNCHANGED (DM-root
+[0x106a68818]=0, MH_* false). SH366 proves the window-condition *entry* is reachable
+via the bounded process_cmd leaf — the ALooper loop itself is still not entered (SH365
+drain dead-letter unchanged). The window obj handed to 0x2bd29a0 is a ZEROED host
+buffer, not a wired EGL surface; the real window-attach completion (and the do-init
+chain that would build the DM) is the standing next step, not reached this cycle.
+SH174 capture-latch stays the single forward hook.
+
+### Next (on the SH366 line)
+Hand the engine a REAL wired ANativeWindow — the wired X11 XID 0x200000 (SH112/SH365,
+via anativewindow_fromsurface) — in [inner+64] instead of the zeroed obj, so the
+window-attach helper 0x2bd29a0 takes its real GL-surface path; then chain process_cmd
+to the do-init ladder per the operator's SESSION-CTOR "drive until the upstream ctor
+RUNS" directive. Do NOT re-attach a zeroed obj expecting the DM to move; do NOT re-enter
+the infinite ALooper loop (bounded process_cmd is the correct entry).
+
 ## SH365 (Sep 19, 2026, hermes-worker): MEASURED dead-letter — the host app-command FIFO is never drained by the guest android_app glue loop (addfd=0, pollonce=0, posted=3, 3/3) on the completing ladder, pinning the SESSION-CTOR "window/GL-surface APP_CMD_INIT_WINDOW" precondition as an undelivered lifecycle event; recon-v3 deliverables re-verified green at HEAD
 Single-agent (cone suppressed). Always-on ALooper drain counters
 (`app_command_drain_stats` in shims.rs) + a 1.5s-grace readback in the elfjit

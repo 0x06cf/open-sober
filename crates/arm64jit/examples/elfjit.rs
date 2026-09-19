@@ -6356,8 +6356,8 @@ fn main() {
     const STACK_SIZE: usize = 4 * 1024 * 1024;
     let stack = Box::leak(vec![0u8; STACK_SIZE].into_boxed_slice());
     // Lay out a real kernel-style initial stack (argc/argv/envp/auxv) so glibc
-    // IFUNCs resolve to scalar paths reading garbage auxv into SMP
-    // (which drove the JIT into an unsupported `str za` wall). No SME/SVE bits.
+    // IFUNCs resolve to scalar paths reading garbage auxv into SMP (a `str za` wall).
+    // No SME/SVE bits.
     let mut auxv = arm64jit::boot::standard_auxv(
         &el,
         arm64jit::boot::HWCAP_FP | arm64jit::boot::HWCAP_ASIMD,
@@ -6648,6 +6648,15 @@ fn main() {
                     ("V2StartAppWithParams", 0x10258b144, [env_ptr, thiz, start_params, 0, 0, 0, 0, 0]),
                 ];
                 dump("boot start");
+                // SH366 (--v2boot-glue-cmd): ENTER the guest app-cmd dispatcher process_cmd
+                // (0x102bcd6e4) to deliver APP_CMD_INIT_WINDOW through the real engine
+                // window-attach path — the SESSION-CTOR window precondition never ENTERED
+                // (SH39b watched 0 hits; SH365 dead-drain). Bounded fn. Run FIRST (before the
+                // crash-prone lifecycle natives) so the measurement survives run-variable walls.
+                if std::env::args().any(|a| a == "--v2boot-glue-cmd") {
+                    arm64jit::jit::drive_glue_process_cmd(iimg, ib, tpidr, boot_sp);
+                    dump("glue-cmd INIT_WINDOW");
+                }
                 // Route-B latch (recon-routeB-globaltinit-unblock.md): gameGlobalInit only leaves its
             // nanosleep park once [0x72739d4].bit0==1 (flags loaded). Drive nativeInitializeNativeFlags
             // (0x10232048c) FIRST as rung 0 - the engine's OWN flags-loaded write chain. SH82: GlobalInit
@@ -7413,12 +7422,10 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                         arm64jit::jni::nativehelper_flags_loaded(),
                         arm64jit::jni::nativehelper_app_ready()
                     );
-                    // SH295: drive the LAST never-driven item-proc edge - [item+48]. Setting
-                    // item[+48]=benign obj makes `bl 0x22193a0` (0x22079e0) EXECUTE; it sets
-                    // w2=xzr -> trampoline 0x22076e8 -> dispatcher 0x2850ef0 -> bl 0x28511c4 =
-                    // the vt[+112] LIVE-OBJECT wall (guestpc=0x1028511f8), reached BEFORE the
-                    // benign-cell subpaths (read [0x1068262e8], SH294) - seeding that cell
-                    // CANNOT unlock it. MEASURED (SH293 "not driveable" -> measured wall).
+                    // SH295: drive the LAST never-driven item-proc edge - [item+48]. Setting it benign makes
+                    // `bl 0x22193a0` EXECUTE -> trampoline 0x22076e8 -> dispatcher 0x2850ef0 ->
+                    // bl 0x28511c4 = vt[+112] LIVE-OBJECT wall (0x1028511f8), reached BEFORE the
+                    // benign subpaths - seeding can't unlock it. MEASURED (SH293).
                     let item48 = Box::leak(vec![0x0u8; 0x40usize].into_boxed_slice()).as_mut_ptr() as u64;
                     unsafe { *(item.wrapping_add(48) as *mut u64) = item48; } // item[+48]=benign cont obj
                     unsafe { *(item.wrapping_add(32) as *mut u64) = obj; }    // keep [item+32] vt[+48] leaf
@@ -7778,19 +7785,13 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                     eprintln!("[elfjit:v2boot-r1] stage results: {} ({} mirrored files)", wrote.join(", "), wrote.len());
                 }
                 eprintln!("[elfjit:v2boot] ladder done; final [0x106829ea8] = {:#x}", dw(BSS_TASKV4));
-                    // SH126-gate: signal the render pipeline it may start now
-                    // (JIT_SERIALIZE_RENDER=1 makes --renderinit wait for this so
-                    // render jit_runs never overlap the ladder's - SH55/64 class).
+                    // SH126-gate: signal render pipeline it may start (JIT_SERIALIZE_RENDER waits).
                     LADDER_DONE.store(true, core::sync::atomic::Ordering::Relaxed);
                     eprintln!("[elfjit:v2boot] LADDER_DONE=1 signaled (render may start)");
-                    // SH130: the ladder is cleanly done with no worker racing it -
-                    // release the engine's clone workers now (their free admission
-                    // gate) so post-ladder engine work/drain can use them.
+                    // SH130: release engine clone workers' admission gate now the ladder is clean.
                     arm64jit::jit::WORKER_ADMISSION_GATE.store(false, core::sync::atomic::Ordering::Release);
                     eprintln!("[elfjit:worker-gate] SH130 admission gate CLEARED (LADDER_DONE) — engine clone workers may run");
-                    // SH122 session-advance probe: after the ladder, read the
-                    // NativeHelper milestones + data-dir path state to confirm
-                    // whether StartLuaAppDM's do-init advanced the session.
+                    // SH122 session-advance probe: post-ladder NativeHelper milestones + data-dir state.
                     let nf = arm64jit::jni::nativehelper_flags_loaded();
                     let ni = arm64jit::jni::nativehelper_engine_initialized();
                     let ar = arm64jit::jni::nativehelper_app_ready();
@@ -8340,13 +8341,9 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                             continue;
                         }
                         let old = unsafe { *(latch as *const libc::c_int) };
-                        // Version-counter futex: the waiter captures *latch as
-                        // its "expected" value and blocks WHILE *latch is
-                        // unchanged. Releasing it requires writing a NEW value
-                        // (increment the version - never reuse the previous or
-                        // the next waiter captures that same value and
-                        // re-blocks; a fixed write self-defeating one-off).
-                        // Gate exact idle call-site.
+                        // Version-counter futex: waiter captures *latch as "expected" and blocks while
+                        // unchanged; release needs a NEW value (increment, never reuse)
+                        // else the next waiter re-blocks. Gate exact idle call-site.
                         let nv = set_val.unwrap_or_else(|| old.wrapping_add(1));
                         // --futex-bump: increment the VERSION word [Q]
                         // high-32 consumer's proceed-gate
