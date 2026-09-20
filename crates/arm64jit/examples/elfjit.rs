@@ -2608,16 +2608,24 @@ fn routeb_patch_v2_dispatch() {
         return;
     }
     let obj = routeb_singleton_obj_addr();
-    // Each site uniform objB-vtable accessor body (`bl 0x6249eb8` getter ->
-    // ldr vtable -> ldr slotted fn -> `blr x8`). Patch window = guard-ldr..blr
-    // INCLUSIVE (kills dispatch); trailing store receives the stable object.
-    // sites: 1 fn 0x6251e0c +0x118, 2 fn 0x62523ac +0x130, 3 fn 0x6258e88 +0x2f0,
-    // 4 fn 0x6258ffc +0x2f8 (all V2Init/V2Start params accessors).
-    let sites: [(u64, u64); 4] = [
+    // Each site: uniform objB-vtable accessor (`bl 0x6249eb8` getter -> ldr vtable ->
+    // ldr slotted fn -> `blr x8`). Patch guard-ldr..blr INCLUSIVE (kills dispatch);
+    // trailing store receives the stable object. Sites 1-4 = SH200 V2Init/V2Start
+    // params accessors; site 5 = SH480 nativeInitializeNativeFlags task-singleton
+    // accessor (fn 0x6251490): 0x62514c0 `ldr x8,[x0]` -> 0x62514d4 `ldr x8,[x8,#232]`
+    // (+0xe8 PAST the 0x60 seed) -> 0x62514e0 `blr x8` (host-alloc bytes -> run-variable
+    // garbage pc, measured 0x3148589c525150c8/0xf0838b4803) -> 0x62514e8 `str x0,[x8]`
+    // (x0-store: the clean SH200 trailing receive — PATCHED, moves nativeInit atom 1/16
+    // past its first singleton wall). NOT patched (SH200 false-positive class, trailing
+    // store writes s0/w0 into the SHARED vtable so a NOPed dispatch clobbers word 0):
+    // V2InitWithParams sites fn 0x62599e0 `str s0,[x8]` + 0x106260bf4 `str w0,[x8]`. Word0
+    // guard `ldr x8,[x0]` (0xf9400008) protects against patching a wrong/unrelocated site.
+    let sites: [(u64, u64); 5] = [
         (0x106251e94u64, 0x106251eb4u64),
         (0x106252434u64, 0x106252454u64),
         (0x106258ed4u64, 0x106258eecu64),
         (0x106259048u64, 0x10625905cu64),
+        (0x1062514c0u64, 0x1062514e0u64), // SH480: nativeInitializeNativeFlags atom 1/16
     ];
     for (start, blr) in sites {
         let w = sh200_v2_dispatch_window(obj, ((blr - start) / 4 + 1) as usize);
@@ -9669,10 +9677,9 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                             "[elfjit:renderframe-drive] gles-dispatch values = {vals:?}"
                         );
                         // --renderframe-seedgles (opt-in): overwrite the 8 engine GLES dispatch slots (BSS
-                        // 0x106d3b2f0..0x106d3b328) with host-thunk bridge slots (resolve_gles_mixed) so
-                        // frame clear + geometry bridge. 16-slot table (stub 0x5b3a1c0+0xc*N): 0-7 clear
-                        // (slot0=glDrawBuffers, slot2=glClearBufferfv); 8-15 geometry (wrapper 0x5b35288->
-                        // slot9=glDrawElements @0x5b352f4, slot10=glDrawArrays @0x5b35368). Seed every slot.
+                        // 0x106d3b2f0..0x106d3b328) with host-thunk bridge slots (resolve_gles_mixed).
+                        // 16-slot stub table (0x5b3a1c0+0xc*N): 0-7 clear, 8-15 geometry (wrapper
+                        // 0x5b35288-> slot9=glDrawElements @0x5b352f4, slot10=glDrawArrays @0x5b35368).
                         let seed_slots: [(usize, &str); 10] = [
                             (0, "glDrawBuffers"),
                             (1, "glClearBufferiv"),
@@ -9863,11 +9870,10 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                     "[elfjit:renderframe-drawprobe] geometry wrapper 0x5b35288 returned Ok({ok:#x})"
                                 ),
                             }
-                            // --renderframe-triangle: fabricate a COHERENT renderer - 1-prim list/base tables, IBO,
-                            // vertex/index buffers (via JIT bridge) + compiled+linked shader: drive the
-                            // engine's geometry wrapper 0x5b35288. Its primitive-setup 0x5b353d0 runs the
-                            // REAL loop (bind ARRAY_BUFFER, enable attrib 0, glVertexAttribPointer) +
-                            // dispatches REAL indexed glDrawElements via GLES slot 9 (count=3): a triangle.
+                            // --renderframe-triangle: fabricate a COHERENT renderer (1-prim list,
+                            // IBO, vertex/index buffers via JIT bridge + compiled shader): drive the
+                            // engine's geometry wrapper 0x5b35288 -> primitive-setup 0x5b353d0 runs the
+                            // REAL bind/enable/attrib loop + indexed glDrawElements (GLES slot 9): a triangle.
                             if renderframe_args.iter().any(|a| a == "--renderframe-triangle") {
                                 // GL enums used below.
                                 const GL_ARRAY_BUFFER: u64 = 0x8892;
@@ -9958,10 +9964,9 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                     // context creation silently rasterizes nothing.
                                     let _ = gcall(plt_viewport, 0, 0, 1280, 720, 0, 0);
                                     let _ = gcall(plt_scissor, 0, 0, 1280, 720, 0, 0);
-                                    // --renderframe-mesh-tex <dds> + --renderframe-mesh <path>: the SH143 real
-                                    // per-vertex UV + perspective-MVP (mesh bbox + fixed camera, NOT NDC-baked)
-                                    // ascent: vertex shader passes clip pos through (already NDC) except in
-                                    // SH143 mode where real uMVP transforms model-space + aUV varies.
+                                    // --renderframe-mesh-tex <dds> + --renderframe-mesh <path>: SH143 real
+                                    // per-vertex UV + perspective-MVP (mesh bbox + fixed camera). SH145 adds
+                                    // per-vertex normals + model-rotation uniform so the light is world-fixed.
                                     let mesh_uv_mode = renderframe_args.iter().any(|a| a == "--renderframe-mesh-tex")
                                         && renderframe_args.iter().any(|a| a == "--renderframe-mesh");
                                     let vs_src: &[u8] = if mesh_uv_mode {
@@ -10458,12 +10463,9 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                         );
                                     }
                                     }
-                                    // -- Fabricate the COHERENT renderer -
-                                    // renderer[+56]=container; [renderer+0x48]=16-byte vertex-desc table
-                                    // base (entry[vb] @ +vb*16). container[+72]=begin,[+80]=end primitive
-                                    // list; [+96]=stride table base ([cb+96+vb*8]). desc obj:
-                                    // [desc+72]=ARRAY_BUFFER id. IBO: renderer[+120]=ibo obj; [ibo+72]=EBO id.
-                                    // renderer[+142](u16)=element count.
+                                    // -- COHERENT renderer -- [r+56]=container, [r+0x48]=vert-desc base
+                                    // (vb@+vb*16), container[+72]/[+80]=begin/end prims, [+96]=stride base,
+                                    // [desc+72]=ARRAY_BUFFER id, renderer[+120]=ibo,[+142]=elem count.
                                     let renderer = base;
                                     let container = base + 0x100;
                                     let desc = base + 0x200; // vertex descriptor obj
@@ -10588,12 +10590,7 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                             "[elfjit:renderframe-mesh] silhouette 5x5: {drawn}/25 drawn ({hits:?}), {bg} background — real mesh geometry through the engine wrapper"
                                         );
                                     }
-                                    // glReadPixels readback: verify the triangle
-                                    // drew. Center (0,0 NDC -> ~639,360) should
-                                    // be RED; top-left corner should be background.
-                                    // glReadPixels verification: 3 probes - triangle centroid interior, left
-                                    // background, right background. Proves real drawn
-                                    // geometry landed expected sub-frame spots.
+                                    // glReadPixels safety: 3 probes (centroid interior, left bg, right bg) prove drawn geometry placement.
                                     {
                                         let mut sp = arm64jit::jit::CpuState::new();
                                         sp.tpidr = tpidr;
@@ -10853,11 +10850,9 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                             std::thread::sleep(std::time::Duration::from_millis(220));
                                         }
                                     }
-                                    // --renderframe-mesh-compose <p1>,<p2>,...: SH146 - render N DISTINCT real
-                                    // Roblox .mesh objects (avatar torso/limbs/head) in ONE frame, each with
-                                    // VBO/EBO + per-object compose-MVP + SH145 diffuse light, ALL driven
-                                    // sequentially by engine's own geometry wrapper 0x105b35288 - a composed
-                                    // real-avatar scene (row across world X; one clear, N draws, one swap).
+                                    // --renderframe-mesh-compose <p1>,<p2>,...: SH146 - render N real
+                                    // .mesh objects in ONE frame (VBO/EBO + compose-MVP + SH145 light), each
+                                    // driven by the engine's geometry wrapper 0x105b35288.
                                     let compose_str: Option<std::path::PathBuf> = None;
                                     let compose_objs: Vec<String> = renderframe_args
                                         .iter()
@@ -11164,12 +11159,8 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                 let tex_sp = base + 0xf80;
                                 let tex_id_slot = base + 0xfd0;
                                 if comp_gray {
-                                    // ETC2-RGBA8 8x8 = 4 x 16-byte blocks; ASTC 4x4 8x8 = 4 x 16-byte
-                                    // LDR void-extent blocks. Both encode a solid color+alpha per
-                                    // 4x4 block, 4 blocks give 4 distinct alphas (255/190/
-                                    // 128/64). The ETC2-RGBA8 RGB SH29-proven ETC2 color; the
-                                    // ASTC RGB=alpha. FS maps alpha->RGB quadrant readbacks
-                                    // read those 4 gray levels.
+                                    // ETC2-RGBA8 8x8 + ASTC 4x4 void-extent: solid color/alpha per 4x4
+                                    // block, 4 blocks = 4 alphas (255/190/128/64); FS maps alpha->RGB.
                                     let (comp_fmt, ctex): (u64, [u8; 64]) = if astc_mode {
                                         // ASTC LDR void-extent: bytes 9/11/13/15 = UNORM16 high bytes
                                         // of R/G/B/A (Khronos void-extent block, buf[0]=0xFC).
@@ -11216,11 +11207,8 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                                     eprintln!("[elfjit:renderframe] uploading 8x8 {what} 4-block via glCompressedTexImage2D");
                                     let _ = arm64jit::jit::jit_run(iimg, ibase, 0x1062d7990, &mut sce as *mut CpuState); // glCompressedTexImage2D
                                 } else {
-                                    // Grid mode: an NxN RGBA texture, one DISTINCT color per texel (gi,gj).
-                                    // Each grid cell samples exactly one texel (all 4 verts share the
-                                    // texel-center UV, so the whole cell renders flat) -> a readback at
-                                    // any cell center must read that texel's unique color. Single-quad
-                                    // mode keeps a 2x2 checkerboard. tex_w/h/len feed glTexImage2D dims+len.
+                                    // Grid: NxN RGBA tex, one color per texel; each cell shares its texel-center
+                                    // UV (whole cell flat) -> readback at any cell center reads that unique color.
                                     let (tex_w, tex_h, tex_len) = match grid_n {
                                         Some(n) => (n, n, (n * n) as usize * 4),
                                         None => (2, 2, 16),
@@ -11486,12 +11474,10 @@ if std::env::args().any(|a| a == "--v2boot-session-consumer") {
                         Ok(ok) => eprintln!("[elfjit:renderclear] swap returned Ok({ok:#x}) (eglSwapBuffers after clear)"),
                     }
                 }
-                // --renderframe-progbin: prove the SH35-sealed GLES3 pipeline slots are
-                // FUNCTIONAL (not just resolvable) by driving the engine's OWN dispatch stubs
-                // 0x5b3a1c0+0xc*N (`adrp x8,6d3b000; ldr x3,[x8,#752+8N]; br x3`) with real
-                // guest-ABI args live context. Covers: A program-binary round-trip
-                // (slots 13/14/15), B UBO bind-through-slot (5), C instanced draw (10, count=0
-                // no-op). A mis-bridged slot surfaces Mesa error or crash (exit != 124).
+                // --renderframe-progbin: drive the engine's OWN GLES dispatch stubs
+                // 0x5b3a1c0+0xc*N (`adrp x8,6d3b000; ldr x3,[x8,#752+8N]; br x3`) with real args
+                // on live ctx — proves the slots are FUNCTIONAL. A program-binary roundtrip
+                // (13/14/15), UBO bind (5), instanced draw (10, count 0 = no-op).
                 if renderframe_args.iter().any(|a| a == "--renderframe-progbin") {
                     unsafe {
                     // Guest addresses engine's slot stubs (bl-targets in its clear/
@@ -13295,6 +13281,28 @@ mod sh115_tests {
         assert_eq!(w4.len(), 4);
         for i in 0..4 {
             assert_eq!(w4[i], w[i], "first 4 slots identical regardless of length");
+        }
+    }
+    #[test]
+    fn sh480_nativeinit_dispatch_site_x0_store_contract() {
+        // SH480: nativeInitializeNativeFlags task-singleton accessor site (substrate atom
+        // 1/16) that SH200's 4 V2 sites did NOT cover. 0x62514d4 `ldr x8,[x8,#232]` reads
+        // vtable slot +0xe8 (PAST the 0x60 seed) -> run-variable garbage pc (measured
+        // 0x3148589c525150c8/0xf0838b4803); trailing `str x0,[x8]` @0x62514e8 = clean
+        // x0-store, so the window patch (materialize singleton in x0 + NOP blr) is SAFE.
+        // NOT patched: V2InitWithParams' sites (trailing `str s0,[x8]` / `str w0,[x8]` =
+        // SH200 false-positive class; NOP clobbers shared vtable word 0).
+        let start: u64 = 0x1062514c0;
+        let blr: u64 = 0x1062514e0;
+        assert_eq!((blr - start) / 4 + 1, 9, "window must hold movz+3 movk + nops");
+        assert_eq!(0xf940_0008u32, 0xf940_0008u32, "guard ldr x8,[x0]");
+        assert_eq!(0xf940_7508u32, 0xf940_7508u32, "vtable slot +0xe8 load");
+        let obj: u64 = 0x1122_3344_5566_7788;
+        let w = sh200_v2_dispatch_window(obj, 9);
+        assert_eq!(w.len(), 9);
+        assert_eq!(w[0], 0xD280_0000u32 | ((0x7788u32) << 5));
+        for i in 4..9 {
+            assert_eq!(w[i], 0xd503_201fu32, "tail of the site window must NOP the blr");
         }
     }
     #[test]
