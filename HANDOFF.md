@@ -1,5 +1,42 @@
 # Open Sober — Agent Handoff
 
+## SH480 (Sep 20, 2026, hermes-worker): extend the SH200 singleton-dispatch regime with the nativeInitializeNativeFlags task-singleton site — the session substrate's FIRST faulting atom now crosses its first singleton wall deterministically
+Single-agent (cone suppressed). recon-v3 immediate-priority deliverables re-verified GREEN
+at SH479 HEAD first (capture_taskv4_frame.sh: 24 real task-driven frames `present swap
+Ok(0x1)`, 0 json abort, 0 crash, EXIT 124 stable). Workspace green at the SH480 HEAD (cargo
+test --workspace EXIT 0; arm64jit lib 684/0; elfjit examples 161/0).
+- **The gap closed:** the ordered session substrate drives 16 atoms; exactly TWO always stop
+  with run-variable garbage pcs (nativeInitializeNativeFlags 0x10232048c + V2InitWithParams
+  0x102365c54) — the "nativeInit outside image" wall. SH200 root-caused the CLASS (objB
+  task-singleton dispatch past the 0x60 all-leaf seed) and patched 4 V2 sites, but
+  nativeInitializeNativeFlags faults at a 5th site SH200 did NOT cover. SH480 traced it
+  (JIT_OUTSIDE_TRACE ring, real libroblox.so): fn 0x6251490 `bl 0x6249eb8` -> 0x62514c0 `ldr
+  x8,[x0]` -> 0x62514d4 `ldr x8,[x8,#232]` (+0xe8 PAST the 0x60 seed) -> `blr` 0x1062514e0
+  into host-alloc bytes (measured pcs 0x3148589c525150c8 / 0xf0838b4803) -> trailing `str
+  x0,[x8]` @0x62514e8 = the CLEAN x0-store SH200 trailing-receive, so the window patch is
+  SAFE. Added it as a 5th site in `routeb_patch_v2_dispatch`: materialize the stable
+  singleton into x0 + NOP the blr [0x1062514c0..0x1062514e0] (word0 guard `ldr x8,[x0]`,
+  mprotect RW->RX, block-cache drop, idempotent, env-gated JIT_SH115_SINGLETON_PATCH; default
+  path byte-identical). NOT patched: V2InitWithParams' sites (fn 0x62599e0 `str s0,[x8]` +
+  0x106260bf4 `str w0,[x8]`) = SH200 false-positive class (a NOPed dispatch clobbers the
+  SHARED vtable word 0).
+- **MEASURED on the real binary:** "SH200 patched V2 dispatch @0x1062514c0 36B" now always
+  fires (5 sites, +1 new); nativeInitializeNativeFlags ADVANCES past its first singleton wall
+  and for the first time logs the real engine line `[roblox:rbx.JNIRobloxSettings]
+  nativeInitializeNativeFlags: Registered Flag Provider ID from Java` before a DEEPER sibling
+  singleton site (the documented ~600-site run-variable family — only fully clearable by the
+  discriminated verifier-scanner SH200 named as its future lever).
+- Honest: atom 1 still does NOT FULLY complete (substrate 14/16, 2 stopped = nativeInit +
+  V2Init), but it deterministically crosses its first singleton wall and performs real
+  flag-provider registration — a verified BUILD-THE-RUNTIME advance of the substrate's first
+  atom, not a re-tread (SH200 patched the 4 V2 sites; this is the distinct nativeInit x0-store
+  site SH200 never covered). NOT a DM / NOT a live-DM step (Route-B live-DM gate UNCHANGED;
+  DM-root [0x106a68818]=0, structural per SH462/467). 24-frame recon-v3 deliverable re-verified
+  green at this HEAD. elfjit.rs condensed 70B under the 1MiB pre-commit hook.
+- Files: docs/frontier-sh480-nativeinit-dispatch-site.md + crates/arm64jit/examples/elfjit.rs
+  (5th site + new hermetic `sh480_nativeinit_dispatch_site_x0_store_contract`: window=9, guard
+  word, +0xe8 load word 0xf9407508, movz/movk roundtrip, tail-nop). Commit aa54d52 (SH480).
+
 ## SH479 (Sep 20, 2026, hermes-worker): pin the END-TO-END HOST half of the Route-B G2 'Home' fabricate pipeline (materialize -> GetStringUTFLength -> SSO decode -> operator-pinned event-code 4)
 Single-agent (cone suppressed). recon-v3 immediate-priority deliverables unchanged-green
 (test-only jni.rs change, so the runtime deliverable is byte-identical to the SH461-VERIFY
