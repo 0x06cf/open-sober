@@ -1780,20 +1780,19 @@ pub fn routeb_appstart_adapter_object() -> u64 {
     })
 }
 
-/// SH259 (opt-in JIT_ROUTEB_APPSART_SETTINGS_ONCE): seed the once-guard of the settings/registry
-/// singleton factory the deepest app-start reach bl's. SH258 measured nativeAppBridgeAppStart's
-/// orchestrator 0x2339d0c reaching 0x102339d44 = `bl 0x21dac2c` (a once-guarded settings singleton
-/// factory), then EXIT 134 at the live-object map wall 0x1021dde34. Disasm of 0x21dac2c:
-/// `adrp x8,6a6f000; add x8,#0x430; ldar w8,[x8]; tbz w8,#0,0x21dac54` reads once-guard
-/// [0x106a6f430]. bit0 CLEAR (headless) -> builder path (`bl 0x284ce54` __call_once
-/// then `bl 0x21dac80`; body registry setters) hands into the map-construction chain (0x21ddc44 ->
-/// 0x21ddcac, stride-0x2a0 live-object map) = the SH174/SH204 wall. bit0 SET -> 0x21dac2c takes
-/// `adrp x0,6a6f000; add x0,#0x3f0; ret` = early-ret the (zeroed .bss) registry 0x6a6f3f0 WITHOUT
-/// the builder, so control returns to 0x2339d48 and it walks its OWN real app-start body
-/// (0x233a804/0x233af10/0x233bbac/0x233bf20/0x233d11c/0x233d2bc..) — a fresh Path-B surface never
-/// reached headlessly. Unlike SH248e (seeds the -1 CELL [0x106b0bdf0]) this seeds the once-guard
-/// FLAG itself, the SH156 "flags-latch" pattern at a NEW cell. Fires at block-entry
-/// [0x102339d40,0x102339d4c) (immediately before the bl); idempotent (ORs bit0 only); default-inert.
+/// SH259 (opt-in JIT_ROUTEB_APPSART_SETTINGS_ONCE): seed the once-guard of the
+/// settings/registry singleton factory the deepest app-start reach bl's. SH258
+/// measured nativeAppBridgeAppStart's orchestrator 0x2339d0c reaching 0x102339d44
+/// = `bl 0x21dac2c` (once-guarded settings singleton factory), then EXIT 134 at
+/// the live-object map wall 0x1021dde34. 0x21dac2c reads once-guard
+/// [0x106a6f430].bit0 CLEAR (headless) -> builder -> map-construction chain
+/// (0x21ddc44 -> 0x21ddcac, stride-0x2a0 map) = the SH174/SH204 wall. bit0 SET ->
+/// early-ret the zeroed .bss registry 0x6a6f3f0 WITHOUT the builder, so control
+/// returns and walks its OWN real app-start body (0x233a804/0x233af10/0x233bbac/
+/// 0x233bf20/0x233d11c/0x233d2bc..) — a fresh Path-B surface never reached
+/// headlessly. Unlike SH248e (seeds the -1 CELL [0x106b0bdf0]) this seeds the
+/// once-guard FLAG itself (SH156 flags-latch at a NEW cell). Fires at block-entry
+/// [0x102339d40,0x102339d4c); idempotent (ORs bit0 only); default-inert.
 fn routeb_appstart_settings_once_seed_guard(_state: *mut CpuState, pc: u64) {
     if std::env::var_os("JIT_ROUTEB_APPSART_SETTINGS_ONCE").is_none() {
         return;
